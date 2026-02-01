@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ToolCall",
+  "type": "object",
+  "properties": {
+    "tool_name": {"type": "string"},
+    "input": {"type": "object"},
+    "idempotency_key": {"type": "string"},
+    "trace_id": {"type": "string"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": ["string", "null"], "format": "date-time"},
+    "status": {"type": "string"},
+    "output_or_error": {"type": "object"}
+  },
+  "required": ["tool_name", "input", "idempotency_key", "trace_id", "started_at", "status"]
+}

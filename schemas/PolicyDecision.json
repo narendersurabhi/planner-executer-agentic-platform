@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PolicyDecision",
+  "type": "object",
+  "properties": {
+    "scope": {"type": "string"},
+    "decision": {"type": "string"},
+    "reasons": {"type": "array", "items": {"type": "string"}},
+    "rewrites": {"type": ["object", "null"]},
+    "decided_at": {"type": "string", "format": "date-time"}
+  },
+  "required": ["scope", "decision", "reasons", "decided_at"]
+}

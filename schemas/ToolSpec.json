@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ToolSpec",
+  "type": "object",
+  "properties": {
+    "name": {"type": "string"},
+    "description": {"type": "string"},
+    "input_schema": {"type": "object"},
+    "output_schema": {"type": "object"},
+    "auth_required": {"type": "boolean"},
+    "timeout_s": {"type": "integer"},
+    "risk_level": {"type": "string"}
+  },
+  "required": ["name", "description", "input_schema", "output_schema"]
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plan",
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"},
+    "job_id": {"type": "string"},
+    "planner_version": {"type": "string"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "tasks_summary": {"type": "string"},
+    "dag_edges": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+    "policy_decision": {"type": ["object", "null"]}
+  },
+  "required": ["id", "job_id", "planner_version", "created_at"]
+}

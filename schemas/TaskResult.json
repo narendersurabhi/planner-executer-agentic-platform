@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskResult",
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string"},
+    "status": {"type": "string"},
+    "outputs": {"type": "object"},
+    "artifacts": {"type": "array", "items": {"type": "object"}},
+    "tool_calls": {"type": "array", "items": {"type": "object"}},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": ["string", "null"], "format": "date-time"},
+    "error": {"type": ["string", "null"]}
+  },
+  "required": ["task_id", "status", "outputs", "artifacts", "tool_calls", "started_at"]
+}

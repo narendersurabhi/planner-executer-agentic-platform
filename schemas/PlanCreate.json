@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlanCreate",
+  "type": "object",
+  "properties": {
+    "planner_version": {"type": "string"},
+    "tasks_summary": {"type": "string"},
+    "dag_edges": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+    "tasks": {"type": "array", "items": {"type": "object"}}
+  },
+  "required": ["planner_version", "tasks_summary", "tasks", "dag_edges"]
+}

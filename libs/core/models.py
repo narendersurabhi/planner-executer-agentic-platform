@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class JobStatus(str, Enum):
+    queued = "queued"
+    planning = "planning"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    canceled = "canceled"
+
+
+class TaskStatus(str, Enum):
+    pending = "pending"
+    ready = "ready"
+    running = "running"
+    blocked = "blocked"
+    completed = "completed"
+    accepted = "accepted"
+    rework_requested = "rework_requested"
+    failed = "failed"
+    canceled = "canceled"
+
+
+class PolicyDecisionType(str, Enum):
+    allow = "allow"
+    deny = "deny"
+    rewrite = "rewrite"
+
+
+class RiskLevel(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
+class ToolSpec(BaseModel):
+    name: str
+    description: str
+    input_schema: Dict[str, Any]
+    output_schema: Dict[str, Any]
+    auth_required: bool = False
+    timeout_s: int = 30
+    risk_level: RiskLevel = RiskLevel.low
+
+
+class ToolCall(BaseModel):
+    tool_name: str
+    input: Dict[str, Any]
+    idempotency_key: str
+    trace_id: str
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    status: str
+    output_or_error: Dict[str, Any]
+
+
+class TaskResult(BaseModel):
+    task_id: str
+    status: TaskStatus
+    outputs: Dict[str, Any]
+    artifacts: List[Dict[str, Any]]
+    tool_calls: List[ToolCall]
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+
+class CriticResult(BaseModel):
+    task_id: str
+    decision: str
+    reasons: List[str]
+    feedback: Optional[str] = None
+    checked_at: datetime
+
+
+class PolicyDecision(BaseModel):
+    scope: str
+    decision: PolicyDecisionType
+    reasons: List[str]
+    rewrites: Optional[Dict[str, Any]] = None
+    decided_at: datetime
+
+
+class EventEnvelope(BaseModel):
+    type: str
+    version: str
+    occurred_at: datetime
+    correlation_id: str
+    job_id: Optional[str] = None
+    task_id: Optional[str] = None
+    payload: Dict[str, Any]
+
+
+class Job(BaseModel):
+    id: str
+    goal: str
+    context_json: Dict[str, Any] = Field(default_factory=dict)
+    status: JobStatus
+    created_at: datetime
+    updated_at: datetime
+    priority: int = 0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class Plan(BaseModel):
+    id: str
+    job_id: str
+    planner_version: str
+    created_at: datetime
+    tasks_summary: str
+    dag_edges: List[List[str]]
+    policy_decision: Optional[PolicyDecision] = None
+
+
+class Task(BaseModel):
+    id: str
+    job_id: str
+    plan_id: str
+    name: str
+    description: str
+    instruction: str
+    acceptance_criteria: List[str]
+    expected_output_schema_ref: str
+    status: TaskStatus
+    deps: List[str]
+    attempts: int
+    max_attempts: int
+    rework_count: int
+    max_reworks: int
+    assigned_to: Optional[str] = None
+    tool_requests: List[str]
+    created_at: datetime
+    updated_at: datetime
+    critic_required: bool = True
+
+
+class TaskCreate(BaseModel):
+    name: str
+    description: str
+    instruction: str
+    acceptance_criteria: List[str]
+    expected_output_schema_ref: str
+    deps: List[str]
+    tool_requests: List[str]
+    critic_required: bool = True
+
+
+class PlanCreate(BaseModel):
+    planner_version: str
+    tasks_summary: str
+    dag_edges: List[List[str]]
+    tasks: List[TaskCreate]
+
+
+class JobCreate(BaseModel):
+    goal: str
+    context_json: Dict[str, Any] = Field(default_factory=dict)
+    priority: int = 0
+    idempotency_key: Optional[str] = None
+
+
+class JobUpdate(BaseModel):
+    status: JobStatus
+
+
+class TaskUpdate(BaseModel):
+    status: TaskStatus
+    assigned_to: Optional[str] = None
+    attempts: Optional[int] = None
+    rework_count: Optional[int] = None

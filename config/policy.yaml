@@ -1,0 +1,15 @@
+policy:
+  allowlist:
+    - json_transform
+    - math_eval
+    - text_summarize
+    - file_write_artifact
+    - sleep
+  max_tool_calls: 5
+  max_runtime_s: 120
+  output_size_cap: 50000
+  artifact_prefix: /shared/artifacts
+  sensitive_keys:
+    - ssn
+    - dob
+    - member_id

@@ -1,0 +1,105 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: agentic
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/agentic
+      REDIS_URL: redis://redis:6379/0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+  planner:
+    build:
+      context: .
+      dockerfile: services/planner/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PLANNER_MODE: rule_based
+    depends_on:
+      - redis
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TOOL_HTTP_FETCH_ENABLED: "false"
+    volumes:
+      - artifacts:/shared/artifacts
+    depends_on:
+      - redis
+  critic:
+    build:
+      context: .
+      dockerfile: services/critic/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CRITIC_ENABLED: "false"
+      CRITIC_MAX_REWORKS: "2"
+    depends_on:
+      - redis
+  policy:
+    build:
+      context: .
+      dockerfile: services/policy/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POLICY_GATE_ENABLED: "false"
+      POLICY_MODE: dev
+      POLICY_CONFIG_PATH: /app/config/policy.yaml
+      TOOL_HTTP_FETCH_ENABLED: "false"
+    volumes:
+      - ./config:/app/config
+    depends_on:
+      - redis
+  ui:
+    build:
+      context: .
+      dockerfile: services/ui/Dockerfile
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+  jaeger:
+    image: jaegertracing/all-in-one:1.53
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  db-data:
+  artifacts:
+  grafana-data:

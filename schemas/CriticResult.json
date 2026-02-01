@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CriticResult",
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string"},
+    "decision": {"type": "string"},
+    "reasons": {"type": "array", "items": {"type": "string"}},
+    "feedback": {"type": ["string", "null"]},
+    "checked_at": {"type": "string", "format": "date-time"}
+  },
+  "required": ["task_id", "decision", "reasons", "checked_at"]
+}
