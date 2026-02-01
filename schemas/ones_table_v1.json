@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["ones_table"],
+  "properties": {
+    "ones_table": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["multiplier", "multiplicand", "product"],
+        "properties": {
+          "multiplier": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "multiplicand": {
+            "type": "integer",
+            "const": 1
+          },
+          "product": {
+            "type": "integer"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

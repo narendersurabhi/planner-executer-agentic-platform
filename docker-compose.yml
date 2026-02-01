@@ -13,7 +13,7 @@ services:
   redis:
     image: redis:7
     ports:
-      - "6379:6379"
+      - "16379:6379"
   api:
     build:
       context: .
@@ -22,8 +22,13 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/agentic
       REDIS_URL: redis://redis:6379/0
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      POLICY_GATE_ENABLED: ${POLICY_GATE_ENABLED:-false}
+      ORCHESTRATOR_ENABLED: ${ORCHESTRATOR_ENABLED:-true}
+      ORCHESTRATOR_RECOVER_PENDING: ${ORCHESTRATOR_RECOVER_PENDING:-true}
+      ORCHESTRATOR_RECOVER_IDLE_MS: ${ORCHESTRATOR_RECOVER_IDLE_MS:-60000}
+      JOB_RECOVERY_ENABLED: ${JOB_RECOVERY_ENABLED:-true}
     ports:
-      - "8000:8000"
+      - "18000:8000"
     depends_on:
       - db
       - redis
@@ -33,7 +38,15 @@ services:
       dockerfile: services/planner/Dockerfile
     environment:
       REDIS_URL: redis://redis:6379/0
-      PLANNER_MODE: rule_based
+      PLANNER_MODE: llm
+      LLM_PROVIDER: openai
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
+      OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
     depends_on:
       - redis
   worker:
@@ -43,6 +56,17 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       TOOL_HTTP_FETCH_ENABLED: "false"
+      TOOL_HTTP_FETCH_ALLOWLIST: ${TOOL_HTTP_FETCH_ALLOWLIST:-}
+      TOOL_OUTPUT_SIZE_CAP: ${TOOL_OUTPUT_SIZE_CAP:-50000}
+      WORKER_MODE: llm
+      LLM_PROVIDER: openai
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
+      OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
     volumes:
       - artifacts:/shared/artifacts
     depends_on:
@@ -63,7 +87,7 @@ services:
       dockerfile: services/policy/Dockerfile
     environment:
       REDIS_URL: redis://redis:6379/0
-      POLICY_GATE_ENABLED: "false"
+      POLICY_GATE_ENABLED: ${POLICY_GATE_ENABLED:-false}
       POLICY_MODE: dev
       POLICY_CONFIG_PATH: /app/config/policy.yaml
       TOOL_HTTP_FETCH_ENABLED: "false"
@@ -75,29 +99,34 @@ services:
     build:
       context: .
       dockerfile: services/ui/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
     ports:
-      - "3000:3000"
+      - "3002:3000"
     depends_on:
       - api
   jaeger:
     image: jaegertracing/all-in-one:1.53
     ports:
       - "16686:16686"
-      - "4318:4318"
+      - "14318:4318"
   prometheus:
     image: prom/prometheus:latest
     ports:
       - "9090:9090"
     volumes:
       - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./docs/prometheus.rules.yml:/etc/prometheus/prometheus.rules.yml
   grafana:
     image: grafana/grafana:latest
     ports:
       - "3001:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./docs/grafana/provisioning:/etc/grafana/provisioning
+      - ./docs/grafana/dashboards:/var/lib/grafana/dashboards
 
 volumes:
   db-data:

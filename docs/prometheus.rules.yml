@@ -1,0 +1,19 @@
+groups:
+  - name: orchestrator.rules
+    rules:
+      - alert: OrchestratorLoopError
+        expr: increase(orchestrator_loop_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orchestrator loop errors detected"
+          description: "Orchestrator loop errors have occurred in the last 5 minutes."
+      - alert: OrchestratorHandleError
+        expr: increase(orchestrator_handle_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orchestrator handler errors detected"
+          description: "Orchestrator handler errors have occurred in the last 5 minutes."

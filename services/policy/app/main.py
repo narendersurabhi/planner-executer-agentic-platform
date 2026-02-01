@@ -35,10 +35,15 @@ def run() -> None:
         for _, entries in messages:
             for message_id, data in entries:
                 payload = json.loads(data["data"])
-                if payload.get("type") != "task.ready":
+                if payload.get("type") != "task.policy_check":
                     redis_client.xack(events.TASK_STREAM, group, message_id)
                     continue
-                task = models.Task(**payload.get("payload", {}))
+                task_payload = payload.get("payload", {})
+                try:
+                    task = models.Task(**task_payload)
+                except Exception:
+                    redis_client.xack(events.TASK_STREAM, group, message_id)
+                    continue
                 decision = engine.evaluate_task(task, TOOL_HTTP_FETCH_ENABLED)
                 event = models.EventEnvelope(
                     type="policy.decision_made",

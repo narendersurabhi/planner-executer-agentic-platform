@@ -9,8 +9,8 @@ JOB_TRANSITIONS: Dict[JobStatus, Set[JobStatus]] = {
     JobStatus.planning: {JobStatus.running, JobStatus.failed, JobStatus.canceled},
     JobStatus.running: {JobStatus.succeeded, JobStatus.failed, JobStatus.canceled},
     JobStatus.succeeded: set(),
-    JobStatus.failed: set(),
-    JobStatus.canceled: set(),
+    JobStatus.failed: {JobStatus.planning},
+    JobStatus.canceled: {JobStatus.planning},
 }
 
 TASK_TRANSITIONS: Dict[TaskStatus, Set[TaskStatus]] = {
@@ -25,7 +25,7 @@ TASK_TRANSITIONS: Dict[TaskStatus, Set[TaskStatus]] = {
     TaskStatus.completed: {TaskStatus.accepted, TaskStatus.rework_requested},
     TaskStatus.accepted: set(),
     TaskStatus.rework_requested: {TaskStatus.ready, TaskStatus.failed},
-    TaskStatus.blocked: set(),
+    TaskStatus.blocked: {TaskStatus.ready, TaskStatus.failed, TaskStatus.canceled},
     TaskStatus.failed: set(),
     TaskStatus.canceled: set(),
 }

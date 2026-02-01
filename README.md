@@ -100,11 +100,38 @@ Set:
 
 ```
 PLANNER_MODE=llm
+PLANNER_MAX_DEPTH=3
 LLM_PROVIDER=openai
 OPENAI_API_KEY=your_key
 ```
 
-Mock provider is used by default so the repo runs without external keys.
+To use LLMs in workers as well:
+
+```
+WORKER_MODE=llm
+OPENAI_MODEL=your_model
+OPENAI_BASE_URL=https://api.openai.com
+# Optional; some models (ex: gpt-5-mini) do not support temperature.
+OPENAI_TEMPERATURE=
+OPENAI_MAX_OUTPUT_TOKENS=
+OPENAI_TIMEOUT_S=60
+OPENAI_MAX_RETRIES=2
+```
+
+Mock provider is used by default so the repo runs without external keys unless `LLM_PROVIDER=openai`.
+
+## Schema validation for task outputs
+
+Workers can validate LLM outputs against JSON Schemas referenced by `expected_output_schema_ref`.
+
+Set:
+
+```
+SCHEMA_REGISTRY_PATH=/app/schemas
+SCHEMA_VALIDATION_STRICT=false
+```
+
+Place JSON schema files in `schemas/` and reference them with `schema/<name>`.
 
 ## Troubleshooting
 

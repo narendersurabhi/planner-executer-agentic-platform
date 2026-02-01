@@ -1,5 +1,6 @@
 FROM python:3.11-slim
 WORKDIR /app
+ENV PYTHONPATH=/app
 COPY libs/core /app/libs/core
 COPY services/api /app/services/api
 WORKDIR /app/services/api

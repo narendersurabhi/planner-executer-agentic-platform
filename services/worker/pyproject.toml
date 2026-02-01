@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
   "redis>=5.0",
   "pydantic>=2.6",
+  "jsonschema>=4.21",
   "structlog>=24.1.0",
 ]
 
@@ -17,6 +18,9 @@ quote-style = "double"
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[tool.setuptools]
+packages = ["app"]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

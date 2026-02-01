@@ -45,6 +45,8 @@ class ToolSpec(BaseModel):
     description: str
     input_schema: Dict[str, Any]
     output_schema: Dict[str, Any]
+    usage_guidance: Optional[str] = None
+    examples: List[Dict[str, Any]] = Field(default_factory=list)
     auth_required: bool = False
     timeout_s: int = 30
     risk_level: RiskLevel = RiskLevel.low

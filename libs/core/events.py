@@ -8,6 +8,7 @@ JOB_EVENTS = ["job.created", "job.canceled"]
 PLAN_EVENTS = ["plan.created", "plan.approved", "plan.rejected"]
 TASK_EVENTS = [
     "task.ready",
+    "task.policy_check",
     "task.started",
     "task.heartbeat",
     "task.completed",

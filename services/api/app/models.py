@@ -19,7 +19,7 @@ class JobRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime)
     priority: Mapped[int] = mapped_column(Integer, default=0)
-    metadata: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
 
     plan: Mapped["PlanRecord"] = relationship("PlanRecord", back_populates="job", uselist=False)
 
