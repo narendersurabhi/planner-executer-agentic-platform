@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JobCreate",
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string"},
+    "context_json": {"type": "object"},
+    "priority": {"type": "integer"},
+    "idempotency_key": {"type": ["string", "null"]}
+  },
+  "required": ["goal"]
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Task",
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"},
+    "job_id": {"type": "string"},
+    "plan_id": {"type": "string"},
+    "name": {"type": "string"},
+    "description": {"type": "string"},
+    "instruction": {"type": "string"},
+    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+    "expected_output_schema_ref": {"type": "string"},
+    "status": {"type": "string"},
+    "deps": {"type": "array", "items": {"type": "string"}},
+    "attempts": {"type": "integer"},
+    "max_attempts": {"type": "integer"},
+    "rework_count": {"type": "integer"},
+    "max_reworks": {"type": "integer"},
+    "assigned_to": {"type": ["string", "null"]},
+    "tool_requests": {"type": "array", "items": {"type": "string"}},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "critic_required": {"type": "boolean"}
+  },
+  "required": ["id", "job_id", "plan_id", "name", "status", "created_at", "updated_at"]
+}

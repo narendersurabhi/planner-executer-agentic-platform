@@ -1,0 +1,23 @@
+[project]
+name = "agentic-worker"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "redis>=5.0",
+  "pydantic>=2.6",
+  "structlog>=24.1.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

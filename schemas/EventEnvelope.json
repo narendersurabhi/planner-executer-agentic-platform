@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EventEnvelope",
+  "type": "object",
+  "properties": {
+    "type": {"type": "string"},
+    "version": {"type": "string"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "correlation_id": {"type": "string"},
+    "job_id": {"type": ["string", "null"]},
+    "task_id": {"type": ["string", "null"]},
+    "payload": {"type": "object"}
+  },
+  "required": ["type", "version", "occurred_at", "correlation_id", "payload"]
+}
