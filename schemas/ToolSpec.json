@@ -9,7 +9,11 @@
     "output_schema": {"type": "object"},
     "auth_required": {"type": "boolean"},
     "timeout_s": {"type": "integer"},
-    "risk_level": {"type": "string"}
+    "risk_level": {"type": "string"},
+    "tool_intent": {
+      "type": "string",
+      "enum": ["transform", "generate", "validate", "render", "io"]
+    }
   },
   "required": ["name", "description", "input_schema", "output_schema"]
 }

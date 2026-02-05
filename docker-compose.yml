@@ -68,7 +68,7 @@ services:
       OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
       OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
     volumes:
-      - artifacts:/shared/artifacts
+      - ./artifacts:/shared/artifacts
     depends_on:
       - redis
   critic:
@@ -130,5 +130,4 @@ services:
 
 volumes:
   db-data:
-  artifacts:
   grafana-data:

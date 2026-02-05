@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: agentic-core
+Version: 0.1.0
+Summary: Shared core models and utilities
+Requires-Python: >=3.11
+Requires-Dist: pydantic>=2.6
+Requires-Dist: pydantic-settings>=2.2
+Requires-Dist: jsonschema>=4.21
+Requires-Dist: python-docx>=1.1
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: opentelemetry-api>=1.22.0
+Requires-Dist: opentelemetry-sdk>=1.22.0
+Requires-Dist: opentelemetry-exporter-otlp>=1.22.0
+Requires-Dist: structlog>=24.1.0
+Requires-Dist: pyyaml>=6.0

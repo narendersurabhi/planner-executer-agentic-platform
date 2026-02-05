@@ -28,6 +28,8 @@ jobs:
         run: |
           pip install ruff mypy pytest
           pip install -e libs/core
+          pip install -e services/api
+          pip install -e services/worker
       - name: Lint
         run: ruff check libs services
       - name: Format

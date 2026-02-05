@@ -4,11 +4,15 @@ import json
 import os
 import uuid
 from datetime import datetime
+from enum import Enum
+from functools import wraps
+from time import perf_counter
 from typing import List
 
 import redis
+from pydantic import BaseModel
 
-from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
+from libs.core import events, llm_provider, logging as core_logging, models, tool_registry, prompts
 
 core_logging.configure_logging("planner")
 
@@ -26,7 +30,85 @@ OPENAI_MAX_RETRIES = os.getenv("OPENAI_MAX_RETRIES")
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+DEFAULT_ALLOWED_BLOCK_TYPES = [
+    "text",
+    "paragraph",
+    "heading",
+    "bullets",
+    "spacer",
+    "optional_paragraph",
+    "repeat",
+]
 
+
+def _log_entry_exit(name: str):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            logger = core_logging.get_logger("planner")
+            safe_args = _safe_log_value(args)
+            safe_kwargs = _safe_log_value(kwargs)
+            logger.info("enter", function=name, args=safe_args, kwargs=safe_kwargs)
+            started = perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                duration_ms = int((perf_counter() - started) * 1000)
+                safe_result = _safe_log_value(result)
+                logger.info(
+                    "exit",
+                    function=name,
+                    status="ok",
+                    duration_ms=duration_ms,
+                    result=safe_result,
+                )
+                return result
+            except Exception as exc:  # noqa: BLE001
+                duration_ms = int((perf_counter() - started) * 1000)
+                logger.error(
+                    "exit",
+                    function=name,
+                    status="error",
+                    duration_ms=duration_ms,
+                    error=str(exc),
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
+def _json_fallback(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, set):
+        return list(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _safe_log_value(value: object, max_len: int = 10000) -> object:
+    try:
+        serialized = json.dumps(value, default=_json_fallback, ensure_ascii=True)
+    except Exception:
+        try:
+            serialized = json.dumps(str(value), ensure_ascii=True)
+        except Exception:
+            return "<unserializable>"
+    if len(serialized) > max_len:
+        return f"{serialized[:max_len]}...[truncated]"
+    try:
+        return json.loads(serialized)
+    except Exception:
+        return serialized
+
+
+@_log_entry_exit("rule_based_plan")
 def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.PlanCreate:
     checklist_task = models.TaskCreate(
         name="create_checklist",
@@ -34,6 +116,7 @@ def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.Pla
         instruction="Generate a detailed checklist for adding a new tool.",
         acceptance_criteria=["Checklist has at least 5 items"],
         expected_output_schema_ref="TaskResult",
+        intent=models.ToolIntent.generate,
         deps=[],
         tool_requests=[],
         critic_required=True,
@@ -44,6 +127,7 @@ def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.Pla
         instruction="Write a tools.md draft file as an artifact.",
         acceptance_criteria=["Artifact path returned"],
         expected_output_schema_ref="TaskResult",
+        intent=models.ToolIntent.render,
         deps=["create_checklist"],
         tool_requests=["file_write_artifact"],
         critic_required=True,
@@ -54,6 +138,7 @@ def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.Pla
         instruction="Summarize the tools.md artifact.",
         acceptance_criteria=["Summary provided"],
         expected_output_schema_ref="TaskResult",
+        intent=models.ToolIntent.transform,
         deps=["write_tools_doc"],
         tool_requests=["text_summarize"],
         critic_required=False,
@@ -66,20 +151,27 @@ def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.Pla
     )
 
 
+@_log_entry_exit("llm_plan")
 def llm_plan(
     job: models.Job, tools: List[models.ToolSpec], provider: llm_provider.LLMProvider
 ) -> models.PlanCreate:
+    logger = core_logging.get_logger("planner")
     prompt = _llm_prompt(job, tools)
     response = provider.generate(prompt)
-    parsed = _parse_llm_plan(response.content)
-    if parsed:
-        return _ensure_llm_tool(_apply_max_depth(parsed))
-    fallback = rule_based_plan(job, tools).model_copy(
-        update={"planner_version": "llm_fallback_rule_based_v1"}
-    )
-    return _ensure_llm_tool(fallback)
+    candidate = _parse_llm_plan(response.content)
+    if not candidate:
+        raise ValueError("Invalid plan generated: parse_failed")
+    candidate = _ensure_llm_tool(candidate)
+    candidate = _ensure_job_inputs(candidate, job, tools)
+    candidate = _apply_max_depth(candidate)
+    valid, reason = _validate_plan(candidate, tools)
+    if not valid:
+        logger.warning("llm_plan_invalid", reason=reason)
+        raise ValueError(f"Invalid plan generated: {reason}")
+    return candidate
 
 
+@_log_entry_exit("plan_job")
 def plan_job(job: models.Job) -> models.PlanCreate:
     if PLANNER_MODE == "llm":
         provider = llm_provider.resolve_provider(
@@ -98,6 +190,7 @@ def plan_job(job: models.Job) -> models.PlanCreate:
     return rule_based_plan(job, registry.list_specs())
 
 
+@_log_entry_exit("_job_from_event_payload")
 def _job_from_event_payload(event: dict) -> models.Job | None:
     data = event.get("payload")
     if not isinstance(data, dict):
@@ -150,35 +243,82 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
         {
             "name": tool.name,
             "description": tool.description,
-            "usage_guidance": tool.usage_guidance,
             "input_schema": tool.input_schema,
-            "output_schema": tool.output_schema,
-            "risk_level": tool.risk_level,
+            "usage_guidance": tool.usage_guidance,
+            "risk_level": tool.risk_level.value if isinstance(tool.risk_level, Enum) else tool.risk_level,
+            "tool_intent": tool.tool_intent.value
+            if isinstance(tool.tool_intent, Enum)
+            else tool.tool_intent,
         }
         for tool in tools
     ]
-    tool_catalog_json = json.dumps(tool_catalog, ensure_ascii=True, indent=2)
+    tool_catalog_json = json.dumps(tool_catalog, ensure_ascii=False, indent=2, default=_json_fallback)
+    job_json = json.dumps(job.model_dump(mode="json"), ensure_ascii=False, indent=2, default=_json_fallback)
     max_depth = _parse_optional_int(PLANNER_MAX_DEPTH)
     depth_hint = ""
     if max_depth:
         depth_hint = f"Max dependency chain depth: {max_depth}.\n"
     return (
-        "You are a planner. Return ONLY valid JSON for a PlanCreate object.\n"
-        "Fields: planner_version (string), tasks_summary (string), dag_edges (list of [from,to]), "
-        "tasks (list of tasks).\n"
-        "Each task must include: name, description, instruction, acceptance_criteria (list of strings), "
-        "expected_output_schema_ref (string), deps (list of strings), tool_requests (list of tool names), "
-        "critic_required (bool).\n"
-        "Use tool usage guidance and input schemas. Only select tools whose required inputs can be satisfied "
-        "by the task instruction and dependency context. If unsure, use llm_generate.\n"
+        "You are a planner. Return ONLY valid JSON for a PlanCreate object (no prose).\n"
+        "Required top-level fields: planner_version, tasks_summary, dag_edges, tasks.\n"
+        "Schema rules:\n"
+        "- dag_edges must be an array of 2-element string arrays, e.g. [[\"A\",\"B\"],[\"B\",\"C\"]].\n"
+        "- acceptance_criteria must be an array of strings, not a single string.\n"
+        "Each task must include: name, description, instruction, acceptance_criteria, "
+        "expected_output_schema_ref, deps, tool_requests, tool_inputs, critic_required.\n"
+        "Example:\n"
+        "{\n"
+        "  \"planner_version\": \"1.0.0\",\n"
+        "  \"tasks_summary\": \"...\",\n"
+        "  \"dag_edges\": [[\"TaskA\",\"TaskB\"],[\"TaskB\",\"TaskC\"]],\n"
+        "  \"tasks\": [\n"
+        "    {\n"
+        "      \"name\": \"TaskA\",\n"
+        "      \"description\": \"...\",\n"
+        "      \"instruction\": \"...\",\n"
+        "      \"acceptance_criteria\": [\"...\"],\n"
+        "      \"expected_output_schema_ref\": \"schemas/example\",\n"
+        "      \"deps\": [],\n"
+        "      \"tool_requests\": [\"llm_generate\"],\n"
+        "      \"tool_inputs\": {\"llm_generate\": {\"text\": \"...\"}},\n"
+        "      \"critic_required\": false\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "\n"
+        "Rules:\n"
+        "1) Use only tool names from the allowed list.\n"
+        "2) deps must reference task names that appear in this plan.\n"
+        "3) If a tool requires structured JSON, add a prior task to generate that JSON and set "
+        "expected_output_schema_ref to that schema.\n"
+        "4) If a tool requires specific inputs, put them in task.tool_inputs "
+        "(a dict keyed by tool name). Do NOT embed JSON in instruction text.\n"
+        "5) Do NOT use placeholder strings like ${Task.output} in tool_inputs. "
+        "If a tool needs dependency output (e.g., document_spec), omit that field and rely on deps; "
+        "the runtime will pull the object from context. You may still include other inputs like "
+        "strict, allowed_block_types, or path.\n"
+        "6) Prefer the generic validation + rendering pipeline:\n"
+        "   - Generate a DocumentSpec JSON.\n"
+        "   - Validate with document_spec_validate.\n"
+        "   - Render with docx_generate_from_spec.\n"
+        "   Use specialized tools (e.g., resume_generate_ats_docx) only if explicitly requested.\n"
+        "7) If unsure, use llm_generate.\n"
+        "\n"
         f"{depth_hint}"
         f"Allowed tool names: {tool_names}\n"
         f"Tool catalog (JSON): {tool_catalog_json}\n"
         f"Goal: {job.goal}\n"
-        f"Context JSON: {job.context_json}\n"
+        f"Job (JSON): {job_json}\n"
     )
 
 
+def _document_spec_prompt(job: models.Job, allowed_block_types: List[str]) -> str:
+    return prompts.document_spec_prompt(
+        job.model_dump(mode="json"), allowed_block_types
+    )
+
+
+@_log_entry_exit("_parse_llm_plan")
 def _parse_llm_plan(content: str) -> models.PlanCreate | None:
     cleaned = _extract_json(content)
     if not cleaned:
@@ -193,6 +333,7 @@ def _parse_llm_plan(content: str) -> models.PlanCreate | None:
         return None
 
 
+@_log_entry_exit("_extract_json")
 def _extract_json(content: str) -> str:
     text = content.strip()
     if text.startswith("```"):
@@ -217,6 +358,106 @@ def _ensure_llm_tool(plan: models.PlanCreate) -> models.PlanCreate:
         else:
             updated_tasks.append(task)
     return plan.model_copy(update={"tasks": updated_tasks})
+
+
+def _ensure_job_inputs(
+    plan: models.PlanCreate, job: models.Job, tools: List[models.ToolSpec]
+) -> models.PlanCreate:
+    tool_map = {tool.name: tool for tool in tools}
+    job_payload = job.model_dump(mode="json")
+    updated_tasks = []
+    for task in plan.tasks:
+        tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
+        changed = False
+        for tool_name in task.tool_requests or []:
+            tool = tool_map.get(tool_name)
+            if tool is None:
+                continue
+            required_sets = _required_sets_from_schema(tool.input_schema or {})
+            if not required_sets:
+                continue
+            if not any("job" in required for required in required_sets):
+                continue
+            payload = tool_inputs.get(tool_name)
+            if isinstance(payload, dict) and "job" in payload:
+                continue
+            payload = dict(payload) if isinstance(payload, dict) else {}
+            payload["job"] = job_payload
+            tool_inputs[tool_name] = payload
+            changed = True
+        if changed:
+            updated_tasks.append(task.model_copy(update={"tool_inputs": tool_inputs}))
+        else:
+            updated_tasks.append(task)
+    return plan.model_copy(update={"tasks": updated_tasks})
+
+
+def _validate_plan(plan: models.PlanCreate, tools: List[models.ToolSpec]) -> tuple[bool, str]:
+    tool_map = {tool.name: tool for tool in tools}
+    task_by_name = {task.name: task for task in plan.tasks}
+    for task in plan.tasks:
+        if not task.tool_requests:
+            continue
+        for tool_name in task.tool_requests:
+            tool = tool_map.get(tool_name)
+            if tool is None:
+                return False, f"unknown_tool:{tool_name}"
+            required_sets = _required_sets_from_schema(tool.input_schema or {})
+            if not required_sets:
+                continue
+            tool_inputs = _extract_tool_inputs(task, tool_name)
+            if _inputs_satisfy_required(required_sets, tool_inputs, bool(task.deps)):
+                continue
+            return False, f"tool_inputs_missing:{tool_name}:{task.name}"
+    return True, "ok"
+
+
+def _inputs_satisfy_required(
+    required_sets: list[set[str]], inputs: set[str], has_deps: bool
+) -> bool:
+    context_fillable = {
+        "content",
+        "text",
+        "prompt",
+        "data",
+        "document_spec",
+        "validation_report",
+        "errors",
+        "original_spec",
+        "tailored_resume",
+        "resume_content",
+    }
+    for required in required_sets:
+        missing = required - inputs
+        if not missing:
+            return True
+        if has_deps and missing.issubset(context_fillable):
+            return True
+    return False
+
+
+def _required_sets_from_schema(schema: dict) -> list[set[str]]:
+    if not isinstance(schema, dict):
+        return []
+    required_sets: list[set[str]] = []
+    if isinstance(schema.get("required"), list):
+        required_sets.append(set(schema["required"]))
+    for keyword in ("anyOf", "oneOf"):
+        if isinstance(schema.get(keyword), list):
+            for entry in schema[keyword]:
+                if isinstance(entry, dict) and isinstance(entry.get("required"), list):
+                    required_sets.append(set(entry["required"]))
+    if not required_sets:
+        return []
+    return required_sets
+
+
+def _extract_tool_inputs(task: models.TaskCreate, tool_name: str) -> set[str]:
+    if isinstance(task.tool_inputs, dict) and tool_name in task.tool_inputs:
+        payload = task.tool_inputs.get(tool_name)
+        if isinstance(payload, dict):
+            return {key for key in payload.keys() if isinstance(key, str)}
+    return set()
 
 
 def _parse_optional_float(value: str | None) -> float | None:
@@ -310,16 +551,27 @@ def run() -> None:
                 if not job:
                     redis_client.xack(events.JOB_STREAM, group, message_id)
                     continue
-                plan = plan_job(job)
-                event = models.EventEnvelope(
-                    type="plan.created",
-                    version="1",
-                    occurred_at=datetime.utcnow(),
-                    correlation_id=payload.get("correlation_id", str(uuid.uuid4())),
-                    job_id=job.id,
-                    payload=plan.model_dump(),
-                )
-                redis_client.xadd(events.PLAN_STREAM, {"data": event.model_dump_json()})
+                try:
+                    plan = plan_job(job)
+                    event = models.EventEnvelope(
+                        type="plan.created",
+                        version="1",
+                        occurred_at=datetime.utcnow(),
+                        correlation_id=payload.get("correlation_id", str(uuid.uuid4())),
+                        job_id=job.id,
+                        payload=plan.model_dump(),
+                    )
+                    redis_client.xadd(events.PLAN_STREAM, {"data": event.model_dump_json()})
+                except Exception as exc:  # noqa: BLE001
+                    fail_event = models.EventEnvelope(
+                        type="plan.failed",
+                        version="1",
+                        occurred_at=datetime.utcnow(),
+                        correlation_id=payload.get("correlation_id", str(uuid.uuid4())),
+                        job_id=job.id,
+                        payload={"job_id": job.id, "error": str(exc)},
+                    )
+                    redis_client.xadd(events.PLAN_STREAM, {"data": fail_event.model_dump_json()})
                 redis_client.xack(events.JOB_STREAM, group, message_id)
 
 

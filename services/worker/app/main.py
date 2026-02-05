@@ -33,6 +33,24 @@ LLM_ENABLED = WORKER_MODE == "llm"
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+DEFAULT_ALLOWED_BLOCK_TYPES = [
+    "text",
+    "paragraph",
+    "heading",
+    "bullets",
+    "spacer",
+    "optional_paragraph",
+    "repeat",
+]
+
+TASK_INTENTS = {
+    "transform",
+    "generate",
+    "validate",
+    "render",
+    "io",
+}
+
 
 def _parse_optional_float(value: str | None) -> float | None:
     if value is None or value == "":
@@ -73,6 +91,7 @@ def execute_task(task_payload: dict) -> models.TaskResult:
     task_id = task_payload.get("task_id")
     tool_requests = task_payload.get("tool_requests", [])
     context = task_payload.get("context", {})
+    tool_inputs = task_payload.get("tool_inputs", {})
     registry = tool_registry.default_registry(
         TOOL_HTTP_FETCH_ENABLED,
         llm_enabled=LLM_ENABLED,
@@ -82,8 +101,38 @@ def execute_task(task_payload: dict) -> models.TaskResult:
     started_at = datetime.utcnow()
     outputs = {}
     tool_error = None
+    task_intent = _infer_task_intent(task_payload)
     for tool_name in tool_requests:
-        payload = _tool_payload(tool_name, task_payload.get("instruction", ""), context, task_payload)
+        try:
+            tool = registry.get(tool_name)
+        except KeyError:
+            tool_error = f"unknown_tool:{tool_name}"
+            outputs[tool_name] = {"error": tool_error}
+            break
+        mismatch = _intent_mismatch(task_intent, tool.spec.tool_intent, tool_name)
+        if mismatch:
+            tool_error = mismatch
+            outputs[tool_name] = {"error": tool_error}
+            tool_calls.append(
+                models.ToolCall(
+                    tool_name=tool_name,
+                    input={},
+                    idempotency_key=str(uuid.uuid4()),
+                    trace_id=task_payload.get("correlation_id", ""),
+                    started_at=started_at,
+                    finished_at=datetime.utcnow(),
+                    status="failed",
+                    output_or_error={"error": tool_error},
+                )
+            )
+            break
+        payload = _tool_payload(
+            tool_name,
+            task_payload.get("instruction", ""),
+            context,
+            task_payload,
+            tool_inputs,
+        )
         call = registry.execute(
             tool_name,
             payload=payload,
@@ -119,21 +168,59 @@ def execute_task(task_payload: dict) -> models.TaskResult:
     )
 
 
-def _tool_payload(tool_name: str, instruction: str, context: dict, task_payload: dict) -> dict:
-    if tool_name in {"file_write_artifact", "file_write_text"}:
-        content = None
-        if isinstance(task_payload.get("content"), str):
-            content = task_payload.get("content")
-        if content is None:
-            content = _extract_text_from_context(context)
-        payload = {"content": content or ""}
-        if isinstance(task_payload.get("path"), str):
-            payload["path"] = task_payload.get("path")
+def _infer_task_intent(task_payload: dict) -> str:
+    for key in ("intent", "task_intent"):
+        value = task_payload.get(key)
+        if isinstance(value, str) and value in TASK_INTENTS:
+            return value
+    parts: list[str] = []
+    for key in ("description", "instruction"):
+        value = task_payload.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    criteria = task_payload.get("acceptance_criteria")
+    if isinstance(criteria, list):
+        parts.extend([item for item in criteria if isinstance(item, str)])
+    text = " ".join(parts).lower()
+    keyword_map = [
+        ("validate", ["validate", "verify", "check", "lint", "schema"]),
+        ("render", ["render", "rendering", "docx", "pdf"]),
+        ("generate", ["generate", "create", "draft", "write", "compose", "produce", "build"]),
+        ("transform", ["transform", "reshape", "wrap", "convert", "summarize", "repair"]),
+        ("io", ["read", "fetch", "list", "search", "load", "save", "download", "upload"]),
+    ]
+    for intent, keywords in keyword_map:
+        if any(keyword in text for keyword in keywords):
+            return intent
+    return "generate"
+
+
+def _intent_mismatch(task_intent: str, tool_intent: models.ToolIntent, tool_name: str) -> str | None:
+    if task_intent == "generate" and tool_intent == models.ToolIntent.transform:
+        return f"tool_intent_mismatch:{tool_name}:{tool_intent.value}:{task_intent}"
+    return None
+
+
+def _tool_payload(
+    tool_name: str,
+    instruction: str,
+    context: dict,
+    task_payload: dict,
+    tool_inputs: dict,
+) -> dict:
+    has_tool_inputs = False
+    payload = {}
+    if isinstance(tool_inputs, dict) and tool_name in tool_inputs:
+        tool_payload = tool_inputs.get(tool_name)
+        if isinstance(tool_payload, dict):
+            payload = dict(tool_payload)
+            has_tool_inputs = True
+    payload = _merge_payload_from_task(payload, task_payload, instruction)
+    payload = _fill_payload_from_context(payload, context)
+    if has_tool_inputs:
         return payload
-    if tool_name == "file_read_text":
-        if isinstance(task_payload.get("path"), str):
-            return {"path": task_payload.get("path")}
-        return {"path": ""}
+    if payload:
+        return payload
     if not context:
         return {"text": instruction}
     try:
@@ -141,6 +228,355 @@ def _tool_payload(tool_name: str, instruction: str, context: dict, task_payload:
     except (TypeError, ValueError):
         context_blob = str(context)
     return {"text": f"{instruction}\n\nContext (JSON):\n{context_blob}"}
+
+
+def _merge_payload_from_task(payload: dict, task_payload: dict, instruction: str) -> dict:
+    merged = dict(payload)
+    if not isinstance(task_payload, dict):
+        task_payload = {}
+    for key in (
+        "data",
+        "schema_ref",
+        "template_id",
+        "template_path",
+        "output_path",
+        "path",
+        "content",
+        "render_context",
+    ):
+        if key not in merged and key in task_payload:
+            merged[key] = task_payload.get(key)
+    if "schema_ref" not in merged:
+        value = _extract_schema_ref(instruction)
+        if value:
+            merged["schema_ref"] = value
+    if "template_id" not in merged:
+        value = _extract_template_id(instruction)
+        if value:
+            merged["template_id"] = value
+    if "template_path" not in merged:
+        value = _extract_template_path(instruction)
+        if value:
+            merged["template_path"] = value
+    if "output_path" not in merged:
+        value = _extract_output_path(instruction)
+        if value:
+            merged["output_path"] = value
+    if "path" not in merged and isinstance(task_payload.get("path"), str):
+        merged["path"] = task_payload.get("path")
+    if "content" not in merged and isinstance(task_payload.get("content"), str):
+        merged["content"] = task_payload.get("content")
+    return merged
+
+
+def _fill_payload_from_context(payload: dict, context: dict) -> dict:
+    filled = dict(payload)
+    if "document_spec" not in filled:
+        doc = _extract_json_from_context(context)
+        if isinstance(doc, dict):
+            filled["document_spec"] = doc
+    if "data" not in filled:
+        doc = _extract_json_from_context(context)
+        if isinstance(doc, dict):
+            filled["data"] = doc
+    if "errors" not in filled:
+        errors = _extract_validation_errors_from_context(context)
+        if isinstance(errors, list):
+            filled["errors"] = errors
+    if "validation_report" not in filled:
+        report = _extract_validation_report_from_context(context)
+        if isinstance(report, dict):
+            filled["validation_report"] = report
+    if "original_spec" not in filled:
+        doc = _extract_json_from_context(context)
+        if isinstance(doc, dict):
+            filled["original_spec"] = doc
+    if "tailored_resume" not in filled:
+        resume = _extract_resume_content_from_context(context)
+        if resume is not None:
+            filled["tailored_resume"] = resume
+    if "resume_content" not in filled:
+        resume = _extract_resume_content_from_context(context)
+        if resume is not None:
+            filled["resume_content"] = resume
+    if "content" not in filled:
+        text = _extract_text_from_context(context)
+        if isinstance(text, str):
+            filled["content"] = text
+    if "text" not in filled:
+        text = _extract_text_from_context(context)
+        if isinstance(text, str):
+            filled["text"] = text
+    return filled
+
+
+def _extract_json_from_context(context: dict) -> dict | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            json_candidate = _extract_json_from_outputs(output)
+            if isinstance(json_candidate, dict):
+                return json_candidate
+    return None
+
+
+def _extract_validation_errors_from_context(context: dict) -> list[dict] | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            entry = output.get("document_spec_validate")
+            if isinstance(entry, dict):
+                errors = entry.get("errors")
+                if isinstance(errors, list):
+                    return errors
+    return None
+
+
+def _extract_validation_report_from_context(context: dict) -> dict | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            entry = output.get("document_spec_validate")
+            if isinstance(entry, dict):
+                return entry
+    return None
+
+
+def _extract_resume_content_from_context(context: dict) -> dict | str | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            value = _extract_resume_content_from_outputs(output)
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_json_from_outputs(outputs: dict) -> dict | None:
+    if not isinstance(outputs, dict):
+        return None
+    spec_output = outputs.get("llm_generate_document_spec")
+    if isinstance(spec_output, dict):
+        document_spec = spec_output.get("document_spec")
+        if isinstance(document_spec, dict):
+            return document_spec
+    resume_spec_output = outputs.get("llm_generate_resume_doc_spec")
+    if isinstance(resume_spec_output, dict):
+        resume_doc_spec = resume_spec_output.get("resume_doc_spec")
+        if isinstance(resume_doc_spec, dict):
+            return resume_doc_spec
+    llm_output = outputs.get("llm_generate")
+    if isinstance(llm_output, dict):
+        text = llm_output.get("text")
+        if isinstance(text, str):
+            json_text = _extract_json(text)
+            if json_text:
+                try:
+                    return json.loads(json_text)
+                except json.JSONDecodeError:
+                    return None
+    llm_repair = outputs.get("llm_repair_json")
+    if isinstance(llm_repair, dict):
+        document_spec = llm_repair.get("document_spec")
+        if isinstance(document_spec, dict):
+            return document_spec
+    llm_improve = outputs.get("llm_improve_document_spec")
+    if isinstance(llm_improve, dict):
+        document_spec = llm_improve.get("document_spec")
+        if isinstance(document_spec, dict):
+            return document_spec
+    json_transform = outputs.get("json_transform")
+    if isinstance(json_transform, dict):
+        result = json_transform.get("result")
+        if isinstance(result, dict):
+            return result
+    payload = outputs.get("result")
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _extract_resume_content_from_outputs(outputs: dict) -> dict | str | None:
+    if not isinstance(outputs, dict):
+        return None
+    for key in ("tailored_resume", "resume_content"):
+        value = outputs.get(key)
+        if isinstance(value, (dict, str)):
+            return value
+    llm_output = outputs.get("llm_generate")
+    if isinstance(llm_output, dict):
+        text = llm_output.get("text")
+        if isinstance(text, str):
+            json_text = _extract_json(text)
+            if json_text:
+                try:
+                    data = json.loads(json_text)
+                except json.JSONDecodeError:
+                    return None
+                if isinstance(data, dict):
+                    for key in ("tailored_resume", "resume_content"):
+                        value = data.get(key)
+                        if isinstance(value, (dict, str)):
+                            return value
+                    return data
+    json_transform = outputs.get("json_transform")
+    if isinstance(json_transform, dict):
+        result = json_transform.get("result")
+        if isinstance(result, dict):
+            for key in ("tailored_resume", "resume_content"):
+                value = result.get(key)
+                if isinstance(value, (dict, str)):
+                    return value
+            return result
+        if isinstance(result, str):
+            return result
+    return None
+
+
+def _extract_template_id(instruction: str) -> str | None:
+    if not instruction:
+        return None
+    json_text = _extract_json(instruction)
+    if json_text:
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            value = data.get("template_id")
+            if isinstance(value, str) and value:
+                return value
+            output = data.get("output")
+            if isinstance(output, dict):
+                value = output.get("template_id")
+                if isinstance(value, str) and value:
+                    return value
+    value = _extract_key_from_text(instruction, "template_id")
+    if value:
+        return value
+    return None
+
+
+def _extract_template_path(instruction: str) -> str | None:
+    if not instruction:
+        return None
+    json_text = _extract_json(instruction)
+    if json_text:
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            value = data.get("template_path")
+            if isinstance(value, str) and value:
+                return value
+    value = _extract_key_from_text(instruction, "template_path")
+    if value:
+        return value
+    return None
+
+
+def _extract_output_path(instruction: str) -> str | None:
+    if not instruction:
+        return None
+    json_text = _extract_json(instruction)
+    if json_text:
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            value = data.get("output_path")
+            if isinstance(value, str) and value:
+                return value
+    value = _extract_key_from_text(instruction, "output_path")
+    if value:
+        return value
+    return None
+
+
+def _extract_schema_ref(instruction: str) -> str | None:
+    if not instruction:
+        return None
+    json_text = _extract_json(instruction)
+    if json_text:
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            value = data.get("schema_ref")
+            if isinstance(value, str) and value:
+                return value
+            output = data.get("output")
+            if isinstance(output, dict):
+                value = output.get("schema_ref")
+                if isinstance(value, str) and value:
+                    return value
+    value = _extract_key_from_text(instruction, "schema_ref")
+    if value:
+        return value
+    return None
+
+
+def _extract_key_from_text(text: str, key: str) -> str | None:
+    import re
+
+    patterns = [
+        rf"{key}\\s*[:=]\\s*\"([^\"]+)\"",
+        rf"{key}\\s*[:=]\\s*'([^']+)'",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
+def _extract_template_id_from_task(task_payload: dict) -> str | None:
+    value = task_payload.get("template_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _extract_template_path_from_task(task_payload: dict) -> str | None:
+    value = task_payload.get("template_path")
+    return value if isinstance(value, str) and value else None
+
+
+def _extract_output_path_from_task(task_payload: dict) -> str | None:
+    value = task_payload.get("output_path")
+    return value if isinstance(value, str) and value else None
+
+
+def _extract_schema_ref_from_task(task_payload: dict) -> str | None:
+    value = task_payload.get("schema_ref")
+    return value if isinstance(value, str) and value else None
 
 
 def _extract_text_from_context(context: dict) -> str | None:
@@ -238,7 +674,11 @@ def _resolve_schema_path(schema_ref: str) -> Path | None:
         return None
     if not name.endswith(".json"):
         name = f"{name}.json"
-    return Path(SCHEMA_REGISTRY_PATH) / name
+    registry_path = Path(SCHEMA_REGISTRY_PATH) / name
+    if registry_path.exists():
+        return registry_path
+    template_dir = Path(os.getenv("DOCX_TEMPLATE_DIR", "/shared/templates"))
+    return template_dir / name
 
 
 def _extract_llm_text(outputs: dict) -> str:
@@ -272,6 +712,21 @@ def _extract_json(text: str) -> str:
     if start == -1 or end == -1 or end <= start:
         return ""
     return content[start : end + 1]
+
+
+def _extract_instruction_payload(instruction: str) -> dict:
+    if not instruction:
+        return {}
+    json_text = _extract_json(instruction)
+    if not json_text:
+        return {}
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(data, dict):
+        return data
+    return {}
 
 
 def run() -> None:

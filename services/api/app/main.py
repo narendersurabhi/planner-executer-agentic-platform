@@ -49,8 +49,10 @@ ORCHESTRATOR_RECOVER_PENDING = (
     os.getenv("ORCHESTRATOR_RECOVER_PENDING", "true").lower() == "true"
 )
 ORCHESTRATOR_RECOVER_IDLE_MS = int(os.getenv("ORCHESTRATOR_RECOVER_IDLE_MS", "60000"))
+REPLAN_MAX = int(os.getenv("REPLAN_MAX", "1"))
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 TASK_OUTPUT_KEY_PREFIX = "task_output:"
+TASK_RESULT_KEY_PREFIX = "task_result:"
 
 
 @app.on_event("startup")
@@ -117,6 +119,7 @@ def _task_from_record(record: TaskRecord) -> models.Task:
         acceptance_criteria=record.acceptance_criteria or [],
         expected_output_schema_ref=record.expected_output_schema_ref,
         status=record.status,
+        intent=record.intent,
         deps=record.deps or [],
         attempts=record.attempts or 0,
         max_attempts=record.max_attempts or 0,
@@ -124,6 +127,7 @@ def _task_from_record(record: TaskRecord) -> models.Task:
         max_reworks=record.max_reworks or 0,
         assigned_to=record.assigned_to,
         tool_requests=record.tool_requests or [],
+        tool_inputs=record.tool_inputs or {},
         created_at=record.created_at,
         updated_at=record.updated_at,
         critic_required=bool(record.critic_required),
@@ -142,6 +146,12 @@ def _emit_event(event_type: str, payload: dict[str, Any]) -> None:
     )
     stream = _stream_for_event(event_type)
     redis_client.xadd(stream, {"data": envelope.model_dump_json()})
+
+
+def _plan_created_payload(plan: models.PlanCreate, job_id: str) -> dict[str, Any]:
+    payload = plan.model_dump()
+    payload["job_id"] = job_id
+    return payload
 
 
 def _stream_for_event(event_type: str) -> str:
@@ -206,9 +216,20 @@ def _recover_pending_events(
 ) -> None:
     for stream in stream_keys:
         try:
-            next_id, messages = local_redis.xautoclaim(
-                stream, group, consumer, min_idle_time=ORCHESTRATOR_RECOVER_IDLE_MS, start_id="0-0", count=50
+            res = local_redis.xautoclaim(
+                stream,
+                group,
+                consumer,
+                min_idle_time=ORCHESTRATOR_RECOVER_IDLE_MS,
+                start_id="0-0",
+                count=50,
             )
+            next_id, messages, *rest = res
+            if rest:
+                logger.info(
+                    "orchestrator_recover_deleted_ids",
+                    extra={"stream": stream, "deleted_ids": rest[0]},
+                )
         except Exception:
             logger.exception("orchestrator_recover_error", extra={"stream": stream})
             continue
@@ -234,6 +255,8 @@ def _handle_event(stream_name: str, data: dict[str, str]) -> None:
     event_type = envelope.get("type")
     if event_type == "plan.created":
         _handle_plan_created(envelope)
+    elif event_type == "plan.failed":
+        _handle_plan_failed(envelope)
     elif event_type == "task.completed":
         _handle_task_completed(envelope)
     elif event_type == "task.failed":
@@ -275,17 +298,20 @@ def _handle_plan_created(envelope: dict) -> None:
             policy_decision={},
         )
         db.add(record)
+        db.flush()
+        plan_record_id = record.id
         for task in plan.tasks:
             task_record = TaskRecord(
                 id=str(uuid.uuid4()),
                 job_id=job_id,
-                plan_id=record.id,
+                plan_id=plan_record_id,
                 name=task.name,
                 description=task.description,
                 instruction=task.instruction,
                 acceptance_criteria=task.acceptance_criteria,
                 expected_output_schema_ref=task.expected_output_schema_ref,
                 status=models.TaskStatus.pending.value,
+                intent=task.intent.value if isinstance(task.intent, models.ToolIntent) else task.intent,
                 deps=task.deps,
                 attempts=0,
                 max_attempts=3,
@@ -293,6 +319,7 @@ def _handle_plan_created(envelope: dict) -> None:
                 max_reworks=2,
                 assigned_to=None,
                 tool_requests=task.tool_requests,
+                tool_inputs=task.tool_inputs,
                 created_at=now,
                 updated_at=now,
                 critic_required=1 if task.critic_required else 0,
@@ -303,8 +330,28 @@ def _handle_plan_created(envelope: dict) -> None:
             _set_job_status(job, models.JobStatus.planning)
             job.updated_at = now
         db.commit()
-    _enqueue_ready_tasks(job_id, record.id, envelope.get("correlation_id"))
+    _enqueue_ready_tasks(job_id, plan_record_id, envelope.get("correlation_id"))
     _refresh_job_status(job_id)
+
+
+def _handle_plan_failed(envelope: dict) -> None:
+    payload = envelope.get("payload") or {}
+    job_id = envelope.get("job_id") or payload.get("job_id") or payload.get("id")
+    if not job_id:
+        return
+    error_message = payload.get("error")
+    now = datetime.utcnow()
+    with SessionLocal() as db:
+        job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+        if not job:
+            return
+        _set_job_status(job, models.JobStatus.failed)
+        if error_message:
+            metadata = job.metadata_json or {}
+            metadata["plan_error"] = error_message
+            job.metadata_json = metadata
+        job.updated_at = now
+        db.commit()
 
 
 def _handle_task_completed(envelope: dict) -> None:
@@ -313,6 +360,7 @@ def _handle_task_completed(envelope: dict) -> None:
     if not task_id:
         return
     _store_task_output(task_id, payload.get("outputs", {}))
+    _store_task_result(task_id, payload)
     now = datetime.utcnow()
     with SessionLocal() as db:
         task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
@@ -332,11 +380,17 @@ def _handle_task_failed(envelope: dict) -> None:
     task_id = payload.get("task_id") or envelope.get("task_id")
     if not task_id:
         return
+    _store_task_result(task_id, payload)
+    error = payload.get("error")
     now = datetime.utcnow()
     with SessionLocal() as db:
         task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
         if not task:
             return
+        if isinstance(error, str) and error.startswith("tool_intent_mismatch"):
+            replan_done = _replan_job_for_intent_mismatch(db, task.job_id)
+            if replan_done:
+                return
         task.status = models.TaskStatus.failed.value
         task.updated_at = now
         job = db.query(JobRecord).filter(JobRecord.id == task.job_id).first()
@@ -344,6 +398,25 @@ def _handle_task_failed(envelope: dict) -> None:
             _set_job_status(job, models.JobStatus.failed)
             job.updated_at = now
         db.commit()
+
+
+def _replan_job_for_intent_mismatch(db: Session, job_id: str) -> bool:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    if not job:
+        return False
+    metadata = job.metadata_json or {}
+    count = int(metadata.get("replan_count", 0))
+    if count >= REPLAN_MAX:
+        return False
+    metadata["replan_count"] = count + 1
+    job.metadata_json = metadata
+    job.status = models.JobStatus.planning.value
+    job.updated_at = datetime.utcnow()
+    db.query(TaskRecord).filter(TaskRecord.job_id == job_id).delete(synchronize_session=False)
+    db.query(PlanRecord).filter(PlanRecord.job_id == job_id).delete(synchronize_session=False)
+    db.commit()
+    _emit_event("job.created", _job_from_record(job).model_dump())
+    return True
 
 
 def _handle_task_accepted(envelope: dict) -> None:
@@ -477,7 +550,9 @@ def _task_payload_from_record(
         "max_reworks": record.max_reworks or 0,
         "assigned_to": record.assigned_to,
         "tool_requests": record.tool_requests or [],
+        "tool_inputs": record.tool_inputs or {},
         "critic_required": bool(record.critic_required),
+        "intent": record.intent,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "correlation_id": correlation_id or str(uuid.uuid4()),
@@ -597,6 +672,8 @@ def _apply_task_rewrites(task: TaskRecord, rewrites: dict[str, Any]) -> None:
         task.expected_output_schema_ref = rewrites["expected_output_schema_ref"]
     if "tool_requests" in rewrites and isinstance(rewrites["tool_requests"], list):
         task.tool_requests = rewrites["tool_requests"]
+    if "tool_inputs" in rewrites and isinstance(rewrites["tool_inputs"], dict):
+        task.tool_inputs = rewrites["tool_inputs"]
 
 
 def _resolve_task_deps(task_records: list[TaskRecord]) -> list[models.Task]:
@@ -631,6 +708,23 @@ def _load_task_output(task_id: str) -> dict[str, Any]:
         return {}
 
 
+def _store_task_result(task_id: str, result: dict[str, Any]) -> None:
+    try:
+        redis_client.set(f"{TASK_RESULT_KEY_PREFIX}{task_id}", json.dumps(result))
+    except Exception:
+        return
+
+
+def _load_task_result(task_id: str) -> dict[str, Any]:
+    try:
+        raw = redis_client.get(f"{TASK_RESULT_KEY_PREFIX}{task_id}")
+        if not raw:
+            return {}
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
 def _build_task_context(
     task_id: str, task_map: dict[str, models.Task], id_to_name: dict[str, str]
 ) -> dict[str, Any]:
@@ -638,7 +732,19 @@ def _build_task_context(
     if not task:
         return {}
     deps = task.deps or []
-    outputs_by_id = {dep_id: _load_task_output(dep_id) for dep_id in deps}
+    visited: set[str] = set()
+    stack: list[str] = list(deps)
+    while stack:
+        dep_id = stack.pop()
+        if dep_id in visited:
+            continue
+        visited.add(dep_id)
+        dep_task = task_map.get(dep_id)
+        if dep_task and dep_task.deps:
+            for child in dep_task.deps:
+                if child not in visited:
+                    stack.append(child)
+    outputs_by_id = {dep_id: _load_task_output(dep_id) for dep_id in visited}
     outputs_by_name = {id_to_name.get(dep_id, dep_id): output for dep_id, output in outputs_by_id.items()}
     return {"dependencies": outputs_by_id, "dependencies_by_name": outputs_by_name}
 
@@ -722,6 +828,27 @@ def get_tasks(job_id: str, db: Session = Depends(get_db)) -> List[models.Task]:
     return [_task_from_record(task) for task in tasks]
 
 
+@app.get("/jobs/{job_id}/task_results")
+def get_task_results(job_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+    return {task.id: _load_task_result(task.id) for task in tasks}
+
+
+@app.get("/jobs/{job_id}/details", response_model=models.JobDetails)
+def get_job_details(job_id: str, db: Session = Depends(get_db)) -> models.JobDetails:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    plan_record = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
+    tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+    return models.JobDetails(
+        job_id=job_id,
+        plan=_plan_from_record(plan_record) if plan_record else None,
+        tasks=[_task_from_record(task) for task in tasks],
+        task_results={task.id: _load_task_result(task.id) for task in tasks},
+    )
+
+
 @app.get("/tasks/{task_id}", response_model=models.Task)
 def get_task(task_id: str, db: Session = Depends(get_db)) -> models.Task:
     task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
@@ -770,6 +897,36 @@ def retry_job(job_id: str, db: Session = Depends(get_db)) -> models.Job:
     now = datetime.utcnow()
     tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
     for task in tasks:
+        task.status = models.TaskStatus.pending.value
+        task.attempts = 0
+        task.rework_count = 0
+        task.updated_at = now
+    _set_job_status(job, models.JobStatus.planning)
+    job.updated_at = now
+    db.commit()
+    plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
+    if plan:
+        _enqueue_ready_tasks(job_id, plan.id, None)
+    return _job_from_record(job)
+
+
+@app.post("/jobs/{job_id}/retry_failed", response_model=models.Job)
+def retry_failed_tasks(job_id: str, db: Session = Depends(get_db)) -> models.Job:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    now = datetime.utcnow()
+    failed_tasks = (
+        db.query(TaskRecord)
+        .filter(
+            TaskRecord.job_id == job_id,
+            TaskRecord.status == models.TaskStatus.failed.value,
+        )
+        .all()
+    )
+    if not failed_tasks:
+        raise HTTPException(status_code=400, detail="No failed tasks to retry")
+    for task in failed_tasks:
         task.status = models.TaskStatus.pending.value
         task.attempts = 0
         task.rework_count = 0
@@ -853,14 +1010,14 @@ def create_plan(plan: models.PlanCreate, job_id: str, db: Session = Depends(get_
             max_reworks=2,
             assigned_to=None,
             tool_requests=task.tool_requests,
+            tool_inputs=task.tool_inputs,
             created_at=now,
             updated_at=now,
             critic_required=1 if task.critic_required else 0,
         )
         db.add(task_record)
     db.commit()
-    _emit_event(
-        "plan.created",
-        {"job_id": job_id, "plan_id": plan_id, "correlation_id": str(uuid.uuid4())},
-    )
+    payload = _plan_created_payload(plan, job_id)
+    payload["correlation_id"] = str(uuid.uuid4())
+    _emit_event("plan.created", payload)
     return _plan_from_record(record)

@@ -5,7 +5,7 @@ CRITIC_STREAM = "critic.events"
 POLICY_STREAM = "policy.events"
 
 JOB_EVENTS = ["job.created", "job.canceled"]
-PLAN_EVENTS = ["plan.created", "plan.approved", "plan.rejected"]
+PLAN_EVENTS = ["plan.created", "plan.approved", "plan.rejected", "plan.failed"]
 TASK_EVENTS = [
     "task.ready",
     "task.policy_check",

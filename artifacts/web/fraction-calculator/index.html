@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Friendly Fraction Calculator (Beta)</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="container">
+    <h1>Friendly Fraction Calculator</h1>
+    <p class="tagline">Add, multiply, or divide fractions. Clear steps explained for a 10-year-old.</p>
+
+    <section class="card">
+      <h2>Your Problem</h2>
+      <div class="frac-row">
+        <div class="fraction">
+          <label>Fraction A</label>
+          <div class="inputs">
+            <input id="num1" type="number" min="1" value="1" aria-label="Numerator of first fraction">
+            <span class="bar"></span>
+            <input id="den1" type="number" min="1" value="2" aria-label="Denominator of first fraction">
+          </div>
+        </div>
+
+        <div class="op">
+          <label>Operation</label>
+          <select id="opSelect" aria-label="Operation">
+            <option value="add">+</option>
+            <option value="mul">×</option>
+            <option value="div">÷</option>
+          </select>
+        </div>
+
+        <div class="fraction">
+          <label>Fraction B</label>
+          <div class="inputs">
+            <input id="num2" type="number" min="1" value="1" aria-label="Numerator of second fraction">
+            <span class="bar"></span>
+            <input id="den2" type="number" min="1" value="3" aria-label="Denominator of second fraction">
+          </div>
+        </div>
+      </div>
+      <button id="calculateBtn" class="primary">Calculate</button>
+      <p class="note">Tip: Use small whole numbers to start. All steps are shown in kid-friendly language.</p>
+    </section>
+
+    <section class="card">
+      <h2>Answer</h2>
+      <p id="resultFraction" class="answer">—</p>
+      <p id="resultMixed" class="answer-sub">—</p>
+    </section>
+
+    <section class="card">
+      <h2>Step-by-step</h2>
+      <ol id="steps" class="steps">
+      </ol>
+    </section>
+
+    <section class="card">
+      <h2>Try similar questions</h2>
+      <ul id="similarList" class="similar">
+      </ul>
+    </section>
+
+    <footer>
+      <p>Beta v0.1 · No sign-in · No ads · Works offline</p>
+    </footer>
+  </main>
+  <script src="app.js" defer></script>
+</body>
+</html>

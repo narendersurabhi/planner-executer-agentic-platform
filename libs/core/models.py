@@ -40,6 +40,14 @@ class RiskLevel(str, Enum):
     high = "high"
 
 
+class ToolIntent(str, Enum):
+    transform = "transform"
+    generate = "generate"
+    validate = "validate"
+    render = "render"
+    io = "io"
+
+
 class ToolSpec(BaseModel):
     name: str
     description: str
@@ -50,6 +58,7 @@ class ToolSpec(BaseModel):
     auth_required: bool = False
     timeout_s: int = 30
     risk_level: RiskLevel = RiskLevel.low
+    tool_intent: ToolIntent = ToolIntent.transform
 
 
 class ToolCall(BaseModel):
@@ -131,6 +140,7 @@ class Task(BaseModel):
     acceptance_criteria: List[str]
     expected_output_schema_ref: str
     status: TaskStatus
+    intent: Optional[ToolIntent] = None
     deps: List[str]
     attempts: int
     max_attempts: int
@@ -138,9 +148,17 @@ class Task(BaseModel):
     max_reworks: int
     assigned_to: Optional[str] = None
     tool_requests: List[str]
+    tool_inputs: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
     critic_required: bool = True
+
+
+class JobDetails(BaseModel):
+    job_id: str
+    plan: Optional[Plan] = None
+    tasks: List[Task] = Field(default_factory=list)
+    task_results: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskCreate(BaseModel):
@@ -149,8 +167,10 @@ class TaskCreate(BaseModel):
     instruction: str
     acceptance_criteria: List[str]
     expected_output_schema_ref: str
+    intent: Optional[ToolIntent] = None
     deps: List[str]
     tool_requests: List[str]
+    tool_inputs: Dict[str, Any] = Field(default_factory=dict)
     critic_required: bool = True
 
 

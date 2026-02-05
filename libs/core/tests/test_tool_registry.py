@@ -1,7 +1,7 @@
 import time
 
 from libs.core.models import RiskLevel, ToolSpec
-from libs.core.tool_registry import Tool, ToolRegistry
+from libs.core.tool_registry import Tool, ToolRegistry, default_registry
 
 
 def test_input_schema_validation() -> None:
@@ -95,3 +95,31 @@ def test_output_size_cap() -> None:
     call = registry.execute("big_output", {}, "idempotency", "trace", max_output_bytes=10)
     assert call.status == "failed"
     assert "output exceeded max size" in call.output_or_error["error"]
+
+
+def test_docx_render_tool_registered() -> None:
+    registry = default_registry()
+    tool = registry.get("docx_render")
+    schema = tool.spec.input_schema
+    assert "data" in schema["properties"]
+    assert "template_id" in schema["properties"]
+    assert "template_path" in schema["properties"]
+    assert "schema_ref" in schema["properties"]
+    assert any("template_id" in entry.get("required", []) for entry in schema["anyOf"])
+    assert "output_path" in schema["required"]
+
+
+def test_file_write_text_requires_path() -> None:
+    registry = default_registry()
+    call = registry.execute("file_write_text", {"content": "hello"}, "id", "trace")
+    assert call.status == "failed"
+    assert "input schema validation failed" in call.output_or_error["error"]
+
+
+def test_file_write_code_requires_extension() -> None:
+    registry = default_registry()
+    call = registry.execute(
+        "file_write_code", {"content": "hello", "path": "output"}, "id", "trace"
+    )
+    assert call.status == "failed"
+    assert "Unsupported code file extension" in call.output_or_error["error"]
