@@ -16,7 +16,16 @@ from fastapi.responses import StreamingResponse
 from prometheus_client import Counter, Histogram, make_asgi_app
 from sqlalchemy.orm import Session
 
-from libs.core import events, logging as core_logging, models, orchestrator, payload_resolver, state_machine
+from libs.core import (
+    events,
+    logging as core_logging,
+    models,
+    orchestrator,
+    payload_resolver,
+    state_machine,
+    tool_registry,
+)
+from libs.core.llm_provider import MockLLMProvider
 from .database import Base, SessionLocal, engine
 from .models import JobRecord, PlanRecord, TaskRecord
 
@@ -50,9 +59,19 @@ ORCHESTRATOR_RECOVER_PENDING = (
 )
 ORCHESTRATOR_RECOVER_IDLE_MS = int(os.getenv("ORCHESTRATOR_RECOVER_IDLE_MS", "60000"))
 REPLAN_MAX = int(os.getenv("REPLAN_MAX", "1"))
+TOOL_INPUT_VALIDATION_ENABLED = (
+    os.getenv("TOOL_INPUT_VALIDATION_ENABLED", "true").lower() == "true"
+)
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 TASK_OUTPUT_KEY_PREFIX = "task_output:"
 TASK_RESULT_KEY_PREFIX = "task_result:"
+
+_tool_spec_registry = tool_registry.default_registry(
+    http_fetch_enabled=False,
+    llm_enabled=True,
+    llm_provider=MockLLMProvider(),
+)
+TOOL_INPUT_SCHEMAS = {spec.name: spec.input_schema for spec in _tool_spec_registry.list_specs()}
 
 
 @app.on_event("startup")
@@ -522,6 +541,16 @@ def _enqueue_ready_tasks(job_id: str, plan_id: str, correlation_id: str | None) 
                 record.updated_at = now
                 context = _build_task_context(record.id, task_map, id_to_name)
                 payload = _task_payload_from_record(record, correlation_id, context)
+                if TOOL_INPUT_VALIDATION_ENABLED and payload.get("tool_inputs_validation"):
+                    record.status = models.TaskStatus.failed.value
+                    record.updated_at = now
+                    events.append(
+                        (
+                            "task.failed",
+                            _task_payload_with_error(record, correlation_id, "tool_inputs_invalid"),
+                        )
+                    )
+                    continue
                 events.append(("task.ready", payload))
         db.commit()
     for event_type, payload in events:
@@ -570,6 +599,11 @@ def _task_payload_from_record(
     if resolved_inputs:
         payload["tool_inputs"] = resolved_inputs
         payload["tool_inputs_resolved"] = True
+        validation_errors = payload_resolver.validate_tool_inputs(
+            resolved_inputs, TOOL_INPUT_SCHEMAS
+        )
+        if validation_errors:
+            payload["tool_inputs_validation"] = validation_errors
     return payload
 
 
@@ -638,7 +672,18 @@ def _handle_policy_decision(envelope: dict) -> None:
                 id_to_name = {record.id: record.name for record in task_records}
                 context = _build_task_context(task.id, task_map, id_to_name)
                 payload = _task_payload_from_record(task, correlation_id, context)
-                events_to_emit.append(("task.ready", payload))
+                if TOOL_INPUT_VALIDATION_ENABLED and payload.get("tool_inputs_validation"):
+                    task.status = models.TaskStatus.failed.value
+                    task.updated_at = now
+                    db.commit()
+                    events_to_emit.append(
+                        (
+                            "task.failed",
+                            _task_payload_with_error(task, correlation_id, "tool_inputs_invalid"),
+                        )
+                    )
+                else:
+                    events_to_emit.append(("task.ready", payload))
         db.commit()
     for event_type, event_payload in events_to_emit:
         _emit_event(event_type, event_payload)
@@ -1004,6 +1049,7 @@ def stream_events(request: Request, once: bool = False):
                     payload = data.get("data")
                     yield f"data: {payload}\n\n"
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 
 @app.post("/plans", response_model=models.Plan)

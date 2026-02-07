@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
+from jsonschema import Draft202012Validator
+
 
 def resolve_tool_inputs(
     tool_requests: list[str],
@@ -19,6 +21,26 @@ def resolve_tool_inputs(
         if isinstance(resolved_payload, dict):
             resolved[tool_name] = resolved_payload
     return resolved
+
+
+def validate_tool_inputs(
+    tool_inputs: dict[str, Any],
+    tool_schemas: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    errors: dict[str, str] = {}
+    if not isinstance(tool_inputs, dict):
+        return errors
+    for tool_name, payload in tool_inputs.items():
+        schema = tool_schemas.get(tool_name)
+        if not schema:
+            continue
+        if not isinstance(payload, dict):
+            errors[tool_name] = "input schema validation failed: <root>: payload must be an object"
+            continue
+        validation_error = _validate_schema(schema, payload, "input")
+        if validation_error:
+            errors[tool_name] = validation_error
+    return errors
 
 
 def resolve_tool_payload(
@@ -438,6 +460,22 @@ def _extract_instruction_payload(instruction: str) -> dict:
     if isinstance(data, dict):
         return data
     return {}
+
+
+def _validate_schema(schema: Dict[str, Any] | None, payload: Dict[str, Any], label: str) -> str | None:
+    if not schema:
+        return None
+    try:
+        validator = Draft202012Validator(schema)
+    except Exception as exc:  # noqa: BLE001
+        return f"Invalid {label} schema: {exc}"
+    errors = sorted(validator.iter_errors(payload), key=lambda err: err.path)
+    if errors:
+        messages = "; ".join(
+            f"{'/'.join(map(str, err.path)) or '<root>'}: {err.message}" for err in errors[:5]
+        )
+        return f"{label} schema validation failed: {messages}"
+    return None
 
 
 def _extract_template_id(instruction: str) -> str | None:
