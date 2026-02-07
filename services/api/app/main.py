@@ -853,6 +853,19 @@ def create_job(job: models.JobCreate, db: Session = Depends(get_db)) -> models.J
     db.add(record)
     db.commit()
     jobs_created_total.inc()
+    if isinstance(job.context_json, dict) and job.context_json:
+        try:
+            memory_store.write_memory(
+                db,
+                models.MemoryWrite(
+                    name="job_context",
+                    job_id=job_id,
+                    payload=job.context_json,
+                    metadata={"source": "job_create"},
+                ),
+            )
+        except (KeyError, ValueError):
+            pass
     _emit_event("job.created", _job_from_record(record).model_dump())
     return _job_from_record(record)
 

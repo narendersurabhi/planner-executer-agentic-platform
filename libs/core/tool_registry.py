@@ -1298,12 +1298,28 @@ def _llm_tailor_resume_text(payload: Dict[str, Any], provider: LLMProvider) -> D
     if not isinstance(job, dict):
         raise ToolExecutionError("job must be an object")
     context_json = job.get("context_json") if isinstance(job, dict) else None
-    candidate_resume = None
-    if isinstance(context_json, dict):
-        candidate_resume = context_json.get("candidate_resume")
+    if not isinstance(context_json, dict):
+        context_json = {}
+    memory_context = {}
+    memory = payload.get("memory")
+    if isinstance(memory, dict):
+        memory_entries = memory.get("job_context")
+        if isinstance(memory_entries, list):
+            for entry in memory_entries:
+                if isinstance(entry, dict):
+                    memory_context = entry
+                    break
+    merged_context = dict(memory_context)
+    merged_context.update(context_json)
+    for key in ("job_description", "candidate_resume", "target_role_name", "seniority_level"):
+        if not merged_context.get(key) and isinstance(job.get(key), str):
+            merged_context[key] = job.get(key)
+    candidate_resume = merged_context.get("candidate_resume")
     if not isinstance(candidate_resume, str) or not candidate_resume.strip():
         raise ToolExecutionError("candidate_resume_missing")
-    prompt = prompts.resume_tailoring_prompt(job)
+    job_payload = dict(job)
+    job_payload["context_json"] = merged_context
+    prompt = prompts.resume_tailoring_prompt(job_payload)
     response = provider.generate(prompt)
     text = response.content.strip()
     if not text:
