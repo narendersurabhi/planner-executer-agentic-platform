@@ -11,6 +11,7 @@ import redis
 from jsonschema import Draft202012Validator
 
 from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
+from libs.core.memory_client import MemoryClient
 
 core_logging.configure_logging("worker")
 LOGGER = core_logging.get_logger("worker")
@@ -72,6 +73,10 @@ def _parse_optional_int(value: str | None) -> int | None:
 
 
 OUTPUT_SIZE_CAP = _parse_optional_int(TOOL_OUTPUT_SIZE_CAP) or 50000
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://api:8000")
+MEMORY_READ_ENABLED = os.getenv("MEMORY_READ_ENABLED", "true").lower() == "true"
+MEMORY_WRITE_ENABLED = os.getenv("MEMORY_WRITE_ENABLED", "true").lower() == "true"
+MEMORY_CLIENT = MemoryClient(MEMORY_API_URL)
 
 
 LLM_PROVIDER_INSTANCE = None
@@ -127,6 +132,7 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                 )
             )
             break
+        trace_id = task_payload.get("correlation_id", "")
         payload = _tool_payload(
             tool_name,
             task_payload.get("instruction", ""),
@@ -134,9 +140,11 @@ def execute_task(task_payload: dict) -> models.TaskResult:
             task_payload,
             tool_inputs,
         )
+        memory_payload = _load_memory_inputs(tool, task_payload, trace_id)
+        if memory_payload:
+            payload.setdefault("memory", {}).update(memory_payload)
         payload["_registry"] = registry
         idempotency_key = str(uuid.uuid4())
-        trace_id = task_payload.get("correlation_id", "")
         core_logging.log_event(
             LOGGER,
             "tool_call_started",
@@ -168,6 +176,8 @@ def execute_task(task_payload: dict) -> models.TaskResult:
         )
         tool_calls.append(call)
         outputs[tool_name] = call.output_or_error
+        if call.status == "completed":
+            _persist_memory_outputs(tool, task_payload, call, trace_id)
         if call.status != "completed":
             tool_error = call.output_or_error.get("error", "tool_failed")
             break
@@ -225,6 +235,69 @@ def _intent_mismatch(task_intent: str, tool_intent: models.ToolIntent, tool_name
     if task_intent == "generate" and tool_intent == models.ToolIntent.transform:
         return f"tool_intent_mismatch:{tool_name}:{tool_intent.value}:{task_intent}"
     return None
+
+
+def _load_memory_inputs(tool, task_payload: dict, trace_id: str) -> dict:
+    if not MEMORY_READ_ENABLED:
+        return {}
+    memory_reads = getattr(tool.spec, "memory_reads", None) or []
+    if not memory_reads:
+        return {}
+    job_id = task_payload.get("job_id")
+    if not job_id:
+        return {}
+    memory_payload: dict[str, list] = {}
+    for name in memory_reads:
+        entries = MEMORY_CLIENT.read(name=name, job_id=job_id)
+        memory_payload[name] = [entry.get("payload", {}) for entry in entries]
+        core_logging.log_event(
+            LOGGER,
+            "memory_read",
+            {
+                "task_id": task_payload.get("task_id"),
+                "tool_name": tool.spec.name,
+                "memory_name": name,
+                "count": len(entries),
+                "trace_id": trace_id,
+            },
+        )
+    return memory_payload
+
+
+def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, trace_id: str) -> None:
+    if not MEMORY_WRITE_ENABLED:
+        return
+    memory_writes = getattr(tool.spec, "memory_writes", None) or []
+    if not memory_writes:
+        return
+    job_id = task_payload.get("job_id")
+    if not job_id:
+        return
+    task_id = task_payload.get("task_id") or task_payload.get("id")
+    for name in memory_writes:
+        entry = {
+            "name": name,
+            "job_id": job_id,
+            "key": str(task_id) if task_id else None,
+            "payload": {
+                "tool_name": tool.spec.name,
+                "task_id": task_id,
+                "output": call.output_or_error,
+            },
+            "metadata": {"trace_id": trace_id},
+        }
+        written = MEMORY_CLIENT.write(entry)
+        core_logging.log_event(
+            LOGGER,
+            "memory_write",
+            {
+                "task_id": task_id,
+                "tool_name": tool.spec.name,
+                "memory_name": name,
+                "status": "ok" if written else "failed",
+                "trace_id": trace_id,
+            },
+        )
 
 
 def _tool_payload(

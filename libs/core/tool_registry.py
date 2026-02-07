@@ -729,6 +729,8 @@ def default_registry(
                             "reached_threshold",
                         ],
                     },
+                    memory_reads=["job_context", "task_outputs"],
+                    memory_writes=["task_outputs"],
                     timeout_s=_resolve_llm_timeout_s(llm_provider),
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
@@ -758,6 +760,8 @@ def default_registry(
                         "properties": {"tailored_text": {"type": "string"}},
                         "required": ["tailored_text"],
                     },
+                    memory_reads=["job_context"],
+                    memory_writes=["task_outputs"],
                     examples=[
                         {
                             "task": {
@@ -846,6 +850,8 @@ def default_registry(
                         "properties": {"resume_doc_spec": {"type": "object"}},
                         "required": ["resume_doc_spec"],
                     },
+                    memory_reads=["job_context", "task_outputs"],
+                    memory_writes=["task_outputs"],
                     examples=[
                         {
                             "task": {
@@ -928,6 +934,8 @@ def default_registry(
                         "properties": {"resume_doc_spec": {"type": "object"}},
                         "required": ["resume_doc_spec"],
                     },
+                    memory_reads=["job_context", "task_outputs"],
+                    memory_writes=["task_outputs"],
                     examples=[
                         {
                             "task": {
