@@ -2015,12 +2015,19 @@ const openTemplateModal = (template: Template) => {
                       Job Entries
                     </div>
                   </div>
-                  <button
-                    className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
-                    onClick={() => setShowMemory((prev) => !prev)}
-                  >
-                    {showMemory ? "Hide" : "Show"}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    {memoryFilters.key.trim() || memoryFilters.tool.trim() ? (
+                      <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-amber-700">
+                        Filters active
+                      </span>
+                    ) : null}
+                    <button
+                      className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+                      onClick={() => setShowMemory((prev) => !prev)}
+                    >
+                      {showMemory ? "Hide" : "Show"}
+                    </button>
+                  </div>
                 </div>
                 {showMemory ? (
                   <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-500">
