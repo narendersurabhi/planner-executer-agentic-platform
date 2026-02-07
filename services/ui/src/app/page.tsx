@@ -66,6 +66,22 @@ type EventEnvelope = {
   version?: string;
 };
 
+type MemoryEntry = {
+  id: string;
+  name: string;
+  scope: string;
+  payload: Record<string, unknown>;
+  key?: string | null;
+  job_id?: string | null;
+  user_id?: string | null;
+  project_id?: string | null;
+  metadata?: Record<string, unknown>;
+  version?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  expires_at?: string | null;
+};
+
 type TemplateVariable = {
   id?: string;
   key: string;
@@ -440,8 +456,16 @@ export default function Home() {
   const [dragOverTemplateId, setDragOverTemplateId] = useState<string | null>(null);
   const [showTaskInputs, setShowTaskInputs] = useState(false);
   const [showRecentEvents, setShowRecentEvents] = useState(false);
+  const [showMemory, setShowMemory] = useState(false);
   const [expandedTaskInputs, setExpandedTaskInputs] = useState<Set<string>>(new Set());
   const [expandedRecentEvents, setExpandedRecentEvents] = useState<Set<number>>(new Set());
+  const [expandedMemoryGroups, setExpandedMemoryGroups] = useState<Set<string>>(new Set());
+  const [expandedMemoryEntries, setExpandedMemoryEntries] = useState<
+    Record<string, Set<number>>
+  >({});
+  const [memoryEntries, setMemoryEntries] = useState<Record<string, MemoryEntry[]>>({});
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryError, setMemoryError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [isResizing, setIsResizing] = useState(false);
@@ -1001,6 +1025,41 @@ const openTemplateModal = (template: Template) => {
       }
     }
 
+    setMemoryLoading(true);
+    setMemoryError(null);
+    const memoryNames = ["job_context", "task_outputs"];
+    const memoryResults = await Promise.all(
+      memoryNames.map((name) =>
+        fetchJson(
+          `${apiUrl}/memory/read?name=${encodeURIComponent(name)}&job_id=${encodeURIComponent(jobId)}&limit=50`
+        )
+      )
+    );
+    const nextMemoryEntries: Record<string, MemoryEntry[]> = {};
+    let memoryFailure = false;
+    memoryResults.forEach((result, index) => {
+      const name = memoryNames[index];
+      if (result.ok && Array.isArray(result.data)) {
+        nextMemoryEntries[name] = result.data as MemoryEntry[];
+      } else {
+        nextMemoryEntries[name] = [];
+        memoryFailure = true;
+      }
+    });
+    setMemoryEntries(nextMemoryEntries);
+    if (memoryFailure) {
+      if (memoryResults.some((result) => result.status)) {
+        const status = memoryResults.find((result) => result.status)?.status;
+        setMemoryError(`Failed to load memory entries (${status}).`);
+      } else if (memoryResults.some((result) => result.error)) {
+        const error = memoryResults.find((result) => result.error)?.error;
+        setMemoryError(`Failed to load memory entries (${error}).`);
+      } else {
+        setMemoryError("Failed to load memory entries.");
+      }
+    }
+    setMemoryLoading(false);
+
     setDetailsLoading(false);
   };
 
@@ -1010,6 +1069,11 @@ const openTemplateModal = (template: Template) => {
     setSelectedTasks([]);
     setTaskResults({});
     setDetailsError(null);
+    setMemoryEntries({});
+    setMemoryError(null);
+    setMemoryLoading(false);
+    setExpandedMemoryGroups(new Set());
+    setExpandedMemoryEntries({});
   };
 
   const stopJob = async (jobId: string) => {
@@ -1901,6 +1965,148 @@ const openTemplateModal = (template: Template) => {
                     })}
                   </div>
                 ) : null}
+              </div>
+            ) : null}
+
+            {selectedJobId ? (
+              <div className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-800">Memory</div>
+                    <div className="text-[11px] uppercase tracking-[0.2em] text-slate-400">
+                      Job Entries
+                    </div>
+                  </div>
+                  <button
+                    className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+                    onClick={() => setShowMemory((prev) => !prev)}
+                  >
+                    {showMemory ? "Hide" : "Show"}
+                  </button>
+                </div>
+                {memoryLoading ? (
+                  <div className="mt-3 text-xs text-slate-500">Loading memory entries...</div>
+                ) : memoryError ? (
+                  <div className="mt-3 text-xs text-rose-600">{memoryError}</div>
+                ) : showMemory ? (
+                  <div className="mt-4 space-y-3">
+                    {["job_context", "task_outputs"].map((name) => {
+                      const entries = memoryEntries[name] || [];
+                      const groupExpanded = expandedMemoryGroups.has(name);
+                      return (
+                        <div
+                          key={name}
+                          className="rounded-xl border border-slate-100 bg-slate-50 p-3"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">{name}</div>
+                              <div className="mt-1 text-xs text-slate-500">
+                                {entries.length} entries
+                              </div>
+                            </div>
+                            <button
+                              className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500"
+                              onClick={() =>
+                                setExpandedMemoryGroups((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(name)) {
+                                    next.delete(name);
+                                  } else {
+                                    next.add(name);
+                                  }
+                                  return next;
+                                })
+                              }
+                            >
+                              {groupExpanded ? "Hide" : "Show"}
+                            </button>
+                          </div>
+                          {groupExpanded ? (
+                            entries.length > 0 ? (
+                              <div className="mt-3 space-y-3">
+                                {entries.map((entry, index) => {
+                                  const entryExpanded =
+                                    expandedMemoryEntries[name]?.has(index) ?? false;
+                                  return (
+                                    <div
+                                      key={`${name}-${entry.id}-${index}`}
+                                      className="rounded-lg border border-slate-200 bg-white p-3"
+                                    >
+                                      <div className="flex items-center justify-between gap-3">
+                                        <div className="text-xs font-semibold text-slate-700">
+                                          {entry.key || "Untitled entry"}
+                                        </div>
+                                        <button
+                                          className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500"
+                                          onClick={() =>
+                                            setExpandedMemoryEntries((prev) => {
+                                              const next = { ...prev };
+                                              const current = new Set(next[name] ?? []);
+                                              if (current.has(index)) {
+                                                current.delete(index);
+                                              } else {
+                                                current.add(index);
+                                              }
+                                              next[name] = current;
+                                              return next;
+                                            })
+                                          }
+                                        >
+                                          {entryExpanded ? "Hide" : "Show"}
+                                        </button>
+                                      </div>
+                                      {entryExpanded ? (
+                                        <div className="mt-2 grid gap-3 text-xs text-slate-600 md:grid-cols-2">
+                                          <div>
+                                            <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                              Metadata
+                                            </div>
+                                            <pre className="mt-1 whitespace-pre-wrap rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
+                                              {JSON.stringify(entry.metadata || {}, null, 2)}
+                                            </pre>
+                                          </div>
+                                          <div>
+                                            <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                              Payload
+                                            </div>
+                                            <pre className="mt-1 whitespace-pre-wrap rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
+                                              {JSON.stringify(entry.payload || {}, null, 2)}
+                                            </pre>
+                                          </div>
+                                          <div className="md:col-span-2">
+                                            <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                              Updated
+                                            </div>
+                                            <div className="mt-1 text-xs text-slate-600">
+                                              {entry.updated_at || entry.created_at || "—"}
+                                            </div>
+                                          </div>
+                                        </div>
+                                      ) : (
+                                        <div className="mt-2 text-[11px] text-slate-500">
+                                          Collapsed.
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <div className="mt-3 text-xs text-slate-500">
+                                No memory entries yet.
+                              </div>
+                            )
+                          ) : (
+                            <div className="mt-3 text-xs text-slate-500">Collapsed.</div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="mt-3 text-xs text-slate-500">Hidden by default.</div>
+                )}
               </div>
             ) : null}
           </div>
