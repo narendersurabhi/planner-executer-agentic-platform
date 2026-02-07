@@ -4,10 +4,14 @@ from typing import Any, Mapping, Sequence
 
 
 MEMORY_OUTPUT_KEYS = {
-    "llm_tailor_resume_text": ["tailored_text"],
-    "llm_improve_tailored_resume_text": ["tailored_text", "alignment_score", "alignment_summary"],
+    "llm_tailor_resume_text": ["tailored_resume"],
+    "llm_improve_tailored_resume_text": [
+        "tailored_resume",
+        "alignment_score",
+        "alignment_summary",
+    ],
     "llm_iterative_improve_tailored_resume_text": [
-        "tailored_text",
+        "tailored_resume",
         "alignment_score",
         "alignment_summary",
         "iterations",
@@ -16,9 +20,9 @@ MEMORY_OUTPUT_KEYS = {
 }
 
 MEMORY_INPUT_KEYS = {
-    "llm_improve_tailored_resume_text": ["tailored_text"],
-    "llm_iterative_improve_tailored_resume_text": ["tailored_text"],
-    "llm_generate_resume_doc_spec_from_text": ["tailored_text"],
+    "llm_improve_tailored_resume_text": ["tailored_resume"],
+    "llm_iterative_improve_tailored_resume_text": ["tailored_resume"],
+    "llm_generate_resume_doc_spec_from_text": ["tailored_resume"],
 }
 
 

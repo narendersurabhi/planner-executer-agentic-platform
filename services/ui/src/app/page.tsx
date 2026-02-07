@@ -107,9 +107,9 @@ const BUILT_IN_TEMPLATES: Template[] = [
   {
     id: "tpl-resume-tailor-text",
     name: "Resume Tailor (Structured Inputs)",
-    description: "Use structured inputs to tailor a resume and return plain text sections.",
+    description: "Use structured inputs to tailor a resume and return JSON sections.",
     goal:
-      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role and return text sections.",
+      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role and return structured JSON sections.",
     contextJson:
       '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "target_role_name": "{{target_role_name}}",\n  "seniority_level": "{{seniority_level}}"\n}',
     priority: 2,
@@ -148,9 +148,9 @@ const BUILT_IN_TEMPLATES: Template[] = [
   {
     id: "tpl-resume-tailor-docspec",
     name: "Resume Tailor -> ResumeDocSpec",
-    description: "Tailor resume text, then generate a ResumeDocSpec from that text.",
+    description: "Tailor resume JSON, improve it, then generate a ResumeDocSpec.",
     goal:
-      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role. Iteratively improve it with llm_iterative_improve_tailored_resume_text until alignment >= {{min_alignment_score}} or {{max_iterations}} iterations. Then use llm_generate_resume_doc_spec_from_text on the improved tailored text to produce resume_doc_spec. Validate with resume_doc_spec_validate. Convert with resume_doc_spec_to_document_spec. Finally render a DOCX with docx_generate_from_spec. You MUST derive a filename (e.g., role + date) and set tool_inputs.path to {{output_dir}}/<derived_filename>.docx.",
+      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role. Iteratively improve it with llm_iterative_improve_tailored_resume_text until alignment >= {{min_alignment_score}} or {{max_iterations}} iterations. Then use llm_generate_resume_doc_spec_from_text on the improved tailored JSON to produce resume_doc_spec. Validate with resume_doc_spec_validate. Convert with resume_doc_spec_to_document_spec. Finally render a DOCX with docx_generate_from_spec. You MUST derive a filename (e.g., role + date) and set tool_inputs.path to {{output_dir}}/<derived_filename>.docx.",
     contextJson:
       '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "target_role_name": "{{target_role_name}}",\n  "seniority_level": "{{seniority_level}}",\n  "output_dir": "{{output_dir}}",\n  "min_alignment_score": "{{min_alignment_score}}",\n  "max_iterations": "{{max_iterations}}"\n}',
     priority: 2,

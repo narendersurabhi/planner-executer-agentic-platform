@@ -698,23 +698,24 @@ def default_registry(
                         "Iteratively improve tailored resume text until alignment threshold or max iterations"
                     ),
                     usage_guidance=(
-                        "Provide tailored_text (required). Optionally provide job, min_alignment_score "
-                        "(0-100), and max_iterations. Returns the best tailored_text plus alignment stats."
+                        "Provide tailored_resume (preferred). Optionally provide job, min_alignment_score "
+                        "(0-100), and max_iterations. Returns the best tailored_resume plus alignment stats."
                     ),
                     input_schema={
                         "type": "object",
                         "properties": {
                             "tailored_text": {"type": "string"},
+                            "tailored_resume": {"type": "object"},
                             "job": {"type": "object"},
                             "min_alignment_score": {"type": "number"},
                             "max_iterations": {"type": "integer"},
                         },
-                        "required": ["tailored_text"],
+                        "required": [],
                     },
                     output_schema={
                         "type": "object",
                         "properties": {
-                            "tailored_text": {"type": "string"},
+                            "tailored_resume": {"type": "object"},
                             "alignment_score": {"type": "number"},
                             "alignment_summary": {"type": "string"},
                             "iterations": {"type": "integer"},
@@ -722,7 +723,7 @@ def default_registry(
                             "history": {"type": "array", "items": {"type": "object"}},
                         },
                         "required": [
-                            "tailored_text",
+                            "tailored_resume",
                             "alignment_score",
                             "alignment_summary",
                             "iterations",
@@ -744,11 +745,11 @@ def default_registry(
             Tool(
                 spec=ToolSpec(
                     name="llm_tailor_resume_text",
-                    description="Tailor a resume to a job description and return plain text sections",
+                    description="Tailor a resume to a job description and return structured JSON content",
                     usage_guidance=(
                         "Provide a full job object in 'job'. The job should include context_json "
                         "with the job description, candidate resume, target role name, and seniority "
-                        "level. The tool returns plain text with SECTION headings."
+                        "level. The tool returns JSON resume content."
                     ),
                     input_schema={
                         "type": "object",
@@ -757,8 +758,8 @@ def default_registry(
                     },
                     output_schema={
                         "type": "object",
-                        "properties": {"tailored_text": {"type": "string"}},
-                        "required": ["tailored_text"],
+                        "properties": {"tailored_resume": {"type": "object"}},
+                        "required": ["tailored_resume"],
                     },
                     memory_reads=["job_context"],
                     memory_writes=["task_outputs"],
@@ -799,25 +800,26 @@ def default_registry(
                     name="llm_improve_tailored_resume_text",
                     description="Review and improve tailored resume text while preserving truthfulness",
                     usage_guidance=(
-                        "Provide tailored_text (required) and job context (optional). "
-                        "Returns improved tailored_text plus alignment score and summary."
+                        "Provide tailored_resume (preferred) and job context (optional). "
+                        "Returns improved tailored_resume plus alignment score and summary."
                     ),
                     input_schema={
                         "type": "object",
                         "properties": {
                             "tailored_text": {"type": "string"},
+                            "tailored_resume": {"type": "object"},
                             "job": {"type": "object"},
                         },
-                        "required": ["tailored_text"],
+                        "required": [],
                     },
                     output_schema={
                         "type": "object",
                         "properties": {
-                            "tailored_text": {"type": "string"},
+                            "tailored_resume": {"type": "object"},
                             "alignment_score": {"type": "number"},
                             "alignment_summary": {"type": "string"},
                         },
-                        "required": ["tailored_text", "alignment_score", "alignment_summary"],
+                        "required": ["tailored_resume", "alignment_score", "alignment_summary"],
                     },
                     memory_reads=["job_context", "task_outputs"],
                     memory_writes=["task_outputs"],
@@ -836,16 +838,17 @@ def default_registry(
                     name="llm_generate_resume_doc_spec_from_text",
                     description="Generate a ResumeDocSpec JSON from tailored resume text",
                     usage_guidance=(
-                        "Provide tailored resume text in 'tailored_text'. Optionally provide "
+                        "Provide tailored_resume (preferred) or tailored_text. Optionally provide "
                         "job context in 'job'. Returns a resume_doc_spec object."
                     ),
                     input_schema={
                         "type": "object",
                         "properties": {
                             "tailored_text": {"type": "string"},
+                            "tailored_resume": {"type": "object"},
                             "job": {"type": "object"},
                         },
-                        "required": ["tailored_text"],
+                        "required": [],
                     },
                     output_schema={
                         "type": "object",
@@ -1321,22 +1324,36 @@ def _llm_tailor_resume_text(payload: Dict[str, Any], provider: LLMProvider) -> D
     job_payload["context_json"] = merged_context
     prompt = prompts.resume_tailoring_prompt(job_payload)
     response = provider.generate(prompt)
-    text = response.content.strip()
-    if not text:
-        raise ToolExecutionError("Empty response from LLM")
-    _ensure_required_resume_sections(text)
-    return {"tailored_text": text}
+    json_text = _extract_json(response.content)
+    if not json_text:
+        raise ToolExecutionError("Failed to extract JSON from LLM response")
+    try:
+        resume_payload = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
+    if not isinstance(resume_payload, dict):
+        raise ToolExecutionError("tailored_resume must be an object")
+    _ensure_required_resume_sections(resume_payload)
+    return {"tailored_resume": resume_payload}
 
 
 def _llm_improve_tailored_resume_text(
     payload: Dict[str, Any], provider: LLMProvider
 ) -> Dict[str, Any]:
+    tailored_resume = payload.get("tailored_resume")
     tailored_text = payload.get("tailored_text")
     job = payload.get("job")
-    if not isinstance(tailored_text, str) or not tailored_text.strip():
-        raise ToolExecutionError("tailored_text must be a non-empty string")
-    _ensure_required_resume_sections(tailored_text)
-    prompt = prompts.resume_tailoring_improve_prompt(tailored_text, job=job)
+    if isinstance(tailored_text, str) and tailored_text.strip() and tailored_resume is None:
+        try:
+            parsed = json.loads(tailored_text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            tailored_resume = parsed
+    if not isinstance(tailored_resume, dict):
+        raise ToolExecutionError("tailored_resume must be an object")
+    _ensure_required_resume_sections(tailored_resume)
+    prompt = prompts.resume_tailoring_improve_prompt(tailored_resume, job=job)
     response = provider.generate(prompt)
     json_text = _extract_json(response.content)
     if not json_text:
@@ -1347,17 +1364,17 @@ def _llm_improve_tailored_resume_text(
         raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
     if not isinstance(payload_out, dict):
         raise ToolExecutionError("Response must be a JSON object")
-    improved = payload_out.get("tailored_text")
+    improved = payload_out.get("tailored_resume")
     score = payload_out.get("alignment_score")
     summary = payload_out.get("alignment_summary")
-    if not isinstance(improved, str) or not improved.strip():
-        raise ToolExecutionError("tailored_text must be a non-empty string")
+    if not isinstance(improved, dict):
+        raise ToolExecutionError("tailored_resume must be an object")
     if not isinstance(score, (int, float)):
         raise ToolExecutionError("alignment_score must be a number")
     if not isinstance(summary, str) or not summary.strip():
         raise ToolExecutionError("alignment_summary must be a non-empty string")
     return {
-        "tailored_text": improved,
+        "tailored_resume": improved,
         "alignment_score": float(score),
         "alignment_summary": summary.strip(),
     }
@@ -1366,10 +1383,19 @@ def _llm_improve_tailored_resume_text(
 def _llm_iterative_improve_tailored_resume_text(
     payload: Dict[str, Any], provider: LLMProvider
 ) -> Dict[str, Any]:
+    tailored_resume = payload.get("tailored_resume")
     tailored_text = payload.get("tailored_text")
     job = payload.get("job")
-    if not isinstance(tailored_text, str) or not tailored_text.strip():
-        raise ToolExecutionError("tailored_text must be a non-empty string")
+    if isinstance(tailored_text, str) and tailored_text.strip() and tailored_resume is None:
+        try:
+            parsed = json.loads(tailored_text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            tailored_resume = parsed
+    if not isinstance(tailored_resume, dict):
+        raise ToolExecutionError("tailored_resume must be an object")
+    _ensure_required_resume_sections(tailored_resume)
 
     threshold = payload.get("min_alignment_score", 85)
     max_iterations = payload.get("max_iterations", 2)
@@ -1378,15 +1404,15 @@ def _llm_iterative_improve_tailored_resume_text(
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise ToolExecutionError("max_iterations must be a positive integer")
 
-    best_text = tailored_text
+    best_resume = tailored_resume
     best_score = -1.0
     best_summary = ""
     reached = False
     history: list[dict[str, Any]] = []
 
-    current_text = tailored_text
+    current_resume = tailored_resume
     for idx in range(max_iterations):
-        prompt = prompts.resume_tailoring_improve_prompt(current_text, job=job)
+        prompt = prompts.resume_tailoring_improve_prompt(current_resume, job=job)
         response = provider.generate(prompt)
         json_text = _extract_json(response.content)
         if not json_text:
@@ -1398,11 +1424,11 @@ def _llm_iterative_improve_tailored_resume_text(
         if not isinstance(payload_out, dict):
             raise ToolExecutionError("Response must be a JSON object")
 
-        improved = payload_out.get("tailored_text")
+        improved = payload_out.get("tailored_resume")
         score = payload_out.get("alignment_score")
         summary = payload_out.get("alignment_summary")
-        if not isinstance(improved, str) or not improved.strip():
-            raise ToolExecutionError("tailored_text must be a non-empty string")
+        if not isinstance(improved, dict):
+            raise ToolExecutionError("tailored_resume must be an object")
         if not isinstance(score, (int, float)):
             raise ToolExecutionError("alignment_score must be a number")
         if not isinstance(summary, str) or not summary.strip():
@@ -1418,16 +1444,16 @@ def _llm_iterative_improve_tailored_resume_text(
         )
         if score_value > best_score:
             best_score = score_value
-            best_text = improved
+            best_resume = improved
             best_summary = summary.strip()
 
-        current_text = improved
+        current_resume = improved
         if score_value >= float(threshold):
             reached = True
             break
 
     return {
-        "tailored_text": best_text,
+        "tailored_resume": best_resume,
         "alignment_score": best_score,
         "alignment_summary": best_summary,
         "iterations": len(history),
@@ -1440,11 +1466,23 @@ def _llm_generate_resume_doc_spec_from_text(
     payload: Dict[str, Any], provider: LLMProvider
 ) -> Dict[str, Any]:
     tailored_text = payload.get("tailored_text")
+    tailored_resume = payload.get("tailored_resume")
     job = payload.get("job")
-    if not isinstance(tailored_text, str) or not tailored_text.strip():
-        raise ToolExecutionError("tailored_text must be a non-empty string")
-    _ensure_required_resume_sections(tailored_text)
-    prompt = prompts.resume_doc_spec_from_text_prompt(tailored_text, job=job)
+    if isinstance(tailored_text, str) and tailored_text.strip() and tailored_resume is None:
+        try:
+            parsed = json.loads(tailored_text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            tailored_resume = parsed
+    if isinstance(tailored_resume, dict):
+        _ensure_required_resume_sections(tailored_resume)
+        prompt = prompts.resume_doc_spec_prompt(job or {}, tailored_resume=tailored_resume)
+    else:
+        if not isinstance(tailored_text, str) or not tailored_text.strip():
+            raise ToolExecutionError("tailored_text must be a non-empty string")
+        _ensure_required_resume_sections(tailored_text)
+        prompt = prompts.resume_doc_spec_from_text_prompt(tailored_text, job=job)
     response = provider.generate(prompt)
     json_text = _extract_json(response.content)
     if not json_text:
@@ -1477,7 +1515,20 @@ def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider
     return {"resume_doc_spec": resume_doc_spec}
 
 
-def _ensure_required_resume_sections(text: str) -> None:
+def _ensure_required_resume_sections(content: Any) -> None:
+    if isinstance(content, dict):
+        required_keys = ["summary", "skills", "experience", "education", "certifications"]
+        missing = [key for key in required_keys if key not in content]
+        if missing:
+            raise ToolExecutionError(f"tailored_resume_missing_fields:{','.join(missing)}")
+        if not isinstance(content.get("summary"), str) or not content["summary"].strip():
+            raise ToolExecutionError("tailored_resume_invalid_summary")
+        for list_key in ("skills", "experience", "education", "certifications"):
+            if not isinstance(content.get(list_key), list):
+                raise ToolExecutionError(f"tailored_resume_invalid_{list_key}")
+        return
+    if not isinstance(content, str):
+        raise ToolExecutionError("tailored_resume_invalid_type")
     required = [
         "SECTION 1 SUMMARY",
         "SECTION 2 SKILLS",
@@ -1485,7 +1536,7 @@ def _ensure_required_resume_sections(text: str) -> None:
         "SECTION 6 EDUCATION",
         "SECTION 7 CERTIFICATIONS",
     ]
-    missing = [section for section in required if section not in text]
+    missing = [section for section in required if section not in content]
     if missing:
         raise ToolExecutionError(f"tailored_text_missing_sections:{','.join(missing)}")
 
