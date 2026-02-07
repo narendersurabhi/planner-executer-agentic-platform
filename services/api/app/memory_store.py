@@ -73,9 +73,7 @@ def read_memory(db: Session, query: models.MemoryQuery) -> list[models.MemoryEnt
     q = db.query(MemoryRecord).filter(
         MemoryRecord.name == spec.name, MemoryRecord.scope == scope.value
     )
-    if query.key is None:
-        q = q.filter(MemoryRecord.key.is_(None))
-    else:
+    if query.key is not None:
         q = q.filter(MemoryRecord.key == query.key)
     if query.job_id:
         q = q.filter(MemoryRecord.job_id == query.job_id)
