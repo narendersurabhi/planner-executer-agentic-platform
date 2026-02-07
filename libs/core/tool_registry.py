@@ -819,6 +819,8 @@ def default_registry(
                         },
                         "required": ["tailored_text", "alignment_score", "alignment_summary"],
                     },
+                    memory_reads=["job_context", "task_outputs"],
+                    memory_writes=["task_outputs"],
                     timeout_s=_resolve_llm_timeout_s(llm_provider),
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.transform,

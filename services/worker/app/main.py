@@ -12,6 +12,7 @@ from jsonschema import Draft202012Validator
 
 from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
 from libs.core.memory_client import MemoryClient
+from services.worker.app.memory_semantics import apply_memory_defaults, select_memory_payload
 
 core_logging.configure_logging("worker")
 LOGGER = core_logging.get_logger("worker")
@@ -143,6 +144,7 @@ def execute_task(task_payload: dict) -> models.TaskResult:
         memory_payload = _load_memory_inputs(tool, task_payload, trace_id)
         if memory_payload:
             payload.setdefault("memory", {}).update(memory_payload)
+            payload = apply_memory_defaults(tool.spec.name, payload)
         payload["_registry"] = registry
         idempotency_key = str(uuid.uuid4())
         core_logging.log_event(
@@ -275,15 +277,14 @@ def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, tra
         return
     task_id = task_payload.get("task_id") or task_payload.get("id")
     for name in memory_writes:
+        selected_payload = select_memory_payload(tool.spec.name, call.output_or_error)
+        if not selected_payload:
+            continue
         entry = {
             "name": name,
             "job_id": job_id,
-            "key": str(task_id) if task_id else None,
-            "payload": {
-                "tool_name": tool.spec.name,
-                "task_id": task_id,
-                "output": call.output_or_error,
-            },
+            "key": f"{tool.spec.name}:{task_id}" if task_id else tool.spec.name,
+            "payload": {"source_tool": tool.spec.name, **selected_payload},
             "metadata": {"trace_id": trace_id},
         }
         written = MEMORY_CLIENT.write(entry)
