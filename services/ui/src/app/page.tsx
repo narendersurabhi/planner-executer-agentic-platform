@@ -6,6 +6,7 @@ const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const TEMPLATE_STORAGE_KEY = "ape.templates.v1";
 const TEMPLATE_ORDER_KEY = "ape.templates.order.v1";
 const TEMPLATE_DEFAULTS_KEY = "ape.template.defaults.v1";
+const MEMORY_LIMIT_STORAGE_KEY = "ape.memory.limit.v1";
 const SIDEBAR_MIN_WIDTH = 260;
 const SIDEBAR_MAX_WIDTH = 420;
 
@@ -466,6 +467,7 @@ export default function Home() {
   const [memoryEntries, setMemoryEntries] = useState<Record<string, MemoryEntry[]>>({});
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryError, setMemoryError] = useState<string | null>(null);
+  const [memoryLimitDefault, setMemoryLimitDefault] = useState(10);
   const [memoryLimits, setMemoryLimits] = useState<Record<string, number>>({
     job_context: 10,
     task_outputs: 10
@@ -655,6 +657,30 @@ export default function Home() {
       return;
     }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const raw = window.localStorage.getItem(MEMORY_LIMIT_STORAGE_KEY);
+    if (!raw) {
+      return;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      return;
+    }
+    const clamped = Math.max(10, Math.min(200, parsed));
+    setMemoryLimitDefault(clamped);
+    setMemoryLimits({ job_context: clamped, task_outputs: clamped });
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(MEMORY_LIMIT_STORAGE_KEY, String(memoryLimitDefault));
+  }, [memoryLimitDefault]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1111,7 +1137,7 @@ const openTemplateModal = (template: Template) => {
     setExpandedMemoryGroups(new Set());
     setExpandedMemoryEntries({});
     setMemoryFilters({ key: "", tool: "" });
-    setMemoryLimits({ job_context: 10, task_outputs: 10 });
+    setMemoryLimits({ job_context: memoryLimitDefault, task_outputs: memoryLimitDefault });
   };
 
   const stopJob = async (jobId: string) => {
@@ -2047,6 +2073,36 @@ const openTemplateModal = (template: Template) => {
                         setMemoryFilters((prev) => ({ ...prev, tool: event.target.value }))
                       }
                     />
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] uppercase tracking-[0.2em] text-slate-400">
+                        Limit
+                      </span>
+                      <select
+                        className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700"
+                        value={memoryLimitDefault}
+                        onChange={(event) => {
+                          const nextLimit = Number(event.target.value);
+                          if (!Number.isFinite(nextLimit)) {
+                            return;
+                          }
+                          setMemoryLimitDefault(nextLimit);
+                          const nextLimits = {
+                            job_context: nextLimit,
+                            task_outputs: nextLimit
+                          };
+                          setMemoryLimits(nextLimits);
+                          if (selectedJobId) {
+                            loadMemoryEntries(selectedJobId, nextLimits);
+                          }
+                        }}
+                      >
+                        {[10, 25, 50, 100, 200].map((limit) => (
+                          <option key={limit} value={limit}>
+                            {limit}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                     <button
                       className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
                       onClick={() => setMemoryFilters({ key: "", tool: "" })}
