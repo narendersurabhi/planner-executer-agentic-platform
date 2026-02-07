@@ -13,6 +13,7 @@ from jsonschema import Draft202012Validator
 from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
 
 core_logging.configure_logging("worker")
+LOGGER = core_logging.get_logger("worker")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 TOOL_HTTP_FETCH_ENABLED = os.getenv("TOOL_HTTP_FETCH_ENABLED", "false").lower() == "true"
@@ -133,12 +134,37 @@ def execute_task(task_payload: dict) -> models.TaskResult:
             task_payload,
             tool_inputs,
         )
+        payload["_registry"] = registry
+        idempotency_key = str(uuid.uuid4())
+        trace_id = task_payload.get("correlation_id", "")
+        core_logging.log_event(
+            LOGGER,
+            "tool_call_started",
+            {
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "trace_id": trace_id,
+                "idempotency_key": idempotency_key,
+                "payload_keys": sorted(payload.keys()),
+            },
+        )
         call = registry.execute(
             tool_name,
             payload=payload,
-            idempotency_key=str(uuid.uuid4()),
-            trace_id=task_payload.get("correlation_id", ""),
+            idempotency_key=idempotency_key,
+            trace_id=trace_id,
             max_output_bytes=OUTPUT_SIZE_CAP,
+        )
+        core_logging.log_event(
+            LOGGER,
+            "tool_call_finished",
+            {
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "trace_id": trace_id,
+                "idempotency_key": idempotency_key,
+                "status": call.status,
+            },
         )
         tool_calls.append(call)
         outputs[tool_name] = call.output_or_error
@@ -208,6 +234,10 @@ def _tool_payload(
     task_payload: dict,
     tool_inputs: dict,
 ) -> dict:
+    if task_payload.get("tool_inputs_resolved"):
+        resolved = tool_inputs.get(tool_name) if isinstance(tool_inputs, dict) else None
+        if isinstance(resolved, dict):
+            return resolved
     has_tool_inputs = False
     payload = {}
     if isinstance(tool_inputs, dict) and tool_name in tool_inputs:
@@ -217,6 +247,15 @@ def _tool_payload(
             has_tool_inputs = True
     payload = _merge_payload_from_task(payload, task_payload, instruction)
     payload = _fill_payload_from_context(payload, context)
+    if tool_name == "llm_generate":
+        base_text = payload.get("text") or payload.get("prompt") or instruction
+        if context:
+            try:
+                context_blob = json.dumps(context, indent=2, ensure_ascii=True)
+            except (TypeError, ValueError):
+                context_blob = str(context)
+            base_text = f"{base_text}\n\nContext (JSON):\n{context_blob}"
+        return {"text": base_text}
     if has_tool_inputs:
         return payload
     if payload:
@@ -272,7 +311,7 @@ def _merge_payload_from_task(payload: dict, task_payload: dict, instruction: str
 def _fill_payload_from_context(payload: dict, context: dict) -> dict:
     filled = dict(payload)
     if "document_spec" not in filled:
-        doc = _extract_json_from_context(context)
+        doc = _extract_document_spec_from_context(context)
         if isinstance(doc, dict):
             filled["document_spec"] = doc
     if "data" not in filled:
@@ -299,6 +338,14 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
         resume = _extract_resume_content_from_context(context)
         if resume is not None:
             filled["resume_content"] = resume
+    if "resume_doc_spec" not in filled:
+        resume_spec = _extract_resume_doc_spec_from_context(context)
+        if isinstance(resume_spec, dict):
+            filled["resume_doc_spec"] = resume_spec
+    if "tailored_text" not in filled:
+        text = _extract_text_from_context(context)
+        if isinstance(text, str):
+            filled["tailored_text"] = text
     if "content" not in filled:
         text = _extract_text_from_context(context)
         if isinstance(text, str):
@@ -323,6 +370,38 @@ def _extract_json_from_context(context: dict) -> dict | None:
             json_candidate = _extract_json_from_outputs(output)
             if isinstance(json_candidate, dict):
                 return json_candidate
+    return None
+
+
+def _extract_document_spec_from_context(context: dict) -> dict | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            doc = _extract_document_spec_from_outputs(output)
+            if isinstance(doc, dict):
+                return doc
+    return None
+
+
+def _extract_resume_doc_spec_from_context(context: dict) -> dict | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            resume_spec = _extract_resume_doc_spec_from_outputs(output)
+            if isinstance(resume_spec, dict):
+                return resume_spec
     return None
 
 
@@ -389,6 +468,16 @@ def _extract_json_from_outputs(outputs: dict) -> dict | None:
         resume_doc_spec = resume_spec_output.get("resume_doc_spec")
         if isinstance(resume_doc_spec, dict):
             return resume_doc_spec
+    resume_spec_text_output = outputs.get("llm_generate_resume_doc_spec_from_text")
+    if isinstance(resume_spec_text_output, dict):
+        resume_doc_spec = resume_spec_text_output.get("resume_doc_spec")
+        if isinstance(resume_doc_spec, dict):
+            return resume_doc_spec
+    converted = outputs.get("resume_doc_spec_to_document_spec")
+    if isinstance(converted, dict):
+        document_spec = converted.get("document_spec")
+        if isinstance(document_spec, dict):
+            return document_spec
     llm_output = outputs.get("llm_generate")
     if isinstance(llm_output, dict):
         text = llm_output.get("text")
@@ -417,6 +506,44 @@ def _extract_json_from_outputs(outputs: dict) -> dict | None:
     payload = outputs.get("result")
     if isinstance(payload, dict):
         return payload
+    return None
+
+
+def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
+    if not isinstance(outputs, dict):
+        return None
+    for key in (
+        "resume_doc_spec_to_document_spec",
+        "llm_generate_document_spec",
+        "llm_repair_json",
+        "llm_improve_document_spec",
+    ):
+        candidate = outputs.get(key)
+        if isinstance(candidate, dict):
+            document_spec = candidate.get("document_spec")
+            if isinstance(document_spec, dict):
+                return document_spec
+    direct = outputs.get("document_spec")
+    if isinstance(direct, dict):
+        return direct
+    return None
+
+
+def _extract_resume_doc_spec_from_outputs(outputs: dict) -> dict | None:
+    if not isinstance(outputs, dict):
+        return None
+    for key in (
+        "llm_generate_resume_doc_spec",
+        "llm_generate_resume_doc_spec_from_text",
+    ):
+        candidate = outputs.get(key)
+        if isinstance(candidate, dict):
+            resume_doc_spec = candidate.get("resume_doc_spec")
+            if isinstance(resume_doc_spec, dict):
+                return resume_doc_spec
+    direct = outputs.get("resume_doc_spec")
+    if isinstance(direct, dict):
+        return direct
     return None
 
 
@@ -598,6 +725,9 @@ def _extract_text_from_context(context: dict) -> str | None:
 def _extract_text_from_outputs(outputs: dict) -> str | None:
     if not isinstance(outputs, dict):
         return None
+    direct = outputs.get("tailored_text")
+    if isinstance(direct, str) and direct:
+        return direct
     for tool_key in ("llm_generate", "text_summarize", "json_transform"):
         entry = outputs.get(tool_key)
         if not isinstance(entry, dict):
@@ -620,6 +750,9 @@ def _extract_text_from_outputs(outputs: dict) -> str | None:
                 return result
     for entry in outputs.values():
         if isinstance(entry, dict):
+            value = entry.get("tailored_text")
+            if isinstance(value, str) and value:
+                return value
             text = entry.get("text")
             if isinstance(text, str) and text:
                 return text

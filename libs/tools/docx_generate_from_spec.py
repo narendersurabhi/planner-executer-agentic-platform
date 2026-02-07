@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List
 
 from docx import Document
 from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
 
@@ -27,7 +28,9 @@ def register_docx_tools(registry) -> None:
                     "Provide document_spec and path (required, relative .docx filename), "
                     "render_context (merged into tokens), and strict (default true). "
                     "Supported blocks: text, paragraph, heading, bullets, spacer, "
-                    "optional_paragraph, repeat."
+                    "optional_paragraph, repeat. "
+                    "If you only have an output folder (e.g., output_dir in job.context_json), "
+                    "derive a safe filename and pass the full relative path as path."
                 ),
                 input_schema={
                     "type": "object",
@@ -127,6 +130,23 @@ def _apply_theme(document: Document, theme: Dict[str, Any]) -> None:
     normal_style = document.styles["Normal"]
     normal_style.font.name = body_font
     normal_style.font.size = Pt(float(body_size))
+    spacing = (
+        theme.get("spacing", {}) if isinstance(theme.get("spacing", {}), dict) else {}
+    )
+    para_after = spacing.get("para_after_pt")
+    if para_after is not None:
+        normal_style.paragraph_format.space_after = Pt(float(para_after))
+    line_spacing = spacing.get("line")
+    if line_spacing is not None:
+        normal_style.paragraph_format.line_spacing = float(line_spacing)
+
+    heading_size = font_sizes.get("h1")
+    if heading_size is not None:
+        try:
+            heading_style = document.styles["Heading 1"]
+            heading_style.font.size = Pt(float(heading_size))
+        except KeyError:
+            pass
 
     margins = (
         theme.get("page_margins_in", {})
@@ -206,6 +226,20 @@ def _add_paragraph(document: Document, text: str, style_hint: Any, bullet: bool 
     run = paragraph.add_run(text)
     if style_hint in {"name", "body_bold"}:
         run.bold = True
+    if style_hint == "contact":
+        paragraph.paragraph_format.space_after = Pt(0)
+        paragraph.paragraph_format.space_before = Pt(0)
+    if style_hint == "dates_right":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    if style_hint == "divider":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_before = Pt(2)
+        paragraph.paragraph_format.space_after = Pt(2)
+        run.font.size = Pt(8)
+    if bullet:
+        paragraph.paragraph_format.space_after = Pt(2)
+        paragraph.paragraph_format.left_indent = Pt(18)
+        paragraph.paragraph_format.first_line_indent = Pt(-9)
 
 
 def _resolve_items(value: Any, context: Dict[str, Any], strict: bool) -> List[Any]:

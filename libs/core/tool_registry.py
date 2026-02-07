@@ -19,7 +19,8 @@ from . import prompts
 from .models import RiskLevel, ToolCall, ToolIntent, ToolSpec
 from libs.tools.docx_generate import register_docx_tools
 from libs.tools.document_spec_validate import register_document_spec_tools
-from libs.tools.resume_generate_ats_docx import register_resume_generate_tools
+from libs.tools.resume_doc_spec_validate import register_resume_doc_spec_tools
+from libs.tools.resume_doc_spec_to_document_spec import register_resume_doc_spec_convert_tools
 from libs.tools.cover_letter_generate_ats_docx import register_cover_letter_generate_tools
 
 class ToolExecutionError(Exception):
@@ -61,6 +62,7 @@ class ToolRegistry:
     ) -> ToolCall:
         tool = self.get(name)
         started_at = time.time()
+        payload_for_call = _sanitize_payload(payload)
         try:
             tool.spec.model_validate(tool.spec.model_dump())
             _validate_schema(tool.spec.input_schema, payload, "input")
@@ -80,7 +82,7 @@ class ToolRegistry:
         finished_at = time.time()
         return ToolCall(
             tool_name=name,
-            input=payload,
+            input=payload_for_call,
             idempotency_key=idempotency_key,
             trace_id=trace_id,
             started_at=_to_datetime(started_at),
@@ -94,6 +96,39 @@ def _to_datetime(timestamp: float):
     from datetime import datetime
 
     return datetime.utcfromtimestamp(timestamp)
+
+
+def _sanitize_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            cleaned: Dict[str, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, str) and key.startswith("_"):
+                    continue
+                cleaned_item = sanitize(item)
+                if cleaned_item is not _SKIP:
+                    cleaned[key] = cleaned_item
+            return cleaned
+        if isinstance(value, list):
+            cleaned_list = []
+            for item in value:
+                cleaned_item = sanitize(item)
+                if cleaned_item is not _SKIP:
+                    cleaned_list.append(cleaned_item)
+            return cleaned_list
+        try:
+            json.dumps(value, ensure_ascii=True)
+            return value
+        except Exception:  # noqa: BLE001
+            return str(value)
+
+    _SKIP = object()
+    return sanitize(payload) or {}
 
 
 def _run_with_timeout(handler: Callable[[], tool_output_type], timeout_s: int | None) -> tool_output_type:
@@ -592,7 +627,8 @@ def default_registry(
 
     register_docx_tools(registry)
     register_document_spec_tools(registry)
-    register_resume_generate_tools(registry)
+    register_resume_doc_spec_tools(registry)
+    register_resume_doc_spec_convert_tools(registry)
     register_cover_letter_generate_tools(registry)
 
     if http_fetch_enabled:
@@ -644,14 +680,196 @@ def default_registry(
                     },
                     output_schema={
                         "type": "object",
-                        "properties": {"text": {"type": "string"}},
-                        "required": ["text"],
+                        "properties": {"tailored_text": {"type": "string"}},
+                        "required": ["tailored_text"],
                     },
                     timeout_s=_resolve_llm_timeout_s(llm_provider),
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
                 ),
                 handler=lambda payload, provider=llm_provider: _llm_generate(payload, provider),
+            )
+        )
+        registry.register(
+            Tool(
+                spec=ToolSpec(
+                    name="llm_iterative_improve_tailored_resume_text",
+                    description=(
+                        "Iteratively improve tailored resume text until alignment threshold or max iterations"
+                    ),
+                    usage_guidance=(
+                        "Provide tailored_text (required). Optionally provide job, min_alignment_score "
+                        "(0-100), and max_iterations. Returns the best tailored_text plus alignment stats."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "tailored_text": {"type": "string"},
+                            "job": {"type": "object"},
+                            "min_alignment_score": {"type": "number"},
+                            "max_iterations": {"type": "integer"},
+                        },
+                        "required": ["tailored_text"],
+                    },
+                    output_schema={
+                        "type": "object",
+                        "properties": {
+                            "tailored_text": {"type": "string"},
+                            "alignment_score": {"type": "number"},
+                            "alignment_summary": {"type": "string"},
+                            "iterations": {"type": "integer"},
+                            "reached_threshold": {"type": "boolean"},
+                            "history": {"type": "array", "items": {"type": "object"}},
+                        },
+                        "required": [
+                            "tailored_text",
+                            "alignment_score",
+                            "alignment_summary",
+                            "iterations",
+                            "reached_threshold",
+                        ],
+                    },
+                    timeout_s=_resolve_llm_timeout_s(llm_provider),
+                    risk_level=RiskLevel.high,
+                    tool_intent=ToolIntent.generate,
+                ),
+                handler=lambda payload, provider=llm_provider: _llm_iterative_improve_tailored_resume_text(
+                    payload, provider
+                ),
+            )
+        )
+        registry.register(
+            Tool(
+                spec=ToolSpec(
+                    name="llm_tailor_resume_text",
+                    description="Tailor a resume to a job description and return plain text sections",
+                    usage_guidance=(
+                        "Provide a full job object in 'job'. The job should include context_json "
+                        "with the job description, candidate resume, target role name, and seniority "
+                        "level. The tool returns plain text with SECTION headings."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {"job": {"type": "object"}},
+                        "required": ["job"],
+                    },
+                    output_schema={
+                        "type": "object",
+                        "properties": {"tailored_text": {"type": "string"}},
+                        "required": ["tailored_text"],
+                    },
+                    examples=[
+                        {
+                            "task": {
+                                "name": "TailorResumeText",
+                                "tool_requests": ["llm_tailor_resume_text"],
+                                "tool_inputs": {
+                                    "llm_tailor_resume_text": {
+                                        "job": {
+                                            "id": "job-id",
+                                            "goal": "Tailor resume for target role",
+                                            "context_json": {
+                                                "job_description": "Paste JD here",
+                                                "candidate_resume": "Paste resume here",
+                                                "target_role_name": "Target role",
+                                                "seniority_level": "Senior",
+                                            },
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    ],
+                    timeout_s=_resolve_llm_timeout_s(llm_provider),
+                    risk_level=RiskLevel.high,
+                    tool_intent=ToolIntent.generate,
+                ),
+                handler=lambda payload, provider=llm_provider: _llm_tailor_resume_text(
+                    payload, provider
+                ),
+            )
+        )
+        registry.register(
+            Tool(
+                spec=ToolSpec(
+                    name="llm_improve_tailored_resume_text",
+                    description="Review and improve tailored resume text while preserving truthfulness",
+                    usage_guidance=(
+                        "Provide tailored_text (required) and job context (optional). "
+                        "Returns improved tailored_text plus alignment score and summary."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "tailored_text": {"type": "string"},
+                            "job": {"type": "object"},
+                        },
+                        "required": ["tailored_text"],
+                    },
+                    output_schema={
+                        "type": "object",
+                        "properties": {
+                            "tailored_text": {"type": "string"},
+                            "alignment_score": {"type": "number"},
+                            "alignment_summary": {"type": "string"},
+                        },
+                        "required": ["tailored_text", "alignment_score", "alignment_summary"],
+                    },
+                    timeout_s=_resolve_llm_timeout_s(llm_provider),
+                    risk_level=RiskLevel.high,
+                    tool_intent=ToolIntent.transform,
+                ),
+                handler=lambda payload, provider=llm_provider: _llm_improve_tailored_resume_text(
+                    payload, provider
+                ),
+            )
+        )
+        registry.register(
+            Tool(
+                spec=ToolSpec(
+                    name="llm_generate_resume_doc_spec_from_text",
+                    description="Generate a ResumeDocSpec JSON from tailored resume text",
+                    usage_guidance=(
+                        "Provide tailored resume text in 'tailored_text'. Optionally provide "
+                        "job context in 'job'. Returns a resume_doc_spec object."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "tailored_text": {"type": "string"},
+                            "job": {"type": "object"},
+                        },
+                        "required": ["tailored_text"],
+                    },
+                    output_schema={
+                        "type": "object",
+                        "properties": {"resume_doc_spec": {"type": "object"}},
+                        "required": ["resume_doc_spec"],
+                    },
+                    examples=[
+                        {
+                            "task": {
+                                "name": "BuildResumeDocSpecFromText",
+                                "tool_requests": ["llm_generate_resume_doc_spec_from_text"],
+                                "deps": ["TailorResumeText"],
+                                "tool_inputs": {
+                                    "llm_generate_resume_doc_spec_from_text": {
+                                        "tailored_text": {
+                                            "$ref": "tasks.TailorResumeText.output.text"
+                                        },
+                                        "job": {"id": "job-id", "goal": "Tailor resume"},
+                                    }
+                                },
+                            }
+                        }
+                    ],
+                    timeout_s=_resolve_llm_timeout_s(llm_provider),
+                    risk_level=RiskLevel.high,
+                    tool_intent=ToolIntent.generate,
+                ),
+                handler=lambda payload, provider=llm_provider: _llm_generate_resume_doc_spec_from_text(
+                    payload, provider
+                ),
             )
         )
         registry.register(
@@ -1065,6 +1283,155 @@ def _llm_generate_document_spec(payload: Dict[str, Any], provider: LLMProvider) 
     return {"document_spec": document_spec}
 
 
+def _llm_tailor_resume_text(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:
+    job = payload.get("job")
+    if not isinstance(job, dict):
+        raise ToolExecutionError("job must be an object")
+    context_json = job.get("context_json") if isinstance(job, dict) else None
+    candidate_resume = None
+    if isinstance(context_json, dict):
+        candidate_resume = context_json.get("candidate_resume")
+    if not isinstance(candidate_resume, str) or not candidate_resume.strip():
+        raise ToolExecutionError("candidate_resume_missing")
+    prompt = prompts.resume_tailoring_prompt(job)
+    response = provider.generate(prompt)
+    text = response.content.strip()
+    if not text:
+        raise ToolExecutionError("Empty response from LLM")
+    _ensure_required_resume_sections(text)
+    return {"tailored_text": text}
+
+
+def _llm_improve_tailored_resume_text(
+    payload: Dict[str, Any], provider: LLMProvider
+) -> Dict[str, Any]:
+    tailored_text = payload.get("tailored_text")
+    job = payload.get("job")
+    if not isinstance(tailored_text, str) or not tailored_text.strip():
+        raise ToolExecutionError("tailored_text must be a non-empty string")
+    _ensure_required_resume_sections(tailored_text)
+    prompt = prompts.resume_tailoring_improve_prompt(tailored_text, job=job)
+    response = provider.generate(prompt)
+    json_text = _extract_json(response.content)
+    if not json_text:
+        raise ToolExecutionError("Failed to extract JSON from LLM response")
+    try:
+        payload_out = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
+    if not isinstance(payload_out, dict):
+        raise ToolExecutionError("Response must be a JSON object")
+    improved = payload_out.get("tailored_text")
+    score = payload_out.get("alignment_score")
+    summary = payload_out.get("alignment_summary")
+    if not isinstance(improved, str) or not improved.strip():
+        raise ToolExecutionError("tailored_text must be a non-empty string")
+    if not isinstance(score, (int, float)):
+        raise ToolExecutionError("alignment_score must be a number")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ToolExecutionError("alignment_summary must be a non-empty string")
+    return {
+        "tailored_text": improved,
+        "alignment_score": float(score),
+        "alignment_summary": summary.strip(),
+    }
+
+
+def _llm_iterative_improve_tailored_resume_text(
+    payload: Dict[str, Any], provider: LLMProvider
+) -> Dict[str, Any]:
+    tailored_text = payload.get("tailored_text")
+    job = payload.get("job")
+    if not isinstance(tailored_text, str) or not tailored_text.strip():
+        raise ToolExecutionError("tailored_text must be a non-empty string")
+
+    threshold = payload.get("min_alignment_score", 85)
+    max_iterations = payload.get("max_iterations", 2)
+    if not isinstance(threshold, (int, float)):
+        raise ToolExecutionError("min_alignment_score must be a number")
+    if not isinstance(max_iterations, int) or max_iterations < 1:
+        raise ToolExecutionError("max_iterations must be a positive integer")
+
+    best_text = tailored_text
+    best_score = -1.0
+    best_summary = ""
+    reached = False
+    history: list[dict[str, Any]] = []
+
+    current_text = tailored_text
+    for idx in range(max_iterations):
+        prompt = prompts.resume_tailoring_improve_prompt(current_text, job=job)
+        response = provider.generate(prompt)
+        json_text = _extract_json(response.content)
+        if not json_text:
+            raise ToolExecutionError("Failed to extract JSON from LLM response")
+        try:
+            payload_out = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
+        if not isinstance(payload_out, dict):
+            raise ToolExecutionError("Response must be a JSON object")
+
+        improved = payload_out.get("tailored_text")
+        score = payload_out.get("alignment_score")
+        summary = payload_out.get("alignment_summary")
+        if not isinstance(improved, str) or not improved.strip():
+            raise ToolExecutionError("tailored_text must be a non-empty string")
+        if not isinstance(score, (int, float)):
+            raise ToolExecutionError("alignment_score must be a number")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ToolExecutionError("alignment_summary must be a non-empty string")
+
+        score_value = float(score)
+        history.append(
+            {
+                "iteration": idx + 1,
+                "alignment_score": score_value,
+                "alignment_summary": summary.strip(),
+            }
+        )
+        if score_value > best_score:
+            best_score = score_value
+            best_text = improved
+            best_summary = summary.strip()
+
+        current_text = improved
+        if score_value >= float(threshold):
+            reached = True
+            break
+
+    return {
+        "tailored_text": best_text,
+        "alignment_score": best_score,
+        "alignment_summary": best_summary,
+        "iterations": len(history),
+        "reached_threshold": reached,
+        "history": history,
+    }
+
+
+def _llm_generate_resume_doc_spec_from_text(
+    payload: Dict[str, Any], provider: LLMProvider
+) -> Dict[str, Any]:
+    tailored_text = payload.get("tailored_text")
+    job = payload.get("job")
+    if not isinstance(tailored_text, str) or not tailored_text.strip():
+        raise ToolExecutionError("tailored_text must be a non-empty string")
+    _ensure_required_resume_sections(tailored_text)
+    prompt = prompts.resume_doc_spec_from_text_prompt(tailored_text, job=job)
+    response = provider.generate(prompt)
+    json_text = _extract_json(response.content)
+    if not json_text:
+        raise ToolExecutionError("Failed to extract JSON from LLM response")
+    try:
+        resume_doc_spec = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
+    if not isinstance(resume_doc_spec, dict):
+        raise ToolExecutionError("ResumeDocSpec must be an object")
+    return {"resume_doc_spec": resume_doc_spec}
+
+
 def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:
     job = payload.get("job")
     tailored_resume = payload.get("tailored_resume")
@@ -1082,6 +1449,19 @@ def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider
     if not isinstance(resume_doc_spec, dict):
         raise ToolExecutionError("ResumeDocSpec must be an object")
     return {"resume_doc_spec": resume_doc_spec}
+
+
+def _ensure_required_resume_sections(text: str) -> None:
+    required = [
+        "SECTION 1 SUMMARY",
+        "SECTION 2 SKILLS",
+        "SECTION 3 EXPERIENCE",
+        "SECTION 6 EDUCATION",
+        "SECTION 7 CERTIFICATIONS",
+    ]
+    missing = [section for section in required if section not in text]
+    if missing:
+        raise ToolExecutionError(f"tailored_text_missing_sections:{','.join(missing)}")
 
 
 def _llm_generate_tailored_resume_content(

@@ -149,6 +149,7 @@ class Task(BaseModel):
     assigned_to: Optional[str] = None
     tool_requests: List[str]
     tool_inputs: Dict[str, Any] = Field(default_factory=dict)
+    tool_inputs_resolved: bool = False
     created_at: datetime
     updated_at: datetime
     critic_required: bool = True

@@ -426,6 +426,8 @@ def _inputs_satisfy_required(
         "original_spec",
         "tailored_resume",
         "resume_content",
+        "tailored_text",
+        "resume_doc_spec",
     }
     for required in required_sets:
         missing = required - inputs

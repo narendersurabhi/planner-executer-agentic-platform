@@ -1,15 +1,11 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ValidationError
 
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
-
-
-class ResumeBullet(BaseModel):
-    text: str
-    source_experience_index: int | None = None
 
 
 class ResumeExperience(BaseModel):
@@ -18,41 +14,49 @@ class ResumeExperience(BaseModel):
     location: str | None = None
     start_date: str | None = None
     end_date: str | None = None
-    bullets: List[ResumeBullet]
+    dates: str | None = None
+    bullets: List[str | dict]
 
 
 class ResumeEducation(BaseModel):
     degree: str
-    institution: str
+    school: str
     location: str | None = None
     start_date: str | None = None
     end_date: str | None = None
+    dates: str | None = None
 
 
 class ResumeCertification(BaseModel):
     name: str
     issuer: str | None = None
     year: str | None = None
+    url: str | None = None
 
 
-class ResumeSkillCategory(BaseModel):
+class ResumeProject(BaseModel):
     name: str
-    items: List[str]
+    url: str | None = None
+    highlights: List[str] = []
 
 
-class TailoredResume(BaseModel):
-    full_name: str
-    headline: str | None = None
+class ResumeHeader(BaseModel):
+    name: str
     location: str | None = None
     phone: str | None = None
     email: str | None = None
-    linkedin_url: str | None = None
-    github_url: str | None = None
+    linkedin: str | None = None
+    github: str | None = None
+
+
+class TailoredResume(BaseModel):
+    header: ResumeHeader
     summary: str
-    skills: List[ResumeSkillCategory]
+    skills: Dict[str, List[str]]
     experience: List[ResumeExperience]
     education: List[ResumeEducation]
     certifications: List[ResumeCertification] = []
+    projects: List[ResumeProject] = []
     resume_text: str | None = None
 
 
@@ -126,6 +130,7 @@ def _resume_generate_ats_docx(payload: Dict[str, Any]) -> Dict[str, Any]:
     # but ensure your registry doesn't forbid re-entrancy.
     registry = _get_registry_from_payload(payload)
 
+    trace_id = payload.get("trace_id", "") if isinstance(payload, dict) else ""
     v = registry.execute(
         "document_spec_validate",
         {
@@ -133,8 +138,11 @@ def _resume_generate_ats_docx(payload: Dict[str, Any]) -> Dict[str, Any]:
             "render_context": {"TODAY": today},
             "strict": strict,
         },
+        idempotency_key=str(uuid.uuid4()),
+        trace_id=trace_id,
     )
-    if not isinstance(v, dict) or not v.get("valid", False):
+    v_out = v.output_or_error if hasattr(v, "output_or_error") else v
+    if not isinstance(v_out, dict) or not v_out.get("valid", False):
         raise ToolExecutionError(f"DocumentSpec validation failed: {v}")
 
     out = registry.execute(
@@ -145,47 +153,59 @@ def _resume_generate_ats_docx(payload: Dict[str, Any]) -> Dict[str, Any]:
             "render_context": {"TODAY": today},
             "strict": strict,
         },
+        idempotency_key=str(uuid.uuid4()),
+        trace_id=trace_id,
     )
-    if not isinstance(out, dict) or "path" not in out:
+    out_data = out.output_or_error if hasattr(out, "output_or_error") else out
+    if not isinstance(out_data, dict) or "path" not in out_data:
         raise ToolExecutionError(f"docx_generate_from_spec failed: {out}")
 
     return {
-        "path": out["path"],
-        "bytes_written": int(out.get("bytes_written", 0)),
-        "validation_warnings": v.get("warnings", []),
+        "path": out_data["path"],
+        "bytes_written": int(out_data.get("bytes_written", 0)),
+        "validation_warnings": v_out.get("warnings", []),
     }
 
 
 def _build_resume_ats_document_spec(resume: TailoredResume) -> Dict[str, Any]:
     # Contact lines (single column)
-    contact_parts = [p for p in [resume.location, resume.phone, resume.email] if p]
+    contact_parts = [p for p in [resume.header.location, resume.header.phone, resume.header.email] if p]
     contact_line = " | ".join(contact_parts)
 
     # Skills as paragraphs: "Category: item1, item2"
     skill_paragraphs: List[str] = []
-    for cat in resume.skills:
-        items = ", ".join(cat.items)
-        skill_paragraphs.append(f"{cat.name}: {items}")
+    for name, items in resume.skills.items():
+        if not isinstance(items, list):
+            continue
+        skill_paragraphs.append(f"{name}: {', '.join(items)}")
 
     # Experience items
     exp_items: List[Dict[str, Any]] = []
     for r in resume.experience:
-        dates = _format_dates(r.start_date, r.end_date)
+        dates = r.dates or _format_dates(r.start_date, r.end_date)
+        bullets: List[str] = []
+        for b in r.bullets:
+            if isinstance(b, str):
+                bullets.append(b)
+            elif isinstance(b, dict):
+                text = b.get("text")
+                if isinstance(text, str):
+                    bullets.append(text)
         exp_items.append(
             {
                 "title": r.title,
                 "company": r.company,
                 "location": r.location or "",
                 "dates": dates,
-                "bullets": [b.text for b in r.bullets],
+                "bullets": bullets,
             }
         )
 
     # Education lines
     edu_lines: List[str] = []
     for e in resume.education:
-        dates = _format_dates(e.start_date, e.end_date)
-        parts = [e.degree, e.institution]
+        dates = e.dates or _format_dates(e.start_date, e.end_date)
+        parts = [e.degree, e.school]
         if e.location:
             parts.append(e.location)
         if dates:
@@ -202,17 +222,31 @@ def _build_resume_ats_document_spec(resume: TailoredResume) -> Dict[str, Any]:
             parts.append(c.year)
         cert_lines.append(" - ".join([p for p in parts if p]))
 
+    # Projects
+    project_items: List[Dict[str, Any]] = []
+    for p in resume.projects:
+        project_items.append(
+            {
+                "name": p.name,
+                "url": p.url or "",
+                "highlights": list(p.highlights),
+            }
+        )
+    projects_section = [1] if project_items else []
+
     tokens: Dict[str, Any] = {
-        "name": resume.full_name,
-        "headline": resume.headline or "",
+        "name": resume.header.name,
+        "headline": "",
         "contact_line": contact_line,
-        "linkedin": resume.linkedin_url or "",
-        "github": resume.github_url or "",
+        "linkedin": resume.header.linkedin or "",
+        "github": resume.header.github or "",
         "summary": resume.summary,
         "skill_paragraphs": skill_paragraphs,
         "experience": exp_items,
         "education_lines": edu_lines,
         "cert_lines": cert_lines,
+        "projects": project_items,
+        "projects_section": projects_section,
     }
 
     return {
@@ -221,33 +255,49 @@ def _build_resume_ats_document_spec(resume: TailoredResume) -> Dict[str, Any]:
         "theme": {
             "fonts": {"body": "Calibri", "heading": "Calibri"},
             "font_sizes": {"body": 11, "name": 16, "h1": 12},
-            "spacing": {"line": 1.12, "para_after_pt": 6, "tight_after_heading_pt": 2},
+            "spacing": {"line": 1.1, "para_after_pt": 3, "tight_after_heading_pt": 2},
             "page_margins_in": {"top": 0.8, "bottom": 0.8, "left": 0.9, "right": 0.9},
         },
         "tokens": tokens,
         "blocks": [
             {"type": "text", "style": "name", "text": "{{name}}"},
             {"type": "optional_paragraph", "when": "{{headline}}", "text": "{{headline}}"},
-            {"type": "optional_paragraph", "when": "{{contact_line}}", "text": "{{contact_line}}"},
-            {"type": "optional_paragraph", "when": "{{linkedin}}", "text": "LinkedIn: {{linkedin}}"},
-            {"type": "optional_paragraph", "when": "{{github}}", "text": "GitHub: {{github}}"},
+            {"type": "optional_paragraph", "when": "{{contact_line}}", "style": "contact", "text": "{{contact_line}}"},
+            {"type": "optional_paragraph", "when": "{{linkedin}}", "style": "contact", "text": "LinkedIn: {{linkedin}}"},
+            {"type": "optional_paragraph", "when": "{{github}}", "style": "contact", "text": "GitHub: {{github}}"},
             {"type": "heading", "level": 1, "text": "SUMMARY"},
+            {"type": "paragraph", "style": "divider", "text": "—"},
             {"type": "paragraph", "text": "{{summary}}"},
             {"type": "heading", "level": 1, "text": "SKILLS"},
+            {"type": "paragraph", "style": "divider", "text": "—"},
             {"type": "repeat", "items": "{{skill_paragraphs}}", "as": "p", "template": [
                 {"type": "paragraph", "text": "{{p}}"}
             ]},
             {"type": "heading", "level": 1, "text": "EXPERIENCE"},
+            {"type": "paragraph", "style": "divider", "text": "—"},
             {"type": "repeat", "items": "{{experience}}", "as": "r", "template": [
-                {"type": "paragraph", "style": "body_bold", "text": "{{r.title}} | {{r.company}} | {{r.location}} | {{r.dates}}"},
+                {"type": "paragraph", "style": "body_bold", "text": "{{r.title}} | {{r.company}} | {{r.location}}"},
+                {"type": "paragraph", "style": "dates_right", "text": "{{r.dates}}"},
                 {"type": "bullets", "items": "{{r.bullets}}"},
                 {"type": "spacer"}
             ]},
+            {"type": "repeat", "items": "{{projects_section}}", "as": "s", "template": [
+                {"type": "heading", "level": 1, "text": "PROJECTS"},
+                {"type": "paragraph", "style": "divider", "text": "—"},
+                {"type": "repeat", "items": "{{projects}}", "as": "p", "template": [
+                    {"type": "paragraph", "style": "body_bold", "text": "{{p.name}}"},
+                    {"type": "optional_paragraph", "when": "{{p.url}}", "text": "{{p.url}}"},
+                    {"type": "bullets", "items": "{{p.highlights}}"},
+                    {"type": "spacer"}
+                ]}
+            ]},
             {"type": "heading", "level": 1, "text": "EDUCATION"},
+            {"type": "paragraph", "style": "divider", "text": "—"},
             {"type": "repeat", "items": "{{education_lines}}", "as": "e", "template": [
                 {"type": "paragraph", "text": "{{e}}"}
             ]},
             {"type": "heading", "level": 1, "text": "CERTIFICATIONS"},
+            {"type": "paragraph", "style": "divider", "text": "—"},
             {"type": "repeat", "items": "{{cert_lines}}", "as": "c", "template": [
                 {"type": "paragraph", "text": "{{c}}"}
             ]},

@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from prometheus_client import Counter, Histogram, make_asgi_app
 from sqlalchemy.orm import Session
 
-from libs.core import events, logging as core_logging, models, orchestrator, state_machine
+from libs.core import events, logging as core_logging, models, orchestrator, payload_resolver, state_machine
 from .database import Base, SessionLocal, engine
 from .models import JobRecord, PlanRecord, TaskRecord
 
@@ -557,8 +557,19 @@ def _task_payload_from_record(
         "updated_at": record.updated_at,
         "correlation_id": correlation_id or str(uuid.uuid4()),
     }
+    ctx = context or {}
     if context:
         payload["context"] = context
+    resolved_inputs = payload_resolver.resolve_tool_inputs(
+        payload["tool_requests"],
+        payload["instruction"],
+        ctx,
+        payload,
+        payload.get("tool_inputs", {}),
+    )
+    if resolved_inputs:
+        payload["tool_inputs"] = resolved_inputs
+        payload["tool_inputs_resolved"] = True
     return payload
 
 
@@ -937,6 +948,24 @@ def retry_failed_tasks(job_id: str, db: Session = Depends(get_db)) -> models.Job
     plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
     if plan:
         _enqueue_ready_tasks(job_id, plan.id, None)
+    return _job_from_record(job)
+
+
+@app.post("/jobs/{job_id}/replan", response_model=models.Job)
+def replan_job(job_id: str, db: Session = Depends(get_db)) -> models.Job:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    metadata = job.metadata_json or {}
+    metadata["replan_count"] = int(metadata.get("replan_count", 0)) + 1
+    metadata["replan_reason"] = "manual"
+    job.metadata_json = metadata
+    job.status = models.JobStatus.planning.value
+    job.updated_at = datetime.utcnow()
+    db.query(TaskRecord).filter(TaskRecord.job_id == job_id).delete(synchronize_session=False)
+    db.query(PlanRecord).filter(PlanRecord.job_id == job_id).delete(synchronize_session=False)
+    db.commit()
+    _emit_event("job.created", _job_from_record(job).model_dump())
     return _job_from_record(job)
 
 

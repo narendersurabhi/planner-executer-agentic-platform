@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const TEMPLATE_STORAGE_KEY = "ape.templates.v1";
@@ -59,6 +59,11 @@ type TaskResult = {
 type EventEnvelope = {
   type: string;
   payload: Record<string, unknown>;
+  job_id?: string;
+  task_id?: string;
+  correlation_id?: string;
+  occurred_at?: string;
+  version?: string;
 };
 
 type TemplateVariable = {
@@ -73,6 +78,7 @@ type TemplateVariable = {
 type Template = {
   id: string;
   name: string;
+  description?: string;
   goal: string;
   contextJson: string;
   priority: number;
@@ -82,103 +88,105 @@ type Template = {
 
 const BUILT_IN_TEMPLATES: Template[] = [
   {
-    id: "tpl-resume-tailor",
-    name: "Resume Tailor",
-    goal: "Tailor my resume for the {{role}} role at {{company}} while staying truthful.",
-    contextJson:
-      '{\n  "jd_text": "{{jd_text}}",\n  "resume_text": "{{resume_text}}",\n  "constraints": {\n    "no_fabrication": true,\n    "max_pages": 1\n  }\n}',
-    priority: 2,
-    builtIn: true,
-    variables: [
-      { key: "company", label: "Company", scope: "per_run", required: true },
-      { key: "role", label: "Role", scope: "per_run", required: true },
-      {
-        key: "jd_text",
-        label: "Job Description",
-        scope: "per_run",
-        required: true,
-        placeholder: "Paste job description"
-      },
-      {
-        key: "resume_text",
-        label: "Resume",
-        scope: "default",
-        required: true,
-        placeholder: "Paste your current resume"
-      }
-    ]
-  },
-  {
-    id: "tpl-resume-docx",
-    name: "Resume + Cover Letter (JD-aligned)",
-    goal: "Tailor my resume and cover letter to best align with the JD. Output Resume and CoverLetter JSON, then render DOCX files using templates {{resume_template_id}} and {{cover_template_id}}.",
-    contextJson:
-      '{\n  "jd_text": "{{jd_text}}",\n  "resume_text": "{{resume_text}}",\n  "output": {\n    "resume": {\n      "schema_ref": "{{resume_template_id}}",\n      "template_id": "{{resume_template_id}}",\n      "output_path": "resume_output.docx"\n    },\n    "cover_letter": {\n      "schema_ref": "{{cover_template_id}}",\n      "template_id": "{{cover_template_id}}",\n      "output_path": "cover_letter_output.docx"\n    }\n  },\n  "constraints": {\n    "no_fabrication": true,\n    "max_pages": "{{max_pages}}"\n  },\n  "preferences": {\n    "alignment_focus": "Match JD keywords and responsibilities while staying truthful."\n  }\n}',
-    priority: 2,
-    builtIn: true,
-    variables: [
-      {
-        key: "jd_text",
-        label: "Job Description",
-        scope: "per_run",
-        required: true,
-        placeholder: "Paste job description"
-      },
-      {
-        key: "resume_text",
-        label: "Resume",
-        scope: "default",
-        required: true,
-        placeholder: "Paste your current resume"
-      },
-      {
-        key: "resume_template_id",
-        label: "Resume Template ID",
-        scope: "default",
-        required: true,
-        placeholder: "resume"
-      },
-      {
-        key: "cover_template_id",
-        label: "Cover Letter Template ID",
-        scope: "default",
-        required: true,
-        placeholder: "cover_letter"
-      },
-      {
-        key: "max_pages",
-        label: "Max Pages",
-        scope: "per_run",
-        required: true,
-        placeholder: "1"
-      }
-    ]
-  },
-  {
-    id: "tpl-resume-doc-spec",
-    name: "Tailored Resume Doc Spec",
+    id: "tpl-resume-tailor-text",
+    name: "Resume Tailor (Structured Inputs)",
+    description: "Use structured inputs to tailor a resume and return plain text sections.",
     goal:
-      "Tailor my resume for the {{role}} role at {{company}}. First output a JSON object with key 'tailored_resume'. Then generate a resume_doc_spec using llm_generate_resume_doc_spec.",
+      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role and return text sections.",
     contextJson:
-      '{\n  "jd_text": "{{jd_text}}",\n  "resume_text": "{{resume_text}}",\n  "constraints": {\n    "no_fabrication": true,\n    "max_pages": 1\n  }\n}',
+      '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "target_role_name": "{{target_role_name}}",\n  "seniority_level": "{{seniority_level}}"\n}',
     priority: 2,
     builtIn: true,
     variables: [
-      { key: "company", label: "Company", scope: "per_run", required: true },
-      { key: "role", label: "Role", scope: "per_run", required: true },
       {
-        key: "jd_text",
+        key: "job_description",
         label: "Job Description",
         scope: "per_run",
         required: true,
         placeholder: "Paste job description"
       },
       {
-        key: "resume_text",
-        label: "Resume",
+        key: "candidate_resume",
+        label: "Candidate Resume",
         scope: "default",
         required: true,
         placeholder: "Paste your current resume"
+      },
+      {
+        key: "target_role_name",
+        label: "Target Role Name",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Senior Backend Engineer"
+      },
+      {
+        key: "seniority_level",
+        label: "Seniority Level",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Senior"
+      }
+    ]
+  },
+  {
+    id: "tpl-resume-tailor-docspec",
+    name: "Resume Tailor -> ResumeDocSpec",
+    description: "Tailor resume text, then generate a ResumeDocSpec from that text.",
+    goal:
+      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role. Iteratively improve it with llm_iterative_improve_tailored_resume_text until alignment >= {{min_alignment_score}} or {{max_iterations}} iterations. Then use llm_generate_resume_doc_spec_from_text on the improved tailored text to produce resume_doc_spec. Validate with resume_doc_spec_validate. Convert with resume_doc_spec_to_document_spec. Finally render a DOCX with docx_generate_from_spec. You MUST derive a filename (e.g., role + date) and set tool_inputs.path to {{output_dir}}/<derived_filename>.docx.",
+    contextJson:
+      '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "target_role_name": "{{target_role_name}}",\n  "seniority_level": "{{seniority_level}}",\n  "output_dir": "{{output_dir}}",\n  "min_alignment_score": "{{min_alignment_score}}",\n  "max_iterations": "{{max_iterations}}"\n}',
+    priority: 2,
+    builtIn: true,
+    variables: [
+      {
+        key: "job_description",
+        label: "Job Description",
+        scope: "per_run",
+        required: true,
+        placeholder: "Paste job description"
+      },
+      {
+        key: "candidate_resume",
+        label: "Candidate Resume",
+        scope: "default",
+        required: true,
+        placeholder: "Paste your current resume"
+      },
+      {
+        key: "target_role_name",
+        label: "Target Role Name",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Senior Backend Engineer"
+      },
+      {
+        key: "seniority_level",
+        label: "Seniority Level",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., Senior"
+      },
+      {
+        key: "output_dir",
+        label: "Output Folder",
+        scope: "default",
+        required: false,
+        placeholder: "resumes"
+      },
+      {
+        key: "min_alignment_score",
+        label: "Min Alignment Score",
+        scope: "default",
+        required: false,
+        placeholder: "85"
+      },
+      {
+        key: "max_iterations",
+        label: "Max Iterations",
+        scope: "default",
+        required: false,
+        placeholder: "2"
       }
     ]
   },
@@ -408,6 +416,7 @@ export default function Home() {
   const [selectedPlan, setSelectedPlan] = useState<Plan | null>(null);
   const [selectedTasks, setSelectedTasks] = useState<Task[]>([]);
   const [taskResults, setTaskResults] = useState<Record<string, TaskResult>>({});
+  const selectedJobIdRef = useRef<string | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -429,7 +438,11 @@ export default function Home() {
   const [isReorderMode, setIsReorderMode] = useState(false);
   const [draggingTemplateId, setDraggingTemplateId] = useState<string | null>(null);
   const [dragOverTemplateId, setDragOverTemplateId] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showTaskInputs, setShowTaskInputs] = useState(false);
+  const [showRecentEvents, setShowRecentEvents] = useState(false);
+  const [expandedTaskInputs, setExpandedTaskInputs] = useState<Set<string>>(new Set());
+  const [expandedRecentEvents, setExpandedRecentEvents] = useState<Set<number>>(new Set());
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [isResizing, setIsResizing] = useState(false);
   const [isDesktop, setIsDesktop] = useState(false);
@@ -438,6 +451,10 @@ export default function Home() {
   const selectedJob = selectedJobId
     ? jobs.find((job) => job.id === selectedJobId) || null
     : null;
+
+  useEffect(() => {
+    selectedJobIdRef.current = selectedJobId;
+  }, [selectedJobId]);
 
   const loadJobs = async () => {
     const response = await fetch(`${apiUrl}/jobs`);
@@ -450,14 +467,33 @@ export default function Home() {
     const source = new EventSource(`${apiUrl}/events/stream`);
     source.onmessage = (event) => {
       try {
-        const payload = JSON.parse(event.data);
-        setEvents((prev) => [payload, ...prev].slice(0, 50));
+        const envelope = JSON.parse(event.data) as EventEnvelope;
+        setEvents((prev) => [envelope, ...prev].slice(0, 50));
+        const activeJobId = selectedJobIdRef.current;
+        if (!activeJobId || !envelope?.type) {
+          return;
+        }
+        if (envelope.type === "task.heartbeat") {
+          return;
+        }
+        const payloadJobId =
+          (typeof envelope.job_id === "string" && envelope.job_id) ||
+          (typeof envelope.payload?.job_id === "string" && envelope.payload.job_id) ||
+          (typeof envelope.payload?.id === "string" && envelope.payload.id) ||
+          null;
+        if (payloadJobId && payloadJobId === activeJobId) {
+          loadJobDetails(activeJobId);
+        }
       } catch {
         return;
       }
     };
     return () => source.close();
   }, []);
+
+  useEffect(() => {
+    setExpandedRecentEvents(new Set());
+  }, [events]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -535,7 +571,7 @@ export default function Home() {
       const desktop = window.innerWidth >= 1024;
       setIsDesktop(desktop);
       if (!hasSetInitialSidebar) {
-        setSidebarOpen(desktop);
+        setSidebarOpen(false);
         setHasSetInitialSidebar(true);
         return;
       }
@@ -741,12 +777,12 @@ export default function Home() {
     });
   };
 
-  const openTemplateModal = (template: Template) => {
-    if (!template.variables || template.variables.length === 0) {
-      applyTemplate(template, {});
-      return;
-    }
-    const nextInputs: Record<string, string> = {};
+const openTemplateModal = (template: Template) => {
+  if (!template.variables || template.variables.length === 0) {
+    applyTemplate(template, {});
+    return;
+  }
+  const nextInputs: Record<string, string> = {};
     for (const variable of template.variables) {
       if (variable.scope === "default") {
         nextInputs[variable.key] = templateDefaults[variable.key] || "";
@@ -754,12 +790,12 @@ export default function Home() {
         nextInputs[variable.key] = "";
       }
     }
-    setActiveTemplate(template);
-    setTemplateInputs(nextInputs);
-    setTemplateInputError(null);
-    setTemplateMissingKeys(new Set());
-    setShowTemplateModal(true);
-  };
+  setActiveTemplate(template);
+  setTemplateInputs(nextInputs);
+  setTemplateInputError(null);
+  setTemplateMissingKeys(new Set());
+  setShowTemplateModal(true);
+};
 
   const closeTemplateModal = () => {
     setShowTemplateModal(false);
@@ -1004,6 +1040,13 @@ export default function Home() {
     }
   };
 
+  const replanJob = async (jobId: string) => {
+    const response = await fetch(`${apiUrl}/jobs/${jobId}/replan`, { method: "POST" });
+    if (response.ok) {
+      loadJobs();
+    }
+  };
+
   const clearJob = async (jobId: string) => {
     const confirmed = window.confirm("Clear this job and all tasks?");
     if (!confirmed) {
@@ -1129,6 +1172,11 @@ export default function Home() {
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <div className="text-sm font-semibold text-slate-900">{template.name}</div>
+                      {template.description ? (
+                        <div className="mt-1 text-xs text-slate-600">
+                          {template.description}
+                        </div>
+                      ) : null}
                       <div className="mt-1 text-xs text-slate-500">
                         {truncate(template.goal, 90)}
                       </div>
@@ -1358,10 +1406,15 @@ export default function Home() {
 
       {showTemplateModal && activeTemplate ? (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/60 px-4 py-10 backdrop-blur-sm">
-          <div className="w-full max-w-2xl rounded-2xl bg-white p-6 shadow-2xl">
-            <div className="flex items-start justify-between gap-4">
+          <div className="w-full max-w-2xl max-h-[85vh] overflow-hidden rounded-2xl bg-white shadow-2xl">
+            <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-6 py-4">
               <div>
                 <h3 className="font-display text-xl">{activeTemplate.name}</h3>
+                {activeTemplate.description ? (
+                  <p className="mt-1 text-sm text-slate-600">
+                    {activeTemplate.description}
+                  </p>
+                ) : null}
                 <p className="mt-1 text-sm text-slate-500">
                   Fill values for this run. Defaults are saved automatically.
                 </p>
@@ -1373,35 +1426,37 @@ export default function Home() {
                 Close
               </button>
             </div>
-            <div className="mt-5 grid gap-4">
-              {activeTemplate.variables?.map((variable) => (
-                <div key={variable.key}>
-                  <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
-                    {variable.label} {variable.scope === "per_run" ? "· per run" : "· default"}
-                  </label>
-                  <textarea
-                    className={`mt-2 w-full rounded-xl border px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 ${
-                      templateMissingKeys.has(variable.key)
-                        ? "border-rose-400 focus:border-rose-400 focus:ring-rose-200"
-                        : "border-slate-200 focus:border-slate-400 focus:ring-slate-200"
-                    }`}
-                    rows={variable.key === "resume_text" ? 6 : 3}
-                    placeholder={variable.placeholder}
-                    value={templateInputs[variable.key] || ""}
-                    onChange={(event) =>
-                      setTemplateInputs((prev) => ({
-                        ...prev,
-                        [variable.key]: event.target.value
-                      }))
-                    }
-                  />
-                </div>
-              ))}
+            <div className="max-h-[60vh] overflow-y-auto px-6 py-5">
+              <div className="grid gap-4">
+                {activeTemplate.variables?.map((variable) => (
+                  <div key={variable.key}>
+                    <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+                      {variable.label} {variable.scope === "per_run" ? "· per run" : "· default"}
+                    </label>
+                    <textarea
+                      className={`mt-2 w-full rounded-xl border px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 ${
+                        templateMissingKeys.has(variable.key)
+                          ? "border-rose-400 focus:border-rose-400 focus:ring-rose-200"
+                          : "border-slate-200 focus:border-slate-400 focus:ring-slate-200"
+                      }`}
+                      rows={variable.key === "resume_text" ? 6 : 3}
+                      placeholder={variable.placeholder}
+                      value={templateInputs[variable.key] || ""}
+                      onChange={(event) =>
+                        setTemplateInputs((prev) => ({
+                          ...prev,
+                          [variable.key]: event.target.value
+                        }))
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+              {templateInputError ? (
+                <div className="mt-3 text-sm text-rose-600">{templateInputError}</div>
+              ) : null}
             </div>
-            {templateInputError ? (
-              <div className="mt-3 text-sm text-rose-600">{templateInputError}</div>
-            ) : null}
-            <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-6 py-4">
               <button
                 className="rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-600"
                 onClick={saveDefaultsFromModal}
@@ -1518,7 +1573,7 @@ export default function Home() {
             No jobs yet. Submit a goal above to start planning.
           </div>
         ) : (
-          <ul className="mt-4 grid gap-3 md:grid-cols-2">
+          <ul className="mt-4 grid gap-3">
             {jobs.map((job, index) => (
               <li
                 key={job.id}
@@ -1526,11 +1581,13 @@ export default function Home() {
                 style={{ animationDelay: `${index * 0.06}s` }}
               >
                 <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900">{job.goal}</div>
-                    <div className="mt-1 text-xs text-slate-500">{job.id}</div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-slate-900 break-words">
+                      {job.goal}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500 break-words">{job.id}</div>
                   </div>
-                  <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500">
+                  <span className="shrink-0 self-start rounded-full bg-slate-100 px-2 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500">
                     {job.status}
                   </span>
                 </div>
@@ -1564,6 +1621,12 @@ export default function Home() {
                     onClick={() => retryFailedTasks(job.id)}
                   >
                     Retry failed
+                  </button>
+                  <button
+                    className="rounded-full border border-slate-200 px-3 py-1 text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                    onClick={() => replanJob(job.id)}
+                  >
+                    Replan
                   </button>
                   <button
                     className="rounded-full border border-rose-200 px-3 py-1 text-rose-600 transition hover:border-rose-300 hover:text-rose-700"
@@ -1695,141 +1758,216 @@ export default function Home() {
             {selectedTasks.length > 0 ? (
               <div className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">
                 <div className="flex items-center justify-between">
-                  <div className="text-sm font-semibold text-slate-800">Task Inputs</div>
-                  <div className="text-[11px] uppercase tracking-[0.2em] text-slate-400">
-                    Instructions + Tools
+                  <div>
+                    <div className="text-sm font-semibold text-slate-800">Task Inputs</div>
+                    <div className="text-[11px] uppercase tracking-[0.2em] text-slate-400">
+                      Instructions + Tools
+                    </div>
                   </div>
+                  <button
+                    className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+                    onClick={() => setShowTaskInputs((prev) => !prev)}
+                  >
+                    {showTaskInputs ? "Hide" : "Show"}
+                  </button>
                 </div>
-                <div className="mt-4 space-y-3">
-                  {selectedTasks.map((task) => (
-                    <div
-                      key={task.id}
-                      className="rounded-xl border border-slate-100 bg-slate-50 p-3"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-semibold text-slate-900">{task.name}</div>
-                          <div className="mt-1 text-xs text-slate-500">{task.id}</div>
-                        </div>
-                        <span className="rounded-full bg-white px-2 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500">
-                          {task.status}
-                        </span>
-                      </div>
-                      <div className="mt-3 grid gap-3 text-xs text-slate-600">
-                        <div>
-                          <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                            Instruction
-                          </div>
-                          <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600">
-                            {task.instruction || "No instruction available."}
-                          </pre>
-                        </div>
-                        <div className="grid gap-3 md:grid-cols-2">
-                          <div>
-                            <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                              Expected Schema
+                {showTaskInputs ? (
+                  <div className="mt-4 space-y-3">
+                    {selectedTasks.map((task) => {
+                      const isExpanded = expandedTaskInputs.has(task.id);
+                      return (
+                        <div
+                          key={task.id}
+                          className="rounded-xl border border-slate-100 bg-slate-50 p-3"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">{task.name}</div>
+                              <div className="mt-1 text-xs text-slate-500">{task.id}</div>
                             </div>
-                            <div className="mt-1 text-xs text-slate-600">
-                              {task.expected_output_schema_ref || "—"}
-                            </div>
-                          </div>
-                          <div>
-                            <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                              Tool Requests
-                            </div>
-                            <div className="mt-1 text-xs text-slate-600">
-                              {task.tool_requests && task.tool_requests.length > 0
-                                ? task.tool_requests.join(", ")
-                                : "—"}
+                            <div className="flex flex-col items-end gap-2">
+                              <span className="rounded-full bg-white px-2 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                                {task.status}
+                              </span>
+                              <button
+                                className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500"
+                                onClick={() =>
+                                  setExpandedTaskInputs((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(task.id)) {
+                                      next.delete(task.id);
+                                    } else {
+                                      next.add(task.id);
+                                    }
+                                    return next;
+                                  })
+                                }
+                              >
+                                {isExpanded ? "Hide" : "Show"}
+                              </button>
                             </div>
                           </div>
-                        </div>
-                        <div>
-                          <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                            Tool Calls
-                          </div>
-                          {taskResults[task.id]?.tool_calls &&
-                          taskResults[task.id].tool_calls!.length > 0 ? (
-                            <div className="mt-2 space-y-3">
-                              {taskResults[task.id].tool_calls!.map((call, index) => (
-                                <div
-                                  key={`${task.id}-call-${index}`}
-                                  className="rounded-lg border border-slate-200 bg-white p-3"
-                                >
-                                  <div className="flex items-center justify-between">
-                                    <div className="text-xs font-semibold text-slate-700">
-                                      {call.tool_name}
-                                    </div>
-                                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-slate-500">
-                                      {call.status}
-                                    </span>
+                          {isExpanded ? (
+                            <div className="mt-3 grid gap-3 text-xs text-slate-600">
+                              <div>
+                                <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                  Instruction
+                                </div>
+                                <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600">
+                                  {task.instruction || "No instruction available."}
+                                </pre>
+                              </div>
+                              <div className="grid gap-3 md:grid-cols-2">
+                                <div>
+                                  <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                    Expected Schema
                                   </div>
-                                  <div className="mt-2 grid gap-3 md:grid-cols-2">
-                                    <div>
-                                      <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                                        Input
-                                      </div>
-                                      <pre className="mt-1 whitespace-pre-wrap rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
-                                        {JSON.stringify(call.input || {}, null, 2)}
-                                      </pre>
-                                    </div>
-                                    <div>
-                                      <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                                        Output
-                                      </div>
-                                      <pre className="mt-1 whitespace-pre-wrap rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
-                                        {JSON.stringify(call.output_or_error || {}, null, 2)}
-                                      </pre>
-                                    </div>
+                                  <div className="mt-1 text-xs text-slate-600">
+                                    {task.expected_output_schema_ref || "—"}
                                   </div>
                                 </div>
-                              ))}
+                                <div>
+                                  <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                    Tool Requests
+                                  </div>
+                                  <div className="mt-1 text-xs text-slate-600">
+                                    {task.tool_requests && task.tool_requests.length > 0
+                                      ? task.tool_requests.join(", ")
+                                      : "—"}
+                                  </div>
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                  Tool Calls
+                                </div>
+                                {taskResults[task.id]?.tool_calls &&
+                                taskResults[task.id].tool_calls!.length > 0 ? (
+                                  <div className="mt-2 space-y-3">
+                                    {taskResults[task.id].tool_calls!.map((call, index) => (
+                                      <div
+                                        key={`${task.id}-call-${index}`}
+                                        className="rounded-lg border border-slate-200 bg-white p-3"
+                                      >
+                                        <div className="flex items-center justify-between">
+                                          <div className="text-xs font-semibold text-slate-700">
+                                            {call.tool_name}
+                                          </div>
+                                          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                                            {call.status}
+                                          </span>
+                                        </div>
+                                        <div className="mt-2 grid gap-3 md:grid-cols-2">
+                                          <div>
+                                            <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                              Input
+                                            </div>
+                                            <pre className="mt-1 whitespace-pre-wrap rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
+                                              {JSON.stringify(call.input || {}, null, 2)}
+                                            </pre>
+                                          </div>
+                                          <div>
+                                            <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                              Output
+                                            </div>
+                                            <pre className="mt-1 whitespace-pre-wrap rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
+                                              {JSON.stringify(call.output_or_error || {}, null, 2)}
+                                            </pre>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <div className="mt-2 text-xs text-slate-500">
+                                    No tool calls recorded yet.
+                                  </div>
+                                )}
+                              </div>
+                              <div>
+                                <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                  Outputs
+                                </div>
+                                <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600">
+                                  {JSON.stringify(taskResults[task.id]?.outputs || {}, null, 2)}
+                                </pre>
+                              </div>
                             </div>
                           ) : (
-                            <div className="mt-2 text-xs text-slate-500">
-                              No tool calls recorded yet.
-                            </div>
+                            <div className="mt-3 text-xs text-slate-500">Collapsed.</div>
                           )}
                         </div>
-                        <div>
-                          <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                            Outputs
-                          </div>
-                          <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600">
-                            {JSON.stringify(taskResults[task.id]?.outputs || {}, null, 2)}
-                          </pre>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>
         )}
       </section>
 
-        <section className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm animate-fade-up-delayed-more">
+      <section className="animate-fade-up-delayed-more rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
         <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="font-display text-xl">Recent Events</h2>
             <p className="mt-1 text-xs text-slate-500">Live event stream snapshots.</p>
           </div>
-          <div className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">
-            {events.length} shown
+          <div className="flex items-center gap-2">
+            <div className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">
+              {events.length} shown
+            </div>
+            <button
+              className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+              onClick={() => setShowRecentEvents((prev) => !prev)}
+            >
+              {showRecentEvents ? "Hide" : "Show"}
+            </button>
           </div>
         </div>
-        <ul className="mt-4 space-y-2 text-xs">
-          {events.map((event, index) => (
-            <li key={index} className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
-              <div className="font-medium text-slate-700">{event.type}</div>
-              <pre className="whitespace-pre-wrap text-slate-500">
-                {JSON.stringify(event.payload, null, 2)}
-              </pre>
-            </li>
-          ))}
-        </ul>
-        </section>
+        {showRecentEvents ? (
+          <ul className="mt-4 space-y-2 text-xs">
+            {events.map((event, index) => {
+              const isExpanded = expandedRecentEvents.has(index);
+              return (
+                <li
+                  key={index}
+                  className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="font-medium text-slate-700">{event.type}</div>
+                    <button
+                      className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500"
+                      onClick={() =>
+                        setExpandedRecentEvents((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(index)) {
+                            next.delete(index);
+                          } else {
+                            next.add(index);
+                          }
+                          return next;
+                        })
+                      }
+                    >
+                      {isExpanded ? "Hide" : "Show"}
+                    </button>
+                  </div>
+                  {isExpanded ? (
+                    <pre className="mt-2 whitespace-pre-wrap text-slate-500">
+                      {JSON.stringify(event.payload, null, 2)}
+                    </pre>
+                  ) : (
+                    <div className="mt-2 text-[11px] text-slate-500">Collapsed.</div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <div className="mt-4 text-xs text-slate-500">Hidden by default.</div>
+        )}
+      </section>
       </div>
     </main>
   );
