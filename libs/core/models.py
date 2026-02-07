@@ -48,6 +48,14 @@ class ToolIntent(str, Enum):
     io = "io"
 
 
+class MemoryScope(str, Enum):
+    request = "request"
+    session = "session"
+    user = "user"
+    project = "project"
+    global_ = "global"
+
+
 class ToolSpec(BaseModel):
     name: str
     description: str
@@ -59,6 +67,58 @@ class ToolSpec(BaseModel):
     timeout_s: int = 30
     risk_level: RiskLevel = RiskLevel.low
     tool_intent: ToolIntent = ToolIntent.transform
+    memory_reads: List[str] = Field(default_factory=list)
+    memory_writes: List[str] = Field(default_factory=list)
+
+
+class MemorySpec(BaseModel):
+    name: str
+    description: str
+    scope: MemoryScope
+    schema_def: Dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: Optional[int] = None
+    version: str = "1.0"
+    read_roles: List[str] = Field(default_factory=list)
+    write_roles: List[str] = Field(default_factory=list)
+
+
+class MemoryWrite(BaseModel):
+    name: str
+    payload: Dict[str, Any]
+    scope: Optional[MemoryScope] = None
+    key: Optional[str] = None
+    job_id: Optional[str] = None
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+    ttl_seconds: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryEntry(BaseModel):
+    id: str
+    name: str
+    scope: MemoryScope
+    payload: Dict[str, Any]
+    key: Optional[str] = None
+    job_id: Optional[str] = None
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    version: str = "1.0"
+    created_at: datetime
+    updated_at: datetime
+    expires_at: Optional[datetime] = None
+
+
+class MemoryQuery(BaseModel):
+    name: str
+    scope: Optional[MemoryScope] = None
+    key: Optional[str] = None
+    job_id: Optional[str] = None
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+    limit: int = 50
+    include_expired: bool = False
 
 
 class ToolCall(BaseModel):
