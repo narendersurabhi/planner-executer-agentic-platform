@@ -996,42 +996,42 @@ const openTemplateModal = (template: Template) => {
     setCustomVariables((prev) => prev.filter((_, idx) => idx !== index));
   };
 
+  const fetchJson = async (url: string) => {
+    try {
+      const response = await fetch(url);
+      const status = response.status;
+      if (!response.ok) {
+        return { ok: false, status, data: null, error: null as string | null };
+      }
+      const text = await response.text();
+      if (!text) {
+        return { ok: true, status, data: null, error: null as string | null };
+      }
+      try {
+        return { ok: true, status, data: JSON.parse(text), error: null as string | null };
+      } catch (parseError) {
+        return {
+          ok: false,
+          status,
+          data: null,
+          error: parseError instanceof Error ? parseError.message : "Invalid JSON"
+        };
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        status: null as number | null,
+        data: null,
+        error: error instanceof Error ? error.message : "Network error"
+      };
+    }
+  };
+
 
   const loadJobDetails = async (jobId: string) => {
     setSelectedJobId(jobId);
     setDetailsLoading(true);
     setDetailsError(null);
-
-    const fetchJson = async (url: string) => {
-      try {
-        const response = await fetch(url);
-        const status = response.status;
-        if (!response.ok) {
-          return { ok: false, status, data: null, error: null as string | null };
-        }
-        const text = await response.text();
-        if (!text) {
-          return { ok: true, status, data: null, error: null as string | null };
-        }
-        try {
-          return { ok: true, status, data: JSON.parse(text), error: null as string | null };
-        } catch (parseError) {
-          return {
-            ok: false,
-            status,
-            data: null,
-            error: parseError instanceof Error ? parseError.message : "Invalid JSON"
-          };
-        }
-      } catch (error) {
-        return {
-          ok: false,
-          status: null as number | null,
-          data: null,
-          error: error instanceof Error ? error.message : "Network error"
-        };
-      }
-    };
 
     const detailsResult = await fetchJson(`${apiUrl}/jobs/${jobId}/details`);
     if (detailsResult.ok && detailsResult.data && typeof detailsResult.data === "object") {
