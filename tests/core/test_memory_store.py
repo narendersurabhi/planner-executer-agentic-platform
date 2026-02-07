@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 
 os.environ["DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
 
@@ -45,3 +46,38 @@ def test_memory_scope_requires_job_id():
             assert "job_id_required" in str(exc)
         else:
             raise AssertionError("Expected job_id requirement error")
+
+
+def test_memory_write_conflict_on_mismatched_updated_at():
+    SessionLocal, memory_store = _init_sqlite_store()
+    with SessionLocal() as db:
+        created = memory_store.write_memory(
+            db,
+            models.MemoryWrite(
+                name="job_context",
+                job_id="job-2",
+                payload={"foo": "bar"},
+            ),
+        )
+
+        ok_update = models.MemoryWrite(
+            name="job_context",
+            job_id="job-2",
+            payload={"foo": "baz"},
+            if_match_updated_at=created.updated_at,
+        )
+        updated = memory_store.write_memory(db, ok_update)
+        assert updated.payload["foo"] == "baz"
+
+        bad_update = models.MemoryWrite(
+            name="job_context",
+            job_id="job-2",
+            payload={"foo": "qux"},
+            if_match_updated_at=created.updated_at - timedelta(seconds=1),
+        )
+        try:
+            memory_store.write_memory(db, bad_update)
+        except ValueError as exc:
+            assert "memory_conflict" in str(exc)
+        else:
+            raise AssertionError("Expected memory conflict error")

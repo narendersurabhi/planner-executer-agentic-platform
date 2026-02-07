@@ -1059,7 +1059,10 @@ def write_memory(entry: models.MemoryWrite, db: Session = Depends(get_db)) -> mo
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        detail = str(exc)
+        if "memory_conflict" in detail:
+            raise HTTPException(status_code=409, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
 
 
 @app.get("/memory/read", response_model=List[models.MemoryEntry])

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import uuid
 from typing import Iterable, Optional
 
@@ -33,6 +33,9 @@ def write_memory(db: Session, request: models.MemoryWrite) -> models.MemoryEntry
         project_id=request.project_id,
     )
     if record:
+        if request.if_match_updated_at is not None:
+            if _normalize_dt(record.updated_at) != _normalize_dt(request.if_match_updated_at):
+                raise ValueError("memory_conflict")
         record.payload = request.payload
         record.metadata_json = request.metadata or {}
         record.updated_at = now
@@ -153,3 +156,9 @@ def _to_entry(record: MemoryRecord) -> models.MemoryEntry:
         updated_at=record.updated_at,
         expires_at=record.expires_at,
     )
+
+
+def _normalize_dt(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)

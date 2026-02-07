@@ -92,6 +92,7 @@ class MemoryWrite(BaseModel):
     project_id: Optional[str] = None
     ttl_seconds: Optional[int] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    if_match_updated_at: Optional[datetime] = None
 
 
 class MemoryEntry(BaseModel):
