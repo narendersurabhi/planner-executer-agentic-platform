@@ -466,6 +466,11 @@ export default function Home() {
   const [memoryEntries, setMemoryEntries] = useState<Record<string, MemoryEntry[]>>({});
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryError, setMemoryError] = useState<string | null>(null);
+  const [memoryLimits, setMemoryLimits] = useState<Record<string, number>>({
+    job_context: 10,
+    task_outputs: 10
+  });
+  const [memoryFilters, setMemoryFilters] = useState({ key: "", tool: "" });
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [isResizing, setIsResizing] = useState(false);
@@ -1025,13 +1030,24 @@ const openTemplateModal = (template: Template) => {
       }
     }
 
+    await loadMemoryEntries(jobId);
+
+    setDetailsLoading(false);
+  };
+
+  const loadMemoryEntries = async (
+    jobId: string,
+    limits: Record<string, number> = memoryLimits
+  ) => {
     setMemoryLoading(true);
     setMemoryError(null);
     const memoryNames = ["job_context", "task_outputs"];
     const memoryResults = await Promise.all(
       memoryNames.map((name) =>
         fetchJson(
-          `${apiUrl}/memory/read?name=${encodeURIComponent(name)}&job_id=${encodeURIComponent(jobId)}&limit=50`
+          `${apiUrl}/memory/read?name=${encodeURIComponent(name)}&job_id=${encodeURIComponent(
+            jobId
+          )}&limit=${encodeURIComponent(String(limits[name] ?? 50))}`
         )
       )
     );
@@ -1059,8 +1075,28 @@ const openTemplateModal = (template: Template) => {
       }
     }
     setMemoryLoading(false);
+  };
 
-    setDetailsLoading(false);
+  const filterMemoryEntries = (entries: MemoryEntry[]) => {
+    const keyFilter = memoryFilters.key.trim().toLowerCase();
+    const toolFilter = memoryFilters.tool.trim().toLowerCase();
+    if (!keyFilter && !toolFilter) {
+      return entries;
+    }
+    return entries.filter((entry) => {
+      const keyValue = (entry.key || "").toLowerCase();
+      const sourceTool =
+        typeof entry.payload?.source_tool === "string"
+          ? entry.payload.source_tool.toLowerCase()
+          : "";
+      if (keyFilter && !keyValue.includes(keyFilter)) {
+        return false;
+      }
+      if (toolFilter && !sourceTool.includes(toolFilter)) {
+        return false;
+      }
+      return true;
+    });
   };
 
   const closeDetails = () => {
@@ -1074,6 +1110,8 @@ const openTemplateModal = (template: Template) => {
     setMemoryLoading(false);
     setExpandedMemoryGroups(new Set());
     setExpandedMemoryEntries({});
+    setMemoryFilters({ key: "", tool: "" });
+    setMemoryLimits({ job_context: 10, task_outputs: 10 });
   };
 
   const stopJob = async (jobId: string) => {
@@ -1984,6 +2022,38 @@ const openTemplateModal = (template: Template) => {
                     {showMemory ? "Hide" : "Show"}
                   </button>
                 </div>
+                {showMemory ? (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                    <input
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 md:w-56"
+                      placeholder="Filter by key"
+                      value={memoryFilters.key}
+                      onChange={(event) =>
+                        setMemoryFilters((prev) => ({ ...prev, key: event.target.value }))
+                      }
+                    />
+                    <input
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 md:w-56"
+                      placeholder="Filter by source tool"
+                      value={memoryFilters.tool}
+                      onChange={(event) =>
+                        setMemoryFilters((prev) => ({ ...prev, tool: event.target.value }))
+                      }
+                    />
+                    <button
+                      className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+                      onClick={() => setMemoryFilters({ key: "", tool: "" })}
+                    >
+                      Clear
+                    </button>
+                    <button
+                      className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+                      onClick={() => selectedJobId && loadMemoryEntries(selectedJobId)}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                ) : null}
                 {memoryLoading ? (
                   <div className="mt-3 text-xs text-slate-500">Loading memory entries...</div>
                 ) : memoryError ? (
@@ -1992,6 +2062,9 @@ const openTemplateModal = (template: Template) => {
                   <div className="mt-4 space-y-3">
                     {["job_context", "task_outputs"].map((name) => {
                       const entries = memoryEntries[name] || [];
+                      const filteredEntries = filterMemoryEntries(entries);
+                      const limit = memoryLimits[name] ?? 50;
+                      const canLoadMore = limit < 200;
                       const groupExpanded = expandedMemoryGroups.has(name);
                       return (
                         <div
@@ -2002,30 +2075,54 @@ const openTemplateModal = (template: Template) => {
                             <div>
                               <div className="text-sm font-semibold text-slate-900">{name}</div>
                               <div className="mt-1 text-xs text-slate-500">
-                                {entries.length} entries
+                                {filteredEntries.length} of {entries.length} entries
                               </div>
                             </div>
-                            <button
-                              className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500"
-                              onClick={() =>
-                                setExpandedMemoryGroups((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(name)) {
-                                    next.delete(name);
-                                  } else {
-                                    next.add(name);
+                            <div className="flex flex-col items-end gap-2">
+                              <span className="rounded-full bg-white px-2 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                                limit {limit}
+                              </span>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500"
+                                  onClick={() =>
+                                    setExpandedMemoryGroups((prev) => {
+                                      const next = new Set(prev);
+                                      if (next.has(name)) {
+                                        next.delete(name);
+                                      } else {
+                                        next.add(name);
+                                      }
+                                      return next;
+                                    })
                                   }
-                                  return next;
-                                })
-                              }
-                            >
-                              {groupExpanded ? "Hide" : "Show"}
-                            </button>
+                                >
+                                  {groupExpanded ? "Hide" : "Show"}
+                                </button>
+                                <button
+                                  className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500 disabled:opacity-50"
+                                  disabled={!canLoadMore}
+                                  onClick={() => {
+                                    if (!selectedJobId || !canLoadMore) {
+                                      return;
+                                    }
+                                    const nextLimits = {
+                                      ...memoryLimits,
+                                      [name]: Math.min(limit + 10, 200)
+                                    };
+                                    setMemoryLimits(nextLimits);
+                                    loadMemoryEntries(selectedJobId, nextLimits);
+                                  }}
+                                >
+                                  Show more
+                                </button>
+                              </div>
+                            </div>
                           </div>
                           {groupExpanded ? (
-                            entries.length > 0 ? (
+                            filteredEntries.length > 0 ? (
                               <div className="mt-3 space-y-3">
-                                {entries.map((entry, index) => {
+                                {filteredEntries.map((entry, index) => {
                                   const entryExpanded =
                                     expandedMemoryEntries[name]?.has(index) ?? false;
                                   return (
@@ -2094,7 +2191,7 @@ const openTemplateModal = (template: Template) => {
                               </div>
                             ) : (
                               <div className="mt-3 text-xs text-slate-500">
-                                No memory entries yet.
+                                No memory entries match the filters.
                               </div>
                             )
                           ) : (
