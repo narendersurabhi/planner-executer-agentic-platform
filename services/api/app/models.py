@@ -65,3 +65,21 @@ class TaskRecord(Base):
     critic_required: Mapped[bool] = mapped_column(Integer, default=1)
 
     plan: Mapped[PlanRecord] = relationship("PlanRecord", back_populates="tasks")
+
+
+class MemoryRecord(Base):
+    __tablename__ = "memory"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, index=True)
+    scope: Mapped[str] = mapped_column(String, index=True)
+    key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    job_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    version: Mapped[str] = mapped_column(String, default="1.0")
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

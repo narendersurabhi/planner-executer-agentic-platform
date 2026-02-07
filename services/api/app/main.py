@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Generator, List
 
 import redis
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from prometheus_client import Counter, Histogram, make_asgi_app
@@ -28,6 +28,7 @@ from libs.core import (
 from libs.core.llm_provider import MockLLMProvider
 from .database import Base, SessionLocal, engine
 from .models import JobRecord, PlanRecord, TaskRecord
+from . import memory_store
 
 core_logging.configure_logging("api")
 logger = logging.getLogger("api.orchestrator")
@@ -1049,6 +1050,46 @@ def stream_events(request: Request, once: bool = False):
                     payload = data.get("data")
                     yield f"data: {payload}\n\n"
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/memory/write", response_model=models.MemoryEntry)
+def write_memory(entry: models.MemoryWrite, db: Session = Depends(get_db)) -> models.MemoryEntry:
+    try:
+        return memory_store.write_memory(db, entry)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/memory/read", response_model=List[models.MemoryEntry])
+def read_memory(
+    name: str = Query(...),
+    scope: models.MemoryScope | None = Query(None),
+    key: str | None = Query(None),
+    job_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+    project_id: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    include_expired: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> List[models.MemoryEntry]:
+    query = models.MemoryQuery(
+        name=name,
+        scope=scope,
+        key=key,
+        job_id=job_id,
+        user_id=user_id,
+        project_id=project_id,
+        limit=limit,
+        include_expired=include_expired,
+    )
+    try:
+        return memory_store.read_memory(db, query)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 
