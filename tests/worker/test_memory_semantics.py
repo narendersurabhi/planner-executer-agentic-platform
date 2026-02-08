@@ -89,3 +89,12 @@ def test_apply_memory_defaults_prefers_latest_keyed_entry() -> None:
     }
     updated = memory_semantics.apply_memory_defaults("llm_improve_tailored_resume_text", payload)
     assert updated["tailored_resume"]["summary"] == "preferred"
+
+
+def test_extract_memory_value_prefers_alignment_latest_key() -> None:
+    entries = [
+        {"alignment_score": 80},
+        {"_memory_key": "alignment_score:latest", "alignment_score": 92},
+    ]
+    value = memory_semantics.extract_memory_value(entries, "alignment_score")
+    assert value == 92

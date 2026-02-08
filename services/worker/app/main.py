@@ -15,7 +15,7 @@ from libs.core.memory_client import MemoryClient
 from services.worker.app.memory_semantics import (
     apply_memory_defaults,
     select_memory_payload,
-    stable_memory_key,
+    stable_memory_keys,
 )
 
 core_logging.configure_logging("worker")
@@ -303,16 +303,17 @@ def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, tra
             "metadata": {"trace_id": trace_id},
         }
         written = MEMORY_CLIENT.write(entry)
-        stable_key = stable_memory_key(tool.spec.name, selected_payload)
-        if stable_key and name == "task_outputs":
-            stable_entry = {
-                "name": name,
-                "job_id": job_id,
-                "key": stable_key,
-                "payload": {"source_tool": tool.spec.name, **selected_payload},
-                "metadata": {"trace_id": trace_id, "alias": True},
-            }
-            MEMORY_CLIENT.write(stable_entry)
+        stable_keys = stable_memory_keys(tool.spec.name, selected_payload)
+        if stable_keys and name == "task_outputs":
+            for stable_key in stable_keys:
+                stable_entry = {
+                    "name": name,
+                    "job_id": job_id,
+                    "key": stable_key,
+                    "payload": {"source_tool": tool.spec.name, **selected_payload},
+                    "metadata": {"trace_id": trace_id, "alias": True, "alias_key": stable_key},
+                }
+                MEMORY_CLIENT.write(stable_entry)
         core_logging.log_event(
             LOGGER,
             "memory_write",

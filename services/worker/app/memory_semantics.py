@@ -27,13 +27,17 @@ MEMORY_INPUT_KEYS = {
 
 MEMORY_PREFERRED_KEYS = {
     "tailored_resume": "tailored_resume:latest",
+    "alignment_score": "alignment_score:latest",
+    "alignment_summary": "alignment_summary:latest",
 }
 
 
-def stable_memory_key(tool_name: str, payload: Mapping[str, Any]) -> str | None:
-    if "tailored_resume" in payload:
-        return "tailored_resume:latest"
-    return None
+def stable_memory_keys(tool_name: str, payload: Mapping[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for field, alias in MEMORY_PREFERRED_KEYS.items():
+        if field in payload:
+            keys.append(alias)
+    return keys
 
 
 def extract_memory_value(entries: Sequence[Mapping[str, Any]], key: str) -> Any:
