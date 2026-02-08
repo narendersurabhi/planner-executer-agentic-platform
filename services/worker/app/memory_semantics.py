@@ -37,7 +37,7 @@ MEMORY_INPUT_KEYS = {
 }
 
 MEMORY_ONLY_INPUTS = {
-    "docx_generate_from_spec": ["document_spec"],
+    tool_name: list(keys) for tool_name, keys in MEMORY_INPUT_KEYS.items()
 }
 
 MEMORY_PREFERRED_KEYS = {

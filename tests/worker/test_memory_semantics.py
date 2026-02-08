@@ -46,19 +46,32 @@ def test_apply_memory_defaults_fills_missing_tailored_text() -> None:
     assert updated["tailored_resume"]["summary"] == "from memory"
 
 
-def test_apply_memory_defaults_respects_existing_value() -> None:
+def test_apply_memory_defaults_overrides_manual_when_memory_only() -> None:
     payload = {
         "tailored_resume": {
-            "summary": "already set",
+            "summary": "manual",
             "skills": [],
             "experience": [],
             "education": [],
             "certifications": [],
         },
-        "memory": {"task_outputs": [{"tailored_text": "from memory"}]},
+        "memory": {
+            "task_outputs": [
+                {
+                    "_memory_key": "tailored_resume:latest",
+                    "tailored_resume": {
+                        "summary": "from memory",
+                        "skills": [],
+                        "experience": [],
+                        "education": [],
+                        "certifications": [],
+                    },
+                }
+            ]
+        },
     }
     updated = memory_semantics.apply_memory_defaults("llm_improve_tailored_resume_text", payload)
-    assert updated["tailored_resume"]["summary"] == "already set"
+    assert updated["tailored_resume"]["summary"] == "from memory"
 
 
 def test_apply_memory_defaults_prefers_latest_keyed_entry() -> None:
