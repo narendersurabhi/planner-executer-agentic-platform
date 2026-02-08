@@ -50,6 +50,7 @@ def register_docx_tools(registry) -> None:
                     },
                     "required": ["path", "bytes_written"],
                 },
+                memory_reads=["job_context", "task_outputs"],
                 timeout_s=25,
                 risk_level=RiskLevel.medium,
                 tool_intent=ToolIntent.render,

@@ -106,3 +106,15 @@ def test_select_memory_payload_includes_resume_doc_spec() -> None:
         "llm_generate_resume_doc_spec_from_text", output
     )
     assert selected == {"resume_doc_spec": {"doc_type": "resume"}}
+
+
+def test_apply_memory_defaults_fills_resume_doc_spec() -> None:
+    payload = {
+        "memory": {
+            "task_outputs": [
+                {"_memory_key": "resume_doc_spec:latest", "resume_doc_spec": {"doc_type": "resume"}}
+            ]
+        }
+    }
+    updated = memory_semantics.apply_memory_defaults("resume_doc_spec_validate", payload)
+    assert updated["resume_doc_spec"]["doc_type"] == "resume"

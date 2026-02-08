@@ -28,6 +28,12 @@ MEMORY_INPUT_KEYS = {
     "llm_improve_tailored_resume_text": ["tailored_resume"],
     "llm_iterative_improve_tailored_resume_text": ["tailored_resume"],
     "llm_generate_resume_doc_spec_from_text": ["tailored_resume"],
+    "llm_generate_resume_doc_spec": ["tailored_resume"],
+    "resume_doc_spec_validate": ["resume_doc_spec"],
+    "resume_doc_spec_to_document_spec": ["resume_doc_spec"],
+    "document_spec_validate": ["document_spec"],
+    "docx_generate_from_spec": ["document_spec"],
+    "llm_improve_document_spec": ["document_spec"],
 }
 
 MEMORY_PREFERRED_KEYS = {

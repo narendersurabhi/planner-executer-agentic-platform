@@ -35,6 +35,7 @@ def register_resume_doc_spec_tools(registry) -> None:
                     },
                     "required": ["valid", "errors", "warnings", "stats"],
                 },
+                memory_reads=["job_context", "task_outputs"],
                 timeout_s=5,
                 risk_level=RiskLevel.low,
                 tool_intent=ToolIntent.validate,
