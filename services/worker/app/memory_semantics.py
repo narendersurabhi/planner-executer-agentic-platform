@@ -17,6 +17,11 @@ MEMORY_OUTPUT_KEYS = {
         "iterations",
         "reached_threshold",
     ],
+    "llm_generate_resume_doc_spec_from_text": ["resume_doc_spec"],
+    "llm_generate_resume_doc_spec": ["resume_doc_spec"],
+    "resume_doc_spec_to_document_spec": ["document_spec"],
+    "llm_generate_document_spec": ["document_spec"],
+    "llm_improve_document_spec": ["document_spec"],
 }
 
 MEMORY_INPUT_KEYS = {
@@ -29,6 +34,8 @@ MEMORY_PREFERRED_KEYS = {
     "tailored_resume": "tailored_resume:latest",
     "alignment_score": "alignment_score:latest",
     "alignment_summary": "alignment_summary:latest",
+    "resume_doc_spec": "resume_doc_spec:latest",
+    "document_spec": "document_spec:latest",
 }
 
 

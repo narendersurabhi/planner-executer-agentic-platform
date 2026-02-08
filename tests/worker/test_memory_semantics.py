@@ -98,3 +98,11 @@ def test_extract_memory_value_prefers_alignment_latest_key() -> None:
     ]
     value = memory_semantics.extract_memory_value(entries, "alignment_score")
     assert value == 92
+
+
+def test_select_memory_payload_includes_resume_doc_spec() -> None:
+    output = {"resume_doc_spec": {"doc_type": "resume"}, "extra": "ignore"}
+    selected = memory_semantics.select_memory_payload(
+        "llm_generate_resume_doc_spec_from_text", output
+    )
+    assert selected == {"resume_doc_spec": {"doc_type": "resume"}}

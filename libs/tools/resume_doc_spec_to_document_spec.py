@@ -27,6 +27,7 @@ def register_resume_doc_spec_convert_tools(registry) -> None:
                     "properties": {"document_spec": {"type": "object"}},
                     "required": ["document_spec"],
                 },
+                memory_writes=["task_outputs"],
                 timeout_s=5,
                 risk_level=RiskLevel.low,
                 tool_intent=ToolIntent.transform,
