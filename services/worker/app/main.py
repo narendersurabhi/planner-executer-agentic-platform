@@ -12,7 +12,11 @@ from jsonschema import Draft202012Validator
 
 from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
 from libs.core.memory_client import MemoryClient
-from services.worker.app.memory_semantics import apply_memory_defaults, select_memory_payload
+from services.worker.app.memory_semantics import (
+    apply_memory_defaults,
+    select_memory_payload,
+    stable_memory_key,
+)
 
 core_logging.configure_logging("worker")
 LOGGER = core_logging.get_logger("worker")
@@ -251,7 +255,18 @@ def _load_memory_inputs(tool, task_payload: dict, trace_id: str) -> dict:
     memory_payload: dict[str, list] = {}
     for name in memory_reads:
         entries = MEMORY_CLIENT.read(name=name, job_id=job_id)
-        memory_payload[name] = [entry.get("payload", {}) for entry in entries]
+        enriched_entries: list[dict] = []
+        for entry in entries:
+            payload = entry.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            enriched = dict(payload)
+            if entry.get("key"):
+                enriched["_memory_key"] = entry.get("key")
+            if entry.get("updated_at"):
+                enriched["_memory_updated_at"] = entry.get("updated_at")
+            enriched_entries.append(enriched)
+        memory_payload[name] = enriched_entries
         core_logging.log_event(
             LOGGER,
             "memory_read",
@@ -288,6 +303,16 @@ def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, tra
             "metadata": {"trace_id": trace_id},
         }
         written = MEMORY_CLIENT.write(entry)
+        stable_key = stable_memory_key(tool.spec.name, selected_payload)
+        if stable_key and name == "task_outputs":
+            stable_entry = {
+                "name": name,
+                "job_id": job_id,
+                "key": stable_key,
+                "payload": {"source_tool": tool.spec.name, **selected_payload},
+                "metadata": {"trace_id": trace_id, "alias": True},
+            }
+            MEMORY_CLIENT.write(stable_entry)
         core_logging.log_event(
             LOGGER,
             "memory_write",

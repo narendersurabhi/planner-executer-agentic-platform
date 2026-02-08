@@ -25,17 +25,46 @@ MEMORY_INPUT_KEYS = {
     "llm_generate_resume_doc_spec_from_text": ["tailored_resume"],
 }
 
+MEMORY_PREFERRED_KEYS = {
+    "tailored_resume": "tailored_resume:latest",
+}
+
+
+def stable_memory_key(tool_name: str, payload: Mapping[str, Any]) -> str | None:
+    if "tailored_resume" in payload:
+        return "tailored_resume:latest"
+    return None
+
 
 def extract_memory_value(entries: Sequence[Mapping[str, Any]], key: str) -> Any:
+    preferred_key = MEMORY_PREFERRED_KEYS.get(key)
+    if preferred_key:
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("_memory_key") != preferred_key:
+                continue
+            value = _extract_entry_value(entry, key)
+            if value is not None:
+                return value
     for entry in entries:
         if not isinstance(entry, Mapping):
             continue
-        value = entry.get(key)
+        value = _extract_entry_value(entry, key)
         if value is None:
             continue
         if isinstance(value, str) and not value.strip():
             continue
         return value
+    return None
+
+
+def _extract_entry_value(entry: Mapping[str, Any], key: str) -> Any:
+    if key in entry:
+        return entry.get(key)
+    payload = entry.get("payload")
+    if isinstance(payload, Mapping):
+        return payload.get(key)
     return None
 
 

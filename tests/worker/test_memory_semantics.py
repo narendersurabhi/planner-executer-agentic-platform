@@ -59,3 +59,33 @@ def test_apply_memory_defaults_respects_existing_value() -> None:
     }
     updated = memory_semantics.apply_memory_defaults("llm_improve_tailored_resume_text", payload)
     assert updated["tailored_resume"]["summary"] == "already set"
+
+
+def test_apply_memory_defaults_prefers_latest_keyed_entry() -> None:
+    payload = {
+        "memory": {
+            "task_outputs": [
+                {
+                    "tailored_resume": {
+                        "summary": "older",
+                        "skills": [],
+                        "experience": [],
+                        "education": [],
+                        "certifications": [],
+                    }
+                },
+                {
+                    "_memory_key": "tailored_resume:latest",
+                    "tailored_resume": {
+                        "summary": "preferred",
+                        "skills": [],
+                        "experience": [],
+                        "education": [],
+                        "certifications": [],
+                    },
+                },
+            ]
+        }
+    }
+    updated = memory_semantics.apply_memory_defaults("llm_improve_tailored_resume_text", payload)
+    assert updated["tailored_resume"]["summary"] == "preferred"
