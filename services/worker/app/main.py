@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 import uuid
+from typing import Any, Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -79,6 +81,11 @@ def _parse_optional_int(value: str | None) -> int | None:
 
 
 OUTPUT_SIZE_CAP = _parse_optional_int(TOOL_OUTPUT_SIZE_CAP) or 50000
+LOG_CANDIDATE_RESUME = os.getenv("LOG_CANDIDATE_RESUME", "false").lower() == "true"
+LOG_CANDIDATE_RESUME_FULL = os.getenv("LOG_CANDIDATE_RESUME_FULL", "false").lower() == "true"
+LOG_CANDIDATE_RESUME_PREVIEW_CHARS = (
+    _parse_optional_int(os.getenv("LOG_CANDIDATE_RESUME_PREVIEW_CHARS", "200")) or 200
+)
 MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://api:8000")
 MEMORY_READ_ENABLED = os.getenv("MEMORY_READ_ENABLED", "true").lower() == "true"
 MEMORY_WRITE_ENABLED = os.getenv("MEMORY_WRITE_ENABLED", "true").lower() == "true"
@@ -167,6 +174,7 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                     )
                 )
                 break
+        _log_candidate_resume(tool.spec.name, payload, task_id, trace_id)
         payload["_registry"] = registry
         idempotency_key = str(uuid.uuid4())
         core_logging.log_event(
@@ -343,6 +351,67 @@ def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, tra
                 "trace_id": trace_id,
             },
         )
+
+
+def _extract_candidate_resume(payload: Mapping[str, Any]) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    job = payload.get("job")
+    if not isinstance(job, Mapping):
+        return None
+    context_json = job.get("context_json")
+    if isinstance(context_json, Mapping):
+        candidate = context_json.get("candidate_resume")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    candidate = job.get("candidate_resume")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate
+    return None
+
+
+def _log_candidate_resume(
+    tool_name: str, payload: Mapping[str, Any], task_id: str | None, trace_id: str
+) -> None:
+    if tool_name != "llm_tailor_resume_text":
+        return
+    if not LOG_CANDIDATE_RESUME:
+        return
+    resume = _extract_candidate_resume(payload)
+    if not resume:
+        core_logging.log_event(
+            LOGGER,
+            "candidate_resume_log",
+            {"task_id": task_id, "tool_name": tool_name, "status": "missing", "trace_id": trace_id},
+        )
+        return
+    resume_len = len(resume)
+    resume_hash = hashlib.sha256(resume.encode("utf-8")).hexdigest()
+    if LOG_CANDIDATE_RESUME_FULL:
+        payload_out = {
+            "task_id": task_id,
+            "tool_name": tool_name,
+            "status": "full",
+            "length": resume_len,
+            "sha256": resume_hash,
+            "resume": resume,
+            "trace_id": trace_id,
+        }
+    else:
+        preview = LOG_CANDIDATE_RESUME_PREVIEW_CHARS
+        head = resume[:preview]
+        tail = resume[-preview:] if resume_len > preview else ""
+        payload_out = {
+            "task_id": task_id,
+            "tool_name": tool_name,
+            "status": "preview",
+            "length": resume_len,
+            "sha256": resume_hash,
+            "head": head,
+            "tail": tail,
+            "trace_id": trace_id,
+        }
+    core_logging.log_event(LOGGER, "candidate_resume_log", payload_out)
 
 
 def _tool_payload(
