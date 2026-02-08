@@ -1333,6 +1333,14 @@ def _llm_tailor_resume_text(payload: Dict[str, Any], provider: LLMProvider) -> D
         raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
     if not isinstance(resume_payload, dict):
         raise ToolExecutionError("tailored_resume must be an object")
+    if "error" in resume_payload:
+        error = resume_payload.get("error")
+        missing_fields = resume_payload.get("missing_fields")
+        if isinstance(missing_fields, list):
+            missing_fields = ",".join(str(item) for item in missing_fields)
+        if missing_fields:
+            raise ToolExecutionError(f"tailored_resume_error:{error}:{missing_fields}")
+        raise ToolExecutionError(f"tailored_resume_error:{error}")
     _ensure_required_resume_sections(resume_payload)
     return {"tailored_resume": resume_payload}
 
@@ -1517,15 +1525,60 @@ def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider
 
 def _ensure_required_resume_sections(content: Any) -> None:
     if isinstance(content, dict):
-        required_keys = ["summary", "skills", "experience", "education", "certifications"]
+        required_keys = [
+            "header",
+            "summary",
+            "skills",
+            "experience",
+            "education",
+            "certifications",
+        ]
         missing = [key for key in required_keys if key not in content]
         if missing:
             raise ToolExecutionError(f"tailored_resume_missing_fields:{','.join(missing)}")
+        header = content.get("header")
+        if not isinstance(header, dict):
+            raise ToolExecutionError("tailored_resume_invalid_header")
+        for field in ("name", "location", "phone", "email"):
+            value = header.get(field)
+            if _is_missing_value(value):
+                raise ToolExecutionError(f"tailored_resume_missing_header:{field}")
         if not isinstance(content.get("summary"), str) or not content["summary"].strip():
             raise ToolExecutionError("tailored_resume_invalid_summary")
         for list_key in ("skills", "experience", "education", "certifications"):
             if not isinstance(content.get(list_key), list):
                 raise ToolExecutionError(f"tailored_resume_invalid_{list_key}")
+        for skill in content.get("skills", []):
+            if not isinstance(skill, dict):
+                raise ToolExecutionError("tailored_resume_invalid_skills")
+            if _is_missing_value(skill.get("term")) or _is_missing_value(skill.get("definition")):
+                raise ToolExecutionError("tailored_resume_invalid_skills")
+        experiences = content.get("experience", [])
+        if not experiences:
+            raise ToolExecutionError("tailored_resume_missing_experience")
+        for idx, role in enumerate(experiences):
+            if not isinstance(role, dict):
+                raise ToolExecutionError(f"tailored_resume_invalid_experience:{idx}")
+            for field in ("company", "title", "location", "dates"):
+                if _is_missing_value(role.get(field)):
+                    raise ToolExecutionError(f"tailored_resume_missing_experience:{idx}.{field}")
+            bullets = role.get("bullets")
+            if not isinstance(bullets, list) or not bullets:
+                raise ToolExecutionError(f"tailored_resume_invalid_experience:{idx}.bullets")
+            for bullet in bullets:
+                if _is_missing_value(bullet):
+                    raise ToolExecutionError(f"tailored_resume_invalid_experience:{idx}.bullets")
+        education = content.get("education", [])
+        for idx, edu in enumerate(education):
+            if not isinstance(edu, dict):
+                raise ToolExecutionError(f"tailored_resume_invalid_education:{idx}")
+            for field in ("degree", "school", "location", "dates"):
+                if _is_missing_value(edu.get(field)):
+                    raise ToolExecutionError(f"tailored_resume_missing_education:{idx}.{field}")
+        certifications = content.get("certifications", [])
+        for idx, cert in enumerate(certifications):
+            if _is_missing_value(cert):
+                raise ToolExecutionError(f"tailored_resume_invalid_certifications:{idx}")
         return
     if not isinstance(content, str):
         raise ToolExecutionError("tailored_resume_invalid_type")
@@ -1539,6 +1592,20 @@ def _ensure_required_resume_sections(content: Any) -> None:
     missing = [section for section in required if section not in content]
     if missing:
         raise ToolExecutionError(f"tailored_text_missing_sections:{','.join(missing)}")
+
+
+def _is_missing_value(value: Any) -> bool:
+    if not isinstance(value, str):
+        return True
+    cleaned = value.strip()
+    if not cleaned:
+        return True
+    lowered = cleaned.lower()
+    if lowered in {"unknown", "n/a", "na", "none"}:
+        return True
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        return True
+    return False
 
 
 def _llm_generate_tailored_resume_content(

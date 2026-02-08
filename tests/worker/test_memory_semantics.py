@@ -49,9 +49,25 @@ def test_apply_memory_defaults_fills_missing_tailored_text() -> None:
 def test_apply_memory_defaults_overrides_manual_when_memory_only() -> None:
     payload = {
         "tailored_resume": {
+            "header": {
+                "name": "Manual",
+                "location": "Somewhere",
+                "phone": "123",
+                "email": "a@b.com",
+                "linkedin": "",
+                "github": "",
+            },
             "summary": "manual",
-            "skills": [],
-            "experience": [],
+            "skills": [{"term": "t", "definition": "d"}],
+            "experience": [
+                {
+                    "company": "Manual",
+                    "title": "Role",
+                    "location": "Somewhere",
+                    "dates": "2020-2021",
+                    "bullets": ["Did thing"],
+                }
+            ],
             "education": [],
             "certifications": [],
         },
@@ -60,9 +76,25 @@ def test_apply_memory_defaults_overrides_manual_when_memory_only() -> None:
                 {
                     "_memory_key": "tailored_resume:latest",
                     "tailored_resume": {
+                        "header": {
+                            "name": "Memory",
+                            "location": "Somewhere",
+                            "phone": "123",
+                            "email": "a@b.com",
+                            "linkedin": "",
+                            "github": "",
+                        },
                         "summary": "from memory",
-                        "skills": [],
-                        "experience": [],
+                        "skills": [{"term": "t", "definition": "d"}],
+                        "experience": [
+                            {
+                                "company": "Memory",
+                                "title": "Role",
+                                "location": "Somewhere",
+                                "dates": "2020-2021",
+                                "bullets": ["Did thing"],
+                            }
+                        ],
                         "education": [],
                         "certifications": [],
                     },
