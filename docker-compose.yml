@@ -55,6 +55,8 @@ services:
       dockerfile: services/worker/Dockerfile
     environment:
       REDIS_URL: redis://redis:6379/0
+      LOG_CANDIDATE_RESUME: "true"
+      LOG_CANDIDATE_RESUME_PREVIEW_CHARS: "200"
       TOOL_HTTP_FETCH_ENABLED: "false"
       TOOL_HTTP_FETCH_ALLOWLIST: ${TOOL_HTTP_FETCH_ALLOWLIST:-}
       TOOL_OUTPUT_SIZE_CAP: ${TOOL_OUTPUT_SIZE_CAP:-50000}
