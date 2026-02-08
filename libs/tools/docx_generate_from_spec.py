@@ -25,7 +25,8 @@ def register_docx_tools(registry) -> None:
                 name="docx_generate_from_spec",
                 description="Generate an ATS-friendly .docx document from a DocumentSpec JSON",
                 usage_guidance=(
-                    "Provide document_spec and path (required, relative .docx filename), "
+                    "Provide path (required, relative .docx filename). document_spec is "
+                    "resolved from memory (document_spec:latest). "
                     "render_context (merged into tokens), and strict (default true). "
                     "Supported blocks: text, paragraph, heading, bullets, spacer, "
                     "optional_paragraph, repeat. "

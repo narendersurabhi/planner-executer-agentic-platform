@@ -36,6 +36,10 @@ MEMORY_INPUT_KEYS = {
     "llm_improve_document_spec": ["document_spec"],
 }
 
+MEMORY_ONLY_INPUTS = {
+    "docx_generate_from_spec": ["document_spec"],
+}
+
 MEMORY_PREFERRED_KEYS = {
     "tailored_resume": "tailored_resume:latest",
     "alignment_score": "alignment_score:latest",
@@ -86,9 +90,12 @@ def _extract_entry_value(entry: Mapping[str, Any], key: str) -> Any:
 
 
 def apply_memory_defaults(tool_name: str, payload: Mapping[str, Any]) -> dict:
+    output = dict(payload)
+    if tool_name in MEMORY_ONLY_INPUTS:
+        for key in MEMORY_ONLY_INPUTS[tool_name]:
+            output.pop(key, None)
     if tool_name not in MEMORY_INPUT_KEYS:
         return dict(payload)
-    output = dict(payload)
     memory = output.get("memory")
     if not isinstance(memory, Mapping):
         return output
@@ -105,6 +112,22 @@ def apply_memory_defaults(tool_name: str, payload: Mapping[str, Any]) -> dict:
         if value is not None:
             output[key] = value
     return output
+
+
+def missing_memory_only_inputs(tool_name: str, payload: Mapping[str, Any]) -> list[str]:
+    required = MEMORY_ONLY_INPUTS.get(tool_name)
+    if not required:
+        return []
+    missing: list[str] = []
+    for key in required:
+        value = payload.get(key)
+        if key == "document_spec":
+            if not isinstance(value, Mapping) or not value:
+                missing.append(key)
+            continue
+        if value is None:
+            missing.append(key)
+    return missing
 
 
 def select_memory_payload(tool_name: str, output_or_error: Mapping[str, Any]) -> dict:

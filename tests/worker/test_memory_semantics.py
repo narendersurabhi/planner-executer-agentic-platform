@@ -118,3 +118,22 @@ def test_apply_memory_defaults_fills_resume_doc_spec() -> None:
     }
     updated = memory_semantics.apply_memory_defaults("resume_doc_spec_validate", payload)
     assert updated["resume_doc_spec"]["doc_type"] == "resume"
+
+
+def test_memory_only_inputs_drop_manual_value() -> None:
+    payload = {
+        "document_spec": {"doc_type": "manual"},
+        "memory": {
+            "task_outputs": [
+                {"_memory_key": "document_spec:latest", "document_spec": {"doc_type": "memory"}}
+            ]
+        },
+    }
+    updated = memory_semantics.apply_memory_defaults("docx_generate_from_spec", payload)
+    assert updated["document_spec"]["doc_type"] == "memory"
+
+
+def test_missing_memory_only_inputs_detects_missing() -> None:
+    payload = {"memory": {"task_outputs": []}}
+    missing = memory_semantics.missing_memory_only_inputs("docx_generate_from_spec", payload)
+    assert missing == ["document_spec"]

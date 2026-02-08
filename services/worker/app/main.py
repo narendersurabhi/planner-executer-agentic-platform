@@ -14,6 +14,7 @@ from libs.core import events, llm_provider, logging as core_logging, models, too
 from libs.core.memory_client import MemoryClient
 from services.worker.app.memory_semantics import (
     apply_memory_defaults,
+    missing_memory_only_inputs,
     select_memory_payload,
     stable_memory_keys,
 )
@@ -149,6 +150,23 @@ def execute_task(task_payload: dict) -> models.TaskResult:
         if memory_payload:
             payload.setdefault("memory", {}).update(memory_payload)
             payload = apply_memory_defaults(tool.spec.name, payload)
+            missing = missing_memory_only_inputs(tool.spec.name, payload)
+            if missing:
+                tool_error = f"memory_only_inputs_missing:{','.join(missing)}"
+                outputs[tool_name] = {"error": tool_error}
+                tool_calls.append(
+                    models.ToolCall(
+                        tool_name=tool_name,
+                        input=payload,
+                        idempotency_key=str(uuid.uuid4()),
+                        trace_id=trace_id,
+                        started_at=started_at,
+                        finished_at=datetime.utcnow(),
+                        status="failed",
+                        output_or_error={"error": tool_error},
+                    )
+                )
+                break
         payload["_registry"] = registry
         idempotency_key = str(uuid.uuid4())
         core_logging.log_event(
