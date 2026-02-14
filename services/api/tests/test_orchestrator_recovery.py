@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime
 
 import pytest
@@ -56,7 +57,7 @@ def test_recover_pending_events_accepts_three_tuple(monkeypatch: pytest.MonkeyPa
 
 
 def test_handle_plan_created_uses_plan_id_after_commit(monkeypatch: pytest.MonkeyPatch) -> None:
-    job_id = "job-plan-recover"
+    job_id = f"job-plan-recover-{uuid.uuid4()}"
     with SessionLocal() as db:
         db.add(
             JobRecord(

@@ -13,7 +13,7 @@ format:
 	ruff format libs services
 
 test:
-	pytest
+	PYTHONPATH=. pytest
 
 typecheck:
 	mypy --config-file mypy.ini

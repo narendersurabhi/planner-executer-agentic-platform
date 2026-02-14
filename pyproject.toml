@@ -9,4 +9,13 @@ python_version = "3.11"
 strict = true
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --ignore=workspace/repos"
+testpaths = [
+  "libs/core/tests",
+  "services/api/tests",
+  "services/critic/tests",
+  "services/planner/tests",
+  "services/policy/tests",
+  "services/worker/tests",
+  "tests",
+]

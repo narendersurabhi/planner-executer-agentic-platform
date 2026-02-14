@@ -58,7 +58,7 @@ def test_timeout_enforced() -> None:
     registry = ToolRegistry()
 
     def slow_handler(payload: dict) -> dict:
-        time.sleep(0.05)
+        time.sleep(1.1)
         return {"ok": True}
 
     registry.register(
@@ -68,7 +68,7 @@ def test_timeout_enforced() -> None:
                 description="test",
                 input_schema={"type": "object"},
                 output_schema={"type": "object"},
-                timeout_s=0.01,
+                timeout_s=1,
                 risk_level=RiskLevel.low,
             ),
             handler=slow_handler,

@@ -59,7 +59,9 @@ def _valid_tailored_resume() -> dict:
                 "dates": "2003 - 2007",
             }
         ],
-        "certifications": [{"name": "AWS Certified AI Practitioner", "issuer": "AWS", "year": "2025"}],
+        "certifications": [
+            {"name": "AWS Certified AI Practitioner", "issuer": "AWS", "year": "2025"}
+        ],
     }
 
 

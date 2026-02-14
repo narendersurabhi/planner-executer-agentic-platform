@@ -35,9 +35,7 @@ class _FakeLLMResponse:
 
 class _FakeCoderProvider:
     def generate(self, _prompt: str) -> _FakeLLMResponse:
-        return _FakeLLMResponse(
-            '{"files":[{"path":"hello.py","content":"print(\\"hello\\")"}]}'
-        )
+        return _FakeLLMResponse('{"files":[{"path":"hello.py","content":"print(\\"hello\\")"}]}')
 
 
 class _FakeTailorProvider:

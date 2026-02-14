@@ -1,4 +1,4 @@
-from libs.tools.document_spec_validate_old import _document_spec_validate
+from libs.tools.document_spec_validate import _document_spec_validate
 
 
 def _base_spec():
@@ -41,7 +41,7 @@ def test_unknown_block_type_fails():
     spec["blocks"].append({"type": "skill_grid", "text": "Nope"})
     result = _document_spec_validate({"document_spec": spec, "strict": True})
     assert result["valid"] is False
-    assert any("unsupported block type" in err["message"] for err in result["errors"])
+    assert any("unknown block type" in err["message"].lower() for err in result["errors"])
 
 
 def test_strict_unresolved_placeholder_fails():
@@ -49,7 +49,7 @@ def test_strict_unresolved_placeholder_fails():
     spec["blocks"].append({"type": "paragraph", "text": "{{missing}}"})
     result = _document_spec_validate({"document_spec": spec, "strict": True})
     assert result["valid"] is False
-    assert any("unresolved placeholder" in err["message"] for err in result["errors"])
+    assert any("unresolved placeholder" in err["message"].lower() for err in result["errors"])
 
 
 def test_non_strict_unresolved_placeholder_warns():
@@ -57,7 +57,7 @@ def test_non_strict_unresolved_placeholder_warns():
     spec["blocks"].append({"type": "paragraph", "text": "{{missing}}"})
     result = _document_spec_validate({"document_spec": spec, "strict": False})
     assert result["valid"] is True
-    assert any("unresolved placeholder" in warn["message"] for warn in result["warnings"])
+    assert any("unresolved placeholder" in warn["message"].lower() for warn in result["warnings"])
 
 
 def test_repeat_template_placeholder_allowed():

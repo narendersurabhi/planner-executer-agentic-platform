@@ -54,7 +54,7 @@ def test_missing_path_fails_schema_validation() -> None:
     spec = _load_fixture("resume_ats_single_column_spec.json")
     call = registry.execute("docx_generate_from_spec", {"document_spec": spec}, "id", "trace")
     assert call.status == "failed"
-    assert "input schema validation failed" in call.output_or_error["error"]
+    assert "path must be a non-empty string" in call.output_or_error["error"]
 
 
 def test_strict_unresolved_placeholder_raises(
@@ -146,15 +146,25 @@ def test_cover_letter_style_spacing(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert paragraphs[6].paragraph_format.space_after.pt == pytest.approx(0.0)
 
 
-def test_experience_heading_and_group_spacing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_experience_heading_and_group_spacing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("ARTIFACTS_DIR", str(_artifact_dir(tmp_path)))
     registry = _make_registry()
     spec = {
         "blocks": [
             {"type": "heading", "level": 1, "style": "section_heading", "text": "EXPERIENCE"},
             {"type": "paragraph", "style": "role_title", "text": "Software Engineer, AI/ML"},
-            {"type": "paragraph", "style": "role_meta", "text": "Acentra Health | Dec 2016 - Present"},
-            {"type": "paragraph", "style": "role_group_heading", "text": "Applied AI & LLM Systems"},
+            {
+                "type": "paragraph",
+                "style": "role_meta",
+                "text": "Acentra Health | Dec 2016 - Present",
+            },
+            {
+                "type": "paragraph",
+                "style": "role_group_heading",
+                "text": "Applied AI & LLM Systems",
+            },
             {"type": "bullets", "items": ["Built platform X"]},
         ],
     }

@@ -167,7 +167,13 @@ def _emit_event(event_type: str, payload: dict[str, Any]) -> None:
         payload=payload,
     )
     stream = _stream_for_event(event_type)
-    redis_client.xadd(stream, {"data": envelope.model_dump_json()})
+    try:
+        redis_client.xadd(stream, {"data": envelope.model_dump_json()})
+    except redis.RedisError:
+        logger.warning(
+            "event_emit_failed",
+            extra={"event_type": event_type, "stream": stream},
+        )
 
 
 def _plan_created_payload(plan: models.PlanCreate, job_id: str) -> dict[str, Any]:
