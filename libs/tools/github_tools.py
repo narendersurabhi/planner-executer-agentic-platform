@@ -15,6 +15,7 @@ from libs.core.models import RiskLevel, ToolIntent, ToolSpec
 
 def register_github_tools(registry) -> None:
     from libs.core.tool_registry import Tool
+
     registry.register(
         Tool(
             spec=ToolSpec(

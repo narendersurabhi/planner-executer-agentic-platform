@@ -152,10 +152,7 @@ def test_derive_output_filename() -> None:
         "trace",
     )
     assert call.status == "completed"
-    assert (
-        call.output_or_error["path"]
-        == "resumes/senior_ai_ml_engineer_2026_02_09.docx"
-    )
+    assert call.output_or_error["path"] == "resumes/senior_ai_ml_engineer_2026_02_09.docx"
 
 
 def test_derive_output_filename_resume_style() -> None:
@@ -358,12 +355,12 @@ def test_llm_generate_cover_letter_from_resume_tool() -> None:
             "education": [],
             "certifications": [],
         },
-            "job": {
-                "context_json": {
-                    "job_description": "Software Engineer, Distributed Systems\nFigma is the collaborative software platform for teams."
-                }
-            },
-        }
+        "job": {
+            "context_json": {
+                "job_description": "Software Engineer, Distributed Systems\nFigma is the collaborative software platform for teams."
+            }
+        },
+    }
     call = registry.execute(
         "llm_generate_cover_letter_from_resume",
         payload,
@@ -439,7 +436,10 @@ def test_coverletter_doc_spec_to_document_spec_tool() -> None:
                 "schema_version": "1.0",
                 "doc_type": "cover_letter",
                 "title": "Example",
-                "page": {"size": "LETTER", "margins_in": {"top": 0.8, "right": 0.8, "bottom": 0.8, "left": 0.8}},
+                "page": {
+                    "size": "LETTER",
+                    "margins_in": {"top": 0.8, "right": 0.8, "bottom": 0.8, "left": 0.8},
+                },
                 "defaults": {"font_family": "Calibri", "font_size_pt": 11, "line_spacing": 1.15},
                 "styles": {"name": {"bold": True, "size_pt": 20}},
                 "content": [

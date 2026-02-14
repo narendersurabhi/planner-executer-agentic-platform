@@ -507,7 +507,9 @@ def _extract_instruction_payload(instruction: str) -> dict:
     return {}
 
 
-def _validate_schema(schema: Dict[str, Any] | None, payload: Dict[str, Any], label: str) -> str | None:
+def _validate_schema(
+    schema: Dict[str, Any] | None, payload: Dict[str, Any], label: str
+) -> str | None:
     if not schema:
         return None
     try:

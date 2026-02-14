@@ -33,6 +33,7 @@ from libs.tools.coverletter_doc_spec_to_document_spec import (
 from libs.tools.cover_letter_generate_ats_docx import register_cover_letter_generate_tools
 from libs.tools.github_tools import register_github_tools
 
+
 class ToolExecutionError(Exception):
     pass
 
@@ -142,7 +143,9 @@ def _sanitize_payload(payload: Any) -> Dict[str, Any]:
     return sanitize(payload) or {}
 
 
-def _run_with_timeout(handler: Callable[[], tool_output_type], timeout_s: int | None) -> tool_output_type:
+def _run_with_timeout(
+    handler: Callable[[], tool_output_type], timeout_s: int | None
+) -> tool_output_type:
     if not timeout_s or timeout_s <= 0:
         return handler()
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -283,7 +286,6 @@ def _host_allowed(host: str, allowlist: List[str]) -> bool:
         elif host == entry:
             return True
     return False
-
 
 
 def default_registry(
@@ -560,7 +562,9 @@ def default_registry(
                 risk_level=RiskLevel.medium,
                 tool_intent=ToolIntent.io,
             ),
-            handler=lambda payload: _write_workspace_text_file(payload, default_filename="output.txt"),
+            handler=lambda payload: _write_workspace_text_file(
+                payload, default_filename="output.txt"
+            ),
         )
     )
 
@@ -743,7 +747,12 @@ def default_registry(
                                                 {"required": ["job_description"]},
                                             ]
                                         },
-                                        {"anyOf": [{"required": ["date"]}, {"required": ["today"]}]},
+                                        {
+                                            "anyOf": [
+                                                {"required": ["date"]},
+                                                {"required": ["today"]},
+                                            ]
+                                        },
                                     ]
                                 },
                                 {
@@ -1092,7 +1101,12 @@ def default_registry(
                             "steps_completed": {"type": "integer"},
                             "written_paths": {"type": "array", "items": {"type": "string"}},
                         },
-                        "required": ["plan_path", "steps_total", "steps_completed", "written_paths"],
+                        "required": [
+                            "plan_path",
+                            "steps_total",
+                            "steps_completed",
+                            "written_paths",
+                        ],
                     },
                     memory_writes=["task_outputs"],
                     timeout_s=_resolve_coding_agent_timeout_s(),
@@ -1150,8 +1164,8 @@ def default_registry(
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
                 ),
-                handler=lambda payload, provider=llm_provider: _llm_iterative_improve_tailored_resume_text(
-                    payload, provider
+                handler=lambda payload, provider=llm_provider: (
+                    _llm_iterative_improve_tailored_resume_text(payload, provider)
                 ),
             )
         )
@@ -1293,8 +1307,8 @@ def default_registry(
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
                 ),
-                handler=lambda payload, provider=llm_provider: _llm_generate_resume_doc_spec_from_text(
-                    payload, provider
+                handler=lambda payload, provider=llm_provider: (
+                    _llm_generate_resume_doc_spec_from_text(payload, provider)
                 ),
             )
         )
@@ -1329,8 +1343,8 @@ def default_registry(
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
                 ),
-                handler=lambda payload, provider=llm_provider: _llm_generate_coverletter_doc_spec_from_text(
-                    payload, provider
+                handler=lambda payload, provider=llm_provider: (
+                    _llm_generate_coverletter_doc_spec_from_text(payload, provider)
                 ),
             )
         )
@@ -1364,8 +1378,8 @@ def default_registry(
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
                 ),
-                handler=lambda payload, provider=llm_provider: _llm_generate_cover_letter_from_resume(
-                    payload, provider
+                handler=lambda payload, provider=llm_provider: (
+                    _llm_generate_cover_letter_from_resume(payload, provider)
                 ),
             )
         )
@@ -1519,7 +1533,6 @@ def default_registry(
     return registry
 
 
-
 def _math_eval(payload: Dict[str, Any]) -> Dict[str, Any]:
     expr = payload.get("expr", "0")
     allowed = {"sqrt": math.sqrt, "pow": pow}
@@ -1527,12 +1540,10 @@ def _math_eval(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"value": value}
 
 
-
 def _text_summarize(payload: Dict[str, Any]) -> Dict[str, Any]:
     text = payload.get("text", "")
     summary = text[:200]
     return {"summary": summary}
-
 
 
 def _write_text_file(payload: Dict[str, Any], default_filename: str) -> Dict[str, Any]:
@@ -1745,11 +1756,14 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         nested_context.get("date"),
         nested_context.get("today"),
     )
-    output_dir = pick_str(
-        payload.get("output_dir"),
-        memory_context.get("output_dir"),
-        nested_context.get("output_dir"),
-    ) or "resumes"
+    output_dir = (
+        pick_str(
+            payload.get("output_dir"),
+            memory_context.get("output_dir"),
+            nested_context.get("output_dir"),
+        )
+        or "resumes"
+    )
     document_type = pick_str(
         payload.get("document_type"),
         memory_context.get("document_type"),
@@ -1779,9 +1793,13 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = re.sub(r"_+", "_", cleaned).strip("_")
         return cleaned
 
-    if (not isinstance(role_name, str) or not role_name.strip()) and isinstance(job_description, str):
+    if (not isinstance(role_name, str) or not role_name.strip()) and isinstance(
+        job_description, str
+    ):
         role_name = _derive_role_name_from_jd(job_description)
-    if (not isinstance(company_name, str) or not company_name.strip()) and isinstance(job_description, str):
+    if (not isinstance(company_name, str) or not company_name.strip()) and isinstance(
+        job_description, str
+    ):
         company_name = _derive_company_name_from_jd(job_description)
 
     if (not isinstance(candidate_name, str) or not candidate_name.strip()) and not (
@@ -1795,9 +1813,13 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     if (
-        (not isinstance(first_name, str) or not first_name.strip())
-        or (not isinstance(last_name, str) or not last_name.strip())
-    ) and isinstance(candidate_name, str) and candidate_name.strip():
+        (
+            (not isinstance(first_name, str) or not first_name.strip())
+            or (not isinstance(last_name, str) or not last_name.strip())
+        )
+        and isinstance(candidate_name, str)
+        and candidate_name.strip()
+    ):
         tokens = [token for token in candidate_name.split() if token]
         if len(tokens) >= 2:
             if not isinstance(first_name, str) or not first_name.strip():
@@ -1969,7 +1991,9 @@ def _run_tests(payload: Dict[str, Any]) -> Dict[str, Any]:
     run_cwd = _safe_artifact_path(cwd, "")
     if not run_cwd.exists():
         raise ToolExecutionError("Working directory not found")
-    result: CompletedProcess[str] = run(cmd, cwd=str(run_cwd), capture_output=True, text=True, check=False)
+    result: CompletedProcess[str] = run(
+        cmd, cwd=str(run_cwd), capture_output=True, text=True, check=False
+    )
     return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 
 
@@ -2076,12 +2100,10 @@ def _docx_render(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"path": str(candidate)}
 
 
-
 def _sleep(payload: Dict[str, Any]) -> Dict[str, Any]:
     seconds = float(payload.get("seconds", 0))
     time.sleep(seconds)
     return {"slept": seconds}
-
 
 
 def _http_fetch(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2319,9 +2341,7 @@ def _build_plan_prompt(goal: str, constraints: Optional[str], max_steps: int) ->
     )
 
 
-def _render_plan_markdown(
-    goal: str, steps: list[dict[str, Any]], statuses: list[bool]
-) -> str:
+def _render_plan_markdown(goal: str, steps: list[dict[str, Any]], statuses: list[bool]) -> str:
     lines = ["# IMPLEMENTATION_PLAN", "", f"Goal: {goal}", "", "## Steps"]
     for idx, step in enumerate(steps, start=1):
         status = "x" if statuses[idx - 1] else " "
@@ -2376,9 +2396,7 @@ def _coding_agent_autonomous(payload: Dict[str, Any], provider: LLMProvider) -> 
         if not isinstance(files, list) or not files:
             raise ToolExecutionError(f"plan_step_missing_files:{idx}")
         step_goal = (
-            f"{goal}\n\n"
-            f"Current step {idx}: {title}\n"
-            f"Only implement the files listed for this step."
+            f"{goal}\n\nCurrent step {idx}: {title}\nOnly implement the files listed for this step."
         )
         request_payload: Dict[str, Any] = {"goal": step_goal, "files": files}
         if constraints:
@@ -2582,7 +2600,9 @@ def _select_job_context_from_memory(memory: Any) -> Dict[str, Any]:
     return {k: v for k, v in best.items() if isinstance(k, str) and not k.startswith("_")}
 
 
-def _merge_resume_job_context(job: Dict[str, Any], memory_context: Dict[str, Any]) -> Dict[str, Any]:
+def _merge_resume_job_context(
+    job: Dict[str, Any], memory_context: Dict[str, Any]
+) -> Dict[str, Any]:
     context_json = job.get("context_json")
     if not isinstance(context_json, dict):
         context_json = {}
@@ -2691,9 +2711,7 @@ def _llm_generate_resume_doc_spec_from_text(
     # Validate the generated ResumeDocSpec before returning it.
     from libs.tools.resume_doc_spec_validate import _resume_doc_spec_validate
 
-    validation = _resume_doc_spec_validate(
-        {"resume_doc_spec": resume_doc_spec, "strict": True}
-    )
+    validation = _resume_doc_spec_validate({"resume_doc_spec": resume_doc_spec, "strict": True})
     if not validation.get("valid", False):
         errors = validation.get("errors") or []
         raise ToolExecutionError(f"resume_doc_spec_validation_failed:{errors}")
@@ -2936,7 +2954,9 @@ def _build_coverletter_doc_spec(cover_letter: Dict[str, Any], date_text: str) ->
     if company:
         content.append({"type": "paragraph", "style": "cover_letter_recipient", "text": company})
     if salutation:
-        content.append({"type": "paragraph", "style": "cover_letter_salutation", "text": salutation})
+        content.append(
+            {"type": "paragraph", "style": "cover_letter_salutation", "text": salutation}
+        )
 
     body_paragraphs = _split_cover_letter_paragraphs(body_text)
     for paragraph in body_paragraphs:
@@ -3148,7 +3168,9 @@ def _ensure_required_resume_sections(content: Any) -> None:
             if isinstance(bullets, list):
                 for bullet in bullets:
                     if _is_missing_value(bullet):
-                        raise ToolExecutionError(f"tailored_resume_invalid_experience:{idx}.bullets")
+                        raise ToolExecutionError(
+                            f"tailored_resume_invalid_experience:{idx}.bullets"
+                        )
             if groups is not None and not isinstance(groups, list):
                 raise ToolExecutionError(f"tailored_resume_invalid_experience:{idx}.groups")
             if isinstance(groups, list):
@@ -3187,7 +3209,9 @@ def _ensure_required_resume_sections(content: Any) -> None:
                 if field == "year" and isinstance(value, int):
                     continue
                 if _is_missing_value(value):
-                    raise ToolExecutionError(f"tailored_resume_missing_certifications:{idx}.{field}")
+                    raise ToolExecutionError(
+                        f"tailored_resume_missing_certifications:{idx}.{field}"
+                    )
         return
     if not isinstance(content, str):
         raise ToolExecutionError("tailored_resume_invalid_type")
@@ -3245,9 +3269,7 @@ def _fill_missing_dates_from_text(resume_doc_spec: Dict[str, Any], tailored_text
                     block["dates"] = next_date
 
 
-def _extract_dates_from_section(
-    text: str, start_heading: str, end_heading: str
-) -> list[str]:
+def _extract_dates_from_section(text: str, start_heading: str, end_heading: str) -> list[str]:
     lines = [line.strip() for line in text.splitlines()]
     start_idx = _find_heading_index(lines, start_heading)
     if start_idx is None:
@@ -3322,11 +3344,7 @@ def _llm_repair_json(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str
         return {"document_spec": original_spec}
     errors_json = json.dumps(errors, ensure_ascii=False, indent=2)
     original_json = json.dumps(original_spec, ensure_ascii=False, indent=2)
-    allowed_json = (
-        json.dumps(allowed, ensure_ascii=False)
-        if isinstance(allowed, list)
-        else "null"
-    )
+    allowed_json = json.dumps(allowed, ensure_ascii=False) if isinstance(allowed, list) else "null"
     prompt = (
         "You are repairing a DocumentSpec JSON object. "
         "Fix the errors and return ONLY the JSON object.\n"

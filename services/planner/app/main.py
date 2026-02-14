@@ -146,7 +146,10 @@ def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.Pla
     return models.PlanCreate(
         planner_version="rule_based_v1",
         tasks_summary="Checklist, write artifact, summarize",
-        dag_edges=[["create_checklist", "write_tools_doc"], ["write_tools_doc", "summarize_artifact"]],
+        dag_edges=[
+            ["create_checklist", "write_tools_doc"],
+            ["write_tools_doc", "summarize_artifact"],
+        ],
         tasks=[checklist_task, write_task, summarize_task],
     )
 
@@ -246,15 +249,21 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
             "description": tool.description,
             "input_schema": tool.input_schema,
             "usage_guidance": tool.usage_guidance,
-            "risk_level": tool.risk_level.value if isinstance(tool.risk_level, Enum) else tool.risk_level,
+            "risk_level": tool.risk_level.value
+            if isinstance(tool.risk_level, Enum)
+            else tool.risk_level,
             "tool_intent": tool.tool_intent.value
             if isinstance(tool.tool_intent, Enum)
             else tool.tool_intent,
         }
         for tool in tools
     ]
-    tool_catalog_json = json.dumps(tool_catalog, ensure_ascii=False, indent=2, default=_json_fallback)
-    job_json = json.dumps(job.model_dump(mode="json"), ensure_ascii=False, indent=2, default=_json_fallback)
+    tool_catalog_json = json.dumps(
+        tool_catalog, ensure_ascii=False, indent=2, default=_json_fallback
+    )
+    job_json = json.dumps(
+        job.model_dump(mode="json"), ensure_ascii=False, indent=2, default=_json_fallback
+    )
     max_depth = _parse_optional_int(PLANNER_MAX_DEPTH)
     depth_hint = ""
     if max_depth:
@@ -263,26 +272,26 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
         "You are a planner. Return ONLY valid JSON for a PlanCreate object (no prose).\n"
         "Required top-level fields: planner_version, tasks_summary, dag_edges, tasks.\n"
         "Schema rules:\n"
-        "- dag_edges must be an array of 2-element string arrays, e.g. [[\"A\",\"B\"],[\"B\",\"C\"]].\n"
+        '- dag_edges must be an array of 2-element string arrays, e.g. [["A","B"],["B","C"]].\n'
         "- acceptance_criteria must be an array of strings, not a single string.\n"
         "Each task must include: name, description, instruction, acceptance_criteria, "
         "expected_output_schema_ref, deps, tool_requests, tool_inputs, critic_required.\n"
         "Example:\n"
         "{\n"
-        "  \"planner_version\": \"1.0.0\",\n"
-        "  \"tasks_summary\": \"...\",\n"
-        "  \"dag_edges\": [[\"TaskA\",\"TaskB\"],[\"TaskB\",\"TaskC\"]],\n"
-        "  \"tasks\": [\n"
+        '  "planner_version": "1.0.0",\n'
+        '  "tasks_summary": "...",\n'
+        '  "dag_edges": [["TaskA","TaskB"],["TaskB","TaskC"]],\n'
+        '  "tasks": [\n'
         "    {\n"
-        "      \"name\": \"TaskA\",\n"
-        "      \"description\": \"...\",\n"
-        "      \"instruction\": \"...\",\n"
-        "      \"acceptance_criteria\": [\"...\"],\n"
-        "      \"expected_output_schema_ref\": \"schemas/example\",\n"
-        "      \"deps\": [],\n"
-        "      \"tool_requests\": [\"llm_generate\"],\n"
-        "      \"tool_inputs\": {\"llm_generate\": {\"text\": \"...\"}},\n"
-        "      \"critic_required\": false\n"
+        '      "name": "TaskA",\n'
+        '      "description": "...",\n'
+        '      "instruction": "...",\n'
+        '      "acceptance_criteria": ["..."],\n'
+        '      "expected_output_schema_ref": "schemas/example",\n'
+        '      "deps": [],\n'
+        '      "tool_requests": ["llm_generate"],\n'
+        '      "tool_inputs": {"llm_generate": {"text": "..."}},\n'
+        '      "critic_required": false\n'
         "    }\n"
         "  ]\n"
         "}\n"
@@ -322,9 +331,7 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
 
 
 def _document_spec_prompt(job: models.Job, allowed_block_types: List[str]) -> str:
-    return prompts.document_spec_prompt(
-        job.model_dump(mode="json"), allowed_block_types
-    )
+    return prompts.document_spec_prompt(job.model_dump(mode="json"), allowed_block_types)
 
 
 @_log_entry_exit("_parse_llm_plan")
@@ -604,7 +611,9 @@ def run() -> None:
     except redis.ResponseError:
         pass
     while True:
-        messages = redis_client.xreadgroup(group, consumer, {events.JOB_STREAM: ">"}, count=1, block=1000)
+        messages = redis_client.xreadgroup(
+            group, consumer, {events.JOB_STREAM: ">"}, count=1, block=1000
+        )
         for _, entries in messages:
             for message_id, data in entries:
                 payload = json.loads(data["data"])

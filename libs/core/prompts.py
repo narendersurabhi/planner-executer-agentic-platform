@@ -60,63 +60,63 @@ def resume_doc_spec_prompt(job: dict[str, Any], tailored_resume: Any | None = No
         "If tailored resume content is provided, use it as the source of truth and do not invent new content.\n"
         "Use tailored_resume.header to populate name, title, and contact lines in the header blocks.\n"
         "If tailored_resume.experience roles include groups, render each group as:\n"
-        "- {\"type\": \"paragraph\", \"style\": \"role_group_heading\", \"text\": \"Group Heading\"}\n"
-        "- followed by {\"type\": \"bullets\", \"items\": [\"...\"]}\n"
+        '- {"type": "paragraph", "style": "role_group_heading", "text": "Group Heading"}\n'
+        '- followed by {"type": "bullets", "items": ["..."]}\n'
         "If a role has groups, you may still include top-level bullets before groups if needed.\n"
         "Always include a 'bullets' array on role blocks (use [] if all bullets are grouped).\n"
         "If tailored_resume includes projects/open_source items, include them as an optional section:\n"
-        "- {\"type\": \"section_heading\", \"text\": \"OPEN SOURCE\"} (or \"PROJECTS\")\n"
-        "- then {\"type\": \"bullets\", \"items\": [\"Project: short description | URL\", ...]}\n"
+        '- {"type": "section_heading", "text": "OPEN SOURCE"} (or "PROJECTS")\n'
+        '- then {"type": "bullets", "items": ["Project: short description | URL", ...]}\n'
         "For CERTIFICATIONS, preserve and render any credential URLs when available\n"
-        "(for example Credly public URLs) appended as: \"Name - Issuer (Year) | https://...\".\n"
-        "For SKILLS definition_list items, separate skills with commas (\", \"), not semicolons.\n"
+        '(for example Credly public URLs) appended as: "Name - Issuer (Year) | https://...".\n'
+        'For SKILLS definition_list items, separate skills with commas (", "), not semicolons.\n'
         "Do not use placeholders like [Phone] or [Email]. If header fields are missing, return:\n"
         "{\n"
-        "  \"error\": \"missing_required_fields\",\n"
-        "  \"missing_fields\": [\"header.name\", \"header.phone\"]\n"
+        '  "error": "missing_required_fields",\n'
+        '  "missing_fields": ["header.name", "header.phone"]\n'
         "}\n"
         "Example (style and structure):\n"
         "{\n"
-        "  \"schema_version\": \"1.0\",\n"
-        "  \"doc_type\": \"resume\",\n"
-        "  \"title\": \"Full Name - Resume\",\n"
-        "  \"page\": {\n"
-        "    \"size\": \"LETTER\",\n"
-        "    \"margins_in\": {\"top\": 0.5, \"right\": 0.5, \"bottom\": 0.5, \"left\": 0.5}\n"
+        '  "schema_version": "1.0",\n'
+        '  "doc_type": "resume",\n'
+        '  "title": "Full Name - Resume",\n'
+        '  "page": {\n'
+        '    "size": "LETTER",\n'
+        '    "margins_in": {"top": 0.5, "right": 0.5, "bottom": 0.5, "left": 0.5}\n'
         "  },\n"
-        "  \"defaults\": {\"font_family\": \"Calibri\", \"font_size_pt\": 11, \"line_spacing\": 1.05},\n"
-        "  \"content\": [\n"
+        '  "defaults": {"font_family": "Calibri", "font_size_pt": 11, "line_spacing": 1.05},\n'
+        '  "content": [\n'
         "    {\n"
-        "      \"type\": \"header\",\n"
-        "      \"align\": \"left\",\n"
-        "      \"blocks\": [\n"
-        "        {\"type\": \"text\", \"style\": \"name\", \"text\": \"Full Name\"},\n"
-        "        {\"type\": \"text\", \"style\": \"title\", \"text\": \"Role\"},\n"
-        "        {\"type\": \"text\", \"style\": \"contact\", \"text\": \"Location | Phone | Email\"},\n"
-        "        {\"type\": \"text\", \"style\": \"contact\", \"text\": \"LinkedIn | GitHub\"}\n"
+        '      "type": "header",\n'
+        '      "align": "left",\n'
+        '      "blocks": [\n'
+        '        {"type": "text", "style": "name", "text": "Full Name"},\n'
+        '        {"type": "text", "style": "title", "text": "Role"},\n'
+        '        {"type": "text", "style": "contact", "text": "Location | Phone | Email"},\n'
+        '        {"type": "text", "style": "contact", "text": "LinkedIn | GitHub"}\n'
         "      ]\n"
         "    },\n"
-        "    {\"type\": \"section_heading\", \"text\": \"SUMMARY\"},\n"
-        "    {\"type\": \"paragraph\", \"text\": \"...\"},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"SKILLS\"},\n"
-        "    {\"type\": \"definition_list\", \"items\": [{\"term\": \"...\", \"definition\": \"...\"}]},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"EXPERIENCE\"},\n"
-        "    {\"type\": \"role\", \"company\": \"...\", \"location\": \"...\", \"title\": \"...\", \"dates\": \"...\", \"bullets\": [\"...\"]},\n"
-        "    {\"type\": \"paragraph\", \"style\": \"role_group_heading\", \"text\": \"Decisioning and Scoring Platforms\"},\n"
-        "    {\"type\": \"bullets\", \"items\": [\"...\"]},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"EDUCATION\"},\n"
-        "    {\"type\": \"education\", \"degree\": \"...\", \"school\": \"...\", \"location\": \"...\", \"dates\": \"...\"},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"CERTIFICATIONS\"},\n"
-        "    {\"type\": \"bullets\", \"items\": [\"...\"]},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"OPEN SOURCE\"},\n"
-        "    {\"type\": \"bullets\", \"items\": [\"Project Name: short description | https://...\"]}\n"
+        '    {"type": "section_heading", "text": "SUMMARY"},\n'
+        '    {"type": "paragraph", "text": "..."},\n'
+        '    {"type": "section_heading", "text": "SKILLS"},\n'
+        '    {"type": "definition_list", "items": [{"term": "...", "definition": "..."}]},\n'
+        '    {"type": "section_heading", "text": "EXPERIENCE"},\n'
+        '    {"type": "role", "company": "...", "location": "...", "title": "...", "dates": "...", "bullets": ["..."]},\n'
+        '    {"type": "paragraph", "style": "role_group_heading", "text": "Decisioning and Scoring Platforms"},\n'
+        '    {"type": "bullets", "items": ["..."]},\n'
+        '    {"type": "section_heading", "text": "EDUCATION"},\n'
+        '    {"type": "education", "degree": "...", "school": "...", "location": "...", "dates": "..."},\n'
+        '    {"type": "section_heading", "text": "CERTIFICATIONS"},\n'
+        '    {"type": "bullets", "items": ["..."]},\n'
+        '    {"type": "section_heading", "text": "OPEN SOURCE"},\n'
+        '    {"type": "bullets", "items": ["Project Name: short description | https://..."]}\n'
         "  ],\n"
-        "  \"styles\": {\n"
-        "    \"name\": {\"bold\": true, \"size_pt\": 16},\n"
-        "    \"title\": {\"bold\": true, \"size_pt\": 12},\n"
-        "    \"contact\": {\"size_pt\": 10},\n"
-        "    \"section_heading\": {\"bold\": true, \"all_caps\": true, \"space_before_pt\": 10, \"space_after_pt\": 4},\n"
-        "    \"role_group_heading\": {\"bold\": true, \"italic\": true, \"space_before_pt\": 6, \"space_after_pt\": 2}\n"
+        '  "styles": {\n'
+        '    "name": {"bold": true, "size_pt": 16},\n'
+        '    "title": {"bold": true, "size_pt": 12},\n'
+        '    "contact": {"size_pt": 10},\n'
+        '    "section_heading": {"bold": true, "all_caps": true, "space_before_pt": 10, "space_after_pt": 4},\n'
+        '    "role_group_heading": {"bold": true, "italic": true, "space_before_pt": 6, "space_after_pt": 2}\n'
         "  }\n"
         "}\n"
         f"Tailored resume content (JSON): {tailored_json}\n"
@@ -141,6 +141,7 @@ def tailored_resume_content_prompt(job: dict[str, Any]) -> str:
         f"Job (JSON): {job_json}\n"
         "Return ONLY the JSON object."
     )
+
 
 def resume_tailoring_prompt(job: dict[str, Any]) -> str:
     job_json = json.dumps(job, ensure_ascii=False, indent=2, default=str)
@@ -175,8 +176,8 @@ def resume_tailoring_prompt(job: dict[str, Any]) -> str:
         "- Decide whether to include years of experience in the summary using these rules.\n"
         "- Include years if the job description explicitly asks for a minimum years requirement or if years strengthens the initial recruiter scan.\n"
         "- Omit years if the summary would become crowded or if scope and impact already make seniority obvious.\n"
-        "- If included, mention years only once in the first line and keep it short, for example \"8 plus years\" or \"10 plus years\".\n"
-        "- Do not include total career years if it conflicts with the role focus. Prefer role relevant years, for example \"8 plus years building production ML and GenAI\" rather than total years.\n"
+        '- If included, mention years only once in the first line and keep it short, for example "8 plus years" or "10 plus years".\n'
+        '- Do not include total career years if it conflicts with the role focus. Prefer role relevant years, for example "8 plus years building production ML and GenAI" rather than total years.\n'
         "- Never invent years. Use only what is supported by the candidate resume dates and stated experience.\n\n"
         "Skills rules:\n"
         "- Provide grouped skills ordered by relevance to the JD.\n"
@@ -206,7 +207,7 @@ def resume_tailoring_prompt(job: dict[str, Any]) -> str:
         "6) education: array\n"
         "7) certifications: array\n\n"
         "Detailed structure:\n"
-        "schema_version: \"1.0\"\n\n"
+        'schema_version: "1.0"\n\n'
         "header:\n"
         "- name: string\n"
         "- title: string\n"
@@ -249,8 +250,8 @@ def resume_tailoring_prompt(job: dict[str, Any]) -> str:
         "- If any required fields are missing in the candidate resume, return the error JSON below.\n\n"
         "If any required fields are missing, return ONLY this JSON object:\n"
         "{\n"
-        "  \"error\": \"missing_required_fields\",\n"
-        "  \"missing_fields\": [\"header.name\", \"header.email\", \"experience[0].company\", \"experience[0].title\"]\n"
+        '  "error": "missing_required_fields",\n'
+        '  "missing_fields": ["header.name", "header.email", "experience[0].company", "experience[0].title"]\n'
         "}\n\n"
         f"Job (JSON): {job_json}\n"
         "Return ONLY the JSON object.\n"
@@ -271,59 +272,59 @@ def resume_doc_spec_from_text_prompt(tailored_text: str, job: dict[str, Any] | N
         "Parse the tailored resume text into Summary, Skills, Experience, Education, Certifications.\n"
         "If the text contains an OPEN SOURCE/OPEN SOURCE (SELECTED)/PROJECTS section, include it in output.\n"
         "Map it as:\n"
-        "- {\"type\": \"section_heading\", \"text\": \"OPEN SOURCE\"} (or \"PROJECTS\")\n"
-        "- then {\"type\": \"bullets\", \"items\": [\"Project Name: short description | URL\", ...]}\n"
+        '- {"type": "section_heading", "text": "OPEN SOURCE"} (or "PROJECTS")\n'
+        '- then {"type": "bullets", "items": ["Project Name: short description | URL", ...]}\n'
         "In CERTIFICATIONS, preserve any URLs present in the source text\n"
         "(for example Credly badge public URLs) and include them in certification bullets.\n"
-        "For SKILLS definition_list items, separate skills with commas (\", \"), not semicolons.\n"
+        'For SKILLS definition_list items, separate skills with commas (", "), not semicolons.\n'
         "Within EXPERIENCE, treat standalone subheadings under a company (lines that are not role headers or bullets)\n"
         "as group headings and render them as:\n"
-        "- {\"type\": \"paragraph\", \"style\": \"role_group_heading\", \"text\": \"Group Heading\"}\n"
-        "- followed by {\"type\": \"bullets\", \"items\": [\"...\"]}\n"
+        '- {"type": "paragraph", "style": "role_group_heading", "text": "Group Heading"}\n'
+        '- followed by {"type": "bullets", "items": ["..."]}\n'
         "Always include a 'bullets' array on role blocks (use [] if all bullets are grouped).\n"
         "Do not invent content beyond the tailored text.\n"
         "Example (style and structure):\n"
         "{\n"
-        "  \"schema_version\": \"1.0\",\n"
-        "  \"doc_type\": \"resume\",\n"
-        "  \"title\": \"Full Name - Resume\",\n"
-        "  \"page\": {\n"
-        "    \"size\": \"LETTER\",\n"
-        "    \"margins_in\": {\"top\": 0.5, \"right\": 0.5, \"bottom\": 0.5, \"left\": 0.5}\n"
+        '  "schema_version": "1.0",\n'
+        '  "doc_type": "resume",\n'
+        '  "title": "Full Name - Resume",\n'
+        '  "page": {\n'
+        '    "size": "LETTER",\n'
+        '    "margins_in": {"top": 0.5, "right": 0.5, "bottom": 0.5, "left": 0.5}\n'
         "  },\n"
-        "  \"defaults\": {\"font_family\": \"Calibri\", \"font_size_pt\": 11, \"line_spacing\": 1.05},\n"
-        "  \"content\": [\n"
+        '  "defaults": {"font_family": "Calibri", "font_size_pt": 11, "line_spacing": 1.05},\n'
+        '  "content": [\n'
         "    {\n"
-        "      \"type\": \"header\",\n"
-        "      \"align\": \"left\",\n"
-        "      \"blocks\": [\n"
-        "        {\"type\": \"text\", \"style\": \"name\", \"text\": \"Full Name\"},\n"
-        "        {\"type\": \"text\", \"style\": \"title\", \"text\": \"Role\"},\n"
-        "        {\"type\": \"text\", \"style\": \"contact\", \"text\": \"Location | Phone | Email\"},\n"
-        "        {\"type\": \"text\", \"style\": \"contact\", \"text\": \"LinkedIn | GitHub\"}\n"
+        '      "type": "header",\n'
+        '      "align": "left",\n'
+        '      "blocks": [\n'
+        '        {"type": "text", "style": "name", "text": "Full Name"},\n'
+        '        {"type": "text", "style": "title", "text": "Role"},\n'
+        '        {"type": "text", "style": "contact", "text": "Location | Phone | Email"},\n'
+        '        {"type": "text", "style": "contact", "text": "LinkedIn | GitHub"}\n'
         "      ]\n"
         "    },\n"
-        "    {\"type\": \"section_heading\", \"text\": \"SUMMARY\"},\n"
-        "    {\"type\": \"paragraph\", \"text\": \"...\"},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"SKILLS\"},\n"
-        "    {\"type\": \"definition_list\", \"items\": [{\"term\": \"...\", \"definition\": \"...\"}]},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"EXPERIENCE\"},\n"
-        "    {\"type\": \"role\", \"company\": \"...\", \"location\": \"...\", \"title\": \"...\", \"dates\": \"...\", \"bullets\": [\"...\"]},\n"
-        "    {\"type\": \"paragraph\", \"style\": \"role_group_heading\", \"text\": \"Decisioning and Scoring Platforms\"},\n"
-        "    {\"type\": \"bullets\", \"items\": [\"...\"]},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"EDUCATION\"},\n"
-        "    {\"type\": \"education\", \"degree\": \"...\", \"school\": \"...\", \"location\": \"...\", \"dates\": \"...\"},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"CERTIFICATIONS\"},\n"
-        "    {\"type\": \"bullets\", \"items\": [\"...\"]},\n"
-        "    {\"type\": \"section_heading\", \"text\": \"OPEN SOURCE\"},\n"
-        "    {\"type\": \"bullets\", \"items\": [\"Project Name: short description | https://...\"]}\n"
+        '    {"type": "section_heading", "text": "SUMMARY"},\n'
+        '    {"type": "paragraph", "text": "..."},\n'
+        '    {"type": "section_heading", "text": "SKILLS"},\n'
+        '    {"type": "definition_list", "items": [{"term": "...", "definition": "..."}]},\n'
+        '    {"type": "section_heading", "text": "EXPERIENCE"},\n'
+        '    {"type": "role", "company": "...", "location": "...", "title": "...", "dates": "...", "bullets": ["..."]},\n'
+        '    {"type": "paragraph", "style": "role_group_heading", "text": "Decisioning and Scoring Platforms"},\n'
+        '    {"type": "bullets", "items": ["..."]},\n'
+        '    {"type": "section_heading", "text": "EDUCATION"},\n'
+        '    {"type": "education", "degree": "...", "school": "...", "location": "...", "dates": "..."},\n'
+        '    {"type": "section_heading", "text": "CERTIFICATIONS"},\n'
+        '    {"type": "bullets", "items": ["..."]},\n'
+        '    {"type": "section_heading", "text": "OPEN SOURCE"},\n'
+        '    {"type": "bullets", "items": ["Project Name: short description | https://..."]}\n'
         "  ],\n"
-        "  \"styles\": {\n"
-        "    \"name\": {\"bold\": true, \"size_pt\": 16},\n"
-        "    \"title\": {\"bold\": true, \"size_pt\": 12},\n"
-        "    \"contact\": {\"size_pt\": 10},\n"
-        "    \"section_heading\": {\"bold\": true, \"all_caps\": true, \"space_before_pt\": 10, \"space_after_pt\": 4},\n"
-        "    \"role_group_heading\": {\"bold\": true, \"italic\": true, \"space_before_pt\": 6, \"space_after_pt\": 2}\n"
+        '  "styles": {\n'
+        '    "name": {"bold": true, "size_pt": 16},\n'
+        '    "title": {"bold": true, "size_pt": 12},\n'
+        '    "contact": {"size_pt": 10},\n'
+        '    "section_heading": {"bold": true, "all_caps": true, "space_before_pt": 10, "space_after_pt": 4},\n'
+        '    "role_group_heading": {"bold": true, "italic": true, "space_before_pt": 6, "space_after_pt": 2}\n'
         "  }\n"
         "}\n"
         f"Tailored resume text:\n{tailored_text}\n"

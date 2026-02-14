@@ -263,7 +263,9 @@ def improve_resume_iterative(
     }
 
 
-def _run_improve_once(current_resume: Dict[str, Any], job_payload: Dict[str, Any], provider: Any) -> Dict[str, Any]:
+def _run_improve_once(
+    current_resume: Dict[str, Any], job_payload: Dict[str, Any], provider: Any
+) -> Dict[str, Any]:
     prompt = prompts.resume_tailoring_improve_prompt(current_resume, job=job_payload)
     response = _generate(provider, prompt)
     payload = _parse_json_response_with_repair(
@@ -319,11 +321,7 @@ def _parse_json_response_with_repair(
             raise
 
     malformed = retry_json_text.strip() or initial_json_text.strip() or response_text.strip()
-    repair_prompt = (
-        f"{_JSON_REPAIR_PROMPT}\n"
-        "Malformed JSON:\n"
-        f"{malformed}\n"
-    )
+    repair_prompt = f"{_JSON_REPAIR_PROMPT}\nMalformed JSON:\n{malformed}\n"
     repaired_response = _generate(provider, repair_prompt)
     repaired_json_text = extract_json(repaired_response.content)
     return parse_json_object(repaired_json_text)

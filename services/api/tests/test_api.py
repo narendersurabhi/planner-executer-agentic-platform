@@ -147,11 +147,18 @@ def test_plan_created_enqueues_ready_tasks():
     )
     payload = plan.model_dump()
     payload["job_id"] = job_id
-    envelope = {"type": "plan.created", "payload": payload, "job_id": job_id, "correlation_id": "corr"}
+    envelope = {
+        "type": "plan.created",
+        "payload": payload,
+        "job_id": job_id,
+        "correlation_id": "corr",
+    }
     events: list[tuple[str, dict]] = []
     original_emit = main._emit_event
     try:
-        main._emit_event = lambda event_type, event_payload: events.append((event_type, event_payload))
+        main._emit_event = lambda event_type, event_payload: events.append(
+            (event_type, event_payload)
+        )
         main._handle_plan_created(envelope)
     finally:
         main._emit_event = original_emit

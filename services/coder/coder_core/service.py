@@ -68,7 +68,7 @@ def build_prompt(request: CodeGenRequest) -> str:
     return (
         "You are a coding agent. Return ONLY JSON (no prose, no markdown).\n"
         "Output must be a single JSON object with this shape:\n"
-        "{\"files\":[{\"path\":\"relative/path.ext\",\"content\":\"...\"}]}\n"
+        '{"files":[{"path":"relative/path.ext","content":"..."}]}\n'
         "Rules:\n"
         "- Paths must be relative (no leading slash), no '..' segments.\n"
         "- Keep code concise and runnable.\n"

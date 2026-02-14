@@ -185,9 +185,7 @@ def _convert_definition_list(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         definition = entry.get("definition")
         if not isinstance(term, str) or not isinstance(definition, str):
             continue
-        blocks.append(
-            {"type": "paragraph", "style": "term_def", "text": f"{term}: {definition}"}
-        )
+        blocks.append({"type": "paragraph", "style": "term_def", "text": f"{term}: {definition}"})
     return blocks
 
 

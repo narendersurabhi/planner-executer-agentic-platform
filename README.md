@@ -2,6 +2,16 @@
 
 A user submits a Job with a Goal in a UI. A Planner creates a structured Plan with tasks, dependencies, and required tools. Executors pick up tasks, call tools when needed, update task status, and stream progress back to the UI in real time. Optionally, a Critic validates task outputs and can trigger rework. Optionally, a Policy Gate enforces allowed tools and guardrails per environment.
 
+## Agentic Pattern
+
+This platform uses a **goal-driven Plan-and-Execute pattern** with hierarchical agents:
+
+1. **Planner (control plane):** converts a goal into a typed task DAG (tools, deps, acceptance criteria, schemas).
+2. **Executor workers (data plane):** execute ready tasks via tool calls (including MCP-backed services) and write outputs to shared memory/state.
+3. **Critic + policy gates (governance):** validate outputs, trigger rework when needed, and enforce tool/guardrail policy per environment.
+
+Operationally, this is **hierarchical multi-agent orchestration (Planner -> Executor -> Critic)** with **tool-augmented DAG execution** and **shared memory handoff** (`job_context`, `task_outputs`).
+
 ## Quickstart
 
 ```bash

@@ -137,9 +137,7 @@ def _apply_theme(document: Document, theme: Dict[str, Any]) -> None:
     normal_style = document.styles["Normal"]
     normal_style.font.name = body_font
     normal_style.font.size = Pt(float(body_size))
-    spacing = (
-        theme.get("spacing", {}) if isinstance(theme.get("spacing", {}), dict) else {}
-    )
+    spacing = theme.get("spacing", {}) if isinstance(theme.get("spacing", {}), dict) else {}
     para_after = spacing.get("para_after_pt")
     if para_after is not None:
         normal_style.paragraph_format.space_after = Pt(float(para_after))

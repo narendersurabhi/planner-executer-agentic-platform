@@ -216,9 +216,7 @@ def execute_task(task_payload: dict) -> models.TaskResult:
     finished_at = datetime.utcnow()
     validation_error = _validate_expected_output(task_payload, outputs)
     status = (
-        models.TaskStatus.failed
-        if tool_error or validation_error
-        else models.TaskStatus.completed
+        models.TaskStatus.failed if tool_error or validation_error else models.TaskStatus.completed
     )
     if tool_error:
         outputs["tool_error"] = {"error": tool_error}
@@ -266,7 +264,9 @@ def _infer_task_intent(task_payload: dict) -> str:
     return "generate"
 
 
-def _intent_mismatch(task_intent: str, tool_intent: models.ToolIntent, tool_name: str) -> str | None:
+def _intent_mismatch(
+    task_intent: str, tool_intent: models.ToolIntent, tool_name: str
+) -> str | None:
     if task_intent == "generate" and tool_intent == models.ToolIntent.transform:
         return f"tool_intent_mismatch:{tool_name}:{tool_intent.value}:{task_intent}"
     return None
@@ -1105,7 +1105,9 @@ def run() -> None:
     except redis.ResponseError:
         pass
     while True:
-        messages = redis_client.xreadgroup(group, consumer, {events.TASK_STREAM: ">"}, count=1, block=1000)
+        messages = redis_client.xreadgroup(
+            group, consumer, {events.TASK_STREAM: ">"}, count=1, block=1000
+        )
         for _, entries in messages:
             for message_id, data in entries:
                 payload = json.loads(data["data"])
@@ -1114,7 +1116,9 @@ def run() -> None:
                     continue
                 task_payload = payload.get("payload", {})
                 result = execute_task(task_payload)
-                event_type = "task.failed" if result.status == models.TaskStatus.failed else "task.completed"
+                event_type = (
+                    "task.failed" if result.status == models.TaskStatus.failed else "task.completed"
+                )
                 event = models.EventEnvelope(
                     type=event_type,
                     version="1",

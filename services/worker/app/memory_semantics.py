@@ -44,9 +44,7 @@ MEMORY_INPUT_KEYS = {
     "llm_improve_document_spec": ["document_spec"],
 }
 
-MEMORY_ONLY_INPUTS = {
-    tool_name: list(keys) for tool_name, keys in MEMORY_INPUT_KEYS.items()
-}
+MEMORY_ONLY_INPUTS = {tool_name: list(keys) for tool_name, keys in MEMORY_INPUT_KEYS.items()}
 MEMORY_ONLY_INPUTS.pop("llm_generate_resume_doc_spec_from_text", None)
 MEMORY_ONLY_INPUTS.pop("llm_generate_coverletter_doc_spec_from_text", None)
 MEMORY_ONLY_INPUTS.pop("llm_generate_cover_letter_from_resume", None)
@@ -161,7 +159,9 @@ def _is_cover_letter_document_spec(document_spec: Any) -> bool:
     return "cover" in normalized
 
 
-def _extract_docx_path_for_document(entries: Sequence[Mapping[str, Any]], document_spec: Any) -> Any:
+def _extract_docx_path_for_document(
+    entries: Sequence[Mapping[str, Any]], document_spec: Any
+) -> Any:
     preferred_alias = (
         "docx_path:cover_letter:latest"
         if _is_cover_letter_document_spec(document_spec)

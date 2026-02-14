@@ -37,7 +37,9 @@ app = FastAPI(title="Agentic Planner Executor API")
 
 cors_origins = [
     origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", "http://localhost:3002,http://localhost:3000").split(",")
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:3002,http://localhost:3000").split(
+        ","
+    )
     if origin.strip()
 ]
 app.add_middleware(
@@ -55,19 +57,13 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 ORCHESTRATOR_ENABLED = os.getenv("ORCHESTRATOR_ENABLED", "true").lower() == "true"
 POLICY_GATE_ENABLED = os.getenv("POLICY_GATE_ENABLED", "false").lower() == "true"
 JOB_RECOVERY_ENABLED = os.getenv("JOB_RECOVERY_ENABLED", "true").lower() == "true"
-DEV_RESUME_RENDER_ENABLED = (
-    os.getenv("DEV_RESUME_RENDER_ENABLED", "false").lower() == "true"
-)
+DEV_RESUME_RENDER_ENABLED = os.getenv("DEV_RESUME_RENDER_ENABLED", "false").lower() == "true"
 LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER", "").strip()
 LLM_MODEL_NAME = os.getenv("OPENAI_MODEL", "").strip()
-ORCHESTRATOR_RECOVER_PENDING = (
-    os.getenv("ORCHESTRATOR_RECOVER_PENDING", "true").lower() == "true"
-)
+ORCHESTRATOR_RECOVER_PENDING = os.getenv("ORCHESTRATOR_RECOVER_PENDING", "true").lower() == "true"
 ORCHESTRATOR_RECOVER_IDLE_MS = int(os.getenv("ORCHESTRATOR_RECOVER_IDLE_MS", "60000"))
 REPLAN_MAX = int(os.getenv("REPLAN_MAX", "1"))
-TOOL_INPUT_VALIDATION_ENABLED = (
-    os.getenv("TOOL_INPUT_VALIDATION_ENABLED", "true").lower() == "true"
-)
+TOOL_INPUT_VALIDATION_ENABLED = os.getenv("TOOL_INPUT_VALIDATION_ENABLED", "true").lower() == "true"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 TASK_OUTPUT_KEY_PREFIX = "task_output:"
 TASK_RESULT_KEY_PREFIX = "task_result:"
@@ -87,6 +83,7 @@ def _init_db() -> None:
         _start_orchestrator()
     if JOB_RECOVERY_ENABLED:
         _recover_jobs()
+
 
 jobs_created_total = Counter("jobs_created_total", "Jobs created")
 orchestrator_loop_errors_total = Counter(
@@ -199,7 +196,12 @@ def _start_orchestrator() -> None:
 def _orchestrator_loop() -> None:
     consumer = str(uuid.uuid4())
     group = "api-orchestrator"
-    stream_keys = [events.PLAN_STREAM, events.TASK_STREAM, events.CRITIC_STREAM, events.POLICY_STREAM]
+    stream_keys = [
+        events.PLAN_STREAM,
+        events.TASK_STREAM,
+        events.CRITIC_STREAM,
+        events.POLICY_STREAM,
+    ]
     local_redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     last_recovery = 0.0
     for stream in stream_keys:
@@ -336,7 +338,9 @@ def _handle_plan_created(envelope: dict) -> None:
                 acceptance_criteria=task.acceptance_criteria,
                 expected_output_schema_ref=task.expected_output_schema_ref,
                 status=models.TaskStatus.pending.value,
-                intent=task.intent.value if isinstance(task.intent, models.ToolIntent) else task.intent,
+                intent=task.intent.value
+                if isinstance(task.intent, models.ToolIntent)
+                else task.intent,
                 deps=task.deps,
                 attempts=0,
                 max_attempts=3,
@@ -807,7 +811,9 @@ def _build_task_context(
                 if child not in visited:
                     stack.append(child)
     outputs_by_id = {dep_id: _load_task_output(dep_id) for dep_id in visited}
-    outputs_by_name = {id_to_name.get(dep_id, dep_id): output for dep_id, output in outputs_by_id.items()}
+    outputs_by_name = {
+        id_to_name.get(dep_id, dep_id): output for dep_id, output in outputs_by_id.items()
+    }
     return {"dependencies": outputs_by_id, "dependencies_by_name": outputs_by_name}
 
 
@@ -827,7 +833,9 @@ def _refresh_job_status(job_id: str) -> None:
             {models.TaskStatus.completed.value, models.TaskStatus.accepted.value}
         ):
             _set_job_status(job, models.JobStatus.succeeded)
-        elif models.TaskStatus.ready.value in statuses or models.TaskStatus.running.value in statuses:
+        elif (
+            models.TaskStatus.ready.value in statuses or models.TaskStatus.running.value in statuses
+        ):
             _set_job_status(job, models.JobStatus.running)
         else:
             _set_job_status(job, models.JobStatus.planning)
@@ -1017,7 +1025,9 @@ def cancel_job(job_id: str, db: Session = Depends(get_db)) -> models.Job:
     job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not state_machine.validate_job_transition(models.JobStatus(job.status), models.JobStatus.canceled):
+    if not state_machine.validate_job_transition(
+        models.JobStatus(job.status), models.JobStatus.canceled
+    ):
         raise HTTPException(status_code=400, detail="Invalid state transition")
     job.status = models.JobStatus.canceled.value
     job.updated_at = datetime.utcnow()
@@ -1124,12 +1134,8 @@ def dev_resume_render_job(
         )
 
     now = datetime.utcnow()
-    db.query(TaskRecord).filter(TaskRecord.job_id == job_id).delete(
-        synchronize_session=False
-    )
-    db.query(PlanRecord).filter(PlanRecord.job_id == job_id).delete(
-        synchronize_session=False
-    )
+    db.query(TaskRecord).filter(TaskRecord.job_id == job_id).delete(synchronize_session=False)
+    db.query(PlanRecord).filter(PlanRecord.job_id == job_id).delete(synchronize_session=False)
 
     plan_id = str(uuid.uuid4())
     tasks_summary = "Dev render: ResumeDocSpec -> DocumentSpec -> DOCX"
@@ -1156,9 +1162,7 @@ def dev_resume_render_job(
             intent=models.ToolIntent.transform,
             deps=[],
             tool_requests=["resume_doc_spec_to_document_spec"],
-            tool_inputs={
-                "resume_doc_spec_to_document_spec": {"resume_doc_spec": resume_doc_spec}
-            },
+            tool_inputs={"resume_doc_spec_to_document_spec": {"resume_doc_spec": resume_doc_spec}},
             critic_required=False,
         )
     )
@@ -1272,6 +1276,7 @@ def stream_events(request: Request, once: bool = False):
                     last_ids[stream_name] = message_id
                     payload = data.get("data")
                     yield f"data: {payload}\n\n"
+
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
@@ -1316,7 +1321,6 @@ def read_memory(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
 
 
 @app.post("/plans", response_model=models.Plan)
