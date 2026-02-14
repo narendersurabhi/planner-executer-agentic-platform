@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "improve_iterative.response.v1",
+  "type": "object",
+  "properties": {
+    "tailored_resume": {"type": "object"},
+    "alignment_score": {"type": "number"},
+    "alignment_summary": {"type": "string"},
+    "iterations": {"type": "integer"},
+    "reached_threshold": {"type": "boolean"},
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "alignment_score": {"type": "number"},
+          "alignment_summary": {"type": "string"}
+        },
+        "required": ["alignment_score", "alignment_summary"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "tailored_resume",
+    "alignment_score",
+    "alignment_summary",
+    "iterations",
+    "reached_threshold",
+    "history"
+  ],
+  "additionalProperties": false
+}

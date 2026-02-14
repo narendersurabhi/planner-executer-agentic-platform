@@ -1,4 +1,4 @@
-# agentic-planner-executor-platform
+# Goal-Driven Agentic Workflow Engine (AWE)
 
 A user submits a Job with a Goal in a UI. A Planner creates a structured Plan with tasks, dependencies, and required tools. Executors pick up tasks, call tools when needed, update task status, and stream progress back to the UI in real time. Optionally, a Critic validates task outputs and can trigger rework. Optionally, a Policy Gate enforces allowed tools and guardrails per environment.
 

@@ -21,12 +21,15 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/agentic
       REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
       POLICY_GATE_ENABLED: ${POLICY_GATE_ENABLED:-false}
       ORCHESTRATOR_ENABLED: ${ORCHESTRATOR_ENABLED:-true}
       ORCHESTRATOR_RECOVER_PENDING: ${ORCHESTRATOR_RECOVER_PENDING:-true}
       ORCHESTRATOR_RECOVER_IDLE_MS: ${ORCHESTRATOR_RECOVER_IDLE_MS:-60000}
       JOB_RECOVERY_ENABLED: ${JOB_RECOVERY_ENABLED:-true}
+      DEV_RESUME_RENDER_ENABLED: ${DEV_RESUME_RENDER_ENABLED:-false}
     ports:
       - "18000:8000"
     depends_on:
@@ -70,10 +73,19 @@ services:
       OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
       OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
       OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
+      CODING_AGENT_TIMEOUT_S: ${CODING_AGENT_TIMEOUT_S:-30}
+      CODER_HTTP_TIMEOUT_S: ${CODER_HTTP_TIMEOUT_S:-30}
+      CODER_API_URL: ${CODER_API_URL:-http://coder:8000}
+      RESUME_TAILOR_API_URL: ${RESUME_TAILOR_API_URL:-http://tailor:8000}
+      WORKSPACE_DIR: /shared/workspace
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
     volumes:
       - ./artifacts:/shared/artifacts
+      - ./workspace:/shared/workspace
     depends_on:
       - redis
+      - coder
+      - tailor
   critic:
     build:
       context: .
@@ -98,14 +110,46 @@ services:
       - ./config:/app/config
     depends_on:
       - redis
+  tailor:
+    build:
+      context: .
+      dockerfile: services/tailor/Dockerfile
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
+      OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
+    ports:
+      - "18011:8000"
+  coder:
+    build:
+      context: .
+      dockerfile: services/coder/Dockerfile
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
+      OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
+    ports:
+      - "18010:8000"
   ui:
     build:
       context: .
       dockerfile: services/ui/Dockerfile
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
+        NEXT_PUBLIC_DEV_TOOLS: ${NEXT_PUBLIC_DEV_TOOLS:-false}
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
+      NEXT_PUBLIC_DEV_TOOLS: ${NEXT_PUBLIC_DEV_TOOLS:-false}
     ports:
       - "3002:3000"
     depends_on:

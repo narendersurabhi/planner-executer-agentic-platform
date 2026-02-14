@@ -7,7 +7,10 @@ from typing import Any, Dict, Iterable, List
 
 from docx import Document
 from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
 
@@ -25,8 +28,9 @@ def register_docx_tools(registry) -> None:
                 name="docx_generate_from_spec",
                 description="Generate an ATS-friendly .docx document from a DocumentSpec JSON",
                 usage_guidance=(
-                    "Provide path (required, relative .docx filename). document_spec is "
-                    "resolved from memory (document_spec:latest). "
+                    "Provide path (relative .docx filename). document_spec is "
+                    "resolved from memory (document_spec:latest) unless explicitly provided. "
+                    "path can be resolved from memory (docx_path:latest) when using derive_output_filename. "
                     "render_context (merged into tokens), and strict (default true). "
                     "Supported blocks: text, paragraph, heading, bullets, spacer, "
                     "optional_paragraph, repeat. "
@@ -41,7 +45,6 @@ def register_docx_tools(registry) -> None:
                         "render_context": {"type": "object"},
                         "strict": {"type": "boolean"},
                     },
-                    "required": ["document_spec", "path"],
                 },
                 output_schema={
                     "type": "object",
@@ -64,7 +67,9 @@ def register_docx_tools(registry) -> None:
 def _docx_generate_from_spec(payload: Dict[str, Any]) -> Dict[str, Any]:
     document_spec = payload.get("document_spec")
     if not isinstance(document_spec, dict):
-        _tool_error("document_spec must be an object")
+        _tool_error(
+            "document_spec missing (not found in memory). Provide document_spec explicitly."
+        )
 
     path = payload.get("path")
     if not isinstance(path, str) or not path:
@@ -143,12 +148,19 @@ def _apply_theme(document: Document, theme: Dict[str, Any]) -> None:
         normal_style.paragraph_format.line_spacing = float(line_spacing)
 
     heading_size = font_sizes.get("h1")
-    if heading_size is not None:
-        try:
-            heading_style = document.styles["Heading 1"]
+    heading_before = spacing.get("heading_before_pt", 12)
+    tight_after = spacing.get("tight_after_heading_pt", 4)
+    try:
+        heading_style = document.styles["Heading 1"]
+        if heading_size is not None:
             heading_style.font.size = Pt(float(heading_size))
-        except KeyError:
-            pass
+        heading_style.font.bold = True
+        if heading_before is not None:
+            heading_style.paragraph_format.space_before = Pt(float(heading_before))
+        if tight_after is not None:
+            heading_style.paragraph_format.space_after = Pt(float(tight_after))
+    except KeyError:
+        pass
 
     margins = (
         theme.get("page_margins_in", {})
@@ -167,10 +179,29 @@ def _apply_theme(document: Document, theme: Dict[str, Any]) -> None:
             section.__setattr__(attr, Inches(float(value)))
 
 
+def _next_rendered_block(
+    blocks: List[Dict[str, Any]], start_index: int, context: Dict[str, Any], strict: bool
+) -> Dict[str, Any] | None:
+    for idx in range(start_index + 1, len(blocks)):
+        candidate = blocks[idx]
+        if not isinstance(candidate, dict):
+            continue
+        block_type = candidate.get("type")
+        if block_type == "spacer":
+            continue
+        if block_type == "optional_paragraph":
+            when_value = candidate.get("when")
+            if not _evaluate_condition(when_value, context, strict):
+                continue
+        return candidate
+    return None
+
+
 def _render_blocks(
     document: Document, blocks: Iterable[Dict[str, Any]], context: Dict[str, Any], strict: bool
 ) -> None:
-    for block in blocks:
+    block_list = [block for block in blocks if isinstance(block, dict)]
+    for index, block in enumerate(block_list):
         if not isinstance(block, dict):
             continue
 
@@ -178,14 +209,28 @@ def _render_blocks(
 
         if block_type in {"text", "paragraph"}:
             text = _render_text(str(block.get("text", "")), context, strict)
-            _add_paragraph(document, text, block.get("style"))
+            paragraph = _add_paragraph(document, text, block.get("style"))
+            if block.get("style") == "contact" and paragraph is not None:
+                next_block = _next_rendered_block(block_list, index, context, strict)
+                next_is_contact = (
+                    isinstance(next_block, dict)
+                    and next_block.get("style") == "contact"
+                    and next_block.get("type") in {"text", "paragraph", "optional_paragraph"}
+                )
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0 if next_is_contact else 10)
 
         elif block_type == "heading":
             level = block.get("level", 1)
             if not isinstance(level, int) or level < 1 or level > 3:
                 level = 1
             text = _render_text(str(block.get("text", "")), context, strict)
-            document.add_heading(text, level=level)
+            paragraph = document.add_heading(text, level=level)
+            if block.get("style") == "section_heading":
+                paragraph.paragraph_format.space_before = Pt(12)
+                paragraph.paragraph_format.space_after = Pt(4)
+                paragraph.paragraph_format.keep_with_next = True
+                _set_paragraph_bottom_border(paragraph)
 
         elif block_type == "bullets":
             items = _resolve_items(block.get("items"), context, strict)
@@ -201,7 +246,16 @@ def _render_blocks(
             should_render = _evaluate_condition(when_value, context, strict)
             if should_render:
                 text = _render_text(str(block.get("text", "")), context, strict)
-                _add_paragraph(document, text, block.get("style"))
+                paragraph = _add_paragraph(document, text, block.get("style"))
+                if block.get("style") == "contact" and paragraph is not None:
+                    next_block = _next_rendered_block(block_list, index, context, strict)
+                    next_is_contact = (
+                        isinstance(next_block, dict)
+                        and next_block.get("style") == "contact"
+                        and next_block.get("type") in {"text", "paragraph", "optional_paragraph"}
+                    )
+                    paragraph.paragraph_format.space_before = Pt(0)
+                    paragraph.paragraph_format.space_after = Pt(0 if next_is_contact else 10)
 
         elif block_type == "repeat":
             items = _resolve_items(block.get("items"), context, strict)
@@ -221,16 +275,109 @@ def _render_blocks(
             continue
 
 
-def _add_paragraph(document: Document, text: str, style_hint: Any, bullet: bool = False) -> None:
+def _add_paragraph(
+    document: Document, text: str, style_hint: Any, bullet: bool = False
+) -> Paragraph | None:
     paragraph = document.add_paragraph()
     if bullet:
         paragraph.style = "List Bullet"
+    if style_hint == "section_rule":
+        paragraph.paragraph_format.space_before = Pt(2)
+        paragraph.paragraph_format.space_after = Pt(6)
+        _set_paragraph_bottom_border(paragraph)
+        return paragraph
+    if style_hint == "term_def":
+        paragraph.paragraph_format.space_after = Pt(2)
+        _add_term_definition_runs(paragraph, text)
+        return paragraph
+    if style_hint == "role_title":
+        run = paragraph.add_run(text)
+        run.bold = True
+        paragraph.paragraph_format.space_before = Pt(10)
+        paragraph.paragraph_format.space_after = Pt(1)
+        paragraph.paragraph_format.keep_with_next = True
+        return paragraph
+    if style_hint == "role_meta":
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(4)
+        paragraph.paragraph_format.keep_with_next = True
+        _add_role_meta_runs(paragraph, text)
+        return paragraph
+    if style_hint == "role_group_heading":
+        run = paragraph.add_run(text)
+        run.bold = True
+        run.italic = True
+        paragraph.paragraph_format.space_before = Pt(6)
+        paragraph.paragraph_format.space_after = Pt(2)
+        paragraph.paragraph_format.keep_with_next = True
+        paragraph.paragraph_format.keep_together = True
+        return paragraph
+    if style_hint == "role_header":
+        _set_right_tab_stop(paragraph, document)
+        if "\t" in text:
+            left, right = text.split("\t", 1)
+            left_run = paragraph.add_run(left.strip())
+            left_run.bold = True
+            paragraph.add_run("\t")
+            paragraph.add_run(right.strip())
+        else:
+            run = paragraph.add_run(text)
+            run.bold = True
+        paragraph.paragraph_format.space_before = Pt(4)
+        paragraph.paragraph_format.space_after = Pt(2)
+        return paragraph
+
     run = paragraph.add_run(text)
-    if style_hint in {"name", "body_bold"}:
+    if style_hint == "cover_letter_name":
+        run.bold = True
+        run.font.size = Pt(20)
+        run.font.name = "Calibri"
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(3)
+        return paragraph
+    if style_hint == "cover_letter_date":
+        paragraph.paragraph_format.space_before = Pt(10)
+        paragraph.paragraph_format.space_after = Pt(8)
+        return paragraph
+    if style_hint == "cover_letter_recipient":
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(2)
+        return paragraph
+    if style_hint == "cover_letter_salutation":
+        paragraph.paragraph_format.space_before = Pt(8)
+        paragraph.paragraph_format.space_after = Pt(8)
+        return paragraph
+    if style_hint == "cover_letter_body":
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(8)
+        return paragraph
+    if style_hint == "cover_letter_closing":
+        paragraph.paragraph_format.space_before = Pt(8)
+        paragraph.paragraph_format.space_after = Pt(2)
+        return paragraph
+    if style_hint == "cover_letter_signature":
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0)
+        return paragraph
+    if style_hint == "title":
+        run.bold = True
+        run.font.size = Pt(22)
+        run.font.name = "Calibri"
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(3)
+    if style_hint == "subtitle":
+        run.bold = False
+        run.font.size = Pt(13)
+        run.font.name = "Calibri"
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(6)
+    if style_hint in {"body_bold"}:
         run.bold = True
     if style_hint == "contact":
         paragraph.paragraph_format.space_after = Pt(0)
         paragraph.paragraph_format.space_before = Pt(0)
+        run.font.name = "Calibri"
+        run.font.size = Pt(10.5)
     if style_hint == "dates_right":
         paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     if style_hint == "divider":
@@ -242,6 +389,62 @@ def _add_paragraph(document: Document, text: str, style_hint: Any, bullet: bool 
         paragraph.paragraph_format.space_after = Pt(2)
         paragraph.paragraph_format.left_indent = Pt(18)
         paragraph.paragraph_format.first_line_indent = Pt(-9)
+    return paragraph
+
+
+def _set_right_tab_stop(paragraph, document: Document) -> None:
+    try:
+        section = document.sections[0]
+        usable_width = section.page_width - section.left_margin - section.right_margin
+        paragraph.paragraph_format.tab_stops.add_tab_stop(
+            usable_width, alignment=WD_TAB_ALIGNMENT.RIGHT
+        )
+    except Exception:
+        return
+
+
+def _set_paragraph_bottom_border(paragraph) -> None:
+    p_pr = paragraph._p.get_or_add_pPr()
+    p_bdr = p_pr.find(qn("w:pBdr"))
+    if p_bdr is None:
+        p_bdr = OxmlElement("w:pBdr")
+        p_pr.append(p_bdr)
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "999999")
+    p_bdr.append(bottom)
+
+
+def _add_term_definition_runs(paragraph, text: str) -> None:
+    if ":" in text:
+        term, definition = text.split(":", 1)
+        term_run = paragraph.add_run(term.strip() + ":")
+        term_run.bold = True
+        if definition.strip():
+            paragraph.add_run(" " + definition.strip())
+        return
+    if " - " in text:
+        term, definition = text.split(" - ", 1)
+        term_run = paragraph.add_run(term.strip())
+        term_run.bold = True
+        if definition.strip():
+            paragraph.add_run(" - " + definition.strip())
+        return
+    run = paragraph.add_run(text)
+    run.bold = True
+
+
+def _add_role_meta_runs(paragraph, text: str) -> None:
+    if "|" in text:
+        left, right = text.split("|", 1)
+        paragraph.add_run(left.strip())
+        paragraph.add_run(" | ")
+        right_run = paragraph.add_run(right.strip())
+        right_run.italic = True
+        return
+    paragraph.add_run(text)
 
 
 def _resolve_items(value: Any, context: Dict[str, Any], strict: bool) -> List[Any]:
@@ -292,6 +495,8 @@ def _render_text(text: str, context: Dict[str, Any], strict: bool) -> str:
         return str(value)
 
     rendered = re.sub(r"\{\{\s*(.*?)\s*\}\}", replace, text)
+    # Normalize en-dash/em-dash to hyphen for ATS-friendly output.
+    rendered = rendered.replace("\u2013", "-").replace("\u2014", "-")
     if strict and re.search(r"\{\{\s*(.*?)\s*\}\}", rendered):
         _tool_error("Unresolved placeholders remain after rendering")
     return rendered

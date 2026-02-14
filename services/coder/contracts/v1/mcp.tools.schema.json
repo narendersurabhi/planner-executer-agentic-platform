@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "coder.mcp.tools.v1",
+  "type": "object",
+  "properties": {
+    "protocol": {"type": "string"},
+    "version": {"type": "string"},
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "description": {"type": "string"},
+          "schema_version": {"type": "string"},
+          "input_schema": {"type": "object"},
+          "output_schema": {"type": "object"}
+        },
+        "required": [
+          "name",
+          "description",
+          "schema_version",
+          "input_schema",
+          "output_schema"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["protocol", "version", "tools"],
+  "additionalProperties": false
+}

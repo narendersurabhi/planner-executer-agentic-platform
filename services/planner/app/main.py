@@ -164,6 +164,7 @@ def llm_plan(
     candidate = _ensure_llm_tool(candidate)
     candidate = _ensure_job_inputs(candidate, job, tools)
     candidate = _apply_max_depth(candidate)
+    logger.info("llm_plan_candidate", plan=candidate.model_dump())
     valid, reason = _validate_plan(candidate, tools)
     if not valid:
         logger.warning("llm_plan_invalid", reason=reason)
@@ -301,8 +302,16 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
         "   - Generate a DocumentSpec JSON.\n"
         "   - Validate with document_spec_validate.\n"
         "   - Render with docx_generate_from_spec.\n"
-        "   Use specialized tools (e.g., resume_generate_ats_docx) only if explicitly requested.\n"
+        "   Use specialized tools only if explicitly requested.\n"
         "7) If unsure, use llm_generate.\n"
+        "8) Keep output compact. Do NOT copy or embed large raw text from Job JSON "
+        "(especially job_description or candidate_resume) into tasks, instructions, "
+        "acceptance criteria, or tool_inputs.\n"
+        "9) For tool_inputs include only minimal scalar params. Omit large/context fields "
+        "(e.g., job, memory, tailored_resume, tailored_text, resume_doc_spec, document_spec) "
+        "and rely on runtime dependency/context injection.\n"
+        "10) Keep each task instruction concise (one short paragraph) and keep acceptance "
+        "criteria short bullets.\n"
         "\n"
         f"{depth_hint}"
         f"Allowed tool names: {tool_names}\n"
@@ -320,34 +329,85 @@ def _document_spec_prompt(job: models.Job, allowed_block_types: List[str]) -> st
 
 @_log_entry_exit("_parse_llm_plan")
 def _parse_llm_plan(content: str) -> models.PlanCreate | None:
-    cleaned = _extract_json(content)
-    if not cleaned:
-        return None
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return None
-    try:
-        return models.PlanCreate.model_validate(data)
-    except Exception:
-        return None
+    candidates = [_extract_json(content), content.strip()]
+    for candidate in candidates:
+        data = _decode_json_object(candidate)
+        if not isinstance(data, dict):
+            continue
+        try:
+            return models.PlanCreate.model_validate(data)
+        except Exception:
+            continue
+    return None
 
 
 @_log_entry_exit("_extract_json")
 def _extract_json(content: str) -> str:
-    text = content.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) > 1:
-            text = parts[1]
-        text = text.lstrip()
-        if text.startswith("json"):
-            text = text[4:].lstrip()
+    text = _strip_markdown_fence(content.strip())
+    text = _unwrap_json_string(text)
+    if text.startswith("{") and text.endswith("}"):
+        return text
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return ""
-    return text[start : end + 1]
+    extracted = text[start : end + 1]
+    extracted = _unwrap_json_string(extracted)
+    return extracted
+
+
+def _strip_markdown_fence(text: str) -> str:
+    if not text.startswith("```"):
+        return text
+    parts = text.split("```")
+    if len(parts) <= 1:
+        return text
+    candidate = parts[1].lstrip()
+    if candidate.startswith("json"):
+        candidate = candidate[4:].lstrip()
+    return candidate
+
+
+def _unwrap_json_string(text: str) -> str:
+    candidate = text.strip()
+    for _ in range(2):
+        if not (candidate.startswith('"') and candidate.endswith('"')):
+            break
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError:
+            break
+        if not isinstance(decoded, str):
+            break
+        candidate = decoded.strip()
+    return candidate
+
+
+def _decode_json_object(text: str) -> dict | None:
+    queue = [text]
+    seen: set[str] = set()
+    while queue:
+        candidate = queue.pop(0).strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            unwrapped = _unwrap_json_string(candidate)
+            if unwrapped and unwrapped != candidate:
+                queue.append(unwrapped)
+            if '\\"' in candidate:
+                queue.append(candidate.replace('\\"', '"'))
+            extracted = _extract_json(candidate)
+            if extracted and extracted != candidate:
+                queue.append(extracted)
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            queue.append(parsed)
+    return None
 
 
 def _ensure_llm_tool(plan: models.PlanCreate) -> models.PlanCreate:
@@ -394,7 +454,6 @@ def _ensure_job_inputs(
 
 def _validate_plan(plan: models.PlanCreate, tools: List[models.ToolSpec]) -> tuple[bool, str]:
     tool_map = {tool.name: tool for tool in tools}
-    task_by_name = {task.name: task for task in plan.tasks}
     for task in plan.tasks:
         if not task.tool_requests:
             continue

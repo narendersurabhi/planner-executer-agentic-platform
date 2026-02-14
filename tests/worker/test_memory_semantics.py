@@ -3,14 +3,44 @@ from services.worker.app import memory_semantics
 
 def test_select_memory_payload_filters_keys() -> None:
     output = {
-        "tailored_resume": {"summary": "hi", "skills": [], "experience": [], "education": [], "certifications": []},
+        "tailored_resume": {
+            "schema_version": "1.0",
+            "header": {
+                "name": "Jane Doe",
+                "title": "Engineer",
+                "location": "Okemos, MI",
+                "phone": "123",
+                "email": "jane@example.com",
+                "links": {"linkedin": "https://example.com"},
+            },
+            "summary": "hi",
+            "skills": [],
+            "experience": [],
+            "education": [],
+            "certifications": [],
+        },
         "alignment_score": 92.5,
         "alignment_summary": "strong match",
         "extra": "ignore",
     }
     selected = memory_semantics.select_memory_payload("llm_improve_tailored_resume_text", output)
     assert selected == {
-        "tailored_resume": {"summary": "hi", "skills": [], "experience": [], "education": [], "certifications": []},
+        "tailored_resume": {
+            "schema_version": "1.0",
+            "header": {
+                "name": "Jane Doe",
+                "title": "Engineer",
+                "location": "Okemos, MI",
+                "phone": "123",
+                "email": "jane@example.com",
+                "links": {"linkedin": "https://example.com"},
+            },
+            "summary": "hi",
+            "skills": [],
+            "experience": [],
+            "education": [],
+            "certifications": [],
+        },
         "alignment_score": 92.5,
         "alignment_summary": "strong match",
     }
@@ -22,6 +52,15 @@ def test_apply_memory_defaults_fills_missing_tailored_text() -> None:
             "task_outputs": [
                 {
                     "tailored_resume": {
+                        "schema_version": "1.0",
+                        "header": {
+                            "name": "Jane Doe",
+                            "title": "Engineer",
+                            "location": "Okemos, MI",
+                            "phone": "123",
+                            "email": "jane@example.com",
+                            "links": {"linkedin": "https://example.com"},
+                        },
                         "summary": "from memory",
                         "skills": [],
                         "experience": [],
@@ -32,6 +71,15 @@ def test_apply_memory_defaults_fills_missing_tailored_text() -> None:
                 },
                 {
                     "tailored_resume": {
+                        "schema_version": "1.0",
+                        "header": {
+                            "name": "Jane Doe",
+                            "title": "Engineer",
+                            "location": "Okemos, MI",
+                            "phone": "123",
+                            "email": "jane@example.com",
+                            "links": {"linkedin": "https://example.com"},
+                        },
                         "summary": "older",
                         "skills": [],
                         "experience": [],
@@ -51,14 +99,15 @@ def test_apply_memory_defaults_overrides_manual_when_memory_only() -> None:
         "tailored_resume": {
             "header": {
                 "name": "Manual",
+                "title": "Role",
                 "location": "Somewhere",
                 "phone": "123",
                 "email": "a@b.com",
-                "linkedin": "",
-                "github": "",
+                "links": {"linkedin": "https://example.com"},
             },
+            "schema_version": "1.0",
             "summary": "manual",
-            "skills": [{"term": "t", "definition": "d"}],
+            "skills": [{"group_name": "Tech", "items": ["t"]}],
             "experience": [
                 {
                     "company": "Manual",
@@ -78,14 +127,15 @@ def test_apply_memory_defaults_overrides_manual_when_memory_only() -> None:
                     "tailored_resume": {
                         "header": {
                             "name": "Memory",
+                            "title": "Role",
                             "location": "Somewhere",
                             "phone": "123",
                             "email": "a@b.com",
-                            "linkedin": "",
-                            "github": "",
+                            "links": {"linkedin": "https://example.com"},
                         },
+                        "schema_version": "1.0",
                         "summary": "from memory",
-                        "skills": [{"term": "t", "definition": "d"}],
+                        "skills": [{"group_name": "Tech", "items": ["t"]}],
                         "experience": [
                             {
                                 "company": "Memory",
@@ -112,6 +162,15 @@ def test_apply_memory_defaults_prefers_latest_keyed_entry() -> None:
             "task_outputs": [
                 {
                     "tailored_resume": {
+                        "schema_version": "1.0",
+                        "header": {
+                            "name": "Jane Doe",
+                            "title": "Engineer",
+                            "location": "Okemos, MI",
+                            "phone": "123",
+                            "email": "jane@example.com",
+                            "links": {"linkedin": "https://example.com"},
+                        },
                         "summary": "older",
                         "skills": [],
                         "experience": [],
@@ -122,6 +181,15 @@ def test_apply_memory_defaults_prefers_latest_keyed_entry() -> None:
                 {
                     "_memory_key": "tailored_resume:latest",
                     "tailored_resume": {
+                        "schema_version": "1.0",
+                        "header": {
+                            "name": "Jane Doe",
+                            "title": "Engineer",
+                            "location": "Okemos, MI",
+                            "phone": "123",
+                            "email": "jane@example.com",
+                            "links": {"linkedin": "https://example.com"},
+                        },
                         "summary": "preferred",
                         "skills": [],
                         "experience": [],
@@ -146,11 +214,41 @@ def test_extract_memory_value_prefers_alignment_latest_key() -> None:
 
 
 def test_select_memory_payload_includes_resume_doc_spec() -> None:
-    output = {"resume_doc_spec": {"doc_type": "resume"}, "extra": "ignore"}
+    output = {
+        "resume_doc_spec": {"doc_type": "resume"},
+        "validation": {"valid": True, "errors": [], "warnings": [], "stats": {"block_count": 1}},
+        "extra": "ignore",
+    }
     selected = memory_semantics.select_memory_payload(
         "llm_generate_resume_doc_spec_from_text", output
     )
-    assert selected == {"resume_doc_spec": {"doc_type": "resume"}}
+    assert selected == {
+        "resume_doc_spec": {"doc_type": "resume"},
+        "validation": {"valid": True, "errors": [], "warnings": [], "stats": {"block_count": 1}},
+    }
+
+
+def test_select_memory_payload_includes_cover_letter() -> None:
+    output = {
+        "cover_letter": {"full_name": "Jane Doe", "body": "Hello"},
+        "extra": "ignore",
+    }
+    selected = memory_semantics.select_memory_payload(
+        "llm_generate_cover_letter_from_resume", output
+    )
+    assert selected == {"cover_letter": {"full_name": "Jane Doe", "body": "Hello"}}
+
+
+def test_select_memory_payload_includes_coverletter_doc_spec() -> None:
+    output = {
+        "coverletter_doc_spec": {"doc_type": "cover_letter"},
+        "validation": {"valid": True},
+        "extra": "ignore",
+    }
+    selected = memory_semantics.select_memory_payload(
+        "llm_generate_coverletter_doc_spec_from_text", output
+    )
+    assert selected == {"coverletter_doc_spec": {"doc_type": "cover_letter"}}
 
 
 def test_apply_memory_defaults_fills_resume_doc_spec() -> None:
@@ -165,7 +263,25 @@ def test_apply_memory_defaults_fills_resume_doc_spec() -> None:
     assert updated["resume_doc_spec"]["doc_type"] == "resume"
 
 
-def test_memory_only_inputs_drop_manual_value() -> None:
+def test_coverletter_doc_spec_converter_fills_from_memory() -> None:
+    payload = {
+        "memory": {
+            "task_outputs": [
+                {
+                    "_memory_key": "coverletter_doc_spec:latest",
+                    "coverletter_doc_spec": {"doc_type": "cover_letter"},
+                }
+            ]
+        }
+    }
+    updated = memory_semantics.apply_memory_defaults(
+        "coverletter_doc_spec_to_document_spec",
+        payload,
+    )
+    assert updated["coverletter_doc_spec"]["doc_type"] == "cover_letter"
+
+
+def test_docx_generate_from_spec_preserves_manual_value() -> None:
     payload = {
         "document_spec": {"doc_type": "manual"},
         "memory": {
@@ -175,10 +291,107 @@ def test_memory_only_inputs_drop_manual_value() -> None:
         },
     }
     updated = memory_semantics.apply_memory_defaults("docx_generate_from_spec", payload)
-    assert updated["document_spec"]["doc_type"] == "memory"
+    assert updated["document_spec"]["doc_type"] == "manual"
+
+
+def test_cover_letter_generate_fills_from_memory() -> None:
+    payload = {
+        "memory": {
+            "task_outputs": [
+                {
+                    "_memory_key": "cover_letter:latest",
+                    "cover_letter": {"full_name": "Jane Doe", "body": "Hello"},
+                },
+                {"_memory_key": "docx_path:latest", "path": "cover_letters/jane.docx"},
+            ]
+        },
+    }
+    updated = memory_semantics.apply_memory_defaults("cover_letter_generate_ats_docx", payload)
+    assert updated["cover_letter"]["full_name"] == "Jane Doe"
+    assert updated["path"] == "cover_letters/jane.docx"
 
 
 def test_missing_memory_only_inputs_detects_missing() -> None:
     payload = {"memory": {"task_outputs": []}}
     missing = memory_semantics.missing_memory_only_inputs("docx_generate_from_spec", payload)
-    assert missing == ["document_spec"]
+    assert missing == []
+
+
+def test_document_spec_validate_is_not_memory_only() -> None:
+    payload = {"memory": {"task_outputs": []}}
+    missing = memory_semantics.missing_memory_only_inputs("document_spec_validate", payload)
+    assert missing == []
+
+
+def test_resume_doc_spec_to_document_spec_is_memory_only() -> None:
+    payload = {"memory": {"task_outputs": []}}
+    missing = memory_semantics.missing_memory_only_inputs(
+        "resume_doc_spec_to_document_spec", payload
+    )
+    assert missing == ["resume_doc_spec"]
+
+
+def test_coverletter_doc_spec_to_document_spec_is_memory_only() -> None:
+    payload = {"memory": {"task_outputs": []}}
+    missing = memory_semantics.missing_memory_only_inputs(
+        "coverletter_doc_spec_to_document_spec", payload
+    )
+    assert missing == ["coverletter_doc_spec"]
+
+
+def test_cover_letter_generate_is_not_memory_only() -> None:
+    payload = {"memory": {"task_outputs": []}}
+    missing = memory_semantics.missing_memory_only_inputs("cover_letter_generate_ats_docx", payload)
+    assert missing == []
+
+
+def test_coverletter_doc_spec_llm_tool_is_not_memory_only() -> None:
+    payload = {"memory": {"task_outputs": []}}
+    missing = memory_semantics.missing_memory_only_inputs(
+        "llm_generate_coverletter_doc_spec_from_text", payload
+    )
+    assert missing == []
+
+
+def test_stable_memory_keys_for_derive_output_filename_adds_type_alias() -> None:
+    resume_keys = memory_semantics.stable_memory_keys(
+        "derive_output_filename",
+        {"path": "resumes/a.docx", "document_type": "resume"},
+    )
+    assert "docx_path:latest" in resume_keys
+    assert "docx_path:resume:latest" in resume_keys
+
+    cover_keys = memory_semantics.stable_memory_keys(
+        "derive_output_filename",
+        {"path": "resumes/b.docx", "document_type": "cover_letter"},
+    )
+    assert "docx_path:latest" in cover_keys
+    assert "docx_path:cover_letter:latest" in cover_keys
+
+
+def test_docx_generate_from_spec_uses_resume_specific_path_alias() -> None:
+    payload = {
+        "document_spec": {"doc_type": "resume_doc_spec_converted"},
+        "memory": {
+            "task_outputs": [
+                {"_memory_key": "docx_path:latest", "path": "resumes/cover.docx"},
+                {"_memory_key": "docx_path:resume:latest", "path": "resumes/resume.docx"},
+            ]
+        },
+    }
+    updated = memory_semantics.apply_memory_defaults("docx_generate_from_spec", payload)
+    assert updated["path"] == "resumes/resume.docx"
+
+
+def test_docx_generate_from_spec_uses_cover_letter_specific_path_alias() -> None:
+    payload = {
+        "document_spec": {"doc_type": "coverletter_doc_spec_converted"},
+        "memory": {
+            "task_outputs": [
+                {"_memory_key": "docx_path:latest", "path": "resumes/resume.docx"},
+                {"_memory_key": "docx_path:cover_letter:latest", "path": "resumes/cover.docx"},
+            ]
+        },
+    }
+    updated = memory_semantics.apply_memory_defaults("docx_generate_from_spec", payload)
+    assert updated["path"] == "resumes/cover.docx"

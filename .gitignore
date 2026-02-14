@@ -5,3 +5,7 @@ node_modules/
 .next/
 .env
 *.sqlite
+/workspace/
+/artifacts/
+/templates/
+/.pytest_cache/

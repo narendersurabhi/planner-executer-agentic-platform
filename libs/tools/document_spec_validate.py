@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
 
@@ -21,7 +21,8 @@ def register_document_spec_tools(registry) -> None:
                     "Provide document_spec and optional render_context merged into tokens. "
                     "strict=true fails on unresolved placeholders (where resolvable). "
                     "Validates supported blocks: text, paragraph, heading, bullets, spacer, "
-                    "optional_paragraph, repeat."
+                    "optional_paragraph, repeat. If document_spec is omitted, it is resolved from "
+                    "memory (document_spec:latest)."
                 ),
                 input_schema={
                     "type": "object",
@@ -33,7 +34,6 @@ def register_document_spec_tools(registry) -> None:
                         "max_depth": {"type": "integer"},
                         "max_blocks": {"type": "integer"},
                     },
-                    "required": ["document_spec"],
                 },
                 output_schema={
                     "type": "object",
@@ -58,7 +58,11 @@ def register_document_spec_tools(registry) -> None:
 def _document_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
     spec = payload.get("document_spec")
     if not isinstance(spec, dict):
-        return _result(False, [err("/", "document_spec must be an object")], [], 0, 0, 0)
+        from libs.core.tool_registry import ToolExecutionError
+
+        raise ToolExecutionError(
+            "document_spec missing (not found in memory). Provide document_spec explicitly."
+        )
 
     render_context = payload.get("render_context", {})
     if render_context is None:

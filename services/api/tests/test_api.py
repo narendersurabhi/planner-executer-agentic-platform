@@ -2,7 +2,6 @@ import os
 import uuid
 from datetime import datetime
 
-import sqlalchemy
 from fastapi.testclient import TestClient
 
 os.environ["DATABASE_URL"] = "sqlite:///./test.db"

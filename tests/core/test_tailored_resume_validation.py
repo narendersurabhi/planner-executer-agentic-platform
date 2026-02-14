@@ -3,16 +3,17 @@ from libs.core.tool_registry import ToolExecutionError, _ensure_required_resume_
 
 def _valid_resume():
     return {
+        "schema_version": "1.0",
         "header": {
             "name": "Jane Doe",
+            "title": "Senior Engineer",
             "location": "Okemos, MI",
             "phone": "+1 (555) 555-5555",
             "email": "jane@example.com",
-            "linkedin": "https://www.linkedin.com/in/janedoe",
-            "github": "https://github.com/janedoe",
+            "links": {"linkedin": "https://www.linkedin.com/in/janedoe"},
         },
         "summary": "Senior engineer with relevant experience.",
-        "skills": [{"term": "Python", "definition": "Backend services"}],
+        "skills": [{"group_name": "Languages", "items": ["Python", "SQL"]}],
         "experience": [
             {
                 "company": "Acme",
@@ -24,8 +25,6 @@ def _valid_resume():
         ],
         "education": [],
         "certifications": [],
-        "credibility_gate": [],
-        "one_page_selection": [],
     }
 
 

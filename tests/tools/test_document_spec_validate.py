@@ -1,5 +1,3 @@
-import pytest
-
 from libs.tools.document_spec_validate_old import _document_spec_validate
 
 

@@ -15,12 +15,12 @@ def register_resume_doc_spec_convert_tools(registry) -> None:
                 description="Convert a ResumeDocSpec JSON into a DocumentSpec JSON",
                 usage_guidance=(
                     "Provide resume_doc_spec. Returns document_spec suitable for document_spec_validate "
-                    "and docx_generate_from_spec."
+                    "and docx_generate_from_spec. If omitted, resume_doc_spec is resolved from memory "
+                    "(resume_doc_spec:latest)."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {"resume_doc_spec": {"type": "object"}},
-                    "required": ["resume_doc_spec"],
                 },
                 output_schema={
                     "type": "object",
@@ -43,7 +43,9 @@ def _resume_doc_spec_to_document_spec(payload: Dict[str, Any]) -> Dict[str, Any]
 
     resume_spec = payload.get("resume_doc_spec")
     if not isinstance(resume_spec, dict):
-        raise ToolExecutionError("resume_doc_spec must be an object")
+        raise ToolExecutionError(
+            "resume_doc_spec missing (not found in memory). Provide resume_doc_spec explicitly."
+        )
 
     defaults = resume_spec.get("defaults", {})
     page = resume_spec.get("page", {})
@@ -99,6 +101,8 @@ def _convert_content(content: Any) -> List[Dict[str, Any]]:
     if not isinstance(content, list):
         return blocks
 
+    current_section = ""
+
     for item in content:
         if not isinstance(item, dict):
             continue
@@ -108,8 +112,15 @@ def _convert_content(content: Any) -> List[Dict[str, Any]]:
         elif item_type == "section_heading":
             text = item.get("text")
             if isinstance(text, str) and text.strip():
-                blocks.append({"type": "heading", "level": 1, "text": text.strip()})
-                blocks.append({"type": "paragraph", "style": "divider", "text": "—"})
+                current_section = text.strip().upper()
+                blocks.append(
+                    {
+                        "type": "heading",
+                        "level": 1,
+                        "text": text.strip(),
+                        "style": "section_heading",
+                    }
+                )
         elif item_type == "paragraph":
             text = item.get("text")
             if isinstance(text, str):
@@ -127,7 +138,10 @@ def _convert_content(content: Any) -> List[Dict[str, Any]]:
         elif item_type == "bullets":
             bullets = item.get("items")
             if isinstance(bullets, list):
-                blocks.append({"type": "bullets", "items": bullets})
+                block: Dict[str, Any] = {"type": "bullets", "items": bullets}
+                if current_section in {"CERTIFICATION", "CERTIFICATIONS"}:
+                    block["style"] = "term_def"
+                blocks.append(block)
         else:
             # ignore unsupported blocks to keep conversion resilient
             continue
@@ -149,7 +163,12 @@ def _convert_header(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         out = {"type": "text", "text": text}
         style = block.get("style")
         if isinstance(style, str):
-            out["style"] = style
+            if style == "name":
+                out["style"] = "title"
+            elif style == "title":
+                out["style"] = "subtitle"
+            else:
+                out["style"] = style
         blocks.append(out)
     return blocks
 
@@ -166,7 +185,9 @@ def _convert_definition_list(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         definition = entry.get("definition")
         if not isinstance(term, str) or not isinstance(definition, str):
             continue
-        blocks.append({"type": "paragraph", "text": f"{term}: {definition}"})
+        blocks.append(
+            {"type": "paragraph", "style": "term_def", "text": f"{term}: {definition}"}
+        )
     return blocks
 
 
@@ -176,18 +197,32 @@ def _convert_role(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     company = item.get("company")
     location = item.get("location")
     dates = item.get("dates")
-    if isinstance(title, str) or isinstance(company, str):
-        parts = [p for p in [title, company, location] if isinstance(p, str) and p.strip()]
-        if parts:
-            blocks.append(
-                {"type": "paragraph", "style": "body_bold", "text": " | ".join(parts)}
-            )
+    title_text = title.strip() if isinstance(title, str) and title.strip() else ""
+    if not title_text:
+        title_text = company.strip() if isinstance(company, str) and company.strip() else ""
+    if title_text:
+        blocks.append({"type": "paragraph", "style": "role_title", "text": title_text})
+    meta_parts = []
+    if isinstance(company, str) and company.strip() and company.strip() != title_text:
+        meta_parts.append(company.strip())
+    if isinstance(location, str) and location.strip():
+        if meta_parts:
+            meta_parts.append(location.strip())
+        else:
+            meta_parts.append(location.strip())
+    if meta_parts:
+        meta_text = " - ".join(meta_parts) if len(meta_parts) > 1 else meta_parts[0]
+    else:
+        meta_text = ""
     if isinstance(dates, str) and dates.strip():
-        blocks.append({"type": "paragraph", "style": "dates_right", "text": dates.strip()})
+        meta_text = f"{meta_text} | {dates.strip()}" if meta_text else dates.strip()
+    if meta_text:
+        blocks.append({"type": "paragraph", "style": "role_meta", "text": meta_text})
     bullets = item.get("bullets")
     if isinstance(bullets, list):
-        blocks.append({"type": "bullets", "items": bullets})
-        blocks.append({"type": "spacer"})
+        items = [b for b in bullets if isinstance(b, str) and b.strip()]
+        if items:
+            blocks.append({"type": "bullets", "items": items})
     return blocks
 
 
@@ -197,7 +232,20 @@ def _convert_education(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     school = item.get("school")
     location = item.get("location")
     dates = item.get("dates")
-    parts = [p for p in [degree, school, location, dates] if isinstance(p, str) and p.strip()]
-    if parts:
-        blocks.append({"type": "paragraph", "text": " | ".join(parts)})
+
+    degree_text = degree.strip() if isinstance(degree, str) and degree.strip() else ""
+    if degree_text:
+        blocks.append({"type": "paragraph", "style": "role_title", "text": degree_text})
+
+    meta_parts = []
+    if isinstance(school, str) and school.strip():
+        meta_parts.append(school.strip())
+    if isinstance(location, str) and location.strip():
+        meta_parts.append(location.strip())
+    meta_text = " - ".join(meta_parts) if meta_parts else ""
+    if isinstance(dates, str) and dates.strip():
+        meta_text = f"{meta_text} | {dates.strip()}" if meta_text else dates.strip()
+    if meta_text:
+        blocks.append({"type": "paragraph", "style": "role_meta", "text": meta_text})
+
     return blocks

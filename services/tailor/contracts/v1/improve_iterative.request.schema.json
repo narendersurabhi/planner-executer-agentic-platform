@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "improve_iterative.request.v1",
+  "type": "object",
+  "properties": {
+    "tailored_resume": {"type": ["object", "null"]},
+    "tailored_text": {"type": ["string", "null"]},
+    "job": {"type": "object"},
+    "memory": {"type": ["object", "null"]},
+    "min_alignment_score": {"type": "number"},
+    "max_iterations": {"type": "integer", "minimum": 1}
+  },
+  "required": ["job"],
+  "additionalProperties": false
+}
