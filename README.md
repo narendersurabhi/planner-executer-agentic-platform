@@ -26,6 +26,10 @@ make test
 make lint
 ```
 
+```bash
+make typecheck
+```
+
 ## Architecture
 
 ```mermaid
@@ -148,3 +152,4 @@ Place JSON schema files in `schemas/` and reference them with `schema/<name>`.
 - If Redis streams are empty, ensure redis is running and the services are connected.
 - If SSE events are not visible, verify the API is reachable at http://localhost:8000.
 - If Postgres migrations fail, confirm DATABASE_URL and run alembic upgrade head.
+- If mypy fails unexpectedly, run `mypy --config-file mypy.ini` (same command used by CI).

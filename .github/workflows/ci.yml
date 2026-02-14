@@ -35,7 +35,7 @@ jobs:
       - name: Format
         run: ruff format --check libs services
       - name: Type check
-        run: mypy libs services
+        run: mypy --config-file mypy.ini
       - name: Tests
         run: pytest
       - name: Docker build
