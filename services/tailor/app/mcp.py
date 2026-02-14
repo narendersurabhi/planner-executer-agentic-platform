@@ -20,8 +20,10 @@ def create_mcp_asgi_app(provider: Any):
         "tailor:8000",
         "localhost",
         "localhost:8000",
+        "localhost:*",
         "127.0.0.1",
         "127.0.0.1:8000",
+        "127.0.0.1:*",
     ]
     raw_allowed_hosts = os.getenv("MCP_ALLOWED_HOSTS", "")
     allowed_hosts = [h.strip() for h in raw_allowed_hosts.split(",") if h.strip()] or default_hosts

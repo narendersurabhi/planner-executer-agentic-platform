@@ -103,9 +103,20 @@ def _extract_result(payload: Any) -> dict[str, Any]:
     raise RuntimeError("mcp_result_invalid")
 
 
+def _candidate_mcp_urls(mcp_url: str) -> list[str]:
+    base = mcp_url.rstrip("/")
+    # FastMCP streamable_http_app route differs by SDK version:
+    # older versions expose at the mount root, newer versions under `/mcp`.
+    return [f"{base}/mcp", base]
+
+
 def _mcp_list_tools(mcp_url: str) -> list[str]:
-    async def _run() -> list[str]:
-        async with streamable_http_client(mcp_url) as (read_stream, write_stream, _session_id):
+    async def _run(candidate_url: str) -> list[str]:
+        async with streamable_http_client(candidate_url) as (
+            read_stream,
+            write_stream,
+            _session_id,
+        ):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 result = await session.list_tools()
@@ -117,18 +128,40 @@ def _mcp_list_tools(mcp_url: str) -> list[str]:
                         names.append(name)
                 return names
 
-    return asyncio.run(_run())
+    last_error: BaseException | None = None
+    for candidate in _candidate_mcp_urls(mcp_url):
+        try:
+            return asyncio.run(_run(candidate))
+        except BaseException as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+    if last_error is None:
+        raise RuntimeError("mcp_tools_list_failed")
+    raise RuntimeError(f"mcp_tools_list_failed:{last_error}") from last_error
 
 
 def _mcp_call_tool(mcp_url: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    async def _run() -> dict[str, Any]:
-        async with streamable_http_client(mcp_url) as (read_stream, write_stream, _session_id):
+    async def _run(candidate_url: str) -> dict[str, Any]:
+        async with streamable_http_client(candidate_url) as (
+            read_stream,
+            write_stream,
+            _session_id,
+        ):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 result = await session.call_tool(name, arguments)
                 return _extract_result(result)
 
-    return asyncio.run(_run())
+    last_error: BaseException | None = None
+    for candidate in _candidate_mcp_urls(mcp_url):
+        try:
+            return asyncio.run(_run(candidate))
+        except BaseException as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+    if last_error is None:
+        raise RuntimeError(f"mcp_tool_call_failed:{name}")
+    raise RuntimeError(f"mcp_tool_call_failed:{name}:{last_error}") from last_error
 
 
 def _load_module(module_name: str, module_path: Path, service_root: Path):
