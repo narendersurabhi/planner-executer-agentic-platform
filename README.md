@@ -1,34 +1,17 @@
 # Goal-Driven Agentic Workflow Engine (AWE)
 
-A user submits a Job with a Goal in a UI. A Planner creates a structured Plan with tasks, dependencies, and required tools. Executors pick up tasks, call tools when needed, update task status, and stream progress back to the UI in real time. Optionally, a Critic validates task outputs and can trigger rework. Optionally, a Policy Gate enforces allowed tools and guardrails per environment.
+AWE is a multi-service agentic platform for turning a user goal into an executable plan, running tool-backed tasks, and streaming progress/results to a UI.
 
 ## Agentic Pattern
 
-This platform uses a **goal-driven Plan-and-Execute pattern** with hierarchical agents:
+This project uses a hierarchical **plan-and-execute** pattern:
 
-1. **Planner (control plane):** converts a goal into a typed task DAG (tools, deps, acceptance criteria, schemas).
-2. **Executor workers (data plane):** execute ready tasks via tool calls (including MCP-backed services) and write outputs to shared memory/state.
-3. **Critic + policy gates (governance):** validate outputs, trigger rework when needed, and enforce tool/guardrail policy per environment.
+1. **Planner** creates a typed task DAG from a goal.
+2. **Worker executors** run ready tasks with tool calls (including MCP-backed services).
+3. **Critic/Policy** optionally enforce quality and guardrails.
+4. **API/UI** expose job state, task outputs, streaming events, and downloadable artifacts.
 
-Operationally, this is **hierarchical multi-agent orchestration (Planner -> Executor -> Critic)** with **tool-augmented DAG execution** and **shared memory handoff** (`job_context`, `task_outputs`).
-
-## Quickstart
-
-```bash
-make up
-```
-
-```bash
-make test
-```
-
-```bash
-make lint
-```
-
-```bash
-make typecheck
-```
+Operationally this is a control-plane/data-plane split with shared job context and task output handoff.
 
 ## Architecture
 
@@ -46,219 +29,215 @@ graph TD
   API --> UI
   API -->|SSE| UI
   API --> Postgres[(Postgres)]
-  API --> Prometheus[(Prometheus)]
-  API --> Jaeger[(Jaeger)]
 ```
 
-## Worker Pool
+## Services
+
+- `api`: job/task APIs, SSE stream, artifact/workspace download endpoints
+- `planner`: goal -> plan DAG generation
+- `worker`: task execution, retries, DLQ, tool orchestration
+- `coder`: code-centric tool service (MCP)
+- `tailor`: resume/document tailoring service (MCP)
+- `policy`: policy gate checks
+- `critic`: optional rework checks
+- `ui`: Next.js frontend
+
+## Local Development (Docker Compose)
+
+1. Create local env from template.
+
+```bash
+cp .env.example .env
+```
+
+2. Start the stack.
+
+```bash
+make up
+```
+
+3. Access services.
+
+- UI: `http://localhost:3002`
+- API: `http://localhost:18000`
+
+4. Run quality checks.
+
+```bash
+make test
+make lint
+make typecheck
+```
+
+## Configuration
+
+- Non-secret runtime variables are documented in `.env.example`.
+- Keep secrets in `.env` only.
+- Typical secrets:
+  - `OPENAI_API_KEY`
+  - `GITHUB_TOKEN`
+  - `AWS_ACCESS_KEY_ID`
+  - `AWS_SECRET_ACCESS_KEY`
+
+## Key Make Targets
+
+- `make up` / `make down`
+- `make images-list`
+- `make images-build`
+- `make images-push`
+- `make k8s-up-local`
+- `make k8s-apply-local`
+- `make k8s-down-local`
+- `make k8s-sync-workspace`
+- `make k8s-sync-artifacts`
+- `make k8s-sync-shared`
+
+## Kubernetes
+
+Kubernetes manifests live under `deploy/k8s`.
+
+- Baseline deployments/services for app + data services
+- HPA for `api`, `coder`, and `tailor`
+- Optional KEDA scaler for worker queue depth
+- Optional observability stack (Prometheus/Grafana/Loki/Jaeger)
+
+See full deployment details in `deploy/k8s/README.md`.
+
+### Local Kubernetes quickstart (Docker Desktop)
+
+```bash
+kubectl config use-context docker-desktop
+make k8s-up-local
+```
+
+This builds and pushes local images to `localhost:5001`, applies local overlay manifests, and rolls deployments.
+
+### Port forwarding
+
+Use the command set in `docs/k8s-port-forward.md`.
+
+Common forwards:
+
+```bash
+kubectl port-forward -n awe svc/api 18000:8000
+kubectl port-forward -n awe svc/ui 8510:80
+kubectl port-forward -n awe svc/grafana 3000:3000
+kubectl port-forward -n awe svc/jaeger 16686:16686
+```
+
+## Worker Reliability and Scaling
 
 Workers consume `task.ready` from Redis Streams consumer group `workers`.
 
-- Scale horizontally: `docker compose up -d --scale worker=4`
-- Stale task recovery: workers use `XAUTOCLAIM` (`WORKER_RECOVER_*` settings)
 - Retry policy: `WORKER_RETRY_POLICY=transient|any|none`
-- Dead-letter stream: failed terminal tasks are written to `tasks.dlq` when `WORKER_DLQ_ENABLED=true`
-- Inspect DLQ per job: `GET /jobs/{job_id}/tasks/dlq?limit=25`
-- Retry one failed task from DLQ: `POST /jobs/{job_id}/tasks/{task_id}/retry` with optional body `{ "stream_id": "<dlq stream id>" }`
+- Stale pending recovery: `WORKER_RECOVER_*`
+- Dead-letter stream: `tasks.dlq` when `WORKER_DLQ_ENABLED=true`
+- Retry failed tasks: `POST /jobs/{job_id}/tasks/{task_id}/retry`
+- Retry all failed tasks: `POST /jobs/{job_id}/retry_failed`
 
-## Kubernetes Autoscaling
+## Artifact and Document Storage
 
-This repo now includes Kubernetes manifests in `deploy/k8s` with:
+### Filesystem mode
 
-- `HPA` for `api` (CPU + memory)
-- `HPA` for `coder` (CPU + memory)
-- `HPA` for `tailor` (CPU + memory)
-- Optional `KEDA` queue-depth scaler for `worker`
-- Baseline Deployments/Services for `api`, `planner`, `worker`, `coder`, `tailor`, `ui`, `redis`, and `postgres`
+- `DOCUMENT_STORE_BACKEND=filesystem`
+- Files are served from `ARTIFACTS_DIR` (default `/shared/artifacts`)
 
-Apply:
+### S3/object store mode
 
-```bash
-make k8s-apply
-```
+- `DOCUMENT_STORE_BACKEND=s3`
+- Required: `DOCUMENT_STORE_S3_BUCKET`
+- Optional: `DOCUMENT_STORE_S3_PREFIX`, `DOCUMENT_STORE_S3_ENDPOINT`, `DOCUMENT_STORE_S3_REGION`
 
-Build and push app images used by Kubernetes:
+In S3 mode, workers upload artifacts and API download falls back to object store if local file is not found.
 
-```bash
-# Build tags:
-IMAGE_OWNER=narendersurabhi IMAGE_TAG=v0.1.0 make images-build
+Download endpoints:
 
-# Push tags to registry:
-IMAGE_OWNER=narendersurabhi IMAGE_TAG=v0.1.0 make images-push
-```
+- `GET /artifacts/download?path=<relative_path>`
+- `GET /workspace/download?path=<relative_path>`
 
-Show the exact image names that will be used:
+## Observability
 
-```bash
-IMAGE_OWNER=narendersurabhi IMAGE_TAG=v0.1.0 make images-list
-```
-
-Check scaling:
+- Metrics: `/metrics` exposed by API
+- Tracing: OTEL endpoint via `OTEL_EXPORTER_OTLP_ENDPOINT`
+- Optional k8s observability stack via:
 
 ```bash
-kubectl get hpa -n awe
-kubectl get deploy -n awe
+make k8s-apply-observability
 ```
 
-Local Docker Desktop Kubernetes (single-node friendly overlay):
-
-```bash
-IMAGE_OWNER=narendersurabhi IMAGE_TAG=local make images-build
-make k8s-apply-local
-```
-
-Open UI/API with port-forward:
-
-```bash
-kubectl port-forward -n awe svc/ui 3002:80
-kubectl port-forward -n awe svc/api 18000:8000
-```
-
-Sync files generated inside worker `/shared` back to your local repo:
-
-```bash
-make k8s-sync-shared
-# or only one side:
-make k8s-sync-workspace
-make k8s-sync-artifacts
-```
-
-Optional object storage (cross-node safe for downloads):
-
-- Set `DOCUMENT_STORE_BACKEND=s3`
-- Set `DOCUMENT_STORE_S3_BUCKET=<bucket>`
-- Optional: `DOCUMENT_STORE_S3_PREFIX=artifacts`, `DOCUMENT_STORE_S3_ENDPOINT=<minio/s3 endpoint>`, `DOCUMENT_STORE_S3_REGION=<region>`
-- Worker uploads generated artifacts to object storage after tool completion.
-- API `/artifacts/download` first reads local artifacts volume, then falls back to object storage.
-
-Enable worker queue-depth scaling (optional):
-
-```bash
-make k8s-apply-keda-worker
-```
-
-Important:
-
-- Update image names in `deploy/k8s/*.yaml` before applying (or keep them aligned with the tags you built/pushed).
-- `worker` replicas require shared workspace storage; `deploy/k8s/pvc-shared.yaml` is `ReadWriteMany`.
-- For queue-depth scaling, install KEDA and apply `deploy/k8s/keda-worker-scaledobject.yaml`.
-- See `deploy/k8s/README.md` for setup details.
-
-## Example curl
+## API Quick Reference
 
 Create a job:
 
 ```bash
-curl -X POST http://localhost:8000/jobs \
+curl -X POST http://localhost:18000/jobs \
   -H "Content-Type: application/json" \
-  -d '{"goal":"Generate an implementation checklist for adding a new tool, then write a tools.md draft file as an artifact, then summarize it.","context_json":{},"priority":1}'
+  -d '{"goal":"Generate an implementation checklist and artifact summary","context_json":{},"priority":1}'
+```
+
+List jobs:
+
+```bash
+curl http://localhost:18000/jobs
+```
+
+Job details:
+
+```bash
+curl http://localhost:18000/jobs/<job_id>/details
 ```
 
 List tasks:
 
 ```bash
-curl http://localhost:8000/jobs/<job_id>/tasks
+curl http://localhost:18000/jobs/<job_id>/tasks
 ```
 
-## Demo flow
+Replan:
 
-Default demo goal:
-
-- Generate an implementation checklist for adding a new tool, then write a tools.md draft file as an artifact, then summarize it.
-
-Planner tasks:
-1. Create checklist (critic_required true)
-2. Write artifact using file_write_artifact (critic_required true)
-3. Summarize artifact using text_summarize (critic_required false)
-
-Critic demo behavior: when CRITIC_ENABLED is true, the critic sometimes requests rework when outputs are missing.
-
-Policy demo: when POLICY_MODE=prod and POLICY_GATE_ENABLED=true, attempts to use http_fetch are blocked with a policy reason.
-
-## How to add a new tool
-
-1. Add ToolSpec and handler in libs/core/tool_registry.py.
-2. Add tests in services/worker/tests or libs/core/tests.
-3. Update docs/tools.md with the new tool.
-
-## Enable Critic loop
-
-Set:
-
-```
-CRITIC_ENABLED=true
-CRITIC_MAX_REWORKS=2
+```bash
+curl -X POST http://localhost:18000/jobs/<job_id>/replan
 ```
 
-## Enable Policy Gate
+## LLM Planner and Worker Modes
 
-Set:
+Set these in `.env`:
 
-```
-POLICY_GATE_ENABLED=true
-POLICY_MODE=prod
-POLICY_CONFIG_PATH=config/policy.yaml
-```
-
-Edit config/policy.yaml to adjust allowlist and limits.
-
-## Enable LLMPlanner
-
-Set:
-
-```
+```bash
 PLANNER_MODE=llm
-PLANNER_MAX_DEPTH=3
-LLM_PROVIDER=openai
-OPENAI_API_KEY=your_key
-```
-
-To use LLMs in workers as well:
-
-```
 WORKER_MODE=llm
-OPENAI_MODEL=your_model
+LLM_PROVIDER=openai
+OPENAI_MODEL=<model>
+OPENAI_API_KEY=<key>
 OPENAI_BASE_URL=https://api.openai.com
-# Optional; some models (ex: gpt-5-mini) do not support temperature.
-OPENAI_TEMPERATURE=
-OPENAI_MAX_OUTPUT_TOKENS=
 OPENAI_TIMEOUT_S=60
 OPENAI_MAX_RETRIES=2
 ```
 
-Mock provider is used by default so the repo runs without external keys unless `LLM_PROVIDER=openai`.
+If `LLM_PROVIDER` is left as `mock`, external keys are not required.
 
-Tailor iterative scoring can be independent from the improve model:
+## Tailor Evaluator (Independent Scoring)
 
-```
+Tailor scoring can be independent of generation:
+
+```bash
 TAILOR_EVAL_MODE=llm        # llm | heuristic | self
 TAILOR_EVAL_PROVIDER=openai
-TAILOR_EVAL_OPENAI_MODEL=gpt-5.2
-# optional overrides:
-TAILOR_EVAL_OPENAI_API_KEY=
-TAILOR_EVAL_OPENAI_BASE_URL=
-TAILOR_EVAL_OPENAI_TIMEOUT_S=
-TAILOR_EVAL_OPENAI_MAX_RETRIES=
+TAILOR_EVAL_OPENAI_MODEL=<model>
+TAILOR_EVAL_OPENAI_TIMEOUT_S=15
+TAILOR_EVAL_OPENAI_MAX_RETRIES=1
 ```
 
-When `TAILOR_EVAL_MODE=llm`, the score used for `min_alignment_score` stopping is produced by a separate evaluation call.
+## Add a New Tool
 
-## Schema validation for task outputs
-
-Workers can validate LLM outputs against JSON Schemas referenced by `expected_output_schema_ref`.
-
-Set:
-
-```
-SCHEMA_REGISTRY_PATH=/app/schemas
-SCHEMA_VALIDATION_STRICT=false
-```
-
-Place JSON schema files in `schemas/` and reference them with `schema/<name>`.
+1. Add `ToolSpec` + handler in `libs/core/tool_registry.py`.
+2. Add/update tests in `libs/core/tests` and/or service tests.
+3. Wire tool usage into planner/task flow as needed.
+4. Update docs.
 
 ## Troubleshooting
 
-- If Redis streams are empty, ensure redis is running and the services are connected.
-- If SSE events are not visible, verify the API is reachable at http://localhost:8000.
-- If Postgres migrations fail, confirm DATABASE_URL and run alembic upgrade head.
-- If mypy fails unexpectedly, run `mypy --config-file mypy.ini` (same command used by CI).
+- If UI shows connection errors, verify API forward is active on `localhost:18000`.
+- If artifact download returns not found, confirm file exists under API-visible artifact root.
+- If pods are `ImagePullBackOff`, confirm image tags/registry and rollout.
+- If planner/worker behavior differs after env changes, run env setup and restart deployments.
