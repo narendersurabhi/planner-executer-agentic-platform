@@ -1,0 +1,107 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../namespace.yaml
+  - ../../configmap.yaml
+  - ../../pvc-postgres.yaml
+  - ../../pvc-redis.yaml
+  - ../../postgres.yaml
+  - ../../redis.yaml
+  - ../../jaeger.yaml
+  - ../../coder.yaml
+  - ../../tailor.yaml
+  - ../../planner.yaml
+  - ../../policy.yaml
+  - ../../worker.yaml
+  - ../../api.yaml
+  - ../../ui.yaml
+  - ../../hpa-api.yaml
+  - ../../hpa-coder.yaml
+  - ../../hpa-tailor.yaml
+  - pv-postgres-hostpath.yaml
+  - pv-redis-hostpath.yaml
+images:
+  - name: ghcr.io/your-org/awe-api
+    newName: localhost:5001/localhost/awe-api
+    newTag: latest
+  - name: ghcr.io/your-org/awe-planner
+    newName: localhost:5001/localhost/awe-planner
+    newTag: latest
+  - name: ghcr.io/your-org/awe-worker
+    newName: localhost:5001/localhost/awe-worker
+    newTag: latest
+  - name: ghcr.io/your-org/awe-coder
+    newName: localhost:5001/localhost/awe-coder
+    newTag: latest
+  - name: ghcr.io/your-org/awe-tailor
+    newName: localhost:5001/localhost/awe-tailor
+    newTag: latest
+  - name: ghcr.io/your-org/awe-ui
+    newName: localhost:5001/localhost/awe-ui
+    newTag: latest
+  - name: ghcr.io/your-org/awe-policy
+    newName: localhost:5001/localhost/awe-policy
+    newTag: latest
+patches:
+  - path: patch-api.yaml
+    target:
+      kind: Deployment
+      name: api
+  - path: patch-planner.yaml
+    target:
+      kind: Deployment
+      name: planner
+  - path: patch-worker.yaml
+    target:
+      kind: Deployment
+      name: worker
+  - path: patch-coder.yaml
+    target:
+      kind: Deployment
+      name: coder
+  - path: patch-tailor.yaml
+    target:
+      kind: Deployment
+      name: tailor
+  - path: patch-ui.yaml
+    target:
+      kind: Deployment
+      name: ui
+  - path: patch-policy.yaml
+    target:
+      kind: Deployment
+      name: policy
+  - path: patch-ui-service.yaml
+    target:
+      kind: Service
+      name: ui
+  - path: patch-hpa-api.yaml
+    target:
+      kind: HorizontalPodAutoscaler
+      name: api
+  - path: patch-hpa-coder.yaml
+    target:
+      kind: HorizontalPodAutoscaler
+      name: coder
+  - path: patch-hpa-tailor.yaml
+    target:
+      kind: HorizontalPodAutoscaler
+      name: tailor
+  - path: patch-worker-hostpath.json
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: worker
+  - path: patch-api-shared.yaml
+    target:
+      kind: Deployment
+      name: api
+  - path: patch-pvc-postgres-hostpath.yaml
+    target:
+      kind: PersistentVolumeClaim
+      name: postgres-data
+  - path: patch-pvc-redis-hostpath.yaml
+    target:
+      kind: PersistentVolumeClaim
+      name: redis-data

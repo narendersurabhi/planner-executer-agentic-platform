@@ -21,12 +21,15 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/agentic
       REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
       POLICY_GATE_ENABLED: ${POLICY_GATE_ENABLED:-false}
       ORCHESTRATOR_ENABLED: ${ORCHESTRATOR_ENABLED:-true}
       ORCHESTRATOR_RECOVER_PENDING: ${ORCHESTRATOR_RECOVER_PENDING:-true}
       ORCHESTRATOR_RECOVER_IDLE_MS: ${ORCHESTRATOR_RECOVER_IDLE_MS:-60000}
       JOB_RECOVERY_ENABLED: ${JOB_RECOVERY_ENABLED:-true}
+      DEV_RESUME_RENDER_ENABLED: ${DEV_RESUME_RENDER_ENABLED:-false}
     ports:
       - "18000:8000"
     depends_on:
@@ -55,6 +58,9 @@ services:
       dockerfile: services/worker/Dockerfile
     environment:
       REDIS_URL: redis://redis:6379/0
+      LOG_CANDIDATE_RESUME: "true"
+      LOG_CANDIDATE_RESUME_FULL: "true"
+      # LOG_CANDIDATE_RESUME_PREVIEW_CHARS: "200"
       TOOL_HTTP_FETCH_ENABLED: "false"
       TOOL_HTTP_FETCH_ALLOWLIST: ${TOOL_HTTP_FETCH_ALLOWLIST:-}
       TOOL_OUTPUT_SIZE_CAP: ${TOOL_OUTPUT_SIZE_CAP:-50000}
@@ -67,10 +73,31 @@ services:
       OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
       OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
       OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
+      CODING_AGENT_TIMEOUT_S: ${CODING_AGENT_TIMEOUT_S:-30}
+      CODER_HTTP_TIMEOUT_S: ${CODER_HTTP_TIMEOUT_S:-30}
+      CODER_API_URL: ${CODER_API_URL:-http://coder:8000}
+      RESUME_TAILOR_API_URL: ${RESUME_TAILOR_API_URL:-http://tailor:8000}
+      WORKER_GROUP: ${WORKER_GROUP:-workers}
+      WORKER_CONSUMER: ${WORKER_CONSUMER:-}
+      WORKER_READ_COUNT: ${WORKER_READ_COUNT:-1}
+      WORKER_BLOCK_MS: ${WORKER_BLOCK_MS:-1000}
+      WORKER_RECOVER_PENDING: ${WORKER_RECOVER_PENDING:-true}
+      WORKER_RECOVER_IDLE_MS: ${WORKER_RECOVER_IDLE_MS:-60000}
+      WORKER_RECOVER_INTERVAL_S: ${WORKER_RECOVER_INTERVAL_S:-10}
+      WORKER_RECOVER_COUNT: ${WORKER_RECOVER_COUNT:-10}
+      WORKER_RETRY_ENABLED: ${WORKER_RETRY_ENABLED:-true}
+      WORKER_RETRY_POLICY: ${WORKER_RETRY_POLICY:-transient}
+      WORKER_DEFAULT_MAX_ATTEMPTS: ${WORKER_DEFAULT_MAX_ATTEMPTS:-3}
+      WORKER_DLQ_ENABLED: ${WORKER_DLQ_ENABLED:-true}
+      WORKSPACE_DIR: /shared/workspace
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
     volumes:
-      - artifacts:/shared/artifacts
+      - ./artifacts:/shared/artifacts
+      - ./workspace:/shared/workspace
     depends_on:
       - redis
+      - coder
+      - tailor
   critic:
     build:
       context: .
@@ -95,14 +122,46 @@ services:
       - ./config:/app/config
     depends_on:
       - redis
+  tailor:
+    build:
+      context: .
+      dockerfile: services/tailor/Dockerfile
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
+      OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
+    ports:
+      - "18011:8000"
+  coder:
+    build:
+      context: .
+      dockerfile: services/coder/Dockerfile
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      OPENAI_MAX_OUTPUT_TOKENS: ${OPENAI_MAX_OUTPUT_TOKENS}
+      OPENAI_TIMEOUT_S: ${OPENAI_TIMEOUT_S}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
+    ports:
+      - "18010:8000"
   ui:
     build:
       context: .
       dockerfile: services/ui/Dockerfile
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
+        NEXT_PUBLIC_DEV_TOOLS: ${NEXT_PUBLIC_DEV_TOOLS:-false}
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
+      NEXT_PUBLIC_DEV_TOOLS: ${NEXT_PUBLIC_DEV_TOOLS:-false}
     ports:
       - "3002:3000"
     depends_on:
@@ -130,5 +189,4 @@ services:
 
 volumes:
   db-data:
-  artifacts:
   grafana-data:

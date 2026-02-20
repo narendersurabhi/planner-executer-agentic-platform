@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tailor_resume.request.v1",
+  "type": "object",
+  "properties": {
+    "job": {"type": "object"},
+    "memory": {"type": ["object", "null"]}
+  },
+  "required": ["job"],
+  "additionalProperties": false
+}

@@ -5,3 +5,50 @@
 body {
   @apply bg-slate-50 text-slate-900;
 }
+
+.font-body {
+  font-family: var(--font-body), "Helvetica Neue", sans-serif;
+}
+
+.font-display {
+  font-family: var(--font-display), "Iowan Old Style", serif;
+}
+
+@keyframes fade-up {
+  0% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes float-soft {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.7s ease-out both;
+}
+
+.animate-fade-up-delayed {
+  animation: fade-up 0.7s ease-out both;
+  animation-delay: 0.2s;
+}
+
+.animate-fade-up-delayed-more {
+  animation: fade-up 0.7s ease-out both;
+  animation-delay: 0.35s;
+}
+
+.animate-float-soft {
+  animation: float-soft 6s ease-in-out infinite;
+}

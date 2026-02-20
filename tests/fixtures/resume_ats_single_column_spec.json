@@ -1,0 +1,45 @@
+{
+  "theme": {
+    "fonts": {"body": "Calibri"},
+    "font_sizes": {"body": 11},
+    "page_margins_in": {"top": 0.5, "bottom": 0.5, "left": 0.7, "right": 0.7}
+  },
+  "tokens": {
+    "name": "Alex Kim",
+    "headline": "Software Engineer",
+    "contact": "alex@example.com | San Francisco, CA",
+    "summary": "Backend engineer focused on distributed systems.",
+    "skills": ["Python", "PostgreSQL", "Kubernetes"],
+    "experience": [
+      {
+        "company": "Nova Labs",
+        "title": "Senior Engineer",
+        "bullets": ["Led migration to microservices", "Improved latency by 30%"]
+      },
+      {
+        "company": "Bright Data",
+        "title": "Engineer",
+        "bullets": ["Built ETL pipelines", "Maintained data quality checks"]
+      }
+    ]
+  },
+  "blocks": [
+    {"type": "text", "text": "{{name}}", "style": "name"},
+    {"type": "paragraph", "text": "{{headline}}"},
+    {"type": "paragraph", "text": "{{contact}}"},
+    {"type": "heading", "level": 1, "text": "SUMMARY"},
+    {"type": "paragraph", "text": "{{summary}}"},
+    {"type": "heading", "level": 1, "text": "SKILLS"},
+    {"type": "bullets", "items": "{{skills}}"},
+    {"type": "heading", "level": 1, "text": "EXPERIENCE"},
+    {
+      "type": "repeat",
+      "items": "{{experience}}",
+      "as": "r",
+      "template": [
+        {"type": "paragraph", "text": "{{r.title}} | {{r.company}}", "style": "body_bold"},
+        {"type": "bullets", "items": "{{r.bullets}}"}
+      ]
+    }
+  ]
+}

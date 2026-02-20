@@ -5,13 +5,21 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from .database import Base
-from . import models
+try:
+    from services.api.app.database import Base
+    from services.api.app import models  # noqa: F401
+except ModuleNotFoundError:
+    from .database import Base
+    from . import models  # noqa: F401
 
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    try:
+        fileConfig(config.config_file_name)
+    except KeyError:
+        # Missing logging sections in alembic.ini; ignore logging config.
+        pass
 
 target_metadata = Base.metadata
 

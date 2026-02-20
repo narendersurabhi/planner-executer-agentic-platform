@@ -12,6 +12,10 @@
     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
     "expected_output_schema_ref": {"type": "string"},
     "status": {"type": "string"},
+    "intent": {
+      "type": ["string", "null"],
+      "enum": ["transform", "generate", "validate", "render", "io", null]
+    },
     "deps": {"type": "array", "items": {"type": "string"}},
     "attempts": {"type": "integer"},
     "max_attempts": {"type": "integer"},

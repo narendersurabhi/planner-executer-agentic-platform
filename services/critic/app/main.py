@@ -45,7 +45,9 @@ def run() -> None:
     except redis.ResponseError:
         pass
     while True:
-        messages = redis_client.xreadgroup(group, consumer, {events.TASK_STREAM: ">"}, count=1, block=1000)
+        messages = redis_client.xreadgroup(
+            group, consumer, {events.TASK_STREAM: ">"}, count=1, block=1000
+        )
         for _, entries in messages:
             for message_id, data in entries:
                 payload = json.loads(data["data"])
@@ -54,7 +56,11 @@ def run() -> None:
                     continue
                 result = models.TaskResult(**payload.get("payload", {}))
                 critic_result = evaluate_task(result)
-                event_type = "task.accepted" if critic_result.decision == "accepted" else "task.rework_requested"
+                event_type = (
+                    "task.accepted"
+                    if critic_result.decision == "accepted"
+                    else "task.rework_requested"
+                )
                 event = models.EventEnvelope(
                     type=event_type,
                     version="1",

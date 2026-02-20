@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc-postgres.yaml
+  - pvc-redis.yaml
+  - pvc-shared.yaml
+  - postgres.yaml
+  - redis.yaml
+  - jaeger.yaml
+  - coder.yaml
+  - tailor.yaml
+  - planner.yaml
+  - policy.yaml
+  - worker.yaml
+  - api.yaml
+  - ui.yaml
+  - hpa-api.yaml
+  - hpa-coder.yaml
+  - hpa-tailor.yaml
+images:
+  - name: ghcr.io/your-org/awe-api
+    newName: localhost:5001/awe-api
+    newTag: latest
+  - name: ghcr.io/your-org/awe-planner
+    newName: localhost:5001/awe-planner
+    newTag: latest
+  - name: ghcr.io/your-org/awe-worker
+    newName: localhost:5001/awe-worker
+    newTag: latest
+  - name: ghcr.io/your-org/awe-coder
+    newName: localhost:5001/awe-coder
+    newTag: latest
+  - name: ghcr.io/your-org/awe-tailor
+    newName: localhost:5001/awe-tailor
+    newTag: latest
+  - name: ghcr.io/your-org/awe-ui
+    newName: localhost:5001/awe-ui
+    newTag: latest
+  - name: ghcr.io/your-org/awe-policy
+    newName: localhost:5001/awe-policy
+    newTag: latest

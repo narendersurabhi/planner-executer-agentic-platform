@@ -22,3 +22,7 @@ def configure_logging(service_name: str) -> None:
 
 def log_event(logger: structlog.BoundLogger, event_type: str, payload: Dict[str, Any]) -> None:
     logger.info(event_type, **payload)
+
+
+def get_logger(service_name: str) -> structlog.BoundLogger:
+    return structlog.get_logger(service=service_name)

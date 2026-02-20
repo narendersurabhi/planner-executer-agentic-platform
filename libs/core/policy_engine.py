@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List
+from typing import List
 
 import yaml
 
@@ -46,7 +46,11 @@ class PolicyEngine:
                     reasons.append(f"Tool not in allowlist: {tool}")
             if reasons:
                 decision = PolicyDecisionType.deny
-        if self.mode == "dev" and "http_fetch" in task.tool_requests and not tool_http_fetch_enabled:
+        if (
+            self.mode == "dev"
+            and "http_fetch" in task.tool_requests
+            and not tool_http_fetch_enabled
+        ):
             decision = PolicyDecisionType.deny
             reasons.append("http_fetch disabled by TOOL_HTTP_FETCH_ENABLED")
         if len(task.tool_requests) > self.config.max_tool_calls:

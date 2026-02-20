@@ -26,15 +26,17 @@ jobs:
           python-version: "3.11"
       - name: Install deps
         run: |
-          pip install ruff mypy pytest
+          pip install ruff mypy pytest httpx
           pip install -e libs/core
+          pip install -e services/api
+          pip install -e services/worker
       - name: Lint
         run: ruff check libs services
       - name: Format
         run: ruff format --check libs services
       - name: Type check
-        run: mypy libs services
+        run: mypy --config-file mypy.ini
       - name: Tests
-        run: pytest
+        run: PYTHONPATH=. pytest
       - name: Docker build
         run: docker compose build
