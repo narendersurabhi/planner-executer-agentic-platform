@@ -122,6 +122,34 @@ def _merge_payload_from_task(payload: dict, task_payload: dict, instruction: str
 
 def _fill_payload_from_context(payload: dict, context: dict) -> dict:
     filled = dict(payload)
+    job_context = context.get("job_context")
+    if isinstance(job_context, dict):
+        # Promote common planning fields from job context so tool input validation
+        # can succeed before worker-side memory hydration.
+        for key in (
+            "topic",
+            "today",
+            "date",
+            "target_pages",
+            "page_count",
+            "target_role_name",
+            "role_name",
+            "company_name",
+            "company",
+            "candidate_name",
+            "first_name",
+            "last_name",
+            "job_description",
+            "candidate_resume",
+            "tailored_text",
+            "output_dir",
+            "document_type",
+        ):
+            if key in filled:
+                continue
+            value = job_context.get(key)
+            if isinstance(value, str) and value.strip():
+                filled[key] = value
     if "document_spec" not in filled:
         doc = _extract_document_spec_from_context(context)
         if isinstance(doc, dict):

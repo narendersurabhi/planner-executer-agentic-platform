@@ -7,16 +7,18 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Generator, List
+from pathlib import Path
+from typing import Any, Dict, Generator, List, Mapping
 
 import redis
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from prometheus_client import Counter, make_asgi_app
 from sqlalchemy.orm import Session
 
 from libs.core import (
+    document_store,
     events,
     logging as core_logging,
     models,
@@ -54,6 +56,8 @@ metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "/shared/artifacts")
+WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/shared/workspace")
 ORCHESTRATOR_ENABLED = os.getenv("ORCHESTRATOR_ENABLED", "true").lower() == "true"
 POLICY_GATE_ENABLED = os.getenv("POLICY_GATE_ENABLED", "false").lower() == "true"
 JOB_RECOVERY_ENABLED = os.getenv("JOB_RECOVERY_ENABLED", "true").lower() == "true"
@@ -176,6 +180,29 @@ def _emit_event(event_type: str, payload: dict[str, Any]) -> None:
         )
 
 
+def _resolve_download_path(path: str, root_dir: str, label: str) -> str:
+    candidate = path.strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail="path is required")
+    if candidate.startswith("/"):
+        raise HTTPException(status_code=400, detail="path must be relative")
+    root = Path(root_dir).resolve()
+    target = (root / candidate).resolve()
+    if not str(target).startswith(str(root)):
+        raise HTTPException(status_code=400, detail=f"Invalid {label} path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail=f"{label.title()} file not found")
+    return str(target)
+
+
+def _resolve_artifact_path(path: str) -> str:
+    return _resolve_download_path(path, ARTIFACTS_DIR, "artifact")
+
+
+def _resolve_workspace_path(path: str) -> str:
+    return _resolve_download_path(path, WORKSPACE_DIR, "workspace")
+
+
 def _plan_created_payload(plan: models.PlanCreate, job_id: str) -> dict[str, Any]:
     payload = plan.model_dump()
     payload["job_id"] = job_id
@@ -294,6 +321,8 @@ def _handle_event(stream_name: str, data: dict[str, str]) -> None:
         _handle_task_completed(envelope)
     elif event_type == "task.failed":
         _handle_task_failed(envelope)
+    elif event_type == "task.started":
+        _handle_task_started(envelope)
     elif event_type == "task.accepted":
         _handle_task_accepted(envelope)
     elif event_type == "task.rework_requested":
@@ -435,6 +464,31 @@ def _handle_task_failed(envelope: dict) -> None:
         db.commit()
 
 
+def _handle_task_started(envelope: dict) -> None:
+    payload = envelope.get("payload") or {}
+    task_id = payload.get("task_id") or envelope.get("task_id")
+    if not task_id:
+        return
+    now = datetime.utcnow()
+    with SessionLocal() as db:
+        task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
+        if not task:
+            return
+        task.status = models.TaskStatus.running.value
+        worker_consumer = payload.get("worker_consumer")
+        if isinstance(worker_consumer, str) and worker_consumer.strip():
+            task.assigned_to = worker_consumer.strip()
+        attempts = payload.get("attempts")
+        if isinstance(attempts, int):
+            task.attempts = max(0, attempts)
+        task.updated_at = now
+        job = db.query(JobRecord).filter(JobRecord.id == task.job_id).first()
+        if job:
+            _set_job_status(job, models.JobStatus.running)
+            job.updated_at = now
+        db.commit()
+
+
 def _replan_job_for_intent_mismatch(db: Session, job_id: str) -> bool:
     job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
     if not job:
@@ -524,6 +578,12 @@ def _enqueue_ready_tasks(job_id: str, plan_id: str, correlation_id: str | None) 
         task_records = db.query(TaskRecord).filter(TaskRecord.plan_id == plan_id).all()
         if not task_records:
             return
+        job_record = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+        job_context = (
+            job_record.context_json
+            if job_record and isinstance(job_record.context_json, dict)
+            else {}
+        )
         tasks = _resolve_task_deps(task_records)
         task_map = {task.id: task for task in tasks}
         id_to_name = {record.id: record.name for record in task_records}
@@ -535,7 +595,7 @@ def _enqueue_ready_tasks(job_id: str, plan_id: str, correlation_id: str | None) 
                 if POLICY_GATE_ENABLED:
                     record.status = models.TaskStatus.blocked.value
                     record.updated_at = now
-                    context = _build_task_context(record.id, task_map, id_to_name)
+                    context = _build_task_context(record.id, task_map, id_to_name, job_context)
                     payload = _task_payload_from_record(record, correlation_id, context)
                     events.append(("task.policy_check", payload))
                     continue
@@ -555,7 +615,7 @@ def _enqueue_ready_tasks(job_id: str, plan_id: str, correlation_id: str | None) 
                 record.attempts = next_attempt
                 record.status = models.TaskStatus.ready.value
                 record.updated_at = now
-                context = _build_task_context(record.id, task_map, id_to_name)
+                context = _build_task_context(record.id, task_map, id_to_name, job_context)
                 payload = _task_payload_from_record(record, correlation_id, context)
                 if TOOL_INPUT_VALIDATION_ENABLED and payload.get("tool_inputs_validation"):
                     record.status = models.TaskStatus.failed.value
@@ -686,7 +746,13 @@ def _handle_policy_decision(envelope: dict) -> None:
                 tasks = _resolve_task_deps(task_records)
                 task_map = {entry.id: entry for entry in tasks}
                 id_to_name = {record.id: record.name for record in task_records}
-                context = _build_task_context(task.id, task_map, id_to_name)
+                job_record = db.query(JobRecord).filter(JobRecord.id == task.job_id).first()
+                job_context = (
+                    job_record.context_json
+                    if job_record and isinstance(job_record.context_json, dict)
+                    else {}
+                )
+                context = _build_task_context(task.id, task_map, id_to_name, job_context)
                 payload = _task_payload_from_record(task, correlation_id, context)
                 if TOOL_INPUT_VALIDATION_ENABLED and payload.get("tool_inputs_validation"):
                     task.status = models.TaskStatus.failed.value
@@ -798,7 +864,10 @@ def _load_task_result(task_id: str) -> dict[str, Any]:
 
 
 def _build_task_context(
-    task_id: str, task_map: dict[str, models.Task], id_to_name: dict[str, str]
+    task_id: str,
+    task_map: dict[str, models.Task],
+    id_to_name: dict[str, str],
+    job_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     task = task_map.get(task_id)
     if not task:
@@ -820,7 +889,13 @@ def _build_task_context(
     outputs_by_name = {
         id_to_name.get(dep_id, dep_id): output for dep_id, output in outputs_by_id.items()
     }
-    return {"dependencies": outputs_by_id, "dependencies_by_name": outputs_by_name}
+    context: dict[str, Any] = {
+        "dependencies": outputs_by_id,
+        "dependencies_by_name": outputs_by_name,
+    }
+    if isinstance(job_context, dict) and job_context:
+        context["job_context"] = job_context
+    return context
 
 
 def _refresh_job_status(job_id: str) -> None:
@@ -892,6 +967,60 @@ def _read_resume_doc_spec_from_memory(db: Session, job_id: str) -> dict[str, Any
             if isinstance(spec, dict):
                 return spec
     return None
+
+
+def _parse_task_dlq_entry(stream_id: str, record: Mapping[str, str]) -> models.TaskDlqEntry | None:
+    raw = record.get("data")
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    envelope = payload.get("envelope")
+    envelope_dict = envelope if isinstance(envelope, dict) else {}
+    task_payload = payload.get("task_payload")
+    task_payload_dict = task_payload if isinstance(task_payload, dict) else {}
+    job_id = payload.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        maybe_job = envelope_dict.get("job_id")
+        job_id = maybe_job if isinstance(maybe_job, str) else None
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        maybe_task = task_payload_dict.get("task_id")
+        task_id = maybe_task if isinstance(maybe_task, str) else None
+    error = payload.get("error")
+    return models.TaskDlqEntry(
+        stream_id=stream_id,
+        message_id=str(payload.get("message_id") or stream_id),
+        failed_at=payload.get("failed_at") if isinstance(payload.get("failed_at"), str) else None,
+        error=error if isinstance(error, str) and error else "unknown_error",
+        worker_consumer=payload.get("worker_consumer")
+        if isinstance(payload.get("worker_consumer"), str)
+        else None,
+        job_id=job_id,
+        task_id=task_id,
+        envelope=envelope_dict,
+        task_payload=task_payload_dict,
+    )
+
+
+def _read_task_dlq(job_id: str, limit: int) -> list[models.TaskDlqEntry]:
+    scan_count = min(max(limit * 5, limit), 500)
+    rows = redis_client.xrevrange(events.TASK_DLQ_STREAM, "+", "-", count=scan_count)
+    entries: list[models.TaskDlqEntry] = []
+    for stream_id, record in rows:
+        parsed = _parse_task_dlq_entry(stream_id, record)
+        if parsed is None:
+            continue
+        if parsed.job_id != job_id:
+            continue
+        entries.append(parsed)
+        if len(entries) >= limit:
+            break
+    return entries
 
 
 @app.post("/jobs", response_model=models.Job)
@@ -1111,6 +1240,48 @@ def retry_failed_tasks(job_id: str, db: Session = Depends(get_db)) -> models.Job
     return _job_from_record(job)
 
 
+@app.post("/jobs/{job_id}/tasks/{task_id}/retry", response_model=models.Job)
+def retry_task(
+    job_id: str,
+    task_id: str,
+    payload: dict[str, Any] = Body(default_factory=dict),
+    db: Session = Depends(get_db),
+) -> models.Job:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    task = (
+        db.query(TaskRecord).filter(TaskRecord.id == task_id, TaskRecord.job_id == job_id).first()
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != models.TaskStatus.failed.value:
+        raise HTTPException(status_code=400, detail="Task is not failed")
+    now = datetime.utcnow()
+    task.status = models.TaskStatus.pending.value
+    task.attempts = 0
+    task.rework_count = 0
+    task.updated_at = now
+    _set_job_status(job, models.JobStatus.planning)
+    job.updated_at = now
+    db.commit()
+    stream_id = payload.get("stream_id")
+    if isinstance(stream_id, str) and stream_id:
+        try:
+            redis_client.xdel(events.TASK_DLQ_STREAM, stream_id)
+        except redis.RedisError:
+            logger.warning(
+                "task_dlq_delete_failed",
+                extra={"job_id": job_id, "task_id": task_id, "stream_id": stream_id},
+            )
+    plan = db.query(PlanRecord).filter(PlanRecord.id == task.plan_id).first()
+    if not plan:
+        plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
+    if plan:
+        _enqueue_ready_tasks(job_id, plan.id, None)
+    return _job_from_record(job)
+
+
 @app.post("/jobs/{job_id}/dev_resume_render", response_model=models.Job)
 def dev_resume_render_job(
     job_id: str,
@@ -1260,6 +1431,38 @@ def clear_job(job_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
     return {"status": "cleared"}
 
 
+@app.get("/artifacts/download")
+def download_artifact(path: str = Query(..., description="Path relative to /shared/artifacts")):
+    filename = Path(path).name
+    try:
+        resolved = _resolve_artifact_path(path)
+        filename = Path(resolved).name
+        return FileResponse(resolved, filename=filename, media_type="application/octet-stream")
+    except HTTPException as exc:
+        if exc.status_code != 404 or not document_store.is_s3_enabled():
+            raise
+    try:
+        payload = document_store.download_artifact_bytes(path)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=404, detail=f"Artifact not found in object store: {exc}"
+        ) from exc
+    return StreamingResponse(
+        iter([payload]),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/workspace/download")
+def download_workspace_file(
+    path: str = Query(..., description="Path relative to /shared/workspace"),
+):
+    resolved = _resolve_workspace_path(path)
+    filename = Path(resolved).name
+    return FileResponse(resolved, filename=filename, media_type="application/octet-stream")
+
+
 @app.get("/events/stream")
 def stream_events(request: Request, once: bool = False):
     def event_generator():
@@ -1327,6 +1530,14 @@ def read_memory(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/jobs/{job_id}/tasks/dlq", response_model=List[models.TaskDlqEntry])
+def read_task_dlq(job_id: str, limit: int = Query(25, ge=1, le=200)) -> List[models.TaskDlqEntry]:
+    try:
+        return _read_task_dlq(job_id, limit)
+    except redis.RedisError as exc:
+        raise HTTPException(status_code=503, detail=f"redis_error:{exc}") from exc
 
 
 @app.post("/plans", response_model=models.Plan)

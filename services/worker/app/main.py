@@ -12,7 +12,15 @@ from pathlib import Path
 import redis
 from jsonschema import Draft202012Validator
 
-from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
+from libs.core import (
+    document_store,
+    events,
+    llm_provider,
+    logging as core_logging,
+    models,
+    tool_registry,
+    tracing as core_tracing,
+)
 from libs.core.memory_client import MemoryClient
 from services.worker.app.memory_semantics import (
     apply_memory_defaults,
@@ -23,6 +31,8 @@ from services.worker.app.memory_semantics import (
 
 core_logging.configure_logging("worker")
 LOGGER = core_logging.get_logger("worker")
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+core_tracing.configure_tracing("worker", endpoint=OTEL_EXPORTER_OTLP_ENDPOINT)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 TOOL_HTTP_FETCH_ENABLED = os.getenv("TOOL_HTTP_FETCH_ENABLED", "false").lower() == "true"
@@ -38,6 +48,9 @@ SCHEMA_VALIDATION_STRICT = os.getenv("SCHEMA_VALIDATION_STRICT", "false").lower(
 OPENAI_TIMEOUT_S = os.getenv("OPENAI_TIMEOUT_S")
 OPENAI_MAX_RETRIES = os.getenv("OPENAI_MAX_RETRIES")
 TOOL_OUTPUT_SIZE_CAP = os.getenv("TOOL_OUTPUT_SIZE_CAP", "50000")
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "unknown")
+POLICY_VERSION = os.getenv("POLICY_VERSION", "unknown")
+TOOL_VERSION = os.getenv("TOOL_VERSION", "unknown")
 
 LLM_ENABLED = WORKER_MODE == "llm"
 
@@ -90,6 +103,22 @@ MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://api:8000")
 MEMORY_READ_ENABLED = os.getenv("MEMORY_READ_ENABLED", "true").lower() == "true"
 MEMORY_WRITE_ENABLED = os.getenv("MEMORY_WRITE_ENABLED", "true").lower() == "true"
 MEMORY_CLIENT = MemoryClient(MEMORY_API_URL)
+WORKER_GROUP = os.getenv("WORKER_GROUP", "workers")
+WORKER_CONSUMER = os.getenv("WORKER_CONSUMER", str(uuid.uuid4()))
+WORKER_READ_COUNT = _parse_optional_int(os.getenv("WORKER_READ_COUNT", "1")) or 1
+WORKER_BLOCK_MS = _parse_optional_int(os.getenv("WORKER_BLOCK_MS", "1000")) or 1000
+WORKER_RECOVER_PENDING = os.getenv("WORKER_RECOVER_PENDING", "true").lower() == "true"
+WORKER_RECOVER_IDLE_MS = _parse_optional_int(os.getenv("WORKER_RECOVER_IDLE_MS", "60000")) or 60000
+WORKER_RECOVER_INTERVAL_S = (
+    _parse_optional_float(os.getenv("WORKER_RECOVER_INTERVAL_S", "10")) or 10.0
+)
+WORKER_RECOVER_COUNT = _parse_optional_int(os.getenv("WORKER_RECOVER_COUNT", "10")) or 10
+WORKER_RETRY_ENABLED = os.getenv("WORKER_RETRY_ENABLED", "true").lower() == "true"
+WORKER_RETRY_POLICY = os.getenv("WORKER_RETRY_POLICY", "transient").strip().lower()
+WORKER_DEFAULT_MAX_ATTEMPTS = (
+    _parse_optional_int(os.getenv("WORKER_DEFAULT_MAX_ATTEMPTS", "3")) or 3
+)
+WORKER_DLQ_ENABLED = os.getenv("WORKER_DLQ_ENABLED", "true").lower() == "true"
 
 
 LLM_PROVIDER_INSTANCE = None
@@ -108,6 +137,9 @@ if LLM_ENABLED:
 
 def execute_task(task_payload: dict) -> models.TaskResult:
     task_id = task_payload.get("task_id")
+    trace_id = str(task_payload.get("correlation_id", ""))
+    run_id = str(task_payload.get("run_id") or trace_id or uuid.uuid4())
+    job_id = str(task_payload.get("job_id") or "")
     tool_requests = task_payload.get("tool_requests", [])
     context = task_payload.get("context", {})
     tool_inputs = task_payload.get("tool_inputs", {})
@@ -121,117 +153,381 @@ def execute_task(task_payload: dict) -> models.TaskResult:
     outputs = {}
     tool_error = None
     task_intent = _infer_task_intent(task_payload)
-    for tool_name in tool_requests:
-        try:
-            tool = registry.get(tool_name)
-        except KeyError:
-            tool_error = f"unknown_tool:{tool_name}"
-            outputs[tool_name] = {"error": tool_error}
-            break
-        mismatch = _intent_mismatch(task_intent, tool.spec.tool_intent, tool_name)
-        if mismatch:
-            tool_error = mismatch
-            outputs[tool_name] = {"error": tool_error}
-            tool_calls.append(
-                models.ToolCall(
-                    tool_name=tool_name,
-                    input={},
-                    idempotency_key=str(uuid.uuid4()),
-                    trace_id=task_payload.get("correlation_id", ""),
-                    started_at=started_at,
-                    finished_at=datetime.utcnow(),
-                    status="failed",
-                    output_or_error={"error": tool_error},
-                )
-            )
-            break
-        trace_id = task_payload.get("correlation_id", "")
-        payload = _tool_payload(
-            tool_name,
-            task_payload.get("instruction", ""),
-            context,
-            task_payload,
-            tool_inputs,
-        )
-        memory_payload = _load_memory_inputs(tool, task_payload, trace_id)
-        if memory_payload:
-            payload.setdefault("memory", {}).update(memory_payload)
-            payload = apply_memory_defaults(tool.spec.name, payload)
-            missing = missing_memory_only_inputs(tool.spec.name, payload)
-            if missing:
-                tool_error = f"memory_only_inputs_missing:{','.join(missing)}"
-                outputs[tool_name] = {"error": tool_error}
-                tool_calls.append(
-                    models.ToolCall(
-                        tool_name=tool_name,
-                        input=payload,
-                        idempotency_key=str(uuid.uuid4()),
-                        trace_id=trace_id,
-                        started_at=started_at,
-                        finished_at=datetime.utcnow(),
-                        status="failed",
-                        output_or_error={"error": tool_error},
+    task_attempt, task_max_attempts = _task_attempt_limits(task_payload)
+    artifacts: list[dict[str, Any]] = []
+    with core_tracing.start_span(
+        "worker.execute_task",
+        attributes={
+            "task.id": str(task_id or ""),
+            "job.id": job_id,
+            "trace.id": trace_id,
+            "run.id": run_id,
+            "task.tool_request_count": len(tool_requests),
+            "task.intent": task_intent,
+            "task.attempt": task_attempt,
+            "task.max_attempts": task_max_attempts,
+            "model.provider": LLM_PROVIDER,
+            "model.name": OPENAI_MODEL,
+            "prompt.version": PROMPT_VERSION,
+            "policy.version": POLICY_VERSION,
+            "tool.version": TOOL_VERSION,
+        },
+    ) as task_span:
+        for tool_index, tool_name in enumerate(tool_requests):
+            with core_tracing.start_span(
+                "worker.execute_tool",
+                attributes={
+                    "task.id": str(task_id or ""),
+                    "job.id": job_id,
+                    "trace.id": trace_id,
+                    "run.id": run_id,
+                    "tool.name": tool_name,
+                    "tool.sequence": tool_index + 1,
+                    "task.attempt": task_attempt,
+                    "task.max_attempts": task_max_attempts,
+                    "model.provider": LLM_PROVIDER,
+                    "model.name": OPENAI_MODEL,
+                    "prompt.version": PROMPT_VERSION,
+                    "policy.version": POLICY_VERSION,
+                    "tool.version": TOOL_VERSION,
+                },
+            ) as tool_span:
+                try:
+                    tool = registry.get(tool_name)
+                except KeyError:
+                    tool_error = f"contract.tool_not_found:unknown_tool:{tool_name}"
+                    outputs[tool_name] = {"error": tool_error}
+                    core_tracing.set_span_attributes(tool_span, {"tool.error": tool_error})
+                    break
+                mismatch = _intent_mismatch(task_intent, tool.spec.tool_intent, tool_name)
+                if mismatch:
+                    tool_error = f"contract.intent_mismatch:{mismatch}"
+                    outputs[tool_name] = {"error": tool_error}
+                    tool_calls.append(
+                        models.ToolCall(
+                            tool_name=tool_name,
+                            input={},
+                            idempotency_key=str(uuid.uuid4()),
+                            trace_id=trace_id,
+                            started_at=started_at,
+                            finished_at=datetime.utcnow(),
+                            status="failed",
+                            output_or_error={"error": tool_error},
+                        )
                     )
+                    core_tracing.set_span_attributes(tool_span, {"tool.error": tool_error})
+                    break
+                payload = _tool_payload(
+                    tool_name,
+                    task_payload.get("instruction", ""),
+                    context,
+                    task_payload,
+                    tool_inputs,
                 )
-                break
-        _log_candidate_resume(tool.spec.name, payload, task_id, trace_id)
-        payload["_registry"] = registry
-        idempotency_key = str(uuid.uuid4())
-        core_logging.log_event(
-            LOGGER,
-            "tool_call_started",
-            {
-                "task_id": task_id,
-                "tool_name": tool_name,
-                "trace_id": trace_id,
-                "idempotency_key": idempotency_key,
-                "payload_keys": sorted(payload.keys()),
-            },
+                memory_payload = _load_memory_inputs(tool, task_payload, trace_id)
+                if memory_payload:
+                    payload.setdefault("memory", {}).update(memory_payload)
+                    payload = apply_memory_defaults(tool.spec.name, payload)
+                    missing = missing_memory_only_inputs(tool.spec.name, payload)
+                    if missing:
+                        tool_error = (
+                            f"contract.input_missing:memory_only_inputs_missing:{','.join(missing)}"
+                        )
+                        outputs[tool_name] = {"error": tool_error}
+                        tool_calls.append(
+                            models.ToolCall(
+                                tool_name=tool_name,
+                                input=payload,
+                                idempotency_key=str(uuid.uuid4()),
+                                trace_id=trace_id,
+                                started_at=started_at,
+                                finished_at=datetime.utcnow(),
+                                status="failed",
+                                output_or_error={"error": tool_error},
+                            )
+                        )
+                        core_tracing.set_span_attributes(tool_span, {"tool.error": tool_error})
+                        break
+                _log_candidate_resume(tool.spec.name, payload, task_id, trace_id)
+                payload["_registry"] = registry
+                idempotency_key = str(uuid.uuid4())
+                tool_started_at = time.monotonic()
+                core_logging.log_event(
+                    LOGGER,
+                    "tool_call_started",
+                    {
+                        "run_id": run_id,
+                        "job_id": job_id,
+                        "task_id": task_id,
+                        "tool_sequence": tool_index + 1,
+                        "task_attempt": task_attempt,
+                        "task_max_attempts": task_max_attempts,
+                        "tool_name": tool_name,
+                        "tool_intent": tool.spec.tool_intent.value,
+                        "tool_timeout_s": tool.spec.timeout_s,
+                        "trace_id": trace_id,
+                        "idempotency_key": idempotency_key,
+                        "model_provider": LLM_PROVIDER,
+                        "model_name": OPENAI_MODEL,
+                        "prompt_version": PROMPT_VERSION,
+                        "policy_version": POLICY_VERSION,
+                        "tool_version": TOOL_VERSION,
+                        "payload_keys": sorted(payload.keys()),
+                    },
+                )
+                call = registry.execute(
+                    tool_name,
+                    payload=payload,
+                    idempotency_key=idempotency_key,
+                    trace_id=trace_id,
+                    max_output_bytes=OUTPUT_SIZE_CAP,
+                )
+                core_logging.log_event(
+                    LOGGER,
+                    "tool_call_finished",
+                    {
+                        "run_id": run_id,
+                        "job_id": job_id,
+                        "task_id": task_id,
+                        "tool_sequence": tool_index + 1,
+                        "task_attempt": task_attempt,
+                        "task_max_attempts": task_max_attempts,
+                        "tool_name": tool_name,
+                        "trace_id": trace_id,
+                        "idempotency_key": idempotency_key,
+                        "status": call.status,
+                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                        "error_code": call.output_or_error.get("error_code"),
+                        "error": call.output_or_error.get("error"),
+                    },
+                )
+                core_tracing.set_span_attributes(
+                    tool_span,
+                    {
+                        "tool.status": call.status,
+                        "tool.idempotency_key": idempotency_key,
+                        "tool.error": call.output_or_error.get("error", ""),
+                        "tool.error_code": call.output_or_error.get("error_code", ""),
+                        "tool.duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                    },
+                )
+                tool_calls.append(call)
+                outputs[tool_name] = call.output_or_error
+                if call.status == "completed":
+                    _sync_output_artifact(call.output_or_error, task_id, tool_name, trace_id)
+                    _persist_memory_outputs(tool, task_payload, call, trace_id)
+                if call.status != "completed":
+                    tool_error = call.output_or_error.get("error", "tool_failed")
+                    error_code = call.output_or_error.get("error_code")
+                    if isinstance(error_code, str) and error_code:
+                        if isinstance(tool_error, str):
+                            if not tool_error.startswith(f"{error_code}:"):
+                                tool_error = f"{error_code}:{tool_error}"
+                                call.output_or_error["error"] = tool_error
+                                outputs[tool_name] = call.output_or_error
+                    if isinstance(tool_error, str):
+                        lowered = tool_error.lower()
+                        if (
+                            "timed out" in lowered
+                            or "timeout" in lowered
+                            or "mcp_sdk_timeout:" in lowered
+                        ):
+                            if not tool_error.startswith("tool_call_timed_out"):
+                                tool_error = f"tool_call_timed_out:{tool_error}"
+                                call.output_or_error["error"] = tool_error
+                                outputs[tool_name] = call.output_or_error
+                    if isinstance(tool_error, str):
+                        core_logging.log_event(
+                            LOGGER,
+                            "tool_call_failed",
+                            {
+                                "run_id": run_id,
+                                "job_id": job_id,
+                                "task_id": task_id,
+                                "tool_sequence": tool_index + 1,
+                                "task_attempt": task_attempt,
+                                "task_max_attempts": task_max_attempts,
+                                "tool_name": tool_name,
+                                "trace_id": trace_id,
+                                "idempotency_key": idempotency_key,
+                                "error": tool_error,
+                                "error_code": call.output_or_error.get("error_code"),
+                                "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                            },
+                        )
+                    break
+        finished_at = datetime.utcnow()
+        validation_error = _validate_expected_output(task_payload, outputs)
+        status = (
+            models.TaskStatus.failed
+            if tool_error or validation_error
+            else models.TaskStatus.completed
         )
-        call = registry.execute(
-            tool_name,
-            payload=payload,
-            idempotency_key=idempotency_key,
+        run_scorecard = _build_task_run_scorecard(
+            run_id=run_id,
             trace_id=trace_id,
-            max_output_bytes=OUTPUT_SIZE_CAP,
+            job_id=job_id,
+            task_id=str(task_id or ""),
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            tool_calls=tool_calls,
+            outputs=outputs,
+            task_attempt=task_attempt,
+            task_max_attempts=task_max_attempts,
+            failure_error=validation_error or tool_error,
         )
-        core_logging.log_event(
-            LOGGER,
-            "tool_call_finished",
+        artifacts.append({"type": "run_scorecard", "summary": run_scorecard})
+        core_logging.log_event(LOGGER, "task_run_scorecard", run_scorecard)
+        core_tracing.set_span_attributes(
+            task_span,
             {
-                "task_id": task_id,
-                "tool_name": tool_name,
-                "trace_id": trace_id,
-                "idempotency_key": idempotency_key,
-                "status": call.status,
+                "task.status": status.value,
+                "task.error": validation_error or tool_error or "",
+                "task.tool_calls": len(tool_calls),
+                "task.total_latency_ms": run_scorecard.get("total_latency_ms", 0),
+                "task.failure_stage": run_scorecard.get("failure_stage", ""),
             },
         )
-        tool_calls.append(call)
-        outputs[tool_name] = call.output_or_error
-        if call.status == "completed":
-            _persist_memory_outputs(tool, task_payload, call, trace_id)
-        if call.status != "completed":
-            tool_error = call.output_or_error.get("error", "tool_failed")
-            break
-    finished_at = datetime.utcnow()
-    validation_error = _validate_expected_output(task_payload, outputs)
-    status = (
-        models.TaskStatus.failed if tool_error or validation_error else models.TaskStatus.completed
-    )
-    if tool_error:
-        outputs["tool_error"] = {"error": tool_error}
-    if validation_error:
-        outputs["validation_error"] = {"error": validation_error}
-    return models.TaskResult(
-        task_id=task_id,
-        status=status,
-        outputs=outputs,
-        artifacts=[],
-        tool_calls=tool_calls,
-        started_at=started_at,
-        finished_at=finished_at,
-        error=validation_error or tool_error,
-    )
+        if tool_error:
+            outputs["tool_error"] = {"error": tool_error}
+        if validation_error:
+            outputs["validation_error"] = {"error": validation_error}
+        return models.TaskResult(
+            task_id=task_id,
+            status=status,
+            outputs=outputs,
+            artifacts=artifacts,
+            tool_calls=tool_calls,
+            started_at=started_at,
+            finished_at=finished_at,
+            error=validation_error or tool_error,
+        )
+
+
+def _build_task_run_scorecard(
+    *,
+    run_id: str,
+    trace_id: str,
+    job_id: str,
+    task_id: str,
+    status: models.TaskStatus,
+    started_at: datetime,
+    finished_at: datetime,
+    tool_calls: list[models.ToolCall],
+    outputs: dict[str, Any],
+    task_attempt: int,
+    task_max_attempts: int,
+    failure_error: str | None,
+) -> dict[str, Any]:
+    total_latency_ms = int(max(0.0, (finished_at - started_at).total_seconds()) * 1000)
+    tool_failures = [call for call in tool_calls if call.status != "completed"]
+    scorecard: dict[str, Any] = {
+        "run_id": run_id,
+        "trace_id": trace_id,
+        "job_id": job_id,
+        "task_id": task_id,
+        "success": status == models.TaskStatus.completed,
+        "task_status": status.value,
+        "failure_stage": _failure_stage_for_error(failure_error),
+        "total_latency_ms": total_latency_ms,
+        "tool_calls_count": len(tool_calls),
+        "tool_failures_count": len(tool_failures),
+        "task_attempt": task_attempt,
+        "task_max_attempts": task_max_attempts,
+        "model_provider": LLM_PROVIDER,
+        "model_name": OPENAI_MODEL,
+        "prompt_version": PROMPT_VERSION,
+        "policy_version": POLICY_VERSION,
+        "tool_version": TOOL_VERSION,
+        "policy_hits": _count_policy_hits(tool_calls, outputs),
+    }
+    token_metrics = _aggregate_token_metrics(tool_calls)
+    scorecard.update(token_metrics)
+    return scorecard
+
+
+def _failure_stage_for_error(error: str | None) -> str:
+    if not isinstance(error, str) or not error:
+        return ""
+    lowered = error.lower()
+    if lowered.startswith("contract."):
+        return "contract"
+    if "validation" in lowered or "schema_" in lowered or "invalid_json" in lowered:
+        return "validation"
+    if "timeout" in lowered:
+        return "timeout"
+    if "mcp_" in lowered:
+        return "mcp"
+    if lowered.startswith("policy.") or lowered.startswith("guardrail_blocked"):
+        return "guardrail"
+    if lowered.startswith("tool_") or lowered.startswith("runtime."):
+        return "tool_call"
+    return "task_execution"
+
+
+def _count_policy_hits(tool_calls: list[models.ToolCall], outputs: dict[str, Any]) -> int:
+    hits = 0
+    for call in tool_calls:
+        output = call.output_or_error if isinstance(call.output_or_error, dict) else {}
+        error_text = output.get("error")
+        error_code = output.get("error_code")
+        if isinstance(error_code, str) and error_code.startswith("policy."):
+            hits += 1
+            continue
+        if isinstance(error_text, str) and "guardrail" in error_text.lower():
+            hits += 1
+    tool_error = outputs.get("tool_error")
+    if isinstance(tool_error, dict):
+        error_text = tool_error.get("error")
+        if isinstance(error_text, str) and "guardrail" in error_text.lower():
+            hits += 1
+    return hits
+
+
+def _aggregate_token_metrics(tool_calls: list[models.ToolCall]) -> dict[str, Any]:
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    cost_usd_est = 0.0
+    for call in tool_calls:
+        output = call.output_or_error if isinstance(call.output_or_error, dict) else {}
+        usage = output.get("usage")
+        usage_dict = usage if isinstance(usage, dict) else output
+        prompt_tokens += _int_metric(usage_dict.get("prompt_tokens"))
+        completion_tokens += _int_metric(usage_dict.get("completion_tokens"))
+        total_tokens += _int_metric(usage_dict.get("total_tokens"))
+        cost_usd_est += _float_metric(usage_dict.get("cost_usd"))
+    return {
+        "tokens_in": prompt_tokens,
+        "tokens_out": completion_tokens,
+        "tokens_total": total_tokens,
+        "cost_usd_est": round(cost_usd_est, 6),
+    }
+
+
+def _int_metric(value: Any) -> int:
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    if isinstance(value, str):
+        try:
+            return max(0, int(float(value)))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _float_metric(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _infer_task_intent(task_payload: dict) -> str:
@@ -351,6 +647,43 @@ def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, tra
                 "tool_name": tool.spec.name,
                 "memory_name": name,
                 "status": "ok" if written else "failed",
+                "trace_id": trace_id,
+            },
+        )
+
+
+def _sync_output_artifact(
+    output: Mapping[str, Any], task_id: str | None, tool_name: str, trace_id: str
+) -> None:
+    if not isinstance(output, Mapping):
+        return
+    path_value = output.get("path")
+    if not isinstance(path_value, str) or not path_value.strip():
+        return
+    try:
+        key = document_store.upload_artifact(path_value)
+    except Exception as exc:  # noqa: BLE001
+        core_logging.log_event(
+            LOGGER,
+            "artifact_sync_failed",
+            {
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "path": path_value,
+                "error": str(exc),
+                "trace_id": trace_id,
+            },
+        )
+        return
+    if key:
+        core_logging.log_event(
+            LOGGER,
+            "artifact_synced",
+            {
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "path": path_value,
+                "object_key": key,
                 "trace_id": trace_id,
             },
         )
@@ -1097,40 +1430,328 @@ def _extract_instruction_payload(instruction: str) -> dict:
     return {}
 
 
+def _task_attempt_limits(task_payload: Mapping[str, Any]) -> tuple[int, int]:
+    attempts_raw = task_payload.get("attempts")
+    max_attempts_raw = task_payload.get("max_attempts")
+    try:
+        attempts = int(attempts_raw) if attempts_raw is not None else 1
+    except (TypeError, ValueError):
+        attempts = 1
+    attempts = max(attempts, 1)
+    if max_attempts_raw is None:
+        max_attempts = WORKER_DEFAULT_MAX_ATTEMPTS
+    else:
+        try:
+            max_attempts = int(max_attempts_raw)
+        except (TypeError, ValueError):
+            max_attempts = WORKER_DEFAULT_MAX_ATTEMPTS
+        if max_attempts <= 0:
+            max_attempts = WORKER_DEFAULT_MAX_ATTEMPTS
+    max_attempts = max(max_attempts, attempts)
+    return attempts, max_attempts
+
+
+def _is_transient_error(error: str | None) -> bool:
+    if not error:
+        return False
+    value = error.lower()
+    transient_tokens = (
+        "timed out",
+        "timeout",
+        "connection refused",
+        "remote end closed",
+        "session terminated",
+        "temporary",
+        "service unavailable",
+        "too many requests",
+        "rate limit",
+        "502",
+        "503",
+        "504",
+    )
+    return any(token in value for token in transient_tokens)
+
+
+def _is_contract_error(error: str | None) -> bool:
+    if not error:
+        return False
+    value = error.strip().lower()
+    head = value.split(":", 1)[0]
+    # Prefer explicit machine codes; keep a tiny legacy prefix map for backward compatibility.
+    explicit_contract_codes = {
+        "contract.input_invalid",
+        "contract.output_invalid",
+        "contract.schema_not_found",
+        "contract.schema_invalid",
+        "contract.tool_not_found",
+        "contract.input_missing",
+        "contract.intent_mismatch",
+    }
+    if head in explicit_contract_codes:
+        return True
+    legacy_contract_prefixes = {
+        "unknown_tool",
+        "memory_only_inputs_missing",
+        "tool_intent_mismatch",
+    }
+    return head in legacy_contract_prefixes
+
+
+def _should_retry_task(task_payload: Mapping[str, Any], error: str | None) -> bool:
+    if not WORKER_RETRY_ENABLED:
+        return False
+    attempts, max_attempts = _task_attempt_limits(task_payload)
+    if attempts >= max_attempts:
+        return False
+    if _is_contract_error(error):
+        return False
+    if WORKER_RETRY_POLICY == "none":
+        return False
+    if WORKER_RETRY_POLICY == "any":
+        return True
+    return _is_transient_error(error)
+
+
+def _emit_task_event(
+    event_type: str, envelope: Mapping[str, Any], payload: Mapping[str, Any]
+) -> None:
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        task_id = envelope.get("task_id") if isinstance(envelope.get("task_id"), str) else None
+    event = models.EventEnvelope(
+        type=event_type,
+        version="1",
+        occurred_at=datetime.utcnow(),
+        correlation_id=str(envelope.get("correlation_id") or str(uuid.uuid4())),
+        job_id=envelope.get("job_id") if isinstance(envelope.get("job_id"), str) else None,
+        task_id=task_id,
+        payload=dict(payload),
+    )
+    redis_client.xadd(events.TASK_STREAM, {"data": event.model_dump_json()})
+
+
+def _emit_task_dlq_event(
+    message_id: str, envelope: Mapping[str, Any], task_payload: Mapping[str, Any], error: str
+) -> None:
+    if not WORKER_DLQ_ENABLED:
+        return
+    dlq_payload = {
+        "message_id": message_id,
+        "failed_at": datetime.utcnow().isoformat(),
+        "error": error,
+        "worker_consumer": WORKER_CONSUMER,
+        "job_id": envelope.get("job_id"),
+        "task_id": task_payload.get("task_id"),
+        "envelope": dict(envelope),
+        "task_payload": dict(task_payload),
+    }
+    redis_client.xadd(events.TASK_DLQ_STREAM, {"data": json.dumps(dlq_payload, ensure_ascii=True)})
+
+
+def _queue_task_retry(
+    task_payload: Mapping[str, Any], envelope: Mapping[str, Any], error: str
+) -> None:
+    attempts, max_attempts = _task_attempt_limits(task_payload)
+    retry_payload = dict(task_payload)
+    run_id = str(
+        retry_payload.get("run_id")
+        or envelope.get("correlation_id")
+        or retry_payload.get("correlation_id")
+        or uuid.uuid4()
+    )
+    retry_payload["run_id"] = run_id
+    retry_payload["attempts"] = attempts + 1
+    retry_payload["max_attempts"] = max_attempts
+    retry_payload["status"] = models.TaskStatus.ready.value
+    retry_payload["last_error"] = error
+    _emit_task_event(
+        "task.heartbeat",
+        envelope,
+        {
+            "task_id": retry_payload.get("task_id"),
+            "status": "retrying",
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "error": error,
+            "worker_consumer": WORKER_CONSUMER,
+            "run_id": run_id,
+        },
+    )
+    _emit_task_event("task.ready", envelope, retry_payload)
+
+
+def _claim_stale_messages(group: str, consumer: str) -> list[tuple[str, Mapping[str, str]]]:
+    try:
+        res = redis_client.xautoclaim(
+            events.TASK_STREAM,
+            group,
+            consumer,
+            min_idle_time=WORKER_RECOVER_IDLE_MS,
+            start_id="0-0",
+            count=WORKER_RECOVER_COUNT,
+        )
+    except Exception:  # noqa: BLE001
+        core_logging.log_event(
+            LOGGER,
+            "worker_claim_failed",
+            {"group": group, "consumer": consumer, "stream": events.TASK_STREAM},
+        )
+        return []
+    if not res or len(res) < 2:
+        return []
+    messages = res[1]
+    if messages:
+        core_logging.log_event(
+            LOGGER,
+            "worker_claimed_messages",
+            {
+                "group": group,
+                "consumer": consumer,
+                "stream": events.TASK_STREAM,
+                "count": len(messages),
+            },
+        )
+    return messages
+
+
+def _process_task_ready_message(message_id: str, envelope: Mapping[str, Any]) -> None:
+    payload = envelope.get("payload")
+    task_payload = dict(payload) if isinstance(payload, dict) else {}
+    if not task_payload:
+        return
+    run_id = str(
+        task_payload.get("run_id")
+        or envelope.get("correlation_id")
+        or task_payload.get("correlation_id")
+        or uuid.uuid4()
+    )
+    task_payload["run_id"] = run_id
+    attempts, max_attempts = _task_attempt_limits(task_payload)
+    _emit_task_event(
+        "task.started",
+        envelope,
+        {
+            "task_id": task_payload.get("task_id"),
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "worker_consumer": WORKER_CONSUMER,
+            "run_id": run_id,
+        },
+    )
+    try:
+        result = execute_task(task_payload)
+    except Exception as exc:  # noqa: BLE001
+        error = f"worker_execution_error:{exc}"
+        core_logging.log_event(
+            LOGGER,
+            "worker_task_execution_error",
+            {
+                "task_id": task_payload.get("task_id"),
+                "message_id": message_id,
+                "error": error,
+                "attempts": attempts,
+                "max_attempts": max_attempts,
+                "run_id": run_id,
+            },
+        )
+        if _should_retry_task(task_payload, error):
+            _queue_task_retry(task_payload, envelope, error)
+            return
+        failed_payload = {
+            "task_id": str(task_payload.get("task_id") or ""),
+            "status": models.TaskStatus.failed.value,
+            "outputs": {"tool_error": {"error": error}},
+            "artifacts": [],
+            "tool_calls": [],
+            "started_at": datetime.utcnow().isoformat(),
+            "finished_at": datetime.utcnow().isoformat(),
+            "error": error,
+            "run_id": run_id,
+        }
+        _emit_task_event("task.failed", envelope, failed_payload)
+        _emit_task_dlq_event(message_id, envelope, task_payload, error)
+        return
+
+    result_error = result.error
+    if not result_error:
+        maybe_tool_error = (
+            result.outputs.get("tool_error") if isinstance(result.outputs, dict) else {}
+        )
+        if isinstance(maybe_tool_error, dict):
+            value = maybe_tool_error.get("error")
+            if isinstance(value, str) and value:
+                result_error = value
+
+    if result.status == models.TaskStatus.failed and _should_retry_task(task_payload, result_error):
+        if isinstance(result_error, str) and result_error.startswith("tool_call_timed_out"):
+            _emit_task_event(
+                "task.heartbeat",
+                envelope,
+                {
+                    "task_id": task_payload.get("task_id"),
+                    "status": "timed_out",
+                    "attempts": attempts,
+                    "max_attempts": max_attempts,
+                    "error": result_error,
+                    "worker_consumer": WORKER_CONSUMER,
+                    "run_id": run_id,
+                },
+            )
+        _queue_task_retry(task_payload, envelope, result_error or "task_failed")
+        return
+
+    event_type = "task.failed" if result.status == models.TaskStatus.failed else "task.completed"
+    result_payload = result.model_dump(mode="json")
+    result_payload["run_id"] = run_id
+    _emit_task_event(event_type, envelope, result_payload)
+    if result.status == models.TaskStatus.failed:
+        _emit_task_dlq_event(
+            message_id,
+            envelope,
+            task_payload,
+            result_error or "task_failed",
+        )
+
+
 def run() -> None:
-    group = "workers"
-    consumer = str(uuid.uuid4())
+    group = WORKER_GROUP
+    consumer = WORKER_CONSUMER
     try:
         redis_client.xgroup_create(events.TASK_STREAM, group, id="0-0", mkstream=True)
     except redis.ResponseError:
         pass
+    last_recovery = 0.0
     while True:
-        messages = redis_client.xreadgroup(
-            group, consumer, {events.TASK_STREAM: ">"}, count=1, block=1000
-        )
-        for _, entries in messages:
-            for message_id, data in entries:
-                payload = json.loads(data["data"])
-                if payload.get("type") != "task.ready":
-                    redis_client.xack(events.TASK_STREAM, group, message_id)
-                    continue
-                task_payload = payload.get("payload", {})
-                result = execute_task(task_payload)
-                event_type = (
-                    "task.failed" if result.status == models.TaskStatus.failed else "task.completed"
-                )
-                event = models.EventEnvelope(
-                    type=event_type,
-                    version="1",
-                    occurred_at=datetime.utcnow(),
-                    correlation_id=payload.get("correlation_id", str(uuid.uuid4())),
-                    job_id=payload.get("job_id"),
-                    task_id=task_payload.get("task_id"),
-                    payload=result.model_dump(),
-                )
-                redis_client.xadd(events.TASK_STREAM, {"data": event.model_dump_json()})
+        reclaimed_messages: list[tuple[str, Mapping[str, str]]] = []
+        now = time.time()
+        if WORKER_RECOVER_PENDING and now - last_recovery >= WORKER_RECOVER_INTERVAL_S:
+            reclaimed_messages = _claim_stale_messages(group, consumer)
+            last_recovery = now
+        if reclaimed_messages:
+            entries = reclaimed_messages
+        else:
+            messages = redis_client.xreadgroup(
+                group,
+                consumer,
+                {events.TASK_STREAM: ">"},
+                count=WORKER_READ_COUNT,
+                block=WORKER_BLOCK_MS,
+            )
+            entries = []
+            for _, stream_entries in messages:
+                entries.extend(stream_entries)
+        for message_id, data in entries:
+            try:
+                raw = data.get("data")
+                payload = json.loads(raw) if isinstance(raw, str) else {}
+            except json.JSONDecodeError:
+                payload = {}
+            try:
+                if payload.get("type") == "task.ready":
+                    _process_task_ready_message(message_id, payload)
+            finally:
                 redis_client.xack(events.TASK_STREAM, group, message_id)
-                time.sleep(0.1)
+        time.sleep(0.05)
 
 
 if __name__ == "__main__":

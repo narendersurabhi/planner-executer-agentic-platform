@@ -9,6 +9,7 @@ from libs.core import logging as core_logging
 from app.mcp import create_mcp_asgi_app
 from tailor_core import (
     TailorError,
+    create_evaluator_from_env,
     create_provider_from_env,
     improve_resume,
     improve_resume_iterative,
@@ -20,6 +21,7 @@ core_logging.configure_logging("tailor")
 LOGGER = core_logging.get_logger("tailor")
 
 LLM_PROVIDER_INSTANCE = create_provider_from_env()
+EVALUATOR_INSTANCE = create_evaluator_from_env(LLM_PROVIDER_INSTANCE)
 
 
 class TailorRequest(BaseModel):
@@ -42,6 +44,7 @@ class ImproveResponse(BaseModel):
     tailored_resume: Dict[str, Any]
     alignment_score: float
     alignment_summary: str
+    alignment_feedback: Dict[str, List[str]] = Field(default_factory=dict)
 
 
 class ImproveIterativeRequest(BaseModel):
@@ -57,6 +60,7 @@ class ImproveIterativeResponse(BaseModel):
     tailored_resume: Dict[str, Any]
     alignment_score: float
     alignment_summary: str
+    alignment_feedback: Dict[str, List[str]] = Field(default_factory=dict)
     iterations: int
     reached_threshold: bool
     history: List[Dict[str, Any]]
@@ -64,7 +68,8 @@ class ImproveIterativeResponse(BaseModel):
 
 app = FastAPI(title="Resume Tailoring Service")
 app.state.tailor_provider = LLM_PROVIDER_INSTANCE
-MCP_APP, MCP_SESSION_MANAGER = create_mcp_asgi_app(LLM_PROVIDER_INSTANCE)
+app.state.tailor_evaluator = EVALUATOR_INSTANCE
+MCP_APP, MCP_SESSION_MANAGER = create_mcp_asgi_app(LLM_PROVIDER_INSTANCE, EVALUATOR_INSTANCE)
 app.mount("/mcp/rpc", MCP_APP)
 
 
@@ -104,6 +109,7 @@ def improve_resume_endpoint(request: ImproveRequest) -> ImproveResponse:
             job=request.job,
             memory=request.memory,
             provider=LLM_PROVIDER_INSTANCE,
+            evaluator=EVALUATOR_INSTANCE,
         )
     except TailorError as exc:
         raise _http_error(exc) from exc
@@ -111,6 +117,7 @@ def improve_resume_endpoint(request: ImproveRequest) -> ImproveResponse:
         tailored_resume=result["tailored_resume"],
         alignment_score=float(result["alignment_score"]),
         alignment_summary=str(result["alignment_summary"]),
+        alignment_feedback=dict(result.get("alignment_feedback") or {}),
     )
 
 
@@ -125,6 +132,7 @@ def improve_resume_iterative_endpoint(request: ImproveIterativeRequest) -> Impro
             min_alignment_score=request.min_alignment_score,
             max_iterations=request.max_iterations,
             provider=LLM_PROVIDER_INSTANCE,
+            evaluator=EVALUATOR_INSTANCE,
         )
     except TailorError as exc:
         raise _http_error(exc) from exc
@@ -133,6 +141,7 @@ def improve_resume_iterative_endpoint(request: ImproveIterativeRequest) -> Impro
         tailored_resume=result["tailored_resume"],
         alignment_score=float(result["alignment_score"]),
         alignment_summary=str(result["alignment_summary"]),
+        alignment_feedback=dict(result.get("alignment_feedback") or {}),
         iterations=int(result["iterations"]),
         reached_threshold=bool(result["reached_threshold"]),
         history=list(result["history"]),

@@ -11,4 +11,5 @@ __all__ = [
     "tracing",
     "logging",
     "memory_client",
+    "document_store",
 ]

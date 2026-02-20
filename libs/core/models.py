@@ -122,6 +122,18 @@ class MemoryQuery(BaseModel):
     include_expired: bool = False
 
 
+class TaskDlqEntry(BaseModel):
+    stream_id: str
+    message_id: str
+    failed_at: Optional[str] = None
+    error: str
+    worker_consumer: Optional[str] = None
+    job_id: Optional[str] = None
+    task_id: Optional[str] = None
+    envelope: Dict[str, Any] = Field(default_factory=dict)
+    task_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ToolCall(BaseModel):
     tool_name: str
     input: Dict[str, Any]

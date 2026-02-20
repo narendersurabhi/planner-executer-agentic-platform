@@ -37,6 +37,65 @@ const formatTimestamp = (value?: string) => {
   return date.toLocaleString();
 };
 
+const ARTIFACT_EXTENSIONS = [".docx", ".pdf", ".md", ".txt", ".json", ".csv"];
+
+const normalizeArtifactPath = (value: string) => {
+  const trimmed = value.trim().replaceAll("\\", "/");
+  const prefixes = ["/shared/artifacts/", "shared/artifacts/", "artifacts/"];
+  for (const prefix of prefixes) {
+    if (trimmed.startsWith(prefix)) {
+      return trimmed.slice(prefix.length);
+    }
+  }
+  return trimmed;
+};
+
+const looksLikeArtifactPath = (value: string) => {
+  const candidate = normalizeArtifactPath(value);
+  if (!candidate || candidate.startsWith("http://") || candidate.startsWith("https://")) {
+    return false;
+  }
+  if (candidate.startsWith("/") || candidate.includes("..")) {
+    return false;
+  }
+  return ARTIFACT_EXTENSIONS.some((ext) => candidate.toLowerCase().endsWith(ext));
+};
+
+const collectArtifactPaths = (value: unknown, output: Set<string>, path = "") => {
+  if (typeof value === "string") {
+    const lowerPath = path.toLowerCase();
+    if (lowerPath.includes(".tokens.") || lowerPath.endsWith(".result_path")) {
+      return;
+    }
+    if (looksLikeArtifactPath(value)) {
+      output.add(normalizeArtifactPath(value));
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectArtifactPaths(item, output, `${path}[${index}]`));
+    return;
+  }
+  if (value && typeof value === "object") {
+    Object.entries(value as Record<string, unknown>).forEach(([key, item]) =>
+      collectArtifactPaths(item, output, path ? `${path}.${key}` : key)
+    );
+  }
+};
+
+const downloadHrefForPath = (path: string) => {
+  const trimmed = path.trim();
+  const workspaceLike =
+    trimmed.startsWith("repos/") ||
+    trimmed.startsWith("workspace/") ||
+    trimmed.startsWith("repos\\") ||
+    trimmed.startsWith("workspace\\");
+  if (workspaceLike) {
+    return `${apiUrl}/workspace/download?path=${encodeURIComponent(trimmed)}`;
+  }
+  return `${apiUrl}/artifacts/download?path=${encodeURIComponent(trimmed)}`;
+};
+
 type Job = {
   id: string;
   goal: string;
@@ -110,6 +169,18 @@ type MemoryEntry = {
   created_at?: string;
   updated_at?: string;
   expires_at?: string | null;
+};
+
+type TaskDlqEntry = {
+  stream_id: string;
+  message_id: string;
+  failed_at?: string | null;
+  error: string;
+  worker_consumer?: string | null;
+  job_id?: string | null;
+  task_id?: string | null;
+  envelope?: Record<string, unknown>;
+  task_payload?: Record<string, unknown>;
 };
 
 type TemplateVariable = {
@@ -854,6 +925,10 @@ export default function Home() {
   const [memoryEntries, setMemoryEntries] = useState<Record<string, MemoryEntry[]>>({});
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryError, setMemoryError] = useState<string | null>(null);
+  const [showDlq, setShowDlq] = useState(false);
+  const [dlqEntries, setDlqEntries] = useState<TaskDlqEntry[]>([]);
+  const [dlqLoading, setDlqLoading] = useState(false);
+  const [dlqError, setDlqError] = useState<string | null>(null);
   const [memoryLimitDefault, setMemoryLimitDefault] = useState(10);
   const [memoryLimits, setMemoryLimits] = useState<Record<string, number>>({
     job_context: 10,
@@ -902,6 +977,16 @@ export default function Home() {
     }
     return [latest];
   }, [jobs, showAllJobs]);
+
+  const jobDownloadPaths = useMemo(() => {
+    const found = new Set<string>();
+    selectedTasks.forEach((task) => {
+      const result = taskResults[task.id];
+      collectArtifactPaths(result?.outputs, found);
+      (result?.tool_calls || []).forEach((call) => collectArtifactPaths(call.output_or_error, found));
+    });
+    return Array.from(found).sort();
+  }, [selectedTasks, taskResults]);
 
   useEffect(() => {
     loadJobs();
@@ -1487,6 +1572,7 @@ const openTemplateModal = (template: Template) => {
     }
 
     await loadMemoryEntries(jobId);
+    await loadDlqEntries(jobId);
 
     setDetailsLoading(false);
   };
@@ -1533,6 +1619,28 @@ const openTemplateModal = (template: Template) => {
     setMemoryLoading(false);
   };
 
+  const loadDlqEntries = async (jobId: string, limit = 25) => {
+    setDlqLoading(true);
+    setDlqError(null);
+    const result = await fetchJson(
+      `${apiUrl}/jobs/${encodeURIComponent(jobId)}/tasks/dlq?limit=${encodeURIComponent(String(limit))}`
+    );
+    if (result.ok && Array.isArray(result.data)) {
+      setDlqEntries(result.data as TaskDlqEntry[]);
+      setDlqLoading(false);
+      return;
+    }
+    setDlqEntries([]);
+    if (result.status) {
+      setDlqError(`Failed to load DLQ entries (${result.status}).`);
+    } else if (result.error) {
+      setDlqError(`Failed to load DLQ entries (${result.error}).`);
+    } else {
+      setDlqError("Failed to load DLQ entries.");
+    }
+    setDlqLoading(false);
+  };
+
   const filterMemoryEntries = (entries: MemoryEntry[]) => {
     const keyFilter = memoryFilters.key.trim().toLowerCase();
     const toolFilter = memoryFilters.tool.trim().toLowerCase();
@@ -1564,6 +1672,10 @@ const openTemplateModal = (template: Template) => {
     setMemoryEntries({});
     setMemoryError(null);
     setMemoryLoading(false);
+    setDlqEntries([]);
+    setDlqError(null);
+    setDlqLoading(false);
+    setShowDlq(false);
     setExpandedMemoryGroups(new Set());
     setExpandedMemoryEntries({});
     setMemoryFilters({ key: "", tool: "" });
@@ -1595,6 +1707,47 @@ const openTemplateModal = (template: Template) => {
     const response = await fetch(`${apiUrl}/jobs/${jobId}/retry_failed`, { method: "POST" });
     if (response.ok) {
       loadJobs();
+    }
+  };
+
+  const retryTaskFromDlq = async (entry: TaskDlqEntry) => {
+    const jobId = selectedJobIdRef.current;
+    if (!jobId || !entry.task_id) {
+      return;
+    }
+    setDlqError(null);
+    let response: Response;
+    try {
+      response = await fetch(
+        `${apiUrl}/jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(entry.task_id)}/retry`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ stream_id: entry.stream_id })
+        }
+      );
+    } catch (error) {
+      setDlqError(
+        `Retry failed (${error instanceof Error ? error.message : "network error"}).`
+      );
+      return;
+    }
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const payload = await response.json();
+        if (payload && typeof payload === "object" && typeof payload.detail === "string") {
+          detail = payload.detail;
+        }
+      } catch {
+        detail = "";
+      }
+      setDlqError(detail ? `Retry failed (${response.status}): ${detail}` : `Retry failed (${response.status}).`);
+      return;
+    }
+    await loadJobs();
+    if (selectedJobIdRef.current === jobId) {
+      await loadJobDetails(jobId);
     }
   };
 
@@ -2315,6 +2468,24 @@ const openTemplateModal = (template: Template) => {
               ) : (
                 <div className="text-xs text-slate-600">Plan not created yet.</div>
               )}
+              <div className="mt-3 font-medium">Downloads</div>
+              {jobDownloadPaths.length > 0 ? (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {jobDownloadPaths.map((path) => (
+                    <a
+                      key={`job-download-${path}`}
+                      href={downloadHrefForPath(path)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1 text-[11px] text-cyan-700 hover:bg-cyan-100"
+                    >
+                      {path}
+                    </a>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-slate-600">No downloadable artifacts yet.</div>
+              )}
             </div>
 
             {selectedTasks.length === 0 ? (
@@ -2406,6 +2577,15 @@ const openTemplateModal = (template: Template) => {
                   <div className="mt-4 space-y-3">
                     {selectedTasks.map((task) => {
                       const isExpanded = expandedTaskInputs.has(task.id);
+                      const taskResult = taskResults[task.id];
+                      const artifactPaths = (() => {
+                        const found = new Set<string>();
+                        collectArtifactPaths(taskResult?.outputs, found);
+                        (taskResult?.tool_calls || []).forEach((call) =>
+                          collectArtifactPaths(call.output_or_error, found)
+                        );
+                        return Array.from(found).sort();
+                      })();
                       return (
                         <div
                           key={task.id}
@@ -2520,9 +2700,29 @@ const openTemplateModal = (template: Template) => {
                                   Outputs
                                 </div>
                                 <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600">
-                                  {JSON.stringify(taskResults[task.id]?.outputs || {}, null, 2)}
+                                  {JSON.stringify(taskResult?.outputs || {}, null, 2)}
                                 </pre>
                               </div>
+                              {artifactPaths.length > 0 ? (
+                                <div>
+                                  <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                    Downloads
+                                  </div>
+                                  <div className="mt-2 flex flex-wrap gap-2">
+                                    {artifactPaths.map((path) => (
+                                      <a
+                                        key={`${task.id}-artifact-${path}`}
+                                        href={downloadHrefForPath(path)}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1 text-[11px] text-cyan-700 hover:bg-cyan-100"
+                                      >
+                                        {path}
+                                      </a>
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : null}
                             </div>
                           ) : (
                             <div className="mt-3 text-xs text-slate-500">Collapsed.</div>
@@ -2767,6 +2967,92 @@ const openTemplateModal = (template: Template) => {
                       );
                     })}
                   </div>
+                ) : (
+                  <div className="mt-3 text-xs text-slate-500">Hidden by default.</div>
+                )}
+              </div>
+            ) : null}
+
+            {selectedJobId ? (
+              <div className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-800">Dead Letter Queue</div>
+                    <div className="text-[11px] uppercase tracking-[0.2em] text-slate-400">
+                      tasks.dlq
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                      {dlqEntries.length} entries
+                    </span>
+                    <button
+                      className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+                      onClick={() => setShowDlq((prev) => !prev)}
+                    >
+                      {showDlq ? "Hide" : "Show"}
+                    </button>
+                    <button
+                      className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500"
+                      onClick={() => selectedJobId && loadDlqEntries(selectedJobId)}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                </div>
+                {dlqLoading ? (
+                  <div className="mt-3 text-xs text-slate-500">Loading DLQ entries...</div>
+                ) : dlqError ? (
+                  <div className="mt-3 text-xs text-rose-600">{dlqError}</div>
+                ) : showDlq ? (
+                  dlqEntries.length > 0 ? (
+                    <div className="mt-3 space-y-3">
+                      {dlqEntries.map((entry) => {
+                        const canRetry =
+                          !!entry.task_id &&
+                          selectedTasks.some(
+                            (task) => task.id === entry.task_id && task.status === "failed"
+                          );
+                        return (
+                          <div
+                            key={`${entry.stream_id}-${entry.message_id}`}
+                            className="rounded-lg border border-slate-200 bg-slate-50 p-3"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="text-xs font-semibold text-slate-700">
+                                {entry.message_id}
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="text-[11px] text-slate-500">
+                                  {formatTimestamp(entry.failed_at || undefined)}
+                                </div>
+                                <button
+                                  className="rounded-full border border-slate-200 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-slate-500 disabled:opacity-40"
+                                  disabled={!canRetry}
+                                  onClick={() => retryTaskFromDlq(entry)}
+                                >
+                                  Retry Task
+                                </button>
+                              </div>
+                            </div>
+                            <div className="mt-2 grid gap-2 text-xs text-slate-600 md:grid-cols-2">
+                              <div>
+                                <span className="font-semibold text-slate-700">Task:</span>{" "}
+                                {entry.task_id || "—"}
+                              </div>
+                              <div>
+                                <span className="font-semibold text-slate-700">Worker:</span>{" "}
+                                {entry.worker_consumer || "—"}
+                              </div>
+                            </div>
+                            <div className="mt-2 text-xs text-rose-700">{entry.error}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="mt-3 text-xs text-slate-500">No DLQ entries for this job.</div>
+                  )
                 ) : (
                   <div className="mt-3 text-xs text-slate-500">Hidden by default.</div>
                 )}

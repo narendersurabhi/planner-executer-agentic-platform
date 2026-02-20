@@ -103,13 +103,16 @@ def _convert_content(content: Any) -> List[Dict[str, Any]]:
 
     current_section = ""
 
-    for item in content:
+    for idx, item in enumerate(content):
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
         if item_type == "header":
             blocks.extend(_convert_header(item))
         elif item_type == "section_heading":
+            if not _section_has_renderable_content(content, idx + 1):
+                current_section = ""
+                continue
             text = item.get("text")
             if isinstance(text, str) and text.strip():
                 current_section = text.strip().upper()
@@ -123,8 +126,8 @@ def _convert_content(content: Any) -> List[Dict[str, Any]]:
                 )
         elif item_type == "paragraph":
             text = item.get("text")
-            if isinstance(text, str):
-                block = {"type": "paragraph", "text": text}
+            if isinstance(text, str) and text.strip():
+                block = {"type": "paragraph", "text": text.strip()}
                 style = item.get("style")
                 if isinstance(style, str):
                     block["style"] = style
@@ -138,10 +141,12 @@ def _convert_content(content: Any) -> List[Dict[str, Any]]:
         elif item_type == "bullets":
             bullets = item.get("items")
             if isinstance(bullets, list):
-                block: Dict[str, Any] = {"type": "bullets", "items": bullets}
-                if current_section in {"CERTIFICATION", "CERTIFICATIONS"}:
-                    block["style"] = "term_def"
-                blocks.append(block)
+                items = [b.strip() for b in bullets if isinstance(b, str) and b.strip()]
+                if items:
+                    block = {"type": "bullets", "items": items}
+                    if current_section in {"CERTIFICATION", "CERTIFICATIONS"}:
+                        block["style"] = "term_def"
+                    blocks.append(block)
         else:
             # ignore unsupported blocks to keep conversion resilient
             continue
@@ -158,9 +163,9 @@ def _convert_header(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not isinstance(block, dict):
             continue
         text = block.get("text")
-        if not isinstance(text, str):
+        if not isinstance(text, str) or not text.strip():
             continue
-        out = {"type": "text", "text": text}
+        out = {"type": "text", "text": text.strip()}
         style = block.get("style")
         if isinstance(style, str):
             if style == "name":
@@ -184,6 +189,10 @@ def _convert_definition_list(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         term = entry.get("term")
         definition = entry.get("definition")
         if not isinstance(term, str) or not isinstance(definition, str):
+            continue
+        term = term.strip()
+        definition = definition.strip()
+        if not term or not definition:
             continue
         blocks.append({"type": "paragraph", "style": "term_def", "text": f"{term}: {definition}"})
     return blocks
@@ -218,7 +227,7 @@ def _convert_role(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         blocks.append({"type": "paragraph", "style": "role_meta", "text": meta_text})
     bullets = item.get("bullets")
     if isinstance(bullets, list):
-        items = [b for b in bullets if isinstance(b, str) and b.strip()]
+        items = [b.strip() for b in bullets if isinstance(b, str) and b.strip()]
         if items:
             blocks.append({"type": "bullets", "items": items})
     return blocks
@@ -247,3 +256,51 @@ def _convert_education(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         blocks.append({"type": "paragraph", "style": "role_meta", "text": meta_text})
 
     return blocks
+
+
+def _section_has_renderable_content(content: List[Any], start_idx: int) -> bool:
+    for idx in range(start_idx, len(content)):
+        item = content[idx]
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "section_heading":
+            return False
+        if item_type == "paragraph":
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                return True
+            continue
+        if item_type == "bullets":
+            values = item.get("items")
+            if isinstance(values, list) and any(
+                isinstance(value, str) and value.strip() for value in values
+            ):
+                return True
+            continue
+        if item_type == "definition_list":
+            values = item.get("items")
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                term = value.get("term")
+                definition = value.get("definition")
+                if (
+                    isinstance(term, str)
+                    and term.strip()
+                    and isinstance(definition, str)
+                    and definition.strip()
+                ):
+                    return True
+            continue
+        if item_type == "role":
+            if _convert_role(item):
+                return True
+            continue
+        if item_type == "education":
+            if _convert_education(item):
+                return True
+            continue
+    return False

@@ -4,7 +4,10 @@ import importlib.util
 import json
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
+
+from libs.core import models
 
 
 def _load_planner_module():
@@ -68,3 +71,64 @@ def test_parse_llm_plan_accepts_markdown_json() -> None:
     parsed = planner_main._parse_llm_plan(content)
     assert parsed is not None
     assert parsed.tasks_summary == "sample"
+
+
+def test_parse_llm_plan_accepts_plan_wrapped_object() -> None:
+    planner_main = _load_planner_module()
+    plan = _sample_plan_json()
+    content = json.dumps({"plan": plan})
+    parsed = planner_main._parse_llm_plan(content)
+    assert parsed is not None
+    assert parsed.tasks_summary == "sample"
+
+
+class _FakeLLMResponse:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _FakeProvider:
+    def __init__(self, outputs: list[str]) -> None:
+        self._outputs = list(outputs)
+        self.calls = 0
+
+    def generate(self, _prompt: str) -> _FakeLLMResponse:
+        self.calls += 1
+        if not self._outputs:
+            raise RuntimeError("no_more_outputs")
+        return _FakeLLMResponse(self._outputs.pop(0))
+
+
+def test_llm_plan_retries_with_repair_prompt_when_initial_parse_fails() -> None:
+    planner_main = _load_planner_module()
+    plan = _sample_plan_json()
+    provider = _FakeProvider(
+        outputs=[
+            '{"planner_version":"1.0.0","tasks_summary":"broken"',  # malformed json
+            json.dumps(plan),
+        ]
+    )
+    job = models.Job(
+        id="job-1",
+        goal="Generate a sample plan",
+        context_json={},
+        status=models.JobStatus.queued,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+        priority=1,
+        metadata={},
+    )
+    tools = [
+        models.ToolSpec(
+            name="llm_generate",
+            description="Generate text",
+            input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
+            output_schema={"type": "object"},
+            tool_intent=models.ToolIntent.generate,
+        )
+    ]
+
+    parsed = planner_main.llm_plan(job, tools, provider)
+
+    assert parsed.tasks_summary == "sample"
+    assert provider.calls == 2

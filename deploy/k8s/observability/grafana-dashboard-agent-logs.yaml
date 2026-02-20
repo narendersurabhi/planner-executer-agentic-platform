@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-agent-logs
+  namespace: awe
+data:
+  awe-agent-task-debug.json: |
+    {
+      "id": null,
+      "uid": "awe-agent-task-debug",
+      "title": "AWE Agent Task Debug",
+      "schemaVersion": 39,
+      "version": 1,
+      "editable": true,
+      "refresh": "10s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "templating": {
+        "list": [
+          {
+            "name": "task_id",
+            "label": "Task ID",
+            "type": "textbox",
+            "query": "",
+            "current": {
+              "text": "",
+              "value": ""
+            }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "logs",
+          "title": "Worker MCP Retries / Timeouts",
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 0
+          },
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "{namespace=\"awe\", app=\"worker\", container=\"worker\"} |~ \"mcp_attempt|mcp_call_failed|tool_call_timed_out|llm_iterative_improve_tailored_resume_text\""
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "sortOrder": "Descending",
+            "enableLogDetails": true,
+            "wrapLogMessage": false,
+            "prettifyLogMessage": true
+          }
+        },
+        {
+          "id": 2,
+          "type": "logs",
+          "title": "Tailor Iterative Improve Progress",
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 9
+          },
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "{namespace=\"awe\", app=\"tailor\", container=\"tailor\"} |~ \"mcp_improve_iterative|improve_iterative|improve_once|alignment_evaluation|llm_generate\""
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "sortOrder": "Descending",
+            "enableLogDetails": true,
+            "wrapLogMessage": false,
+            "prettifyLogMessage": true
+          }
+        },
+        {
+          "id": 3,
+          "type": "logs",
+          "title": "Task-Specific Logs (task_id filter)",
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 18
+          },
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "{namespace=\"awe\", app=~\"worker|tailor|planner|api|coder|policy\"} |= \"$task_id\""
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "sortOrder": "Descending",
+            "enableLogDetails": true,
+            "wrapLogMessage": false,
+            "prettifyLogMessage": true
+          }
+        }
+      ]
+    }
