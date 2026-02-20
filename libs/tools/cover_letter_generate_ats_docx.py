@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, ValidationError
 
@@ -38,7 +38,10 @@ def register_cover_letter_generate_tools(registry) -> None:
                     "type": "object",
                     "properties": {
                         "cover_letter": {"type": "object"},
-                        "path": {"type": "string", "default": "cover_letters/cover_letter_ats.docx"},
+                        "path": {
+                            "type": "string",
+                            "default": "cover_letters/cover_letter_ats.docx",
+                        },
                         "today": {"type": "string", "default": "February 3, 2026"},
                         "strict": {"type": "boolean", "default": True},
                     },
@@ -168,9 +171,12 @@ def _build_cover_letter_ats_document_spec(cl: CoverLetter) -> Dict[str, Any]:
             {"type": "spacer"},
             {"type": "optional_paragraph", "when": "{{role}}", "text": "Re: {{role}}"},
             {"type": "spacer"},
-            {"type": "repeat", "items": "{{body_paragraphs}}", "as": "p", "template": [
-                {"type": "paragraph", "text": "{{p}}"}
-            ]},
+            {
+                "type": "repeat",
+                "items": "{{body_paragraphs}}",
+                "as": "p",
+                "template": [{"type": "paragraph", "text": "{{p}}"}],
+            },
             {"type": "spacer"},
             {"type": "optional_paragraph", "when": "{{closing}}", "text": "{{closing}}"},
             {"type": "paragraph", "text": "{{name}}"},

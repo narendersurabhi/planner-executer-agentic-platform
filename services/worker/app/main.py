@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 import uuid
+from typing import Any, Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -12,7 +14,12 @@ from jsonschema import Draft202012Validator
 
 from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
 from libs.core.memory_client import MemoryClient
-from services.worker.app.memory_semantics import apply_memory_defaults, select_memory_payload
+from services.worker.app.memory_semantics import (
+    apply_memory_defaults,
+    missing_memory_only_inputs,
+    select_memory_payload,
+    stable_memory_keys,
+)
 
 core_logging.configure_logging("worker")
 LOGGER = core_logging.get_logger("worker")
@@ -74,6 +81,11 @@ def _parse_optional_int(value: str | None) -> int | None:
 
 
 OUTPUT_SIZE_CAP = _parse_optional_int(TOOL_OUTPUT_SIZE_CAP) or 50000
+LOG_CANDIDATE_RESUME = os.getenv("LOG_CANDIDATE_RESUME", "false").lower() == "true"
+LOG_CANDIDATE_RESUME_FULL = os.getenv("LOG_CANDIDATE_RESUME_FULL", "false").lower() == "true"
+LOG_CANDIDATE_RESUME_PREVIEW_CHARS = (
+    _parse_optional_int(os.getenv("LOG_CANDIDATE_RESUME_PREVIEW_CHARS", "200")) or 200
+)
 MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://api:8000")
 MEMORY_READ_ENABLED = os.getenv("MEMORY_READ_ENABLED", "true").lower() == "true"
 MEMORY_WRITE_ENABLED = os.getenv("MEMORY_WRITE_ENABLED", "true").lower() == "true"
@@ -145,6 +157,24 @@ def execute_task(task_payload: dict) -> models.TaskResult:
         if memory_payload:
             payload.setdefault("memory", {}).update(memory_payload)
             payload = apply_memory_defaults(tool.spec.name, payload)
+            missing = missing_memory_only_inputs(tool.spec.name, payload)
+            if missing:
+                tool_error = f"memory_only_inputs_missing:{','.join(missing)}"
+                outputs[tool_name] = {"error": tool_error}
+                tool_calls.append(
+                    models.ToolCall(
+                        tool_name=tool_name,
+                        input=payload,
+                        idempotency_key=str(uuid.uuid4()),
+                        trace_id=trace_id,
+                        started_at=started_at,
+                        finished_at=datetime.utcnow(),
+                        status="failed",
+                        output_or_error={"error": tool_error},
+                    )
+                )
+                break
+        _log_candidate_resume(tool.spec.name, payload, task_id, trace_id)
         payload["_registry"] = registry
         idempotency_key = str(uuid.uuid4())
         core_logging.log_event(
@@ -186,9 +216,7 @@ def execute_task(task_payload: dict) -> models.TaskResult:
     finished_at = datetime.utcnow()
     validation_error = _validate_expected_output(task_payload, outputs)
     status = (
-        models.TaskStatus.failed
-        if tool_error or validation_error
-        else models.TaskStatus.completed
+        models.TaskStatus.failed if tool_error or validation_error else models.TaskStatus.completed
     )
     if tool_error:
         outputs["tool_error"] = {"error": tool_error}
@@ -223,8 +251,11 @@ def _infer_task_intent(task_payload: dict) -> str:
     keyword_map = [
         ("validate", ["validate", "verify", "check", "lint", "schema"]),
         ("render", ["render", "rendering", "docx", "pdf"]),
+        (
+            "transform",
+            ["transform", "reshape", "wrap", "convert", "derive", "summarize", "repair"],
+        ),
         ("generate", ["generate", "create", "draft", "write", "compose", "produce", "build"]),
-        ("transform", ["transform", "reshape", "wrap", "convert", "summarize", "repair"]),
         ("io", ["read", "fetch", "list", "search", "load", "save", "download", "upload"]),
     ]
     for intent, keywords in keyword_map:
@@ -233,7 +264,9 @@ def _infer_task_intent(task_payload: dict) -> str:
     return "generate"
 
 
-def _intent_mismatch(task_intent: str, tool_intent: models.ToolIntent, tool_name: str) -> str | None:
+def _intent_mismatch(
+    task_intent: str, tool_intent: models.ToolIntent, tool_name: str
+) -> str | None:
     if task_intent == "generate" and tool_intent == models.ToolIntent.transform:
         return f"tool_intent_mismatch:{tool_name}:{tool_intent.value}:{task_intent}"
     return None
@@ -251,7 +284,18 @@ def _load_memory_inputs(tool, task_payload: dict, trace_id: str) -> dict:
     memory_payload: dict[str, list] = {}
     for name in memory_reads:
         entries = MEMORY_CLIENT.read(name=name, job_id=job_id)
-        memory_payload[name] = [entry.get("payload", {}) for entry in entries]
+        enriched_entries: list[dict] = []
+        for entry in entries:
+            payload = entry.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            enriched = dict(payload)
+            if entry.get("key"):
+                enriched["_memory_key"] = entry.get("key")
+            if entry.get("updated_at"):
+                enriched["_memory_updated_at"] = entry.get("updated_at")
+            enriched_entries.append(enriched)
+        memory_payload[name] = enriched_entries
         core_logging.log_event(
             LOGGER,
             "memory_read",
@@ -288,6 +332,17 @@ def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, tra
             "metadata": {"trace_id": trace_id},
         }
         written = MEMORY_CLIENT.write(entry)
+        stable_keys = stable_memory_keys(tool.spec.name, selected_payload)
+        if stable_keys and name == "task_outputs":
+            for stable_key in stable_keys:
+                stable_entry = {
+                    "name": name,
+                    "job_id": job_id,
+                    "key": stable_key,
+                    "payload": {"source_tool": tool.spec.name, **selected_payload},
+                    "metadata": {"trace_id": trace_id, "alias": True, "alias_key": stable_key},
+                }
+                MEMORY_CLIENT.write(stable_entry)
         core_logging.log_event(
             LOGGER,
             "memory_write",
@@ -299,6 +354,67 @@ def _persist_memory_outputs(tool, task_payload: dict, call: models.ToolCall, tra
                 "trace_id": trace_id,
             },
         )
+
+
+def _extract_candidate_resume(payload: Mapping[str, Any]) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    job = payload.get("job")
+    if not isinstance(job, Mapping):
+        return None
+    context_json = job.get("context_json")
+    if isinstance(context_json, Mapping):
+        candidate = context_json.get("candidate_resume")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    candidate = job.get("candidate_resume")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate
+    return None
+
+
+def _log_candidate_resume(
+    tool_name: str, payload: Mapping[str, Any], task_id: str | None, trace_id: str
+) -> None:
+    if tool_name != "llm_tailor_resume_text":
+        return
+    if not LOG_CANDIDATE_RESUME:
+        return
+    resume = _extract_candidate_resume(payload)
+    if not resume:
+        core_logging.log_event(
+            LOGGER,
+            "candidate_resume_log",
+            {"task_id": task_id, "tool_name": tool_name, "status": "missing", "trace_id": trace_id},
+        )
+        return
+    resume_len = len(resume)
+    resume_hash = hashlib.sha256(resume.encode("utf-8")).hexdigest()
+    if LOG_CANDIDATE_RESUME_FULL:
+        payload_out = {
+            "task_id": task_id,
+            "tool_name": tool_name,
+            "status": "full",
+            "length": resume_len,
+            "sha256": resume_hash,
+            "resume": resume,
+            "trace_id": trace_id,
+        }
+    else:
+        preview = LOG_CANDIDATE_RESUME_PREVIEW_CHARS
+        head = resume[:preview]
+        tail = resume[-preview:] if resume_len > preview else ""
+        payload_out = {
+            "task_id": task_id,
+            "tool_name": tool_name,
+            "status": "preview",
+            "length": resume_len,
+            "sha256": resume_hash,
+            "head": head,
+            "tail": tail,
+            "trace_id": trace_id,
+        }
+    core_logging.log_event(LOGGER, "candidate_resume_log", payload_out)
 
 
 def _tool_payload(
@@ -416,6 +532,10 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
         resume_spec = _extract_resume_doc_spec_from_context(context)
         if isinstance(resume_spec, dict):
             filled["resume_doc_spec"] = resume_spec
+    if "coverletter_doc_spec" not in filled:
+        coverletter_spec = _extract_coverletter_doc_spec_from_context(context)
+        if isinstance(coverletter_spec, dict):
+            filled["coverletter_doc_spec"] = coverletter_spec
     if "tailored_text" not in filled:
         text = _extract_text_from_context(context)
         if isinstance(text, str):
@@ -476,6 +596,22 @@ def _extract_resume_doc_spec_from_context(context: dict) -> dict | None:
             resume_spec = _extract_resume_doc_spec_from_outputs(output)
             if isinstance(resume_spec, dict):
                 return resume_spec
+    return None
+
+
+def _extract_coverletter_doc_spec_from_context(context: dict) -> dict | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            coverletter_spec = _extract_coverletter_doc_spec_from_outputs(output)
+            if isinstance(coverletter_spec, dict):
+                return coverletter_spec
     return None
 
 
@@ -547,9 +683,19 @@ def _extract_json_from_outputs(outputs: dict) -> dict | None:
         resume_doc_spec = resume_spec_text_output.get("resume_doc_spec")
         if isinstance(resume_doc_spec, dict):
             return resume_doc_spec
+    coverletter_spec_output = outputs.get("llm_generate_coverletter_doc_spec_from_text")
+    if isinstance(coverletter_spec_output, dict):
+        coverletter_doc_spec = coverletter_spec_output.get("coverletter_doc_spec")
+        if isinstance(coverletter_doc_spec, dict):
+            return coverletter_doc_spec
     converted = outputs.get("resume_doc_spec_to_document_spec")
     if isinstance(converted, dict):
         document_spec = converted.get("document_spec")
+        if isinstance(document_spec, dict):
+            return document_spec
+    converted_coverletter = outputs.get("coverletter_doc_spec_to_document_spec")
+    if isinstance(converted_coverletter, dict):
+        document_spec = converted_coverletter.get("document_spec")
         if isinstance(document_spec, dict):
             return document_spec
     llm_output = outputs.get("llm_generate")
@@ -588,6 +734,7 @@ def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
         return None
     for key in (
         "resume_doc_spec_to_document_spec",
+        "coverletter_doc_spec_to_document_spec",
         "llm_generate_document_spec",
         "llm_repair_json",
         "llm_improve_document_spec",
@@ -616,6 +763,20 @@ def _extract_resume_doc_spec_from_outputs(outputs: dict) -> dict | None:
             if isinstance(resume_doc_spec, dict):
                 return resume_doc_spec
     direct = outputs.get("resume_doc_spec")
+    if isinstance(direct, dict):
+        return direct
+    return None
+
+
+def _extract_coverletter_doc_spec_from_outputs(outputs: dict) -> dict | None:
+    if not isinstance(outputs, dict):
+        return None
+    candidate = outputs.get("llm_generate_coverletter_doc_spec_from_text")
+    if isinstance(candidate, dict):
+        coverletter_doc_spec = candidate.get("coverletter_doc_spec")
+        if isinstance(coverletter_doc_spec, dict):
+            return coverletter_doc_spec
+    direct = outputs.get("coverletter_doc_spec")
     if isinstance(direct, dict):
         return direct
     return None
@@ -944,7 +1105,9 @@ def run() -> None:
     except redis.ResponseError:
         pass
     while True:
-        messages = redis_client.xreadgroup(group, consumer, {events.TASK_STREAM: ">"}, count=1, block=1000)
+        messages = redis_client.xreadgroup(
+            group, consumer, {events.TASK_STREAM: ">"}, count=1, block=1000
+        )
         for _, entries in messages:
             for message_id, data in entries:
                 payload = json.loads(data["data"])
@@ -953,7 +1116,9 @@ def run() -> None:
                     continue
                 task_payload = payload.get("payload", {})
                 result = execute_task(task_payload)
-                event_type = "task.failed" if result.status == models.TaskStatus.failed else "task.completed"
+                event_type = (
+                    "task.failed" if result.status == models.TaskStatus.failed else "task.completed"
+                )
                 event = models.EventEnvelope(
                     type=event_type,
                     version="1",

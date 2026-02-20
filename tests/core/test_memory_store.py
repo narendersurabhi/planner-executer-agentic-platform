@@ -81,3 +81,32 @@ def test_memory_write_conflict_on_mismatched_updated_at():
             assert "memory_conflict" in str(exc)
         else:
             raise AssertionError("Expected memory conflict error")
+
+
+def test_memory_read_without_key_returns_keyed_entries():
+    SessionLocal, memory_store = _init_sqlite_store()
+    with SessionLocal() as db:
+        memory_store.write_memory(
+            db,
+            models.MemoryWrite(
+                name="job_context",
+                job_id="job-3",
+                key="task:one",
+                payload={"foo": "bar"},
+            ),
+        )
+        memory_store.write_memory(
+            db,
+            models.MemoryWrite(
+                name="job_context",
+                job_id="job-3",
+                key="task:two",
+                payload={"foo": "baz"},
+            ),
+        )
+
+        query = models.MemoryQuery(name="job_context", job_id="job-3", limit=10)
+        results = memory_store.read_memory(db, query)
+        assert len(results) == 2
+        keys = {result.key for result in results}
+        assert keys == {"task:one", "task:two"}

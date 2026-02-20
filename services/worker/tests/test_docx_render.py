@@ -18,7 +18,7 @@ def test_docx_render_renders_docx(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("DOCX_TEMPLATE_DIR", str(template_dir))
     try:
         os.makedirs("/shared/artifacts", exist_ok=True)
-    except PermissionError:
+    except OSError:
         pytest.skip("Cannot create /shared/artifacts in test environment")
 
     registry = default_registry()

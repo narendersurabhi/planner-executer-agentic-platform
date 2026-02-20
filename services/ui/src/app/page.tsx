@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const TEMPLATE_STORAGE_KEY = "ape.templates.v1";
@@ -9,14 +9,43 @@ const TEMPLATE_DEFAULTS_KEY = "ape.template.defaults.v1";
 const MEMORY_LIMIT_STORAGE_KEY = "ape.memory.limit.v1";
 const SIDEBAR_MIN_WIDTH = 260;
 const SIDEBAR_MAX_WIDTH = 420;
+const AUTO_TEMPLATE_KEYS = new Set(["today", "today_pretty"]);
+
+const formatLocalIsoDate = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const getAutoTemplateValues = () => {
+  const now = new Date();
+  return {
+    today: formatLocalIsoDate(now),
+    today_pretty: now.toLocaleDateString("en-US", {
+      month: "long",
+      day: "numeric",
+      year: "numeric"
+    })
+  };
+};
+
+const formatTimestamp = (value?: string) => {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+};
 
 type Job = {
   id: string;
   goal: string;
   status: string;
   created_at: string;
+  updated_at: string;
   priority: number;
   metadata?: Record<string, unknown>;
+  context_json?: Record<string, unknown>;
 };
 
 type Plan = {
@@ -105,54 +134,281 @@ type Template = {
 
 const BUILT_IN_TEMPLATES: Template[] = [
   {
-    id: "tpl-resume-tailor-text",
-    name: "Resume Tailor (Structured Inputs)",
-    description: "Use structured inputs to tailor a resume and return JSON sections.",
+    id: "tpl-coder-generate",
+    name: "Coder: Generate Workspace Code",
+    description:
+      "Use the coding agent to autonomously plan and implement code in the workspace (no GitHub actions).",
     goal:
-      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role and return structured JSON sections.",
+      "Use coding_agent_autonomous to create {{workspace_path}}/IMPLEMENTATION_PLAN.md and then implement each step " +
+      "until complete for this goal: {{code_goal}}. " +
+      "Keep the implementation compact. If constraints are provided, follow them. " +
+      "All file paths must be workspace-relative (repo-relative), e.g., docker-compose.yml or .github/workflows/ci.yml. " +
+      "Do NOT prefix paths with repos/, repositories/, or the repo name. " +
+      "Do not create GitHub repositories or push to Git.",
     contextJson:
-      '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "target_role_name": "{{target_role_name}}",\n  "seniority_level": "{{seniority_level}}"\n}',
+      '{\n  "code_goal": "{{code_goal}}",\n  "workspace_path": "{{workspace_path}}",\n  "constraints": "{{constraints}}",\n  "max_steps": "{{max_steps}}"\n}',
     priority: 2,
     builtIn: true,
     variables: [
       {
-        key: "job_description",
-        label: "Job Description",
+        key: "code_goal",
+        label: "Code Goal",
         scope: "per_run",
         required: true,
-        placeholder: "Paste job description"
+        placeholder:
+          "e.g., Build a small service that demonstrates backpressure in scalable backend systems"
       },
       {
-        key: "candidate_resume",
-        label: "Candidate Resume",
+        key: "max_steps",
+        label: "Max Steps",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., 6"
+      },
+      {
+        key: "workspace_path",
+        label: "Workspace Path",
+        scope: "per_run",
+        required: true,
+        placeholder: "relative path to folder to write (e.g., repos/demo)"
+      },
+      {
+        key: "constraints",
+        label: "Constraints",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., keep files under 80 lines"
+      }
+    ]
+  },
+  {
+    id: "tpl-github-push-workspace",
+    name: "GitHub: Generate Code & Open PR",
+    description:
+      "Generate code into the workspace, create the GitHub repo if missing, then open a PR.",
+    goal:
+      "Ensure the GitHub repository '{{repo_owner}}/{{repo_name}}' exists (create if missing). " +
+      "Use repo_name exactly as provided (it must be a GitHub-safe slug). " +
+      "Do NOT call github_repo_update. If listing repositories, call github_repo_list WITHOUT an org field (personal account). " +
+      "When calling github_repo_create, set auto_init=true and use the provided default_branch so the branch is created. " +
+      "Then clone or pull the repository into '{{workspace_path}}' using github_repo_clone_or_pull " +
+      "(owner '{{repo_owner}}', repo '{{repo_name}}', path '{{workspace_path}}', branch '{{default_branch}}'). " +
+      "If clone/pull fails, stop and do not proceed. " +
+      "Then use coding_agent_autonomous to create {{workspace_path}}/IMPLEMENTATION_PLAN.md and implement each step " +
+      "for this goal: {{code_goal}}. Keep the implementation compact. If constraints are provided, follow them. " +
+      "All file paths must be workspace-relative (repo-relative), e.g., docker-compose.yml or .github/workflows/ci.yml. " +
+      "Do NOT prefix paths with repos/, repositories/, or the repo name. " +
+      "Then create a branch and open a pull request from the workspace using github_repo_push_pr with owner '{{repo_owner}}' " +
+      "and repo '{{repo_name}}'. Do not invent alternate repo names. " +
+      "In the plan, do NOT generate a slug. Set tool_inputs explicitly for github_repo_create " +
+      "(name, description, private, default_branch), github_repo_clone_or_pull (owner, repo, path, branch), " +
+      "and github_repo_push_pr (owner, repo, path, base, branch, title, body, message) " +
+      "using the provided variables.",
+    contextJson:
+      '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "max_steps": "{{max_steps}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "repo_private": "{{repo_private}}",\n  "auto_init": "true",\n  "default_branch": "{{default_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "commit_message": "{{commit_message}}",\n  "pr_branch": "{{pr_branch}}",\n  "pr_title": "{{pr_title}}",\n  "pr_body": "{{pr_body}}"\n}',
+    priority: 2,
+    builtIn: true,
+    variables: [
+      {
+        key: "code_goal",
+        label: "Code Goal",
+        scope: "per_run",
+        required: true,
+        placeholder:
+          "e.g., Build a small service that demonstrates backpressure in scalable backend systems"
+      },
+      {
+        key: "max_steps",
+        label: "Max Steps",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., 6"
+      },
+      {
+        key: "constraints",
+        label: "Constraints",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., keep files under 80 lines"
+      },
+      {
+        key: "repo_name",
+        label: "Repo Name (slug)",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., backpressure-service-demo (lowercase, hyphens)"
+      },
+      {
+        key: "repo_owner",
+        label: "Repo Owner",
         scope: "default",
         required: true,
-        placeholder: "Paste your current resume"
+        placeholder: "e.g., narendersurabhi"
       },
       {
-        key: "target_role_name",
-        label: "Target Role Name",
-        scope: "per_run",
-        required: true,
-        placeholder: "e.g., Senior Backend Engineer"
+        key: "repo_private",
+        label: "Private Repo",
+        scope: "default",
+        required: false,
+        placeholder: "true or false"
       },
       {
-        key: "seniority_level",
-        label: "Seniority Level",
+        key: "default_branch",
+        label: "Default Branch",
+        scope: "default",
+        required: false,
+        placeholder: "dev"
+      },
+      {
+        key: "commit_message",
+        label: "Commit Message",
+        scope: "default",
+        required: false,
+        placeholder: "Initial commit"
+      },
+      {
+        key: "pr_branch",
+        label: "PR Branch",
         scope: "per_run",
         required: true,
-        placeholder: "e.g., Senior"
+        placeholder: "e.g., feature/user-signup"
+      },
+      {
+        key: "pr_title",
+        label: "PR Title",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Add user signup/signin"
+      },
+      {
+        key: "pr_body",
+        label: "PR Body",
+        scope: "default",
+        required: false,
+        placeholder: "Optional PR description"
+      }
+    ]
+  },
+  {
+    id: "tpl-github-improve-repo",
+    name: "GitHub: Improve Existing Repo & Open PR",
+    description:
+      "Clone an existing repo into the workspace, implement the goal, then open a PR.",
+    goal:
+      "Use github_repo_clone_or_pull to fetch '{{repo_owner}}/{{repo_name}}' into '{{workspace_path}}' " +
+      "from base branch '{{base_branch}}'. " +
+      "Do NOT call github_repo_list. If clone/pull fails, stop the plan and do not proceed. " +
+      "Then use coding_agent_autonomous to create {{workspace_path}}/IMPLEMENTATION_PLAN.md and implement each step " +
+      "for this goal: {{code_goal}}. Keep the implementation compact. If constraints are provided, follow them. " +
+      "All file paths must be workspace-relative (repo-relative), e.g., docker-compose.yml or .github/workflows/ci.yml. " +
+      "Do NOT prefix paths with repos/, repositories/, or the repo name. " +
+      "Then create a branch and open a pull request from the workspace using github_repo_push_pr with owner '{{repo_owner}}' " +
+      "and repo '{{repo_name}}'. Do not create or update the repository. " +
+      "Use repo_name exactly as provided (it must be a GitHub-safe slug). " +
+      "Set tool_inputs explicitly for github_repo_clone_or_pull (owner, repo, path, branch) and github_repo_push_pr " +
+      "(owner, repo, path, base, branch, title, body, message) using the provided variables.",
+    contextJson:
+      '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "max_steps": "{{max_steps}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "base_branch": "{{base_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "commit_message": "{{commit_message}}",\n  "pr_branch": "{{pr_branch}}",\n  "pr_title": "{{pr_title}}",\n  "pr_body": "{{pr_body}}"\n}',
+    priority: 2,
+    builtIn: true,
+    variables: [
+      {
+        key: "code_goal",
+        label: "Improvement Goal",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Add rate limiting and request tracing"
+      },
+      {
+        key: "max_steps",
+        label: "Max Steps",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., 6"
+      },
+      {
+        key: "constraints",
+        label: "Constraints",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., keep changes minimal and add tests"
+      },
+      {
+        key: "repo_name",
+        label: "Repo Name (slug)",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., user-signup"
+      },
+      {
+        key: "repo_owner",
+        label: "Repo Owner",
+        scope: "default",
+        required: true,
+        placeholder: "e.g., narendersurabhi"
+      },
+      {
+        key: "base_branch",
+        label: "Base Branch",
+        scope: "default",
+        required: false,
+        placeholder: "main"
+      },
+      {
+        key: "commit_message",
+        label: "Commit Message",
+        scope: "default",
+        required: false,
+        placeholder: "Improve repo per goal"
+      },
+      {
+        key: "pr_branch",
+        label: "PR Branch",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., feature/improvements"
+      },
+      {
+        key: "pr_title",
+        label: "PR Title",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Improve signup reliability"
+      },
+      {
+        key: "pr_body",
+        label: "PR Body",
+        scope: "default",
+        required: false,
+        placeholder: "Optional PR description"
       }
     ]
   },
   {
     id: "tpl-resume-tailor-docspec",
-    name: "Resume Tailor -> ResumeDocSpec",
-    description: "Tailor resume JSON, improve it, then generate a ResumeDocSpec.",
+    name: "Resume Tailor -> DOCX",
+    description: "Tailor resume JSON, improve it, render resume DOCX, and optionally generate/render a cover letter DOCX.",
     goal:
-      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role. Iteratively improve it with llm_iterative_improve_tailored_resume_text until alignment >= {{min_alignment_score}} or {{max_iterations}} iterations. Then use llm_generate_resume_doc_spec_from_text on the improved tailored JSON to produce resume_doc_spec. Validate with resume_doc_spec_validate. Convert with resume_doc_spec_to_document_spec. Finally render a DOCX with docx_generate_from_spec. You MUST derive a filename (e.g., role + date) and set tool_inputs.path to {{output_dir}}/<derived_filename>.docx.",
+      "Use llm_tailor_resume_text to tailor my resume for the {{target_role_name}} role. " +
+      "Iteratively improve it with llm_iterative_improve_tailored_resume_text until alignment >= {{min_alignment_score}} or {{max_iterations}} iterations. " +
+      "Then use llm_generate_resume_doc_spec_from_text on the improved tailored JSON to produce resume_doc_spec. " +
+      "This tool performs resume_doc_spec_validate (strict) internally before returning the spec. " +
+      "Convert with resume_doc_spec_to_document_spec. " +
+      "Derive a filesystem-safe output path with derive_output_filename using candidate_name, target_role_name, and company_name " +
+      "so the file is named 'Firstname Lastname Resume - Target Role - Company.docx'. " +
+      "If those are omitted, allow derive_output_filename to infer them from job_description and candidate_resume " +
+      "(fallback to date naming when needed), " +
+      "then render a DOCX with docx_generate_from_spec using the derived path. " +
+      "If {{generate_cover_letter}} is true, you MUST use this exact cover-letter tool chain: " +
+      "llm_generate_coverletter_doc_spec_from_text -> coverletter_doc_spec_to_document_spec -> derive_output_filename(document_type='cover_letter') -> docx_generate_from_spec. " +
+      "Do NOT use llm_generate_cover_letter_from_resume or cover_letter_generate_ats_docx. " +
+      "Call llm_generate_coverletter_doc_spec_from_text using the improved tailored resume and job description (today_pretty='{{today_pretty}}'). " +
+      "Convert with coverletter_doc_spec_to_document_spec. " +
+      "Derive a cover-letter path with derive_output_filename using document_type 'cover_letter' " +
+      "so the file is named 'Firstname Lastname Cover Letter - Target Role - Company.docx'. " +
+      "Then render a DOCX with docx_generate_from_spec using the derived path.",
     contextJson:
-      '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "target_role_name": "{{target_role_name}}",\n  "seniority_level": "{{seniority_level}}",\n  "output_dir": "{{output_dir}}",\n  "min_alignment_score": "{{min_alignment_score}}",\n  "max_iterations": "{{max_iterations}}"\n}',
+      '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "candidate_name": "{{candidate_name}}",\n  "target_role_name": "{{target_role_name}}",\n  "company_name": "{{company_name}}",\n  "today": "{{today}}",\n  "today_pretty": "{{today_pretty}}",\n  "generate_cover_letter": "{{generate_cover_letter}}",\n  "seniority_level": "{{seniority_level}}",\n  "min_alignment_score": "{{min_alignment_score}}",\n  "max_iterations": "{{max_iterations}}"\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -178,18 +434,46 @@ const BUILT_IN_TEMPLATES: Template[] = [
         placeholder: "e.g., Senior Backend Engineer"
       },
       {
+        key: "candidate_name",
+        label: "Candidate Name",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., Narender Surabhi"
+      },
+      {
+        key: "company_name",
+        label: "Company Name",
+        scope: "per_run",
+        required: false,
+        placeholder: "e.g., Figma"
+      },
+      {
+        key: "today",
+        label: "Today (YYYY-MM-DD)",
+        scope: "per_run",
+        required: false,
+        placeholder: "2026-02-13"
+      },
+      {
+        key: "today_pretty",
+        label: "Cover Letter Date",
+        scope: "per_run",
+        required: false,
+        placeholder: "February 13, 2026"
+      },
+      {
+        key: "generate_cover_letter",
+        label: "Generate Cover Letter",
+        scope: "per_run",
+        required: false,
+        placeholder: "false"
+      },
+      {
         key: "seniority_level",
         label: "Seniority Level",
         scope: "default",
         required: false,
         placeholder: "e.g., Senior"
-      },
-      {
-        key: "output_dir",
-        label: "Output Folder",
-        scope: "default",
-        required: false,
-        placeholder: "resumes"
       },
       {
         key: "min_alignment_score",
@@ -208,22 +492,124 @@ const BUILT_IN_TEMPLATES: Template[] = [
     ]
   },
   {
-    id: "tpl-product-launch",
-    name: "Product Launch Plan",
-    goal: "Create a phased launch plan with risks, dependencies, and measurable milestones.",
+    id: "tpl-resume-render-from-tailored",
+    name: "Resume Render (From Tailored Text)",
+    description: "Render a DOCX from an already tailored resume text.",
+    goal:
+      "Use llm_generate_resume_doc_spec_from_text on the provided tailored text to produce resume_doc_spec. " +
+      "This tool performs resume_doc_spec_validate (strict) internally. Convert with resume_doc_spec_to_document_spec. " +
+      "Derive a filesystem-safe output path with derive_output_filename using candidate_name, target_role_name, and company_name " +
+      "so the file is named 'Firstname Lastname Resume - Target Role - Company.docx'. " +
+      "If target role/company/name are omitted, allow derive_output_filename to infer them from job_description and resume text when available " +
+      "(fallback to date naming when needed), " +
+      "then render a DOCX with docx_generate_from_spec using the derived path.",
     contextJson:
-      '{\n  "product": "New analytics dashboard",\n  "target_date": "2026-05-01",\n  "audience": ["enterprise admins", "data analysts"],\n  "constraints": {\n    "must_include": ["beta program", "security review", "docs"],\n    "no_external_agencies": true\n  }\n}',
-    priority: 1,
-    builtIn: true
+      '{\n  "tailored_text": "{{tailored_text}}",\n  "job_description": "{{job_description}}",\n  "candidate_name": "{{candidate_name}}",\n  "target_role_name": "{{target_role_name}}",\n  "company_name": "{{company_name}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
+    priority: 2,
+    builtIn: true,
+    variables: [
+      {
+        key: "tailored_text",
+        label: "Tailored Resume (Text)",
+        scope: "per_run",
+        required: true,
+        placeholder: "Paste tailored resume text with SUMMARY, SKILLS, EXPERIENCE, EDUCATION, CERTIFICATIONS sections"
+      },
+      {
+        key: "job_description",
+        label: "Job Description",
+        scope: "per_run",
+        required: false,
+        placeholder: "Optional. Helps derive target role/company for filename"
+      },
+      {
+        key: "target_role_name",
+        label: "Target Role Name",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Senior Software Engineer, AI/ML"
+      },
+      {
+        key: "candidate_name",
+        label: "Candidate Name",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., Narender Surabhi"
+      },
+      {
+        key: "company_name",
+        label: "Company Name",
+        scope: "per_run",
+        required: false,
+        placeholder: "e.g., Figma"
+      },
+      {
+        key: "today",
+        label: "Today (YYYY-MM-DD)",
+        scope: "per_run",
+        required: false,
+        placeholder: "2026-02-09"
+      },
+      {
+        key: "output_dir",
+        label: "Output Folder",
+        scope: "default",
+        required: false,
+        placeholder: "resumes"
+      }
+    ]
   },
   {
-    id: "tpl-research-brief",
-    name: "Research Brief",
-    goal: "Summarize recent research, identify gaps, and propose next steps.",
+    id: "tpl-doc-from-topic",
+    name: "Document From Topic -> DOCX",
+    description: "Generate a DocumentSpec from a topic and render a DOCX.",
+    goal:
+      "Use llm_generate_document_spec to create a DocumentSpec about '{{topic}}' for '{{audience}}' in a '{{tone}}' tone. " +
+      "Provide allowed_block_types as [text, paragraph, heading, bullets, spacer, optional_paragraph, repeat]. " +
+      "Validate with document_spec_validate (strict). " +
+      "Derive a filesystem-safe output path with derive_output_filename using the topic and today's date, output_dir '{{output_dir}}'. " +
+      "Render a DOCX with docx_generate_from_spec using the derived path.",
     contextJson:
-      '{\n  "topic": "Retrieval augmented generation evaluation",\n  "scope": "2022-2026",\n  "output": {\n    "format": "bullet summary",\n    "include_citations": true\n  }\n}',
-    priority: 1,
-    builtIn: true
+      '{\n  "topic": "{{topic}}",\n  "audience": "{{audience}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
+    priority: 2,
+    builtIn: true,
+    variables: [
+      {
+        key: "topic",
+        label: "Topic",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., Backpressure in distributed systems"
+      },
+      {
+        key: "audience",
+        label: "Audience",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., Senior engineers"
+      },
+      {
+        key: "tone",
+        label: "Tone",
+        scope: "default",
+        required: false,
+        placeholder: "e.g., Practical, concise"
+      },
+      {
+        key: "today",
+        label: "Today (YYYY-MM-DD)",
+        scope: "per_run",
+        required: true,
+        placeholder: "2026-02-10"
+      },
+      {
+        key: "output_dir",
+        label: "Output Folder",
+        scope: "default",
+        required: false,
+        placeholder: "documents"
+      }
+    ]
   }
 ];
 
@@ -458,6 +844,7 @@ export default function Home() {
   const [showTaskInputs, setShowTaskInputs] = useState(false);
   const [showRecentEvents, setShowRecentEvents] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
+  const [showAllJobs, setShowAllJobs] = useState(false);
   const [expandedTaskInputs, setExpandedTaskInputs] = useState<Set<string>>(new Set());
   const [expandedRecentEvents, setExpandedRecentEvents] = useState<Set<number>>(new Set());
   const [expandedMemoryGroups, setExpandedMemoryGroups] = useState<Set<string>>(new Set());
@@ -478,6 +865,7 @@ export default function Home() {
   const [isResizing, setIsResizing] = useState(false);
   const [isDesktop, setIsDesktop] = useState(false);
   const [hasSetInitialSidebar, setHasSetInitialSidebar] = useState(false);
+  const devToolsEnabled = process.env.NEXT_PUBLIC_DEV_TOOLS === "true";
 
   const selectedJob = selectedJobId
     ? jobs.find((job) => job.id === selectedJobId) || null
@@ -492,6 +880,28 @@ export default function Home() {
     const data = await response.json();
     setJobs(data);
   };
+
+  const jobsToShow = useMemo(() => {
+    if (showAllJobs) {
+      return jobs;
+    }
+    if (jobs.length === 0) {
+      return [];
+    }
+    const runningStates = new Set(["running", "queued", "planning", "in_progress"]);
+    const runningJobs = jobs.filter((job) => runningStates.has(job.status));
+    const candidates = runningJobs.length > 0 ? runningJobs : jobs;
+    let latest = candidates[0];
+    let latestTs = new Date(latest.updated_at || latest.created_at).getTime();
+    for (const job of candidates) {
+      const ts = new Date(job.updated_at || job.created_at).getTime();
+      if (ts > latestTs) {
+        latest = job;
+        latestTs = ts;
+      }
+    }
+    return [latest];
+  }, [jobs, showAllJobs]);
 
   useEffect(() => {
     loadJobs();
@@ -837,8 +1247,13 @@ const openTemplateModal = (template: Template) => {
     applyTemplate(template, {});
     return;
   }
+  const autoValues = getAutoTemplateValues();
   const nextInputs: Record<string, string> = {};
     for (const variable of template.variables) {
+      if (AUTO_TEMPLATE_KEYS.has(variable.key)) {
+        nextInputs[variable.key] = autoValues[variable.key as keyof typeof autoValues] || "";
+        continue;
+      }
       if (variable.scope === "default") {
         nextInputs[variable.key] = templateDefaults[variable.key] || "";
       } else {
@@ -866,6 +1281,9 @@ const openTemplateModal = (template: Template) => {
     }
     const updates: Record<string, string> = {};
     for (const variable of activeTemplate.variables) {
+      if (AUTO_TEMPLATE_KEYS.has(variable.key)) {
+        continue;
+      }
       if (variable.scope === "default") {
         updates[variable.key] = templateInputs[variable.key] || "";
       }
@@ -877,9 +1295,21 @@ const openTemplateModal = (template: Template) => {
     if (!activeTemplate || !activeTemplate.variables) {
       return;
     }
+    const autoValues = getAutoTemplateValues();
+    const effectiveInputs = { ...templateInputs };
+    for (const variable of activeTemplate.variables) {
+      if (!AUTO_TEMPLATE_KEYS.has(variable.key)) {
+        continue;
+      }
+      effectiveInputs[variable.key] =
+        autoValues[variable.key as keyof typeof autoValues] || "";
+    }
     const missingKeys = new Set<string>();
     for (const variable of activeTemplate.variables) {
-      if (variable.required && !templateInputs[variable.key]) {
+      if (AUTO_TEMPLATE_KEYS.has(variable.key)) {
+        continue;
+      }
+      if (variable.required && !effectiveInputs[variable.key]) {
         missingKeys.add(variable.key);
       }
     }
@@ -890,8 +1320,8 @@ const openTemplateModal = (template: Template) => {
     }
     setTemplateInputError(null);
     setTemplateMissingKeys(new Set());
-    const nextGoal = replaceTokens(activeTemplate.goal, templateInputs);
-    const nextContext = replaceTokensForJson(activeTemplate.contextJson, templateInputs);
+    const nextGoal = replaceTokens(activeTemplate.goal, effectiveInputs);
+    const nextContext = replaceTokensForJson(activeTemplate.contextJson, effectiveInputs);
     try {
       JSON.parse(nextContext || "{}");
     } catch {
@@ -1172,6 +1602,33 @@ const openTemplateModal = (template: Template) => {
     const response = await fetch(`${apiUrl}/jobs/${jobId}/replan`, { method: "POST" });
     if (response.ok) {
       loadJobs();
+    }
+  };
+
+  const devRenderResumeDocx = async (jobId: string) => {
+    if (!devToolsEnabled) {
+      return;
+    }
+    const job = jobs.find((candidate) => candidate.id === jobId);
+    const outputDir =
+      typeof job?.context_json?.output_dir === "string" && job.context_json.output_dir.trim()
+        ? job.context_json.output_dir.trim()
+        : "resumes";
+    const suggested = `${outputDir}/dev_render_${jobId}.docx`;
+    const path = window.prompt("Output DOCX path (relative to /shared/artifacts)", suggested);
+    if (!path) {
+      return;
+    }
+    const response = await fetch(`${apiUrl}/jobs/${jobId}/dev_resume_render`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path })
+    });
+    if (response.ok) {
+      loadJobs();
+      if (selectedJobIdRef.current === jobId) {
+        loadJobDetails(jobId);
+      }
     }
   };
 
@@ -1556,7 +2013,9 @@ const openTemplateModal = (template: Template) => {
             </div>
             <div className="max-h-[60vh] overflow-y-auto px-6 py-5">
               <div className="grid gap-4">
-                {activeTemplate.variables?.map((variable) => (
+                {activeTemplate.variables
+                  ?.filter((variable) => !AUTO_TEMPLATE_KEYS.has(variable.key))
+                  .map((variable) => (
                   <div key={variable.key}>
                     <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
                       {variable.label} {variable.scope === "per_run" ? "· per run" : "· default"}
@@ -1580,6 +2039,12 @@ const openTemplateModal = (template: Template) => {
                   </div>
                 ))}
               </div>
+              {activeTemplate.variables?.filter((variable) => !AUTO_TEMPLATE_KEYS.has(variable.key))
+                .length === 0 ? (
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+                  Date fields are auto-filled with today's date.
+                </div>
+              ) : null}
               {templateInputError ? (
                 <div className="mt-3 text-sm text-rose-600">{templateInputError}</div>
               ) : null}
@@ -1692,8 +2157,20 @@ const openTemplateModal = (template: Template) => {
               Track submitted goals and manage their lifecycle.
             </p>
           </div>
-          <div className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">
-            {jobs.length} total
+          <div className="flex items-center gap-2">
+            <div className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">
+              {showAllJobs
+                ? `${jobs.length} total`
+                : `Showing ${jobsToShow.length} of ${jobs.length}`}
+            </div>
+            {jobs.length > 1 ? (
+              <button
+                className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                onClick={() => setShowAllJobs((prev) => !prev)}
+              >
+                {showAllJobs ? "Show recent only" : "Show all jobs"}
+              </button>
+            ) : null}
           </div>
         </div>
         {jobs.length === 0 ? (
@@ -1702,7 +2179,7 @@ const openTemplateModal = (template: Template) => {
           </div>
         ) : (
           <ul className="mt-4 grid gap-3">
-            {jobs.map((job, index) => (
+            {jobsToShow.map((job, index) => (
               <li
                 key={job.id}
                 className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm transition hover:border-slate-200 hover:shadow-md animate-fade-up"
@@ -1714,6 +2191,24 @@ const openTemplateModal = (template: Template) => {
                       {job.goal}
                     </div>
                     <div className="mt-1 text-xs text-slate-500 break-words">{job.id}</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      Run: {formatTimestamp(job.updated_at || job.created_at)}
+                    </div>
+                    {(() => {
+                      const provider =
+                        typeof job.metadata?.llm_provider === "string"
+                          ? job.metadata.llm_provider
+                          : "";
+                      const model =
+                        typeof job.metadata?.llm_model === "string" ? job.metadata.llm_model : "";
+                      if (!provider && !model) return null;
+                      return (
+                        <div className="mt-1 text-xs text-slate-500">
+                          LLM: {provider || "unknown"}
+                          {model ? ` / ${model}` : ""}
+                        </div>
+                      );
+                    })()}
                   </div>
                   <span className="shrink-0 self-start rounded-full bg-slate-100 px-2 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-500">
                     {job.status}
@@ -1756,6 +2251,14 @@ const openTemplateModal = (template: Template) => {
                   >
                     Replan
                   </button>
+                  {devToolsEnabled ? (
+                    <button
+                      className="rounded-full border border-slate-200 px-3 py-1 text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                      onClick={() => devRenderResumeDocx(job.id)}
+                    >
+                      Dev render
+                    </button>
+                  ) : null}
                   <button
                     className="rounded-full border border-rose-200 px-3 py-1 text-rose-600 transition hover:border-rose-300 hover:text-rose-700"
                     onClick={() => clearJob(job.id)}

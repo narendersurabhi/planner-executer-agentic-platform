@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "coder.mcp.tool_call.request.v1",
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "arguments": {"type": "object"}
+  },
+  "required": ["name"],
+  "additionalProperties": false
+}

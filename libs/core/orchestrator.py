@@ -6,7 +6,9 @@ from .models import Task, TaskStatus
 
 
 def ready_tasks(tasks: List[Task]) -> List[str]:
-    completed = {task.id for task in tasks if task.status in {TaskStatus.completed, TaskStatus.accepted}}
+    completed = {
+        task.id for task in tasks if task.status in {TaskStatus.completed, TaskStatus.accepted}
+    }
     ready = []
     for task in tasks:
         if task.status != TaskStatus.pending:

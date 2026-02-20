@@ -169,7 +169,9 @@ def _resume_generate_ats_docx(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _build_resume_ats_document_spec(resume: TailoredResume) -> Dict[str, Any]:
     # Contact lines (single column)
-    contact_parts = [p for p in [resume.header.location, resume.header.phone, resume.header.email] if p]
+    contact_parts = [
+        p for p in [resume.header.location, resume.header.phone, resume.header.email] if p
+    ]
     contact_line = " | ".join(contact_parts)
 
     # Skills as paragraphs: "Category: item1, item2"
@@ -262,45 +264,92 @@ def _build_resume_ats_document_spec(resume: TailoredResume) -> Dict[str, Any]:
         "blocks": [
             {"type": "text", "style": "name", "text": "{{name}}"},
             {"type": "optional_paragraph", "when": "{{headline}}", "text": "{{headline}}"},
-            {"type": "optional_paragraph", "when": "{{contact_line}}", "style": "contact", "text": "{{contact_line}}"},
-            {"type": "optional_paragraph", "when": "{{linkedin}}", "style": "contact", "text": "LinkedIn: {{linkedin}}"},
-            {"type": "optional_paragraph", "when": "{{github}}", "style": "contact", "text": "GitHub: {{github}}"},
+            {
+                "type": "optional_paragraph",
+                "when": "{{contact_line}}",
+                "style": "contact",
+                "text": "{{contact_line}}",
+            },
+            {
+                "type": "optional_paragraph",
+                "when": "{{linkedin}}",
+                "style": "contact",
+                "text": "LinkedIn: {{linkedin}}",
+            },
+            {
+                "type": "optional_paragraph",
+                "when": "{{github}}",
+                "style": "contact",
+                "text": "GitHub: {{github}}",
+            },
             {"type": "heading", "level": 1, "text": "SUMMARY"},
             {"type": "paragraph", "style": "divider", "text": "—"},
             {"type": "paragraph", "text": "{{summary}}"},
             {"type": "heading", "level": 1, "text": "SKILLS"},
             {"type": "paragraph", "style": "divider", "text": "—"},
-            {"type": "repeat", "items": "{{skill_paragraphs}}", "as": "p", "template": [
-                {"type": "paragraph", "text": "{{p}}"}
-            ]},
+            {
+                "type": "repeat",
+                "items": "{{skill_paragraphs}}",
+                "as": "p",
+                "template": [{"type": "paragraph", "text": "{{p}}"}],
+            },
             {"type": "heading", "level": 1, "text": "EXPERIENCE"},
             {"type": "paragraph", "style": "divider", "text": "—"},
-            {"type": "repeat", "items": "{{experience}}", "as": "r", "template": [
-                {"type": "paragraph", "style": "body_bold", "text": "{{r.title}} | {{r.company}} | {{r.location}}"},
-                {"type": "paragraph", "style": "dates_right", "text": "{{r.dates}}"},
-                {"type": "bullets", "items": "{{r.bullets}}"},
-                {"type": "spacer"}
-            ]},
-            {"type": "repeat", "items": "{{projects_section}}", "as": "s", "template": [
-                {"type": "heading", "level": 1, "text": "PROJECTS"},
-                {"type": "paragraph", "style": "divider", "text": "—"},
-                {"type": "repeat", "items": "{{projects}}", "as": "p", "template": [
-                    {"type": "paragraph", "style": "body_bold", "text": "{{p.name}}"},
-                    {"type": "optional_paragraph", "when": "{{p.url}}", "text": "{{p.url}}"},
-                    {"type": "bullets", "items": "{{p.highlights}}"},
-                    {"type": "spacer"}
-                ]}
-            ]},
+            {
+                "type": "repeat",
+                "items": "{{experience}}",
+                "as": "r",
+                "template": [
+                    {
+                        "type": "paragraph",
+                        "style": "body_bold",
+                        "text": "{{r.title}} | {{r.company}} | {{r.location}}",
+                    },
+                    {"type": "paragraph", "style": "dates_right", "text": "{{r.dates}}"},
+                    {"type": "bullets", "items": "{{r.bullets}}"},
+                    {"type": "spacer"},
+                ],
+            },
+            {
+                "type": "repeat",
+                "items": "{{projects_section}}",
+                "as": "s",
+                "template": [
+                    {"type": "heading", "level": 1, "text": "PROJECTS"},
+                    {"type": "paragraph", "style": "divider", "text": "—"},
+                    {
+                        "type": "repeat",
+                        "items": "{{projects}}",
+                        "as": "p",
+                        "template": [
+                            {"type": "paragraph", "style": "body_bold", "text": "{{p.name}}"},
+                            {
+                                "type": "optional_paragraph",
+                                "when": "{{p.url}}",
+                                "text": "{{p.url}}",
+                            },
+                            {"type": "bullets", "items": "{{p.highlights}}"},
+                            {"type": "spacer"},
+                        ],
+                    },
+                ],
+            },
             {"type": "heading", "level": 1, "text": "EDUCATION"},
             {"type": "paragraph", "style": "divider", "text": "—"},
-            {"type": "repeat", "items": "{{education_lines}}", "as": "e", "template": [
-                {"type": "paragraph", "text": "{{e}}"}
-            ]},
+            {
+                "type": "repeat",
+                "items": "{{education_lines}}",
+                "as": "e",
+                "template": [{"type": "paragraph", "text": "{{e}}"}],
+            },
             {"type": "heading", "level": 1, "text": "CERTIFICATIONS"},
             {"type": "paragraph", "style": "divider", "text": "—"},
-            {"type": "repeat", "items": "{{cert_lines}}", "as": "c", "template": [
-                {"type": "paragraph", "text": "{{c}}"}
-            ]},
+            {
+                "type": "repeat",
+                "items": "{{cert_lines}}",
+                "as": "c",
+                "template": [{"type": "paragraph", "text": "{{c}}"}],
+            },
         ],
     }
 

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tailor_resume.response.v1",
+  "type": "object",
+  "properties": {
+    "tailored_resume": {"type": "object"}
+  },
+  "required": ["tailored_resume"],
+  "additionalProperties": false
+}

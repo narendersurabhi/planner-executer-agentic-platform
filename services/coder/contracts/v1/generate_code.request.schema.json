@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "generate_code.request.v1",
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string", "minLength": 1},
+    "files": {
+      "type": ["array", "null"],
+      "items": {"type": "string"}
+    },
+    "constraints": {"type": ["string", "null"]}
+  },
+  "required": ["goal"],
+  "additionalProperties": false
+}

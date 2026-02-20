@@ -154,6 +154,10 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
         resume_spec = _extract_resume_doc_spec_from_context(context)
         if isinstance(resume_spec, dict):
             filled["resume_doc_spec"] = resume_spec
+    if "coverletter_doc_spec" not in filled:
+        coverletter_spec = _extract_coverletter_doc_spec_from_context(context)
+        if isinstance(coverletter_spec, dict):
+            filled["coverletter_doc_spec"] = coverletter_spec
     if "tailored_text" not in filled:
         text = _extract_text_from_context(context)
         if isinstance(text, str):
@@ -214,6 +218,22 @@ def _extract_resume_doc_spec_from_context(context: dict) -> dict | None:
             resume_spec = _extract_resume_doc_spec_from_outputs(output)
             if isinstance(resume_spec, dict):
                 return resume_spec
+    return None
+
+
+def _extract_coverletter_doc_spec_from_context(context: dict) -> dict | None:
+    if not isinstance(context, dict):
+        return None
+    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for output in group.values():
+            if not isinstance(output, dict):
+                continue
+            coverletter_spec = _extract_coverletter_doc_spec_from_outputs(output)
+            if isinstance(coverletter_spec, dict):
+                return coverletter_spec
     return None
 
 
@@ -301,9 +321,19 @@ def _extract_json_from_outputs(outputs: dict) -> dict | None:
         resume_doc_spec = resume_spec_text_output.get("resume_doc_spec")
         if isinstance(resume_doc_spec, dict):
             return resume_doc_spec
+    coverletter_spec_output = outputs.get("llm_generate_coverletter_doc_spec_from_text")
+    if isinstance(coverletter_spec_output, dict):
+        coverletter_doc_spec = coverletter_spec_output.get("coverletter_doc_spec")
+        if isinstance(coverletter_doc_spec, dict):
+            return coverletter_doc_spec
     converted = outputs.get("resume_doc_spec_to_document_spec")
     if isinstance(converted, dict):
         document_spec = converted.get("document_spec")
+        if isinstance(document_spec, dict):
+            return document_spec
+    converted_coverletter = outputs.get("coverletter_doc_spec_to_document_spec")
+    if isinstance(converted_coverletter, dict):
+        document_spec = converted_coverletter.get("document_spec")
         if isinstance(document_spec, dict):
             return document_spec
     llm_output = outputs.get("llm_generate")
@@ -342,6 +372,7 @@ def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
         return None
     for key in (
         "resume_doc_spec_to_document_spec",
+        "coverletter_doc_spec_to_document_spec",
         "llm_generate_document_spec",
         "llm_repair_json",
         "llm_improve_document_spec",
@@ -370,6 +401,20 @@ def _extract_resume_doc_spec_from_outputs(outputs: dict) -> dict | None:
             if isinstance(resume_doc_spec, dict):
                 return resume_doc_spec
     direct = outputs.get("resume_doc_spec")
+    if isinstance(direct, dict):
+        return direct
+    return None
+
+
+def _extract_coverletter_doc_spec_from_outputs(outputs: dict) -> dict | None:
+    if not isinstance(outputs, dict):
+        return None
+    candidate = outputs.get("llm_generate_coverletter_doc_spec_from_text")
+    if isinstance(candidate, dict):
+        coverletter_doc_spec = candidate.get("coverletter_doc_spec")
+        if isinstance(coverletter_doc_spec, dict):
+            return coverletter_doc_spec
+    direct = outputs.get("coverletter_doc_spec")
     if isinstance(direct, dict):
         return direct
     return None
@@ -462,7 +507,9 @@ def _extract_instruction_payload(instruction: str) -> dict:
     return {}
 
 
-def _validate_schema(schema: Dict[str, Any] | None, payload: Dict[str, Any], label: str) -> str | None:
+def _validate_schema(
+    schema: Dict[str, Any] | None, payload: Dict[str, Any], label: str
+) -> str | None:
     if not schema:
         return None
     try:

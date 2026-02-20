@@ -15,7 +15,8 @@ def register_resume_doc_spec_tools(registry) -> None:
                 description="Validate a ResumeDocSpec JSON for required structure and types",
                 usage_guidance=(
                     "Provide resume_doc_spec. strict=true treats unknown section types as errors. "
-                    "Returns valid/errors/warnings and basic stats."
+                    "Returns valid/errors/warnings and basic stats. If omitted, resume_doc_spec is "
+                    "resolved from memory (resume_doc_spec:latest)."
                 ),
                 input_schema={
                     "type": "object",
@@ -23,7 +24,6 @@ def register_resume_doc_spec_tools(registry) -> None:
                         "resume_doc_spec": {"type": "object"},
                         "strict": {"type": "boolean"},
                     },
-                    "required": ["resume_doc_spec"],
                 },
                 output_schema={
                     "type": "object",
@@ -35,6 +35,7 @@ def register_resume_doc_spec_tools(registry) -> None:
                     },
                     "required": ["valid", "errors", "warnings", "stats"],
                 },
+                memory_reads=["job_context", "task_outputs"],
                 timeout_s=5,
                 risk_level=RiskLevel.low,
                 tool_intent=ToolIntent.validate,
@@ -47,7 +48,11 @@ def register_resume_doc_spec_tools(registry) -> None:
 def _resume_doc_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
     spec = payload.get("resume_doc_spec")
     if not isinstance(spec, dict):
-        return _result(False, [err("/", "resume_doc_spec must be an object")], [], 0)
+        from libs.core.tool_registry import ToolExecutionError
+
+        raise ToolExecutionError(
+            "resume_doc_spec missing (not found in memory). Provide resume_doc_spec explicitly."
+        )
 
     strict = payload.get("strict", False)
     if not isinstance(strict, bool):

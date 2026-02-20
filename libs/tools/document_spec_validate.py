@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
 
@@ -21,7 +21,8 @@ def register_document_spec_tools(registry) -> None:
                     "Provide document_spec and optional render_context merged into tokens. "
                     "strict=true fails on unresolved placeholders (where resolvable). "
                     "Validates supported blocks: text, paragraph, heading, bullets, spacer, "
-                    "optional_paragraph, repeat."
+                    "optional_paragraph, repeat. If document_spec is omitted, it is resolved from "
+                    "memory (document_spec:latest)."
                 ),
                 input_schema={
                     "type": "object",
@@ -33,7 +34,6 @@ def register_document_spec_tools(registry) -> None:
                         "max_depth": {"type": "integer"},
                         "max_blocks": {"type": "integer"},
                     },
-                    "required": ["document_spec"],
                 },
                 output_schema={
                     "type": "object",
@@ -45,6 +45,7 @@ def register_document_spec_tools(registry) -> None:
                     },
                     "required": ["valid", "errors", "warnings", "stats"],
                 },
+                memory_reads=["job_context", "task_outputs"],
                 timeout_s=10,
                 risk_level=RiskLevel.low,
                 tool_intent=ToolIntent.validate,
@@ -57,13 +58,19 @@ def register_document_spec_tools(registry) -> None:
 def _document_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
     spec = payload.get("document_spec")
     if not isinstance(spec, dict):
-        return _result(False, [err("/", "document_spec must be an object")], [], 0, 0, 0)
+        from libs.core.tool_registry import ToolExecutionError
+
+        raise ToolExecutionError(
+            "document_spec missing (not found in memory). Provide document_spec explicitly."
+        )
 
     render_context = payload.get("render_context", {})
     if render_context is None:
         render_context = {}
     if not isinstance(render_context, dict):
-        return _result(False, [err("/render_context", "render_context must be an object")], [], 0, 0, 0)
+        return _result(
+            False, [err("/render_context", "render_context must be an object")], [], 0, 0, 0
+        )
 
     strict = payload.get("strict", True)
     if not isinstance(strict, bool):
@@ -155,11 +162,18 @@ def _document_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
             elif btype == "bullets":
                 items = b.get("items")
                 if not (isinstance(items, list) or isinstance(items, str) or items is None):
-                    errors.append(err(bpath + "/items", "bullets.items must be array, string ref, or null"))
+                    errors.append(
+                        err(bpath + "/items", "bullets.items must be array, string ref, or null")
+                    )
                 if isinstance(items, str):
                     # warn if not an exact ref (ATS mode expects "{{...}}" when string)
                     if not _is_exact_ref(items):
-                        warnings.append(err(bpath + "/items", "bullets.items string should be exact '{{...}}' ref"))
+                        warnings.append(
+                            err(
+                                bpath + "/items",
+                                "bullets.items string should be exact '{{...}}' ref",
+                            )
+                        )
                     placeholder_count += _count_placeholders(items)
                     unresolved_count += _check_placeholders(
                         items, context, strict, errors, warnings, bpath + "/items", alias
@@ -176,15 +190,24 @@ def _document_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
                 when_val = b.get("when")
                 if "text" not in b or not isinstance(b.get("text"), str):
                     errors.append(err(bpath + "/text", "optional_paragraph requires text: string"))
-                if not (isinstance(when_val, bool) or isinstance(when_val, str) or when_val is None):
-                    errors.append(err(bpath + "/when", "optional_paragraph.when must be bool or string ref"))
+                if not (
+                    isinstance(when_val, bool) or isinstance(when_val, str) or when_val is None
+                ):
+                    errors.append(
+                        err(bpath + "/when", "optional_paragraph.when must be bool or string ref")
+                    )
                 placeholder_count += _count_placeholders(b.get("text"))
                 unresolved_count += _check_placeholders(
                     b.get("text"), context, strict, errors, warnings, bpath + "/text", alias
                 )
                 if isinstance(when_val, str):
                     if not _is_exact_ref(when_val):
-                        warnings.append(err(bpath + "/when", "optional_paragraph.when string should be exact '{{...}}' ref"))
+                        warnings.append(
+                            err(
+                                bpath + "/when",
+                                "optional_paragraph.when string should be exact '{{...}}' ref",
+                            )
+                        )
                     placeholder_count += _count_placeholders(when_val)
                     unresolved_count += _check_placeholders(
                         when_val, context, strict, errors, warnings, bpath + "/when", alias
@@ -195,7 +218,9 @@ def _document_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
                 alias_name = b.get("as")
                 template = b.get("template")
                 if not (isinstance(items, list) or isinstance(items, str) or items is None):
-                    errors.append(err(bpath + "/items", "repeat.items must be array, string ref, or null"))
+                    errors.append(
+                        err(bpath + "/items", "repeat.items must be array, string ref, or null")
+                    )
                 if not isinstance(alias_name, str) or not alias_name:
                     errors.append(err(bpath + "/as", "repeat.as must be a non-empty string"))
                     alias_name = "item"
@@ -205,9 +230,16 @@ def _document_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
                 if isinstance(items, str):
                     if not _is_exact_ref(items):
-                        warnings.append(err(bpath + "/items", "repeat.items string should be exact '{{...}}' ref"))
+                        warnings.append(
+                            err(
+                                bpath + "/items",
+                                "repeat.items string should be exact '{{...}}' ref",
+                            )
+                        )
                     placeholder_count += _count_placeholders(items)
-                    unresolved_count += _check_placeholders(items, context, strict, errors, warnings, bpath + "/items", alias)
+                    unresolved_count += _check_placeholders(
+                        items, context, strict, errors, warnings, bpath + "/items", alias
+                    )
 
                 # For template placeholders, we allow alias references without requiring resolution
                 walk_block_list(template, bpath + "/template", depth + 1, alias_name)
@@ -219,12 +251,28 @@ def _document_spec_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
             # Simple ATS warnings
             if btype == "heading" and isinstance(b.get("text"), str):
                 h = b["text"].strip().upper()
-                if h and h not in {"SUMMARY", "SKILLS", "EXPERIENCE", "EDUCATION", "CERTIFICATIONS", "OPEN SOURCE", "PROJECTS"}:
-                    warnings.append(err(bpath + "/text", f"Non-standard heading for ATS: '{b['text']}'"))
+                if h and h not in {
+                    "SUMMARY",
+                    "SKILLS",
+                    "EXPERIENCE",
+                    "EDUCATION",
+                    "CERTIFICATIONS",
+                    "OPEN SOURCE",
+                    "PROJECTS",
+                }:
+                    warnings.append(
+                        err(bpath + "/text", f"Non-standard heading for ATS: '{b['text']}'")
+                    )
 
             # Optional long paragraph warning
-            if btype in {"text", "paragraph"} and isinstance(b.get("text"), str) and len(b["text"]) > 500:
-                warnings.append(err(bpath + "/text", "Very long paragraph (>500 chars); consider splitting"))
+            if (
+                btype in {"text", "paragraph"}
+                and isinstance(b.get("text"), str)
+                and len(b["text"]) > 500
+            ):
+                warnings.append(
+                    err(bpath + "/text", "Very long paragraph (>500 chars); consider splitting")
+                )
 
     walk_block_list(blocks, "/blocks", 1, None)
 
@@ -276,7 +324,9 @@ def _check_placeholders(
             continue
 
         # allow alias refs inside repeat templates
-        if alias and (expr == alias or expr.startswith(alias + ".") or expr.startswith(alias + "[")):
+        if alias and (
+            expr == alias or expr.startswith(alias + ".") or expr.startswith(alias + "[")
+        ):
             continue
 
         ok = _can_resolve(expr, context)

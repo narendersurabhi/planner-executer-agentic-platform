@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "improve_resume.response.v1",
+  "type": "object",
+  "properties": {
+    "tailored_resume": {"type": "object"},
+    "alignment_score": {"type": "number"},
+    "alignment_summary": {"type": "string"}
+  },
+  "required": ["tailored_resume", "alignment_score", "alignment_summary"],
+  "additionalProperties": false
+}

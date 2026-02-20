@@ -1,7 +1,7 @@
 """add task intent column
 
 Revision ID: 20260204_add_task_intent
-Revises: 
+Revises:
 Create Date: 2026-02-04
 """
 
