@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
 import os
 import re
 import shutil
+import multiprocessing as mp
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from subprocess import CompletedProcess, run
 from dataclasses import dataclass
@@ -21,7 +24,7 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from .llm_provider import LLMProvider
-from . import prompts
+from . import prompts, tracing as core_tracing
 from .models import RiskLevel, ToolCall, ToolIntent, ToolSpec
 from libs.tools.docx_generate_from_spec import register_docx_tools
 from libs.tools.document_spec_validate import register_document_spec_tools
@@ -87,10 +90,12 @@ class ToolRegistry:
             output = result
         except (ToolExecutionError, ValidationError) as exc:
             status = "failed"
-            output = {"error": str(exc)}
+            raw_error = str(exc)
+            output = {"error": raw_error, "error_code": _classify_tool_error(raw_error)}
         except Exception as exc:  # noqa: BLE001
             status = "failed"
-            output = {"error": str(exc)}
+            raw_error = str(exc)
+            output = {"error": raw_error, "error_code": "runtime.unhandled"}
         finished_at = time.time()
         return ToolCall(
             tool_name=name,
@@ -102,6 +107,57 @@ class ToolRegistry:
             status=status,
             output_or_error=output,
         )
+
+
+def _classify_tool_error(error_text: str) -> str:
+    normalized = (error_text or "").strip()
+    lowered = normalized.lower()
+    if lowered.startswith("contract."):
+        return lowered.split(":", 1)[0]
+    if normalized.startswith("input schema validation failed"):
+        return "contract.input_invalid"
+    if normalized.startswith("output schema validation failed"):
+        return "contract.output_invalid"
+    if normalized.startswith("schema_not_found:"):
+        return "contract.schema_not_found"
+    if normalized.startswith("invalid_schema:"):
+        return "contract.schema_invalid"
+    if normalized.startswith("unknown_tool:"):
+        return "contract.tool_not_found"
+    if normalized.startswith("memory_only_inputs_missing:"):
+        return "contract.input_missing"
+    if normalized.startswith("tool_intent_mismatch:"):
+        return "contract.intent_mismatch"
+    if (
+        "missing_required_fields" in lowered
+        or "tailored_resume_missing_fields" in lowered
+        or "invalid_json" in lowered
+        or "coder_response_missing_files" in lowered
+    ):
+        return "contract.output_invalid"
+    if normalized.startswith("guardrail_blocked:"):
+        return "policy.blocked"
+    if (
+        normalized.startswith("tool_call_timed_out:")
+        or normalized.startswith("mcp_sdk_timeout:")
+        or "timed out" in lowered
+        or "timeout" in lowered
+    ):
+        return "runtime.timeout"
+    if normalized.startswith("mcp_sdk_all_routes_failed:"):
+        return "runtime.upstream_unavailable"
+    if normalized.startswith("mcp_sdk_error:"):
+        return "runtime.upstream_error"
+    if normalized.startswith("coder_http_error:"):
+        return "runtime.http_error"
+    return "runtime.tool_error"
+
+
+def _extract_mcp_error_phase(error_text: str) -> str | None:
+    match = re.search(r"(?:^|[;,\s])phase=([a-zA-Z0-9_.:/-]+)", error_text or "")
+    if not match:
+        return None
+    return match.group(1)
 
 
 def _to_datetime(timestamp: float):
@@ -148,12 +204,16 @@ def _run_with_timeout(
 ) -> tool_output_type:
     if not timeout_s or timeout_s <= 0:
         return handler()
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(handler)
-        try:
-            return future.result(timeout=timeout_s)
-        except FuturesTimeoutError as exc:
-            raise ToolExecutionError(f"Tool execution timed out after {timeout_s}s") from exc
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(handler)
+    try:
+        return future.result(timeout=float(timeout_s))
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise ToolExecutionError(f"tool_call_timed_out:timed out after {timeout_s}s") from exc
+    finally:
+        # Never block caller on hung worker threads.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _validate_schema(schema: Dict[str, Any] | None, payload: Dict[str, Any], label: str) -> None:
@@ -268,6 +328,119 @@ def _resolve_coder_http_timeout_s() -> int:
             except ValueError:
                 return 30
     return 30
+
+
+def _resolve_mcp_timeout_s() -> float:
+    for key in ("MCP_TOOL_TIMEOUT_S", "MCP_TIMEOUT_S"):
+        env_timeout = os.getenv(key)
+        if not env_timeout:
+            continue
+        try:
+            return max(1.0, float(env_timeout))
+        except ValueError:
+            return 45.0
+    for key in ("TAILOR_OPENAI_TIMEOUT_S", "TAILOR_EVAL_OPENAI_TIMEOUT_S", "OPENAI_TIMEOUT_S"):
+        env_timeout = os.getenv(key)
+        if not env_timeout:
+            continue
+        try:
+            # Avoid hanging indefinitely when global model timeout is very large.
+            return min(180.0, max(5.0, float(env_timeout)))
+        except ValueError:
+            continue
+    return 45.0
+
+
+def _resolve_mcp_outer_timeout_headroom_s() -> float:
+    env_headroom = os.getenv("MCP_TOOL_OUTER_TIMEOUT_HEADROOM_S")
+    if env_headroom:
+        try:
+            return max(0.0, min(120.0, float(env_headroom)))
+        except ValueError:
+            return 15.0
+    return 15.0
+
+
+def _resolve_mcp_tool_timeout_s() -> int:
+    timeout_s = _resolve_mcp_timeout_s() + _resolve_mcp_outer_timeout_headroom_s()
+    return max(1, int(math.ceil(timeout_s)))
+
+
+def _resolve_mcp_max_retries() -> int:
+    env_retries = os.getenv("MCP_TOOL_MAX_RETRIES")
+    if env_retries:
+        try:
+            return max(0, int(env_retries))
+        except ValueError:
+            return 1
+    return 1
+
+
+def _resolve_mcp_retry_sleep_s() -> float:
+    env_sleep = os.getenv("MCP_TOOL_RETRY_SLEEP_S")
+    if env_sleep:
+        try:
+            return max(0.0, float(env_sleep))
+        except ValueError:
+            return 0.25
+    return 0.25
+
+
+def _resolve_mcp_first_attempt_reserve_s(timeout_s: float) -> float:
+    env_reserve = os.getenv("MCP_FIRST_ATTEMPT_RESERVE_S")
+    if env_reserve:
+        try:
+            return max(0.05, float(env_reserve))
+        except ValueError:
+            return min(30.0, max(5.0, timeout_s * 0.1))
+    return min(30.0, max(5.0, timeout_s * 0.1))
+
+
+def _resolve_mcp_transport_timeout_s(timeout_s: float) -> float:
+    env_timeout = os.getenv("MCP_TRANSPORT_TIMEOUT_S")
+    if env_timeout:
+        try:
+            return max(1.0, float(env_timeout))
+        except ValueError:
+            return timeout_s
+    return timeout_s
+
+
+def _resolve_mcp_isolation_mode() -> str:
+    mode = os.getenv("MCP_TOOL_ISOLATION_MODE", "process").strip().lower()
+    return "process" if mode == "process" else "thread"
+
+
+def _streamable_http_client_kwargs(
+    client_factory: Callable[..., Any], timeout_s: float
+) -> Dict[str, Any]:
+    """Best-effort timeout kwargs for different MCP SDK versions."""
+    transport_timeout = _resolve_mcp_transport_timeout_s(timeout_s)
+    connect_timeout = min(10.0, transport_timeout)
+    try:
+        params = inspect.signature(client_factory).parameters
+    except (TypeError, ValueError):
+        return {}
+    candidates: Dict[str, Any] = {
+        "timeout": transport_timeout,
+        "request_timeout": transport_timeout,
+        "read_timeout": transport_timeout,
+        "write_timeout": transport_timeout,
+        "connect_timeout": connect_timeout,
+        "sse_read_timeout": transport_timeout,
+        "http_timeout": transport_timeout,
+    }
+    return {name: value for name, value in candidates.items() if name in params}
+
+
+def _is_retryable_mcp_error(message: str) -> bool:
+    lower = message.lower()
+    return (
+        lower.startswith("mcp_sdk_error:")
+        or lower.startswith("mcp_sdk_timeout:")
+        or "session terminated" in lower
+        or "timeout" in lower
+    )
 
 
 def _host_allowed(host: str, allowlist: List[str]) -> bool:
@@ -713,7 +886,8 @@ def default_registry(
                     "'Firstname Lastname Resume - Target Role - Company.docx'. "
                     "If target role/company/name are missing, the tool can derive them from "
                     "job_description plus candidate_resume/tailored_text when provided. "
-                    "Fallback format: provide target_role_name (or role_name) and "
+                    "For general documents, 'topic' can be used in place of role name. "
+                    "Fallback format: provide target_role_name (or role_name or topic) and "
                     "date/today (YYYY-MM-DD) to get role_date naming. "
                     "Optionally provide 'output_dir' (default: resumes)."
                 ),
@@ -722,6 +896,7 @@ def default_registry(
                     "properties": {
                         "target_role_name": {"type": "string", "minLength": 1},
                         "role_name": {"type": "string", "minLength": 1},
+                        "topic": {"type": "string", "minLength": 1},
                         "candidate_name": {"type": "string", "minLength": 1},
                         "first_name": {"type": "string", "minLength": 1},
                         "last_name": {"type": "string", "minLength": 1},
@@ -744,6 +919,7 @@ def default_registry(
                                             "anyOf": [
                                                 {"required": ["target_role_name"]},
                                                 {"required": ["role_name"]},
+                                                {"required": ["topic"]},
                                                 {"required": ["job_description"]},
                                             ]
                                         },
@@ -773,6 +949,7 @@ def default_registry(
                                             "anyOf": [
                                                 {"required": ["target_role_name"]},
                                                 {"required": ["role_name"]},
+                                                {"required": ["topic"]},
                                                 {"required": ["job_description"]},
                                             ]
                                         },
@@ -1146,6 +1323,24 @@ def default_registry(
                             "tailored_resume": {"type": "object"},
                             "alignment_score": {"type": "number"},
                             "alignment_summary": {"type": "string"},
+                            "alignment_feedback": {
+                                "type": "object",
+                                "properties": {
+                                    "top_gaps": {"type": "array", "items": {"type": "string"}},
+                                    "must_fix_before_95": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "missing_evidence": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "recommended_edits": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
                             "iterations": {"type": "integer"},
                             "reached_threshold": {"type": "boolean"},
                             "history": {"type": "array", "items": {"type": "object"}},
@@ -1160,7 +1355,7 @@ def default_registry(
                     },
                     memory_reads=["job_context", "task_outputs"],
                     memory_writes=["task_outputs"],
-                    timeout_s=_resolve_llm_timeout_s(llm_provider),
+                    timeout_s=_resolve_mcp_tool_timeout_s(),
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
                 ),
@@ -1213,7 +1408,7 @@ def default_registry(
                             }
                         }
                     ],
-                    timeout_s=_resolve_llm_timeout_s(llm_provider),
+                    timeout_s=_resolve_mcp_tool_timeout_s(),
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.generate,
                 ),
@@ -1246,12 +1441,30 @@ def default_registry(
                             "tailored_resume": {"type": "object"},
                             "alignment_score": {"type": "number"},
                             "alignment_summary": {"type": "string"},
+                            "alignment_feedback": {
+                                "type": "object",
+                                "properties": {
+                                    "top_gaps": {"type": "array", "items": {"type": "string"}},
+                                    "must_fix_before_95": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "missing_evidence": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "recommended_edits": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                            },
                         },
                         "required": ["tailored_resume", "alignment_score", "alignment_summary"],
                     },
                     memory_reads=["job_context", "task_outputs"],
                     memory_writes=["task_outputs"],
-                    timeout_s=_resolve_llm_timeout_s(llm_provider),
+                    timeout_s=_resolve_mcp_tool_timeout_s(),
                     risk_level=RiskLevel.high,
                     tool_intent=ToolIntent.transform,
                 ),
@@ -1267,7 +1480,8 @@ def default_registry(
                     description="Generate a ResumeDocSpec JSON from tailored resume text",
                     usage_guidance=(
                         "Provide tailored_resume (preferred) or tailored_text. Optionally provide "
-                        "job context in 'job'. Generates and validates resume_doc_spec "
+                        "job context in 'job'. Optionally provide target_pages (1 or 2) to "
+                        "bias output density. Generates and validates resume_doc_spec "
                         "(resume_doc_spec_validate, strict=true) before returning it."
                     ),
                     input_schema={
@@ -1276,6 +1490,7 @@ def default_registry(
                             "tailored_text": {"type": "string"},
                             "tailored_resume": {"type": "object"},
                             "job": {"type": "object"},
+                            "target_pages": {"type": "integer", "enum": [1, 2]},
                         },
                         "required": [],
                     },
@@ -1424,13 +1639,15 @@ def default_registry(
                         "Provide job context in 'job'. You MUST provide 'tailored_resume' from a "
                         "prior task. The output is a 'resume_doc_spec' object "
                         "matching the required schema and style (header, sections, roles, education, "
-                        "certifications, and styles)."
+                        "certifications, and styles). Optionally provide target_pages (1 or 2) "
+                        "to control output density."
                     ),
                     input_schema={
                         "type": "object",
                         "properties": {
                             "job": {"type": "object"},
                             "tailored_resume": {"type": ["object", "string"]},
+                            "target_pages": {"type": "integer", "enum": [1, 2]},
                         },
                         "required": ["job", "tailored_resume"],
                     },
@@ -1705,10 +1922,13 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
     role_name = pick_str(
         payload.get("target_role_name"),
         payload.get("role_name"),
+        payload.get("topic"),
         memory_context.get("target_role_name"),
         memory_context.get("role_name"),
+        memory_context.get("topic"),
         nested_context.get("target_role_name"),
         nested_context.get("role_name"),
+        nested_context.get("topic"),
     )
     company_name = pick_str(
         payload.get("company_name"),
@@ -2149,48 +2369,455 @@ def _post_mcp_tool_call(
 ) -> Dict[str, Any]:
     base_url = service_url.rstrip("/")
     attempts = ("/mcp/rpc/mcp", "/mcp/rpc")
+    timeout_s = _resolve_mcp_timeout_s()
+    max_retries = _resolve_mcp_max_retries()
+    retry_sleep_s = _resolve_mcp_retry_sleep_s()
+    isolation_mode = _resolve_mcp_isolation_mode()
+    first_attempt_reserve_s = _resolve_mcp_first_attempt_reserve_s(timeout_s)
+    started_at = time.monotonic()
+    deadline = started_at + timeout_s
+    total_slots = len(attempts) * (max_retries + 1)
+    prompt_version = os.getenv("PROMPT_VERSION", "unknown")
+    policy_version = os.getenv("POLICY_VERSION", "unknown")
+    tool_version = os.getenv("TOOL_VERSION", "unknown")
     errors: List[str] = []
-    for mcp_path in attempts:
-        mcp_url = f"{base_url}{mcp_path}"
-        try:
-            result = _call_mcp_tool_sdk(mcp_url, tool_name, arguments)
-            LOGGER.info(
-                "service_call_route",
-                extra={
-                    "route": "mcp_sdk",
-                    "tool": tool_name,
-                    "service_url": base_url,
-                    "mcp_url": mcp_url,
+    common_context = {
+        "tool_name": tool_name,
+        "service_url": base_url,
+        "mcp_timeout_s": timeout_s,
+        "max_retries": max_retries,
+        "mcp_isolation_mode": isolation_mode,
+        "prompt_version": prompt_version,
+        "policy_version": policy_version,
+        "tool_version": tool_version,
+    }
+
+    def _log_mcp_event(level: str, event_name: str, payload: Dict[str, Any]) -> None:
+        full_payload = {**common_context, **payload}
+        message = f"{event_name} payload=%s"
+        encoded = json.dumps(full_payload, ensure_ascii=True, sort_keys=True)
+        if level == "warning":
+            LOGGER.warning(message, encoded, extra=full_payload)
+            return
+        if level == "error":
+            LOGGER.error(message, encoded, extra=full_payload)
+            return
+        LOGGER.info(message, encoded, extra=full_payload)
+
+    with core_tracing.start_span(
+        "tool_registry.mcp_tool_call",
+        attributes={
+            "mcp.tool_name": tool_name,
+            "mcp.service_url": base_url,
+            "mcp.timeout_s": timeout_s,
+            "mcp.max_retries": max_retries,
+        },
+    ) as span:
+
+        def _finalize_and_raise(error_text: str, status: str) -> None:
+            elapsed_ms = int(max(0.0, time.monotonic() - started_at) * 1000)
+            payload = {
+                "status": status,
+                "error": error_text,
+                "error_code": _classify_tool_error(error_text),
+                "elapsed_ms": elapsed_ms,
+                "attempt_errors": list(errors),
+            }
+            _log_mcp_event("error", "mcp_call_failed", payload)
+            core_tracing.set_span_attributes(
+                span,
+                {
+                    "mcp.status": status,
+                    "mcp.error": error_text,
+                    "mcp.elapsed_s": max(0.0, time.monotonic() - started_at),
                 },
             )
-            return result
-        except ToolExecutionError as exc:
-            if str(exc).startswith("mcp_tool_error"):
-                raise
-            errors.append(f"{mcp_path}:{exc}")
-    joined = " | ".join(errors)
-    raise ToolExecutionError(f"mcp_sdk_all_routes_failed:{joined}")
+            raise ToolExecutionError(error_text)
+
+        for path_idx, mcp_path in enumerate(attempts):
+            mcp_url = f"{base_url}{mcp_path}"
+            with core_tracing.start_span(
+                "tool_registry.mcp_route_attempt",
+                attributes={
+                    "mcp.tool_name": tool_name,
+                    "mcp.path": mcp_path,
+                    "mcp.url": mcp_url,
+                },
+            ) as route_span:
+                for attempt in range(max_retries + 1):
+                    with core_tracing.start_span(
+                        "tool_registry.mcp_route_attempt_try",
+                        attributes={
+                            "mcp.tool_name": tool_name,
+                            "mcp.path": mcp_path,
+                            "mcp.url": mcp_url,
+                            "mcp.route_attempt": attempt + 1,
+                            "mcp.route_attempts_total": max_retries + 1,
+                        },
+                    ) as attempt_span:
+                        slot_idx = path_idx * (max_retries + 1) + attempt
+                        remaining_s = deadline - time.monotonic()
+                        remaining_slots_after_current = max(0, total_slots - slot_idx - 1)
+                        attempt_started_at = time.monotonic()
+                        start_payload = {
+                            "mcp_url": mcp_url,
+                            "route_path": mcp_path,
+                            "attempt": attempt + 1,
+                            "attempts_total": max_retries + 1,
+                            "deadline_remaining_ms": int(max(0.0, remaining_s) * 1000),
+                        }
+                        _log_mcp_event("info", "mcp_attempt_start", start_payload)
+                        if remaining_s <= 0.05:
+                            detail = f"mcp_call_timed_out_after_{timeout_s:.1f}s"
+                            timeout_error = f"mcp_sdk_timeout:{detail}"
+                            _log_mcp_event(
+                                "warning",
+                                "mcp_attempt_timeout",
+                                {
+                                    **start_payload,
+                                    "error": detail,
+                                    "error_code": _classify_tool_error(timeout_error),
+                                },
+                            )
+                            core_tracing.set_span_attributes(
+                                attempt_span,
+                                {
+                                    "mcp.route_status": "failed",
+                                    "mcp.route_error": timeout_error,
+                                },
+                            )
+                            core_tracing.set_span_attributes(
+                                route_span,
+                                {"mcp.route_status": "failed", "mcp.route_error": timeout_error},
+                            )
+                            _finalize_and_raise(timeout_error, "timeout")
+
+                        if slot_idx == 0 and remaining_slots_after_current > 0:
+                            reserve_s = min(
+                                max(0.05, first_attempt_reserve_s),
+                                max(0.0, remaining_s - 0.05),
+                            )
+                            per_attempt_timeout_s = max(0.05, remaining_s - reserve_s)
+                            timeout_allocation = "first_attempt_bias"
+                        else:
+                            slots_including_current = remaining_slots_after_current + 1
+                            per_attempt_timeout_s = max(0.05, remaining_s / slots_including_current)
+                            timeout_allocation = "equal_remaining"
+                        try:
+                            core_tracing.set_span_attributes(
+                                attempt_span,
+                                {
+                                    "mcp.route_timeout_s": per_attempt_timeout_s,
+                                    "mcp.deadline_remaining_s": remaining_s,
+                                    "mcp.timeout_allocation": timeout_allocation,
+                                    "mcp.remaining_slots_after_current": remaining_slots_after_current,
+                                },
+                            )
+                            result = _call_mcp_tool_sdk(
+                                mcp_url,
+                                tool_name,
+                                arguments,
+                                timeout_s=per_attempt_timeout_s,
+                            )
+                            elapsed_ms = int(max(0.0, time.monotonic() - attempt_started_at) * 1000)
+                            _log_mcp_event(
+                                "info",
+                                "mcp_attempt_success",
+                                {
+                                    **start_payload,
+                                    "route": "mcp_sdk",
+                                    "attempt_timeout_ms": int(per_attempt_timeout_s * 1000),
+                                    "attempt_elapsed_ms": elapsed_ms,
+                                    "timeout_allocation": timeout_allocation,
+                                    "deadline_remaining_ms": int(
+                                        max(0.0, deadline - time.monotonic()) * 1000
+                                    ),
+                                },
+                            )
+                            core_tracing.set_span_attributes(
+                                attempt_span, {"mcp.route_status": "ok"}
+                            )
+                            core_tracing.set_span_attributes(route_span, {"mcp.route_status": "ok"})
+                            core_tracing.set_span_attributes(
+                                span,
+                                {
+                                    "mcp.selected_path": mcp_path,
+                                    "mcp.status": "ok",
+                                    "mcp.elapsed_s": time.monotonic() - started_at,
+                                },
+                            )
+                            return result
+                        except Exception as exc:  # noqa: BLE001
+                            if isinstance(exc, ToolExecutionError):
+                                error_text = str(exc)
+                            else:
+                                error_detail = "; ".join(_flatten_exception_messages(exc))
+                                error_text = (
+                                    "mcp_sdk_error:"
+                                    f"phase=route_call;error_type={exc.__class__.__name__};{error_detail}"
+                                )
+                            error_code = _classify_tool_error(error_text)
+                            error_phase = _extract_mcp_error_phase(error_text)
+                            if error_text.startswith("mcp_tool_error"):
+                                _log_mcp_event(
+                                    "warning",
+                                    "mcp_attempt_tool_error",
+                                    {
+                                        **start_payload,
+                                        "error": error_text,
+                                        "error_code": error_code,
+                                        "error_phase": error_phase,
+                                    },
+                                )
+                                core_tracing.set_span_attributes(
+                                    attempt_span, {"mcp.route_status": "tool_error"}
+                                )
+                                core_tracing.set_span_attributes(
+                                    route_span, {"mcp.route_status": "tool_error"}
+                                )
+                                _finalize_and_raise(error_text, "tool_error")
+                            retryable = _is_retryable_mcp_error(error_text)
+                            if retryable and attempt < max_retries:
+                                _log_mcp_event(
+                                    "info",
+                                    "mcp_attempt_retrying",
+                                    {
+                                        **start_payload,
+                                        "error": error_text,
+                                        "error_code": error_code,
+                                        "error_phase": error_phase,
+                                        "retry_sleep_s": retry_sleep_s * float(attempt + 1),
+                                        "timeout_allocation": timeout_allocation,
+                                        "deadline_remaining_ms": int(
+                                            max(0.0, deadline - time.monotonic()) * 1000
+                                        ),
+                                    },
+                                )
+                                core_tracing.set_span_attributes(
+                                    attempt_span,
+                                    {
+                                        "mcp.route_status": "retrying",
+                                        "mcp.route_error": error_text,
+                                    },
+                                )
+                                core_tracing.set_span_attributes(
+                                    route_span,
+                                    {
+                                        "mcp.route_status": "retrying",
+                                        "mcp.route_error": error_text,
+                                    },
+                                )
+                                if retry_sleep_s > 0:
+                                    next_remaining_s = deadline - time.monotonic()
+                                    if next_remaining_s <= 0:
+                                        detail = f"mcp_call_timed_out_after_{timeout_s:.1f}s"
+                                        _finalize_and_raise(f"mcp_sdk_timeout:{detail}", "timeout")
+                                    sleep_s = min(
+                                        retry_sleep_s * float(attempt + 1),
+                                        max(0.0, next_remaining_s - 0.05),
+                                    )
+                                    if sleep_s > 0:
+                                        time.sleep(sleep_s)
+                                continue
+                            attempt_elapsed_ms = int(
+                                max(0.0, time.monotonic() - attempt_started_at) * 1000
+                            )
+                            failed_payload = {
+                                **start_payload,
+                                "error": error_text,
+                                "error_code": error_code,
+                                "error_phase": error_phase,
+                                "retryable": retryable,
+                                "attempt_timeout_ms": int(per_attempt_timeout_s * 1000),
+                                "attempt_elapsed_ms": attempt_elapsed_ms,
+                                "timeout_allocation": timeout_allocation,
+                                "deadline_remaining_ms": int(
+                                    max(0.0, deadline - time.monotonic()) * 1000
+                                ),
+                            }
+                            core_tracing.set_span_attributes(
+                                attempt_span,
+                                {
+                                    "mcp.route_status": "failed",
+                                    "mcp.route_error": error_text,
+                                },
+                            )
+                            core_tracing.set_span_attributes(
+                                route_span,
+                                {
+                                    "mcp.route_status": "failed",
+                                    "mcp.route_error": error_text,
+                                },
+                            )
+                            _log_mcp_event("warning", "mcp_attempt_failed", failed_payload)
+                            errors.append(f"{mcp_path}#{attempt + 1}:{error_text}")
+                            break
+        joined = " | ".join(errors) if errors else "no_route_errors_recorded"
+        _finalize_and_raise(f"mcp_sdk_all_routes_failed:{joined}", "all_routes_failed")
 
 
-def _call_mcp_tool_sdk(mcp_url: str, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+def _call_mcp_tool_sdk(
+    mcp_url: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    timeout_s: float,
+) -> Dict[str, Any]:
+    mode = _resolve_mcp_isolation_mode()
+    if mode == "process":
+        return _call_mcp_tool_sdk_process(mcp_url, tool_name, arguments, timeout_s)
+    return _call_mcp_tool_sdk_inproc(mcp_url, tool_name, arguments, timeout_s)
+
+
+def _call_mcp_tool_sdk_inproc(
+    mcp_url: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    timeout_s: float,
+) -> Dict[str, Any]:
     try:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamable_http_client
     except Exception as exc:  # noqa: BLE001
         raise ToolExecutionError(f"mcp_sdk_unavailable:{exc}") from exc
 
-    async def _run_call() -> Any:
-        async with streamable_http_client(mcp_url) as (read_stream, write_stream, _session_id):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                return await session.call_tool(tool_name, arguments)
+    streamable_kwargs = _streamable_http_client_kwargs(streamable_http_client, timeout_s)
+    with core_tracing.start_span(
+        "tool_registry.mcp_sdk_call",
+        attributes={
+            "mcp.tool_name": tool_name,
+            "mcp.url": mcp_url,
+            "mcp.timeout_s": timeout_s,
+        },
+    ) as sdk_span:
+        sdk_started_at = time.monotonic()
+        phase = "stream_open"
 
+        async def _run_call() -> Any:
+            nonlocal phase
+            async with streamable_http_client(mcp_url, **streamable_kwargs) as (
+                read_stream,
+                write_stream,
+                _session_id,
+            ):
+                async with ClientSession(read_stream, write_stream) as session:
+                    phase = "initialize"
+                    with core_tracing.start_span(
+                        "tool_registry.mcp_sdk_initialize",
+                        attributes={
+                            "mcp.tool_name": tool_name,
+                            "mcp.url": mcp_url,
+                        },
+                    ):
+                        await session.initialize()
+                    phase = "call_tool"
+                    with core_tracing.start_span(
+                        "tool_registry.mcp_sdk_call_tool",
+                        attributes={
+                            "mcp.tool_name": tool_name,
+                            "mcp.url": mcp_url,
+                        },
+                    ):
+                        return await session.call_tool(tool_name, arguments)
+
+        try:
+            result = asyncio.run(asyncio.wait_for(_run_call(), timeout=timeout_s))
+        except TimeoutError as exc:
+            elapsed_s = time.monotonic() - sdk_started_at
+            detail = (
+                f"phase={phase};mcp_call_timed_out_after_{timeout_s:.1f}s;elapsed_s={elapsed_s:.3f}"
+            )
+            core_tracing.set_span_attributes(
+                sdk_span,
+                {
+                    "mcp.error": detail,
+                    "mcp.phase": phase,
+                    "mcp.elapsed_s": elapsed_s,
+                },
+            )
+            raise ToolExecutionError(f"mcp_sdk_timeout:{detail}") from exc
+        except Exception as exc:  # noqa: BLE001
+            elapsed_s = time.monotonic() - sdk_started_at
+            detail = "; ".join(_flatten_exception_messages(exc))
+            error_detail = f"phase={phase};error_type={exc.__class__.__name__};{detail}"
+            core_tracing.set_span_attributes(
+                sdk_span,
+                {
+                    "mcp.error": error_detail,
+                    "mcp.phase": phase,
+                    "mcp.elapsed_s": elapsed_s,
+                },
+            )
+            raise ToolExecutionError(f"mcp_sdk_error:{error_detail}") from exc
+        core_tracing.set_span_attributes(sdk_span, {"mcp.status": "ok"})
+        return _extract_mcp_sdk_result(result)
+
+
+def _mcp_process_entry(
+    queue: Any, mcp_url: str, tool_name: str, arguments: Dict[str, Any], timeout_s: float
+) -> None:
     try:
-        result = asyncio.run(_run_call())
+        result = _call_mcp_tool_sdk_inproc(mcp_url, tool_name, arguments, timeout_s)
+        queue.put({"ok": result})
     except Exception as exc:  # noqa: BLE001
-        detail = "; ".join(_flatten_exception_messages(exc))
-        raise ToolExecutionError(f"mcp_sdk_error:{detail}") from exc
-    return _extract_mcp_sdk_result(result)
+        queue.put(
+            {
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def _call_mcp_tool_sdk_process(
+    mcp_url: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    timeout_s: float,
+) -> Dict[str, Any]:
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_mcp_process_entry,
+        args=(queue, mcp_url, tool_name, arguments, timeout_s),
+        daemon=True,
+    )
+    process.start()
+    process.join(timeout=timeout_s + 2.0)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1.0)
+        detail = f"phase=process.join;mcp_call_timed_out_after_{timeout_s:.1f}s"
+        raise ToolExecutionError(f"mcp_sdk_timeout:{detail}")
+
+    outcome: Dict[str, Any] | None = None
+    try:
+        if not queue.empty():
+            outcome = queue.get_nowait()
+    except Exception:  # noqa: BLE001
+        outcome = None
+    finally:
+        queue.close()
+
+    if isinstance(outcome, dict):
+        if isinstance(outcome.get("ok"), dict):
+            return outcome["ok"]
+        if isinstance(outcome.get("error"), str):
+            detail = outcome["error"]
+            error_type = outcome.get("error_type")
+            if isinstance(error_type, str) and error_type.strip():
+                detail = f"{detail};child_error_type={error_type}"
+            child_traceback = outcome.get("traceback")
+            if isinstance(child_traceback, str) and child_traceback.strip():
+                LOGGER.warning(
+                    "mcp_child_process_error_traceback tool=%s url=%s traceback=%s",
+                    tool_name,
+                    mcp_url,
+                    child_traceback,
+                )
+            raise ToolExecutionError(detail)
+
+    exit_code = process.exitcode
+    raise ToolExecutionError(f"mcp_sdk_error:process_exit_code_{exit_code}")
 
 
 def _flatten_exception_messages(exc: BaseException) -> List[str]:
@@ -2673,12 +3300,173 @@ def _llm_iterative_improve_tailored_resume_text(
     return response
 
 
+def _parse_target_pages(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
+        parsed = int(value)
+    elif isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        if re.fullmatch(r"\d+", trimmed):
+            parsed = int(trimmed)
+        else:
+            match = re.search(r"\b([12])\s*page(?:s)?\b", trimmed.lower())
+            if match is None:
+                match = re.search(r"\bpage(?:s)?\s*([12])\b", trimmed.lower())
+            if match is None:
+                return None
+            parsed = int(match.group(1))
+    else:
+        return None
+    if parsed in {1, 2}:
+        return parsed
+    return None
+
+
+def _resolve_target_pages(payload: Dict[str, Any], job: Any) -> int | None:
+    candidates: list[Any] = [payload.get("target_pages"), payload.get("page_count")]
+    if isinstance(job, dict):
+        candidates.extend([job.get("target_pages"), job.get("page_count")])
+        context_json = job.get("context_json")
+        if isinstance(context_json, dict):
+            candidates.extend([context_json.get("target_pages"), context_json.get("page_count")])
+    for candidate in candidates:
+        parsed = _parse_target_pages(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _trim_non_empty_strings(items: Any, max_items: int) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    if max_items < 1:
+        return []
+    normalized = [item.strip() for item in items if isinstance(item, str) and item.strip()]
+    return normalized[:max_items]
+
+
+def _trim_summary_sentences(text: str, max_sentences: int) -> str:
+    cleaned = text.strip()
+    if max_sentences < 1 or not cleaned:
+        return cleaned
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    if len(parts) <= max_sentences:
+        return cleaned
+    return " ".join(parts[:max_sentences]).strip()
+
+
+def _apply_resume_target_pages_policy(
+    resume_doc_spec: Dict[str, Any], target_pages: int | None
+) -> None:
+    if target_pages not in {1, 2}:
+        return
+
+    page = resume_doc_spec.get("page")
+    if not isinstance(page, dict):
+        page = {}
+        resume_doc_spec["page"] = page
+    margins_in = page.get("margins_in")
+    if not isinstance(margins_in, dict):
+        margins_in = {}
+        page["margins_in"] = margins_in
+
+    defaults = resume_doc_spec.get("defaults")
+    if not isinstance(defaults, dict):
+        defaults = {}
+        resume_doc_spec["defaults"] = defaults
+
+    if target_pages == 1:
+        margins_in.update({"top": 0.45, "right": 0.45, "bottom": 0.45, "left": 0.45})
+        defaults["font_size_pt"] = 10.5
+        defaults["line_spacing"] = 1.0
+        skills_group_limit = 5
+        first_role_bullet_limit = 4
+        other_role_bullet_limit = 2
+        experience_group_bullet_limit = 2
+        summary_sentence_limit = 2
+        aux_bullet_limit = 2
+        total_experience_bullets_limit = 9
+        total_aux_bullets_limit = 2
+    else:
+        # Keep two-page resumes inside budget without collapsing to one-page density.
+        margins_in.update({"top": 0.45, "right": 0.45, "bottom": 0.45, "left": 0.45})
+        defaults["font_size_pt"] = 10.75
+        defaults["line_spacing"] = 1.0
+        skills_group_limit = 6
+        first_role_bullet_limit = 6
+        other_role_bullet_limit = 3
+        experience_group_bullet_limit = 3
+        summary_sentence_limit = 3
+        aux_bullet_limit = 3
+        total_experience_bullets_limit = 16
+        total_aux_bullets_limit = 3
+
+    content = resume_doc_spec.get("content")
+    if not isinstance(content, list):
+        return
+
+    current_section = ""
+    role_index = 0
+    total_experience_bullets = 0
+    total_aux_bullets = 0
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type == "section_heading":
+            heading = block.get("text")
+            current_section = heading.strip().upper() if isinstance(heading, str) else ""
+            continue
+        if block_type == "definition_list" and current_section == "SKILLS":
+            items = block.get("items")
+            if isinstance(items, list):
+                block["items"] = [item for item in items if isinstance(item, dict)][
+                    :skills_group_limit
+                ]
+            continue
+        if block_type == "paragraph" and current_section == "SUMMARY":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                block["text"] = _trim_summary_sentences(text, summary_sentence_limit)
+            continue
+        if block_type == "role" and current_section == "EXPERIENCE":
+            role_index += 1
+            bullets = block.get("bullets")
+            if isinstance(bullets, list):
+                max_items = first_role_bullet_limit if role_index == 1 else other_role_bullet_limit
+                trimmed = _trim_non_empty_strings(bullets, max_items)
+                remaining = max(0, total_experience_bullets_limit - total_experience_bullets)
+                block["bullets"] = trimmed[:remaining]
+                total_experience_bullets += len(block["bullets"])
+            continue
+        if block_type == "bullets":
+            items = block.get("items")
+            if current_section == "EXPERIENCE":
+                trimmed = _trim_non_empty_strings(items, experience_group_bullet_limit)
+                remaining = max(0, total_experience_bullets_limit - total_experience_bullets)
+                block["items"] = trimmed[:remaining]
+                total_experience_bullets += len(block["items"])
+            elif current_section in {"OPEN SOURCE", "PROJECTS", "OPEN SOURCE (SELECTED)"}:
+                trimmed = _trim_non_empty_strings(items, aux_bullet_limit)
+                remaining = max(0, total_aux_bullets_limit - total_aux_bullets)
+                block["items"] = trimmed[:remaining]
+                total_aux_bullets += len(block["items"])
+
+
 def _llm_generate_resume_doc_spec_from_text(
     payload: Dict[str, Any], provider: LLMProvider
 ) -> Dict[str, Any]:
     tailored_text = payload.get("tailored_text")
     tailored_resume = payload.get("tailored_resume")
     job = payload.get("job")
+    target_pages = _resolve_target_pages(payload, job)
     if isinstance(tailored_text, str) and tailored_text.strip() and tailored_resume is None:
         try:
             parsed = json.loads(tailored_text)
@@ -2704,7 +3492,14 @@ def _llm_generate_resume_doc_spec_from_text(
         raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
     if not isinstance(resume_doc_spec, dict):
         raise ToolExecutionError("ResumeDocSpec must be an object")
+    _apply_resume_target_pages_policy(resume_doc_spec, target_pages)
     _normalize_skills_definition_separators(resume_doc_spec)
+    _ensure_certifications_section_content(
+        resume_doc_spec,
+        tailored_resume=tailored_resume if isinstance(tailored_resume, dict) else None,
+        tailored_text=tailored_text if isinstance(tailored_text, str) else None,
+        candidate_resume_text=_extract_candidate_resume_text_from_job(job),
+    )
     if isinstance(tailored_text, str) and tailored_text.strip():
         _fill_missing_dates_from_text(resume_doc_spec, tailored_text)
 
@@ -3089,6 +3884,7 @@ def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider
     tailored_resume = payload.get("tailored_resume")
     if not isinstance(job, dict):
         raise ToolExecutionError("job must be an object")
+    target_pages = _resolve_target_pages(payload, job)
     prompt = prompts.resume_doc_spec_prompt(job, tailored_resume=tailored_resume)
     response = provider.generate(prompt)
     json_text = _extract_json(response.content)
@@ -3100,6 +3896,13 @@ def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider
         raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
     if not isinstance(resume_doc_spec, dict):
         raise ToolExecutionError("ResumeDocSpec must be an object")
+    _apply_resume_target_pages_policy(resume_doc_spec, target_pages)
+    _ensure_certifications_section_content(
+        resume_doc_spec,
+        tailored_resume=tailored_resume if isinstance(tailored_resume, dict) else None,
+        tailored_text=None,
+        candidate_resume_text=_extract_candidate_resume_text_from_job(job),
+    )
     return {"resume_doc_spec": resume_doc_spec}
 
 
@@ -3267,6 +4070,236 @@ def _fill_missing_dates_from_text(resume_doc_spec: Dict[str, Any], tailored_text
                 next_date = next(edu_iter, None)
                 if next_date:
                     block["dates"] = next_date
+
+
+def _ensure_certifications_section_content(
+    resume_doc_spec: Dict[str, Any],
+    tailored_resume: Dict[str, Any] | None,
+    tailored_text: str | None,
+    candidate_resume_text: str | None,
+) -> None:
+    content = resume_doc_spec.get("content")
+    if not isinstance(content, list):
+        return
+
+    cert_heading_idx = _find_section_heading_block_index(
+        content, {"CERTIFICATIONS", "CERTIFICATION"}
+    )
+    if cert_heading_idx is None:
+        return
+
+    cert_start = cert_heading_idx + 1
+    cert_end = _find_next_section_heading_block_index(content, cert_start)
+    cert_section = content[cert_start:cert_end]
+    existing_items = _extract_non_empty_cert_items(cert_section)
+    if existing_items:
+        return
+
+    fallback_items = _collect_fallback_certification_lines(
+        tailored_resume=tailored_resume,
+        tailored_text=tailored_text,
+        candidate_resume_text=candidate_resume_text,
+    )
+    if fallback_items:
+        for block in cert_section:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "bullets":
+                continue
+            items = block.get("items")
+            if isinstance(items, list):
+                block["items"] = fallback_items
+                return
+        content.insert(cert_start, {"type": "bullets", "items": fallback_items})
+        return
+
+    # If there is no cert content and no fallback, remove the empty section.
+    if _cert_section_is_removable(cert_section):
+        del content[cert_heading_idx:cert_end]
+
+
+def _find_section_heading_block_index(
+    content: List[Dict[str, Any]],
+    headings: set[str],
+    start: int = 0,
+) -> int | None:
+    for idx in range(start, len(content)):
+        block = content[idx]
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "section_heading":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            continue
+        if text.strip().upper() in headings:
+            return idx
+    return None
+
+
+def _find_next_section_heading_block_index(content: List[Dict[str, Any]], start: int) -> int:
+    for idx in range(start, len(content)):
+        block = content[idx]
+        if isinstance(block, dict) and block.get("type") == "section_heading":
+            return idx
+    return len(content)
+
+
+def _extract_non_empty_cert_items(blocks: List[Any]) -> list[str]:
+    items: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "bullets":
+            values = block.get("items")
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if isinstance(value, str) and value.strip():
+                    items.append(value.strip())
+        elif block_type == "paragraph":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                items.append(text.strip())
+    return items
+
+
+def _collect_fallback_certification_lines(
+    tailored_resume: Dict[str, Any] | None,
+    tailored_text: str | None,
+    candidate_resume_text: str | None,
+) -> list[str]:
+    collected: list[str] = []
+    if isinstance(tailored_resume, dict):
+        collected.extend(_certification_lines_from_tailored_resume(tailored_resume))
+    if not collected and isinstance(tailored_text, str) and tailored_text.strip():
+        collected.extend(_certification_lines_from_text(tailored_text))
+    if not collected and isinstance(candidate_resume_text, str) and candidate_resume_text.strip():
+        collected.extend(_certification_lines_from_text(candidate_resume_text))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in collected:
+        normalized = line.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def _certification_lines_from_tailored_resume(tailored_resume: Dict[str, Any]) -> list[str]:
+    certifications = tailored_resume.get("certifications")
+    if not isinstance(certifications, list):
+        return []
+
+    lines: list[str] = []
+    for cert in certifications:
+        if isinstance(cert, str):
+            text = cert.strip()
+            if text:
+                lines.append(text)
+            continue
+        if not isinstance(cert, dict):
+            continue
+
+        name = cert.get("name")
+        issuer = cert.get("issuer")
+        year = cert.get("year")
+        url = (
+            cert.get("url")
+            or cert.get("credential_url")
+            or cert.get("public_url")
+            or cert.get("link")
+        )
+        if not isinstance(name, str) or not name.strip():
+            continue
+
+        line = name.strip()
+        if isinstance(issuer, str) and issuer.strip():
+            line = f"{line} - {issuer.strip()}"
+        if isinstance(year, int):
+            line = f"{line} ({year})"
+        elif isinstance(year, str) and year.strip():
+            line = f"{line} ({year.strip()})"
+        if isinstance(url, str) and url.strip():
+            line = f"{line} | {url.strip()}"
+        lines.append(line)
+
+    return lines
+
+
+def _certification_lines_from_text(text: str) -> list[str]:
+    lines = [line.strip() for line in text.splitlines()]
+    start_idx = _find_heading_index(lines, "CERTIFICATIONS")
+    if start_idx is None:
+        start_idx = _find_heading_index(lines, "CERTIFICATION")
+    if start_idx is None:
+        return []
+
+    end_headings = {
+        "OPEN SOURCE",
+        "OPEN SOURCE (SELECTED)",
+        "PROJECTS",
+        "EXPERIENCE",
+        "PROFESSIONAL EXPERIENCE",
+        "EDUCATION",
+        "SUMMARY",
+        "SKILLS",
+        "CORE SKILLS",
+    }
+
+    cert_lines: list[str] = []
+    for raw in lines[start_idx + 1 :]:
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        if candidate.upper() in end_headings:
+            break
+        normalized = re.sub(r"^[*•\-]\s*", "", candidate).strip()
+        if normalized:
+            cert_lines.append(normalized)
+    return cert_lines
+
+
+def _cert_section_is_removable(blocks: List[Any]) -> bool:
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "bullets":
+            items = block.get("items")
+            if isinstance(items, list) and any(
+                isinstance(item, str) and item.strip() for item in items
+            ):
+                return False
+            continue
+        if block_type == "paragraph":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                return False
+            continue
+        return False
+    return True
+
+
+def _extract_candidate_resume_text_from_job(job_payload: Any) -> str | None:
+    if not isinstance(job_payload, dict):
+        return None
+    direct = job_payload.get("candidate_resume")
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    context = job_payload.get("context_json")
+    if not isinstance(context, dict):
+        return None
+    candidate_resume = context.get("candidate_resume")
+    if isinstance(candidate_resume, str) and candidate_resume.strip():
+        return candidate_resume
+    return None
 
 
 def _extract_dates_from_section(text: str, start_heading: str, end_heading: str) -> list[str]:

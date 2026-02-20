@@ -1,6 +1,7 @@
 JOB_STREAM = "jobs.events"
 PLAN_STREAM = "plans.events"
 TASK_STREAM = "tasks.events"
+TASK_DLQ_STREAM = "tasks.dlq"
 CRITIC_STREAM = "critic.events"
 POLICY_STREAM = "policy.events"
 

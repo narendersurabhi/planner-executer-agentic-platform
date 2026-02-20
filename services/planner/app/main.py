@@ -163,6 +163,15 @@ def llm_plan(
     response = provider.generate(prompt)
     candidate = _parse_llm_plan(response.content)
     if not candidate:
+        logger.warning("llm_plan_parse_retry", reason="initial_parse_failed")
+        repair_prompt = _llm_plan_repair_prompt(
+            original_prompt=prompt,
+            raw_output=response.content,
+            tools=tools,
+        )
+        repaired = provider.generate(repair_prompt)
+        candidate = _parse_llm_plan(repaired.content)
+    if not candidate:
         raise ValueError("Invalid plan generated: parse_failed")
     candidate = _ensure_llm_tool(candidate)
     candidate = _ensure_job_inputs(candidate, job, tools)
@@ -330,6 +339,28 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
     )
 
 
+def _llm_plan_repair_prompt(
+    *, original_prompt: str, raw_output: str, tools: List[models.ToolSpec]
+) -> str:
+    tool_names = ", ".join(sorted(tool.name for tool in tools))
+    return (
+        "You are fixing a malformed planner response.\n"
+        "Return ONLY one valid JSON object for PlanCreate.\n"
+        "Do not include markdown, comments, or prose.\n"
+        "Required top-level fields: planner_version, tasks_summary, dag_edges, tasks.\n"
+        "Each task must include: name, description, instruction, acceptance_criteria, "
+        "expected_output_schema_ref, deps, tool_requests, tool_inputs, critic_required.\n"
+        "Rules:\n"
+        "- acceptance_criteria must be string array.\n"
+        "- dag_edges must be array of 2-string arrays.\n"
+        "- Use only allowed tool names.\n"
+        "- If a field is missing, add a safe default value.\n"
+        f"Allowed tool names: {tool_names}\n\n"
+        f"Original planner prompt (for context):\n{original_prompt}\n\n"
+        f"Malformed planner output to repair:\n{raw_output}\n"
+    )
+
+
 def _document_spec_prompt(job: models.Job, allowed_block_types: List[str]) -> str:
     return prompts.document_spec_prompt(job.model_dump(mode="json"), allowed_block_types)
 
@@ -411,7 +442,13 @@ def _decode_json_object(text: str) -> dict | None:
                 queue.append(extracted)
             continue
         if isinstance(parsed, dict):
+            inner = parsed.get("plan")
+            if isinstance(inner, dict):
+                return inner
             return parsed
+        if isinstance(parsed, list):
+            if len(parsed) == 1 and isinstance(parsed[0], dict):
+                return parsed[0]
         if isinstance(parsed, str):
             queue.append(parsed)
     return None

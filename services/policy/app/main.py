@@ -15,7 +15,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 POLICY_GATE_ENABLED = os.getenv("POLICY_GATE_ENABLED", "false").lower() == "true"
 POLICY_MODE = os.getenv("POLICY_MODE", "dev")
 TOOL_HTTP_FETCH_ENABLED = os.getenv("TOOL_HTTP_FETCH_ENABLED", "false").lower() == "true"
-POLICY_CONFIG_PATH = os.getenv("POLICY_CONFIG_PATH", "config/policy.yaml")
+POLICY_CONFIG_PATH = os.getenv("POLICY_CONFIG_PATH", "/app/config/policy.yaml")
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 engine = policy_engine.PolicyEngine(POLICY_MODE, POLICY_CONFIG_PATH)

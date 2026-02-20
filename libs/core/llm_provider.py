@@ -48,21 +48,23 @@ class OpenAIProvider(LLMProvider):
 
     def generate(self, prompt: str) -> LLMResponse:
         payload: Dict[str, Any] = {"model": self.model, "input": prompt}
-        if self.temperature is not None:
+        if self.temperature is not None and _model_supports_temperature(self.model):
             payload["temperature"] = self.temperature
         if self.max_output_tokens is not None:
             payload["max_output_tokens"] = self.max_output_tokens
-        request = Request(
-            f"{self.base_url}/v1/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
         attempts = self.max_retries + 1
-        for attempt in range(attempts):
+        retried_without_temperature = False
+        attempt = 0
+        while attempt < attempts:
+            request = Request(
+                f"{self.base_url}/v1/responses",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
             try:
                 with urlopen(request, timeout=self.timeout_s) as response:
                     body = response.read().decode("utf-8")
@@ -73,13 +75,23 @@ class OpenAIProvider(LLMProvider):
                 return LLMResponse(content=text)
             except HTTPError as exc:
                 detail = exc.read().decode("utf-8") if exc.fp else str(exc)
+                if (
+                    "temperature" in payload
+                    and not retried_without_temperature
+                    and _is_unsupported_temperature_error(detail)
+                ):
+                    payload.pop("temperature", None)
+                    retried_without_temperature = True
+                    continue
                 if exc.code in {429, 500, 502, 503, 504} and attempt < attempts - 1:
                     time.sleep(min(2**attempt, 8))
+                    attempt += 1
                     continue
                 raise LLMProviderError(f"OpenAI API error: {detail}") from exc
             except (URLError, TimeoutError) as exc:
                 if attempt < attempts - 1:
                     time.sleep(min(2**attempt, 8))
+                    attempt += 1
                     continue
                 raise LLMProviderError(f"OpenAI API connection error: {exc}") from exc
         raise LLMProviderError("OpenAI API request failed after retries")
@@ -123,3 +135,14 @@ def _extract_output_text(response: Dict[str, Any]) -> str:
             if content.get("type") == "output_text":
                 parts.append(content.get("text", ""))
     return "".join(parts).strip()
+
+
+def _model_supports_temperature(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    # GPT-5 responses currently reject temperature.
+    return not normalized.startswith("gpt-5")
+
+
+def _is_unsupported_temperature_error(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return "unsupported parameter" in lowered and "temperature" in lowered

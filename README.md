@@ -50,6 +50,100 @@ graph TD
   API --> Jaeger[(Jaeger)]
 ```
 
+## Worker Pool
+
+Workers consume `task.ready` from Redis Streams consumer group `workers`.
+
+- Scale horizontally: `docker compose up -d --scale worker=4`
+- Stale task recovery: workers use `XAUTOCLAIM` (`WORKER_RECOVER_*` settings)
+- Retry policy: `WORKER_RETRY_POLICY=transient|any|none`
+- Dead-letter stream: failed terminal tasks are written to `tasks.dlq` when `WORKER_DLQ_ENABLED=true`
+- Inspect DLQ per job: `GET /jobs/{job_id}/tasks/dlq?limit=25`
+- Retry one failed task from DLQ: `POST /jobs/{job_id}/tasks/{task_id}/retry` with optional body `{ "stream_id": "<dlq stream id>" }`
+
+## Kubernetes Autoscaling
+
+This repo now includes Kubernetes manifests in `deploy/k8s` with:
+
+- `HPA` for `api` (CPU + memory)
+- `HPA` for `coder` (CPU + memory)
+- `HPA` for `tailor` (CPU + memory)
+- Optional `KEDA` queue-depth scaler for `worker`
+- Baseline Deployments/Services for `api`, `planner`, `worker`, `coder`, `tailor`, `ui`, `redis`, and `postgres`
+
+Apply:
+
+```bash
+make k8s-apply
+```
+
+Build and push app images used by Kubernetes:
+
+```bash
+# Build tags:
+IMAGE_OWNER=narendersurabhi IMAGE_TAG=v0.1.0 make images-build
+
+# Push tags to registry:
+IMAGE_OWNER=narendersurabhi IMAGE_TAG=v0.1.0 make images-push
+```
+
+Show the exact image names that will be used:
+
+```bash
+IMAGE_OWNER=narendersurabhi IMAGE_TAG=v0.1.0 make images-list
+```
+
+Check scaling:
+
+```bash
+kubectl get hpa -n awe
+kubectl get deploy -n awe
+```
+
+Local Docker Desktop Kubernetes (single-node friendly overlay):
+
+```bash
+IMAGE_OWNER=narendersurabhi IMAGE_TAG=local make images-build
+make k8s-apply-local
+```
+
+Open UI/API with port-forward:
+
+```bash
+kubectl port-forward -n awe svc/ui 3002:80
+kubectl port-forward -n awe svc/api 18000:8000
+```
+
+Sync files generated inside worker `/shared` back to your local repo:
+
+```bash
+make k8s-sync-shared
+# or only one side:
+make k8s-sync-workspace
+make k8s-sync-artifacts
+```
+
+Optional object storage (cross-node safe for downloads):
+
+- Set `DOCUMENT_STORE_BACKEND=s3`
+- Set `DOCUMENT_STORE_S3_BUCKET=<bucket>`
+- Optional: `DOCUMENT_STORE_S3_PREFIX=artifacts`, `DOCUMENT_STORE_S3_ENDPOINT=<minio/s3 endpoint>`, `DOCUMENT_STORE_S3_REGION=<region>`
+- Worker uploads generated artifacts to object storage after tool completion.
+- API `/artifacts/download` first reads local artifacts volume, then falls back to object storage.
+
+Enable worker queue-depth scaling (optional):
+
+```bash
+make k8s-apply-keda-worker
+```
+
+Important:
+
+- Update image names in `deploy/k8s/*.yaml` before applying (or keep them aligned with the tags you built/pushed).
+- `worker` replicas require shared workspace storage; `deploy/k8s/pvc-shared.yaml` is `ReadWriteMany`.
+- For queue-depth scaling, install KEDA and apply `deploy/k8s/keda-worker-scaledobject.yaml`.
+- See `deploy/k8s/README.md` for setup details.
+
 ## Example curl
 
 Create a job:
@@ -133,6 +227,21 @@ OPENAI_MAX_RETRIES=2
 ```
 
 Mock provider is used by default so the repo runs without external keys unless `LLM_PROVIDER=openai`.
+
+Tailor iterative scoring can be independent from the improve model:
+
+```
+TAILOR_EVAL_MODE=llm        # llm | heuristic | self
+TAILOR_EVAL_PROVIDER=openai
+TAILOR_EVAL_OPENAI_MODEL=gpt-5.2
+# optional overrides:
+TAILOR_EVAL_OPENAI_API_KEY=
+TAILOR_EVAL_OPENAI_BASE_URL=
+TAILOR_EVAL_OPENAI_TIMEOUT_S=
+TAILOR_EVAL_OPENAI_MAX_RETRIES=
+```
+
+When `TAILOR_EVAL_MODE=llm`, the score used for `min_alignment_score` stopping is produced by a separate evaluation call.
 
 ## Schema validation for task outputs
 

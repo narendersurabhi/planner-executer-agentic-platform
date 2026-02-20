@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planner
+  namespace: awe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: planner
+  template:
+    metadata:
+      labels:
+        app: planner
+    spec:
+      containers:
+        - name: planner
+          image: ghcr.io/your-org/awe-planner:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: awe-config
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

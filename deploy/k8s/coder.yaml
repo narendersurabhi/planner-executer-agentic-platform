@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coder
+  namespace: awe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coder
+  template:
+    metadata:
+      labels:
+        app: coder
+    spec:
+      containers:
+        - name: coder
+          image: ghcr.io/your-org/awe-coder:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: awe-config
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
+          resources:
+            requests:
+              cpu: 150m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coder
+  namespace: awe
+spec:
+  selector:
+    app: coder
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

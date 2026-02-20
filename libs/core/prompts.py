@@ -70,6 +70,12 @@ def resume_doc_spec_prompt(job: dict[str, Any], tailored_resume: Any | None = No
         "For CERTIFICATIONS, preserve and render any credential URLs when available\n"
         '(for example Credly public URLs) appended as: "Name - Issuer (Year) | https://...".\n'
         'For SKILLS definition_list items, separate skills with commas (", "), not semicolons.\n'
+        "If target_pages is provided in job or job.context_json (supported values: 1 or 2), "
+        "optimize content density to that page budget.\n"
+        "For target_pages=1: keep content concise (summary 2-3 lines, skills up to 5 groups, "
+        "most recent role 4-5 bullets, older roles 1-2 bullets).\n"
+        "For target_pages=2: allow fuller detail (summary 3-4 lines, skills up to 7 groups, "
+        "most recent role up to 8 bullets, older roles up to 3-4 bullets).\n"
         "Do not use placeholders like [Phone] or [Email]. If header fields are missing, return:\n"
         "{\n"
         '  "error": "missing_required_fields",\n'
@@ -277,6 +283,12 @@ def resume_doc_spec_from_text_prompt(tailored_text: str, job: dict[str, Any] | N
         "In CERTIFICATIONS, preserve any URLs present in the source text\n"
         "(for example Credly badge public URLs) and include them in certification bullets.\n"
         'For SKILLS definition_list items, separate skills with commas (", "), not semicolons.\n'
+        "If target_pages is provided in job or job.context_json (supported values: 1 or 2), "
+        "optimize content density to that page budget.\n"
+        "For target_pages=1: keep content concise (summary 2-3 lines, skills up to 5 groups, "
+        "most recent role 4-5 bullets, older roles 1-2 bullets).\n"
+        "For target_pages=2: allow fuller detail (summary 3-4 lines, skills up to 7 groups, "
+        "most recent role up to 8 bullets, older roles up to 3-4 bullets).\n"
         "Within EXPERIENCE, treat standalone subheadings under a company (lines that are not role headers or bullets)\n"
         "as group headings and render them as:\n"
         '- {"type": "paragraph", "style": "role_group_heading", "text": "Group Heading"}\n'
@@ -334,6 +346,61 @@ def resume_doc_spec_from_text_prompt(tailored_text: str, job: dict[str, Any] | N
 
 
 def resume_tailoring_improve_prompt(
+    tailored_resume: dict[str, Any],
+    job: dict[str, Any] | None = None,
+    *,
+    evaluator_feedback: str | None = None,
+    previous_alignment_score: float | None = None,
+    min_required_changes: int | None = None,
+) -> str:
+    job_json = (
+        json.dumps(job, ensure_ascii=False, indent=2, default=str)
+        if isinstance(job, dict)
+        else "null"
+    )
+    tailored_json = json.dumps(tailored_resume, ensure_ascii=False, indent=2, default=str)
+    feedback_section = ""
+    if isinstance(evaluator_feedback, str) and evaluator_feedback.strip():
+        feedback_section = (
+            "Iteration guidance from the independent evaluator:\n"
+            f"- Previous evaluated alignment score: {previous_alignment_score if previous_alignment_score is not None else 'unknown'}\n"
+            f"- Feedback to address: {evaluator_feedback.strip()}\n"
+        )
+    change_target = max(4, int(min_required_changes or 8))
+    return (
+        "You are a senior resume reviewer. Improve the tailored resume JSON for clarity, "
+        "impact, and credibility while keeping the content truthful and aligned with the job.\n"
+        "Rules:\n"
+        "- Output ONLY JSON (no prose).\n"
+        "- Preserve the same structure and required keys.\n"
+        "- You may add new skills and experience bullets ONLY when they are clearly defendable from input evidence.\n"
+        "- Defendable means directly grounded in existing roles, technologies, projects, metrics, or responsibilities already present in the provided resume context.\n"
+        "- Never invent new employers, job titles, projects, durations, certifications, or domain claims not evidenced in input.\n"
+        "- Keep bullets action-oriented and outcome-focused.\n"
+        "- Preserve any experience groups (group headings and grouped bullets) if present.\n"
+        "- Preserve certification URLs exactly when present in input (for example Credly badge URLs).\n"
+        "- If you adjust metrics, keep them defensible and use modest ranges.\n"
+        "- Keep each bullet as one sentence, 22 to 35 words.\n"
+        "- Do NOT use en-dashes or em-dashes. Use a simple hyphen '-'.\n"
+        f"- Make at least {change_target} major, high-impact edit(s) to the tailored_resume content.\n"
+        "- Avoid micro wordsmithing only; perform substantial improvements across multiple sections.\n"
+        "- In every iteration, target all key sections where possible: summary, skills, and experience.\n"
+        "- Each edit must improve alignment to the target job (skills coverage, evidence quality, or impact clarity).\n"
+        "Return JSON with keys:\n"
+        "- tailored_resume: object (same schema as input, including header)\n"
+        "- alignment_score: number (0 to 100)\n"
+        "- alignment_summary: string (1 to 3 sentences on JD alignment)\n"
+        "- applied_changes: array of short strings describing each major edit made\n"
+        "- For each newly added skill or bullet, include an applied_changes entry describing the supporting evidence briefly.\n"
+        f"{feedback_section}"
+        "Input tailored resume JSON:\n"
+        f"{tailored_json}\n\n"
+        f"Job (JSON): {job_json}\n"
+        "Return ONLY the JSON object.\n"
+    )
+
+
+def resume_tailoring_evaluation_prompt(
     tailored_resume: dict[str, Any], job: dict[str, Any] | None = None
 ) -> str:
     job_json = (
@@ -343,25 +410,26 @@ def resume_tailoring_improve_prompt(
     )
     tailored_json = json.dumps(tailored_resume, ensure_ascii=False, indent=2, default=str)
     return (
-        "You are a senior resume reviewer. Improve the tailored resume JSON for clarity, "
-        "impact, and credibility while keeping the content truthful and aligned with the job.\n"
-        "Rules:\n"
-        "- Output ONLY JSON (no prose).\n"
-        "- Preserve the same structure and required keys.\n"
-        "- Do not introduce new experience or skills not supported by the input.\n"
-        "- Keep bullets action-oriented and outcome-focused.\n"
-        "- Preserve any experience groups (group headings and grouped bullets) if present.\n"
-        "- Preserve certification URLs exactly when present in input (for example Credly badge URLs).\n"
-        "- If you adjust metrics, keep them defensible and use modest ranges.\n"
-        "- Keep each bullet as one sentence, 22 to 35 words.\n"
-        "- Do NOT use en-dashes or em-dashes. Use a simple hyphen '-'.\n"
-        "Return JSON with keys:\n"
-        "- tailored_resume: object (same schema as input, including header)\n"
-        "- alignment_score: number (0 to 100)\n"
-        "- alignment_summary: string (1 to 3 sentences on JD alignment)\n"
-        "Input tailored resume JSON:\n"
-        f"{tailored_json}\n\n"
-        f"Job (JSON): {job_json}\n"
+        "You are an independent resume evaluator. You only evaluate alignment; do not rewrite content.\n"
+        "Score how well the provided tailored_resume matches the target job description.\n"
+        "Return ONLY one JSON object with keys:\n"
+        "- alignment_score: number from 0 to 100\n"
+        "- alignment_summary: 1 to 3 direct sentences on strengths and gaps\n"
+        "- top_gaps: array of 2 to 5 short strings (blunt gap statements)\n"
+        "- must_fix_before_95: array of 1 to 4 short strings with imperative phrasing\n"
+        "- missing_evidence: array of 1 to 4 short strings naming missing proof/metrics/examples\n"
+        "- recommended_edits: array of 2 to 6 short strings with concrete resume edits\n"
+        "Scoring rubric:\n"
+        "- Role fit and seniority match\n"
+        "- Required skills and platform/tool relevance\n"
+        "- Production impact evidence with credible metrics\n"
+        "- Breadth across architecture, implementation, and operations\n"
+        "- Reward defendable inferred skills and bullets when evidence is explicit; penalize unsupported additions\n"
+        "- Avoid inflated claims and unsupported keywords\n"
+        "- Be blunt and specific; avoid vague wording like 'could be stronger'\n"
+        "Do not include markdown or extra keys.\n"
+        f"Tailored Resume (JSON):\n{tailored_json}\n\n"
+        f"Job (JSON):\n{job_json}\n"
         "Return ONLY the JSON object.\n"
     )
 
