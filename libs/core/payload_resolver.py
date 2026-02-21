@@ -374,7 +374,9 @@ def _extract_json_from_outputs(outputs: dict) -> dict | None:
                     return json.loads(json_text)
                 except json.JSONDecodeError:
                     return None
-    llm_repair = outputs.get("llm_repair_json")
+    llm_repair = outputs.get("llm_repair_document_spec")
+    if not isinstance(llm_repair, dict):
+        llm_repair = outputs.get("llm_repair_json")
     if isinstance(llm_repair, dict):
         document_spec = llm_repair.get("document_spec")
         if isinstance(document_spec, dict):
@@ -402,6 +404,7 @@ def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
         "resume_doc_spec_to_document_spec",
         "coverletter_doc_spec_to_document_spec",
         "llm_generate_document_spec",
+        "llm_repair_document_spec",
         "llm_repair_json",
         "llm_improve_document_spec",
     ):

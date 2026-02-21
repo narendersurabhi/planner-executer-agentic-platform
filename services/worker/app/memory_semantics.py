@@ -25,6 +25,24 @@ MEMORY_OUTPUT_KEYS = {
     "coverletter_doc_spec_to_document_spec": ["document_spec"],
     "llm_generate_document_spec": ["document_spec"],
     "llm_improve_document_spec": ["document_spec"],
+    "llm_iterative_improve_document_spec": [
+        "document_spec",
+        "validation_report",
+        "iterations",
+        "reached_threshold",
+    ],
+    "llm_iterative_improve_runbook_spec": [
+        "document_spec",
+        "validation_report",
+        "iterations",
+        "reached_threshold",
+    ],
+    "llm_iterative_improve_openapi_spec": [
+        "openapi_spec",
+        "validation_report",
+        "iterations",
+        "reached_threshold",
+    ],
     "derive_output_filename": ["path", "document_type"],
 }
 
@@ -42,6 +60,9 @@ MEMORY_INPUT_KEYS = {
     "docx_generate_from_spec": ["document_spec", "path"],
     "cover_letter_generate_ats_docx": ["cover_letter", "path"],
     "llm_improve_document_spec": ["document_spec"],
+    "llm_iterative_improve_document_spec": ["document_spec"],
+    "llm_iterative_improve_runbook_spec": ["document_spec"],
+    "llm_iterative_improve_openapi_spec": ["openapi_spec"],
 }
 
 MEMORY_ONLY_INPUTS = {tool_name: list(keys) for tool_name, keys in MEMORY_INPUT_KEYS.items()}
@@ -61,6 +82,7 @@ MEMORY_PREFERRED_KEYS = {
     "coverletter_doc_spec": "coverletter_doc_spec:latest",
     "validation": "resume_doc_spec_validation:latest",
     "document_spec": "document_spec:latest",
+    "openapi_spec": "openapi_spec:latest",
     "cover_letter": "cover_letter:latest",
     "path": "docx_path:latest",
 }

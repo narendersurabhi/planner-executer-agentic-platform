@@ -682,6 +682,128 @@ def test_sanitize_document_spec_cleans_repeat_template() -> None:
     ]
 
 
+class _SequenceLLMStub(LLMProvider):
+    def __init__(self, payloads: list[dict]) -> None:
+        if not payloads:
+            raise ValueError("payloads must be non-empty")
+        self._payloads = [json.dumps(payload) for payload in payloads]
+        self._index = 0
+
+    def generate(self, prompt: str) -> LLMResponse:
+        if self._index >= len(self._payloads):
+            content = self._payloads[-1]
+        else:
+            content = self._payloads[self._index]
+        self._index += 1
+        return LLMResponse(content=content)
+
+
+def test_llm_iterative_improve_document_spec_stops_when_valid() -> None:
+    provider = _SequenceLLMStub(
+        [
+            {"blocks": [{"type": "heading", "level": 1}]},
+            {
+                "blocks": [
+                    {"type": "heading", "level": 1, "text": "Title"},
+                    {"type": "paragraph", "text": "Hello"},
+                ]
+            },
+        ]
+    )
+    registry = default_registry(llm_enabled=True, llm_provider=provider)
+    call = registry.execute(
+        "llm_iterative_improve_document_spec",
+        {
+            "job": {"goal": "Generate a short doc"},
+            "allowed_block_types": [
+                "heading",
+                "paragraph",
+                "bullets",
+                "text",
+                "optional_paragraph",
+                "repeat",
+            ],
+            "max_iterations": 5,
+        },
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    out = call.output_or_error
+    assert out["iterations"] == 2
+    assert out["reached_threshold"] is True
+    assert out["validation_report"]["valid"] is True
+
+
+def test_llm_iterative_improve_openapi_spec_stops_when_valid() -> None:
+    provider = _SequenceLLMStub(
+        [
+            {"openapi": "3.1.0", "info": {}, "paths": {}},
+            {
+                "openapi": "3.1.0",
+                "info": {"title": "Demo API", "version": "1.0.0"},
+                "paths": {
+                    "/health": {
+                        "get": {
+                            "operationId": "getHealth",
+                            "responses": {"200": {"description": "ok"}},
+                        }
+                    }
+                },
+            },
+        ]
+    )
+    registry = default_registry(llm_enabled=True, llm_provider=provider)
+    call = registry.execute(
+        "llm_iterative_improve_openapi_spec",
+        {"job": {"goal": "Generate OpenAPI spec"}, "max_iterations": 4},
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    out = call.output_or_error
+    assert out["iterations"] == 2
+    assert out["reached_threshold"] is True
+    assert out["validation_report"]["valid"] is True
+    assert out["openapi_spec"]["openapi"] == "3.1.0"
+
+
+def test_llm_iterative_improve_runbook_spec_generates_document_spec() -> None:
+    provider = _SequenceLLMStub(
+        [
+            {
+                "blocks": [
+                    {"type": "heading", "level": 1, "text": "OVERVIEW"},
+                    {"type": "paragraph", "text": "Use this runbook for safe rollout."},
+                ]
+            }
+        ]
+    )
+    registry = default_registry(llm_enabled=True, llm_provider=provider)
+    call = registry.execute(
+        "llm_iterative_improve_runbook_spec",
+        {
+            "job": {"goal": "Create a runbook"},
+            "allowed_block_types": [
+                "heading",
+                "paragraph",
+                "bullets",
+                "text",
+                "optional_paragraph",
+                "repeat",
+            ],
+            "max_iterations": 3,
+        },
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    out = call.output_or_error
+    assert out["iterations"] == 1
+    assert out["reached_threshold"] is True
+    assert out["validation_report"]["valid"] is True
+
+
 def test_normalize_skills_definition_separators_uses_commas() -> None:
     spec = {
         "content": [
