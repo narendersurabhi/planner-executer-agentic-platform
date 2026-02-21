@@ -16,19 +16,30 @@ Operationally this is a control-plane/data-plane split with shared job context a
 ## Architecture
 
 ```mermaid
-graph TD
-  UI[Next.js UI] -->|POST /jobs| API[FastAPI API]
-  API -->|job.created| Redis[(Redis Streams)]
-  Redis --> Planner[Planner Service]
-  Planner -->|plan.created| API
-  API -->|task.ready| Redis
-  Redis --> Worker[Executor Workers]
-  Worker -->|task.completed| Redis
-  Redis --> Critic[Critic Service]
-  Redis --> Policy[Policy Gate]
-  API --> UI
-  API -->|SSE| UI
-  API --> Postgres[(Postgres)]
+flowchart TD
+  UI["UI (Next.js)"] -->|"POST /jobs"| API["API (FastAPI)"]
+  API -->|"job.created"| REDIS[("Redis Streams")]
+  REDIS --> PLANNER["Planner Service"]
+  PLANNER -->|"plan.created"| API
+  API -->|"task.ready"| REDIS
+  REDIS --> WORKER["Executor Workers"]
+  WORKER -->|"task.completed"| REDIS
+  REDIS --> CRITIC["Critic Service"]
+  REDIS --> POLICY["Policy Gate"]
+  API -->|"SSE + REST"| UI
+  API --> PG[("Postgres")]
+```
+
+If your Markdown viewer does not support Mermaid, use this fallback:
+
+```text
+UI (Next.js) -> API (FastAPI) -> Redis Streams -> Planner
+                               -> Redis Streams -> Worker
+Worker -> Redis Streams
+Redis Streams -> Critic
+Redis Streams -> Policy
+API -> UI (SSE + REST)
+API -> Postgres
 ```
 
 ## Services
