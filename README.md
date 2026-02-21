@@ -42,6 +42,22 @@ graph TD
 - `critic`: optional rework checks
 - `ui`: Next.js frontend
 
+## Tooling Architecture
+
+Tool registration is centralized in `libs/core/tool_registry.py`, but implementation is now split by concern:
+
+- `libs/framework/tool_runtime.py`: shared tool execution runtime (schema validation, timeout, error classification)
+- `libs/tools/core_ops.py`: filesystem/workspace/search/render/core utility tools
+- `libs/tools/llm_tool_groups.py`: grouped LLM tool registration specs
+- `libs/tools/document_spec_llm.py`: DocumentSpec generation/repair/improvement tools
+- `libs/tools/document_spec_iterative.py`: iterative DocumentSpec generation loops
+- `libs/tools/openapi_iterative.py`: iterative OpenAPI spec generation loops
+- `libs/tools/mcp_client.py`: MCP transport, retry, timeout budget, process/thread isolation
+- `libs/tools/resume_llm.py`: resume/cover-letter/tailor LLM logic and shaping policies
+- `libs/tools/coder_tools.py`: coding-agent request/plan/step execution logic
+
+This keeps `tool_registry` focused on wiring and composition while tool families evolve independently.
+
 ## Local Development (Docker Compose)
 
 1. Create local env from template.
