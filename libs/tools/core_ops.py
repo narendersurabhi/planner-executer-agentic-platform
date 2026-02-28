@@ -38,6 +38,8 @@ class CoreOpsHandlers:
     search_text: PayloadHandler
     memory_read: PayloadHandler
     memory_write: PayloadHandler
+    memory_semantic_write: PayloadHandler
+    memory_semantic_search: PayloadHandler
     docx_render: PayloadHandler
     sleep: PayloadHandler
     http_fetch: PayloadHandler
@@ -692,7 +694,8 @@ def register_core_ops_tools(
                 description="Derive a generic filesystem-safe output path for generated artifacts",
                 usage_guidance=(
                     "Use for capability-driven document rendering where naming should be generic and deterministic. "
-                    "Provide topic, output_dir, and document_type. "
+                    "Provide topic and output_dir. "
+                    "document_type is optional metadata and defaults to 'document'. "
                     "Optionally provide today/date (YYYY-MM-DD). "
                     "Optionally provide output_extension (or file_extension/extension/format); "
                     "if omitted, document_type can be used as extension when it is a known format, "
@@ -711,7 +714,7 @@ def register_core_ops_tools(
                         "extension": {"type": "string"},
                         "format": {"type": "string"},
                     },
-                    "required": ["topic", "output_dir", "document_type"],
+                    "required": ["topic", "output_dir"],
                 },
                 output_schema={
                     "type": "object",
@@ -1005,6 +1008,89 @@ def register_core_ops_tools(
                 tool_intent=ToolIntent.io,
             ),
             handler=handlers.memory_write,
+        )
+    )
+
+    registry.register(
+        Tool(
+            spec=ToolSpec(
+                name="memory_semantic_write",
+                description="Write distilled semantic facts to semantic memory",
+                usage_guidance=(
+                    "Use to persist stable facts for later reasoning. "
+                    "Provide 'fact' and optional subject/namespace/keywords/aliases/confidence. "
+                    "User scope defaults to SEMANTIC_MEMORY_DEFAULT_USER_ID when user_id is omitted."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "fact": {"type": "string", "minLength": 1},
+                        "subject": {"type": "string"},
+                        "namespace": {"type": "string"},
+                        "aliases": {"type": "array", "items": {"type": "string"}},
+                        "keywords": {"type": "array", "items": {"type": "string"}},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "source": {"type": "string"},
+                        "source_ref": {"type": "string"},
+                        "reasoning": {"type": "string"},
+                        "key": {"type": "string"},
+                        "user_id": {"type": "string"},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["fact"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "entry": {"type": "object"},
+                        "semantic_record": {"type": "object"},
+                    },
+                    "required": ["entry"],
+                },
+                timeout_s=10,
+                risk_level=RiskLevel.medium,
+                tool_intent=ToolIntent.io,
+            ),
+            handler=handlers.memory_semantic_write,
+        )
+    )
+
+    registry.register(
+        Tool(
+            spec=ToolSpec(
+                name="memory_semantic_search",
+                description="Search semantic memory by natural-language query",
+                usage_guidance=(
+                    "Use to retrieve relevant facts for reasoning/context. "
+                    "Provide 'query' and optional namespace/subject filters and score threshold."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "minLength": 1},
+                        "namespace": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "key": {"type": "string"},
+                        "user_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "min_score": {"type": "number", "minimum": 0},
+                        "include_payload": {"type": "boolean"},
+                    },
+                    "required": ["query"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "matches": {"type": "array", "items": {"type": "object"}},
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["matches", "count"],
+                },
+                timeout_s=10,
+                risk_level=RiskLevel.low,
+                tool_intent=ToolIntent.io,
+            ),
+            handler=handlers.memory_semantic_search,
         )
     )
 

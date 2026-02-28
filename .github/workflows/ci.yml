@@ -38,5 +38,7 @@ jobs:
         run: mypy --config-file mypy.ini
       - name: Tests
         run: PYTHONPATH=. pytest
+      - name: Intent Eval Gate
+        run: make eval-intent-gate
       - name: Docker build
         run: docker compose build

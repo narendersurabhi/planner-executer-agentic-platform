@@ -8,6 +8,6 @@
     "render_context": {"type": "object"},
     "strict": {"type": "boolean"}
   },
-  "required": ["document_spec", "path"],
+  "required": ["document_spec"],
   "additionalProperties": true
 }

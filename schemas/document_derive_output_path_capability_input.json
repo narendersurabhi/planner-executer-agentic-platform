@@ -9,6 +9,6 @@
     "document_type": {"type": "string", "minLength": 1},
     "output_extension": {"type": "string", "pattern": "^\\.?[A-Za-z0-9]{1,16}$"}
   },
-  "required": ["topic", "output_dir", "document_type"],
+  "required": ["topic", "output_dir"],
   "additionalProperties": true
 }

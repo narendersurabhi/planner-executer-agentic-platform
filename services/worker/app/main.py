@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any, Mapping
@@ -104,6 +106,30 @@ LOG_CANDIDATE_RESUME_PREVIEW_CHARS = (
 MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://api:8000")
 MEMORY_READ_ENABLED = os.getenv("MEMORY_READ_ENABLED", "true").lower() == "true"
 MEMORY_WRITE_ENABLED = os.getenv("MEMORY_WRITE_ENABLED", "true").lower() == "true"
+SEMANTIC_MEMORY_AUTO_WRITE_ENABLED = (
+    os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_ENABLED", "true").lower() == "true"
+)
+SEMANTIC_MEMORY_AUTO_WRITE_TOOL_PATTERNS = [
+    value.strip().lower()
+    for value in os.getenv(
+        "SEMANTIC_MEMORY_AUTO_WRITE_TOOLS",
+        "llm.text.generate,document.spec.generate,document.spec.improve,"
+        "document.spec.generate_iterative,llm_generate,llm_generate_document_spec,"
+        "llm_improve_document_spec,llm_iterative_improve_document_spec,openapi.iterative.improve",
+    ).split(",")
+    if value.strip()
+]
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS = (
+    _parse_optional_int(os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS", "3")) or 3
+)
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS = max(1, min(SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS, 8))
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS = (
+    _parse_optional_int(os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS", "280")) or 280
+)
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS = max(80, min(SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS, 1200))
+SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE = (
+    os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE", "runtime").strip() or "runtime"
+)
 MEMORY_CLIENT = MemoryClient(MEMORY_API_URL)
 WORKER_GROUP = os.getenv("WORKER_GROUP", "workers")
 WORKER_CONSUMER = os.getenv("WORKER_CONSUMER", str(uuid.uuid4()))
@@ -121,6 +147,8 @@ WORKER_DEFAULT_MAX_ATTEMPTS = (
     _parse_optional_int(os.getenv("WORKER_DEFAULT_MAX_ATTEMPTS", "3")) or 3
 )
 WORKER_DLQ_ENABLED = os.getenv("WORKER_DLQ_ENABLED", "true").lower() == "true"
+_SEMANTIC_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s+|\n+")
+_SEMANTIC_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
 
 
 LLM_PROVIDER_INSTANCE = None
@@ -263,6 +291,7 @@ def execute_task(task_payload: dict) -> models.TaskResult:
     tool_error = None
     task_intent_inference = _infer_task_intent_inference(task_payload)
     task_intent = task_intent_inference.intent
+    task_intent_segment = _intent_segment_from_payload(task_payload)
     task_attempt, task_max_attempts = _task_attempt_limits(task_payload)
     artifacts: list[dict[str, Any]] = []
     core_logging.log_event(
@@ -377,6 +406,37 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                             },
                         )
                         break
+                    capability_mismatch = _capability_intent_mismatch(task_intent, capability_spec)
+                    if capability_mismatch:
+                        tool_error = f"contract.intent_mismatch:{capability_mismatch}"
+                        outputs[tool_name] = {
+                            "error": tool_error,
+                            "error_code": "contract.intent_mismatch",
+                        }
+                        tool_calls.append(
+                            models.ToolCall(
+                                tool_name=tool_name,
+                                input={},
+                                idempotency_key=str(uuid.uuid4()),
+                                trace_id=trace_id,
+                                started_at=started_at,
+                                finished_at=datetime.utcnow(),
+                                status="failed",
+                                output_or_error={
+                                    "error": tool_error,
+                                    "error_code": "contract.intent_mismatch",
+                                },
+                            )
+                        )
+                        core_tracing.set_span_attributes(
+                            tool_span,
+                            {
+                                "tool.error": tool_error,
+                                "tool.error_code": "contract.intent_mismatch",
+                                "capability.id": capability_spec.capability_id,
+                            },
+                        )
+                        break
                     payload = _tool_payload(
                         tool_name,
                         task_payload.get("instruction", ""),
@@ -430,6 +490,44 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                             {
                                 "tool.error": tool_error,
                                 "tool.error_code": "contract.input_invalid",
+                                "capability.id": capability_spec.capability_id,
+                            },
+                        )
+                        break
+                    segment_contract_error = intent_contract.validate_intent_segment_contract(
+                        segment=task_intent_segment,
+                        task_intent=task_intent,
+                        tool_name=tool_name,
+                        payload=payload,
+                        capability_id=capability_spec.capability_id,
+                        capability_risk_tier=capability_spec.risk_tier,
+                    )
+                    if segment_contract_error:
+                        tool_error = f"contract.intent_mismatch:{segment_contract_error}"
+                        outputs[tool_name] = {
+                            "error": tool_error,
+                            "error_code": "contract.intent_mismatch",
+                        }
+                        tool_calls.append(
+                            models.ToolCall(
+                                tool_name=tool_name,
+                                input=payload,
+                                idempotency_key=str(uuid.uuid4()),
+                                trace_id=trace_id,
+                                started_at=started_at,
+                                finished_at=datetime.utcnow(),
+                                status="failed",
+                                output_or_error={
+                                    "error": tool_error,
+                                    "error_code": "contract.intent_mismatch",
+                                },
+                            )
+                        )
+                        core_tracing.set_span_attributes(
+                            tool_span,
+                            {
+                                "tool.error": tool_error,
+                                "tool.error_code": "contract.intent_mismatch",
                                 "capability.id": capability_spec.capability_id,
                             },
                         )
@@ -512,6 +610,14 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                     outputs[tool_name] = call.output_or_error
                     if call.status == "completed":
                         _sync_output_artifact(call.output_or_error, task_id, tool_name, trace_id)
+                        if isinstance(call.output_or_error, Mapping):
+                            _auto_persist_semantic_facts(
+                                tool_name=tool_name,
+                                task_payload=task_payload,
+                                output=call.output_or_error,
+                                trace_id=trace_id,
+                                run_id=run_id,
+                            )
                         continue
                     tool_error = call.output_or_error.get("error", "capability_failed")
                     if isinstance(tool_error, str):
@@ -660,6 +766,43 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                         )
                         core_tracing.set_span_attributes(tool_span, {"tool.error": tool_error})
                         break
+                segment_contract_error = intent_contract.validate_intent_segment_contract(
+                    segment=task_intent_segment,
+                    task_intent=task_intent,
+                    tool_name=tool_name,
+                    payload=payload,
+                    capability_id=None,
+                    capability_risk_tier=None,
+                )
+                if segment_contract_error:
+                    tool_error = f"contract.intent_mismatch:{segment_contract_error}"
+                    outputs[tool_name] = {
+                        "error": tool_error,
+                        "error_code": "contract.intent_mismatch",
+                    }
+                    tool_calls.append(
+                        models.ToolCall(
+                            tool_name=tool_name,
+                            input=payload,
+                            idempotency_key=str(uuid.uuid4()),
+                            trace_id=trace_id,
+                            started_at=started_at,
+                            finished_at=datetime.utcnow(),
+                            status="failed",
+                            output_or_error={
+                                "error": tool_error,
+                                "error_code": "contract.intent_mismatch",
+                            },
+                        )
+                    )
+                    core_tracing.set_span_attributes(
+                        tool_span,
+                        {
+                            "tool.error": tool_error,
+                            "tool.error_code": "contract.intent_mismatch",
+                        },
+                    )
+                    break
                 _log_candidate_resume(tool.spec.name, payload, task_id, trace_id)
                 payload["_registry"] = registry
                 idempotency_key = str(uuid.uuid4())
@@ -731,6 +874,14 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                 if call.status == "completed":
                     _sync_output_artifact(call.output_or_error, task_id, tool_name, trace_id)
                     _persist_memory_outputs(tool, task_payload, call, trace_id)
+                    if isinstance(call.output_or_error, Mapping):
+                        _auto_persist_semantic_facts(
+                            tool_name=tool_name,
+                            task_payload=task_payload,
+                            output=call.output_or_error,
+                            trace_id=trace_id,
+                            run_id=run_id,
+                        )
                 if call.status != "completed":
                     tool_error = call.output_or_error.get("error", "tool_failed")
                     error_code = call.output_or_error.get("error_code")
@@ -949,6 +1100,18 @@ def _infer_task_intent(task_payload: dict) -> str:
     return _infer_task_intent_inference(task_payload).intent
 
 
+def _intent_segment_from_payload(task_payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    segment = task_payload.get("intent_segment")
+    if isinstance(segment, Mapping):
+        return segment
+    profile = task_payload.get("intent_profile")
+    if isinstance(profile, Mapping):
+        maybe_segment = profile.get("segment")
+        if isinstance(maybe_segment, Mapping):
+            return maybe_segment
+    return None
+
+
 def _infer_task_intent_inference(task_payload: dict) -> intent_contract.TaskIntentInference:
     explicit_intent = intent_contract.normalize_task_intent(
         task_payload.get("intent")
@@ -976,6 +1139,34 @@ def _intent_mismatch(
         task_intent,
         tool_intent,
         tool_name,
+    )
+
+
+def _capability_intent_mismatch(
+    task_intent: str,
+    capability_spec: capability_registry.CapabilitySpec,
+) -> str | None:
+    hints = (
+        capability_spec.planner_hints
+        if isinstance(capability_spec.planner_hints, dict)
+        else {}
+    )
+    raw_allowed = hints.get("task_intents")
+    if not isinstance(raw_allowed, list) or not raw_allowed:
+        return None
+    allowed = {
+        normalized
+        for item in raw_allowed
+        for normalized in [intent_contract.normalize_task_intent(item)]
+        if normalized
+    }
+    if not allowed:
+        return None
+    if task_intent in allowed:
+        return None
+    return (
+        f"task_intent_mismatch:{capability_spec.capability_id}:{task_intent}:"
+        f"allowed={','.join(sorted(allowed))}"
     )
 
 
@@ -1095,6 +1286,189 @@ def _sync_output_artifact(
                 "tool_name": tool_name,
                 "path": path_value,
                 "object_key": key,
+                "trace_id": trace_id,
+            },
+        )
+
+
+def _semantic_should_capture(tool_name: str) -> bool:
+    if not SEMANTIC_MEMORY_AUTO_WRITE_ENABLED:
+        return False
+    normalized = (tool_name or "").strip().lower()
+    if not normalized:
+        return False
+    patterns = SEMANTIC_MEMORY_AUTO_WRITE_TOOL_PATTERNS
+    if not patterns:
+        return True
+    return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
+
+
+def _semantic_tokens(text: str) -> set[str]:
+    if not isinstance(text, str):
+        return set()
+    return set(_SEMANTIC_TOKEN_RE.findall(text.lower()))
+
+
+def _semantic_split_facts(text: str) -> list[str]:
+    if not isinstance(text, str):
+        return []
+    candidates: list[str] = []
+    for part in _SEMANTIC_SENTENCE_SPLIT_RE.split(text):
+        sentence = " ".join(part.strip().split())
+        if len(sentence) < 30:
+            continue
+        if sentence.startswith("{") or sentence.startswith("["):
+            continue
+        if sentence.count("/") > 3:
+            # likely file path / URL blob, not a semantic fact sentence
+            continue
+        if len(sentence) > SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS:
+            sentence = sentence[:SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS].strip()
+        candidates.append(sentence)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for sentence in candidates:
+        key = sentence.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(sentence)
+        if len(deduped) >= SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS:
+            break
+    return deduped
+
+
+def _semantic_collect_candidate_texts(output: Mapping[str, Any]) -> list[str]:
+    if not isinstance(output, Mapping):
+        return []
+    preferred_keys = [
+        "fact",
+        "facts",
+        "summary",
+        "alignment_summary",
+        "text",
+        "content",
+        "objective",
+        "analysis",
+        "reasoning",
+    ]
+    texts: list[str] = []
+    for key in preferred_keys:
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    texts.append(item.strip())
+    if texts:
+        return texts
+    # Fallback: shallow scan for string leaves in unknown output shapes.
+    for value in output.values():
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+            if len(texts) >= 6:
+                break
+        elif isinstance(value, Mapping):
+            for nested in value.values():
+                if isinstance(nested, str) and nested.strip():
+                    texts.append(nested.strip())
+                    if len(texts) >= 6:
+                        break
+            if len(texts) >= 6:
+                break
+    return texts
+
+
+def _semantic_confidence_from_output(output: Mapping[str, Any]) -> float:
+    if not isinstance(output, Mapping):
+        return 0.75
+    confidence = output.get("confidence")
+    if isinstance(confidence, (int, float)):
+        return min(1.0, max(0.0, float(confidence)))
+    alignment_score = output.get("alignment_score")
+    if isinstance(alignment_score, (int, float)):
+        score = float(alignment_score)
+        if score > 1.0:
+            score = score / 100.0
+        return min(1.0, max(0.0, score))
+    return 0.75
+
+
+def _auto_persist_semantic_facts(
+    *,
+    tool_name: str,
+    task_payload: Mapping[str, Any],
+    output: Mapping[str, Any],
+    trace_id: str,
+    run_id: str,
+) -> None:
+    if not _semantic_should_capture(tool_name):
+        return
+    job_id = str(task_payload.get("job_id") or "").strip()
+    user_id = str(task_payload.get("user_id") or "").strip() or None
+    task_id = str(task_payload.get("task_id") or "").strip()
+    task_name = str(task_payload.get("name") or tool_name).strip() or tool_name
+    subject = task_name
+    namespace = str(task_payload.get("intent") or SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE).strip()
+    if not namespace:
+        namespace = SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE
+    confidence = _semantic_confidence_from_output(output)
+    candidate_texts = _semantic_collect_candidate_texts(output)
+    facts: list[str] = []
+    for text in candidate_texts:
+        facts.extend(_semantic_split_facts(text))
+        if len(facts) >= SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS:
+            break
+    deduped_facts: list[str] = []
+    seen_fact_tokens: set[str] = set()
+    for fact in facts:
+        token_fingerprint = " ".join(sorted(_semantic_tokens(fact))[:20])
+        if token_fingerprint in seen_fact_tokens:
+            continue
+        seen_fact_tokens.add(token_fingerprint)
+        deduped_facts.append(fact)
+        if len(deduped_facts) >= SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS:
+            break
+    if not deduped_facts:
+        return
+    for fact in deduped_facts:
+        digest = hashlib.sha1(f"{namespace}|{subject}|{fact}".encode("utf-8")).hexdigest()[:12]
+        key = (
+            f"{re.sub(r'[^a-z0-9]+', '_', namespace.lower()).strip('_') or 'runtime'}:"
+            f"{re.sub(r'[^a-z0-9]+', '_', subject.lower()).strip('_') or 'task'}:{digest}"
+        )
+        write_payload: dict[str, Any] = {
+            "fact": fact,
+            "subject": subject,
+            "namespace": namespace,
+            "key": key,
+            "confidence": confidence,
+            "source": "worker_auto",
+            "source_ref": f"tool:{tool_name}",
+            "metadata": {
+                "trace_id": trace_id,
+                "run_id": run_id,
+                "job_id": job_id,
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "auto_distilled": True,
+            },
+        }
+        if user_id:
+            write_payload["user_id"] = user_id
+        if job_id:
+            write_payload["job_id"] = job_id
+        written = MEMORY_CLIENT.semantic_write(write_payload)
+        core_logging.log_event(
+            LOGGER,
+            "semantic_memory_auto_write",
+            {
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "job_id": job_id,
+                "key": key,
+                "status": "ok" if isinstance(written, dict) else "failed",
                 "trace_id": trace_id,
             },
         )

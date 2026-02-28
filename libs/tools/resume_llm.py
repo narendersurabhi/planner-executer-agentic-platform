@@ -18,6 +18,15 @@ _RESUME_CONTEXT_KEYS = (
 )
 
 
+def _build_tailor_job(payload: dict[str, Any]) -> dict[str, Any]:
+    job: dict[str, Any] = dict(payload.get("job") or {})
+    for key in ("job_description", "candidate_resume", "target_role_name", "seniority_level"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            job[key] = value.strip()
+    return job
+
+
 def llm_tailor_resume_text(
     payload: dict[str, Any],
     provider: LLMProvider,
@@ -25,9 +34,9 @@ def llm_tailor_resume_text(
     post_mcp_tool_call: Any,
 ) -> dict[str, Any]:
     del provider
-    job = payload.get("job")
-    if not isinstance(job, dict):
-        raise ToolExecutionError("job must be an object")
+    job = _build_tailor_job(payload)
+    if not job:
+        raise ToolExecutionError("job payload is missing")
     memory = payload.get("memory")
     tailor_url = os.getenv("RESUME_TAILOR_API_URL")
     if not tailor_url:

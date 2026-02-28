@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "job_description": {
+      "type": "string",
+      "description": "Job text used to tailor the resume."
+    },
+    "candidate_resume": {
+      "type": "string",
+      "description": "Existing resume to adapt."
+    }
+  },
+  "required": ["job_description", "candidate_resume"],
+  "additionalProperties": false
+}

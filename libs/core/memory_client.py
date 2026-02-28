@@ -65,6 +65,32 @@ class MemoryClient:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def semantic_write(self, fact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        url = f"{self.base_url}/memory/semantic/write"
+        try:
+            payload = _request_json(
+                url,
+                method="POST",
+                body=fact,
+                timeout_s=self.timeout_s,
+            )
+        except MemoryClientError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def semantic_search(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        url = f"{self.base_url}/memory/semantic/search"
+        try:
+            payload = _request_json(
+                url,
+                method="POST",
+                body=query,
+                timeout_s=self.timeout_s,
+            )
+        except MemoryClientError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
 
 def _request_json(
     url: str,

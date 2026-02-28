@@ -8,7 +8,7 @@ from enum import Enum
 from functools import wraps
 from pathlib import Path
 from time import perf_counter
-from typing import Any, List
+from typing import Any, List, Mapping, Sequence
 
 import redis
 from pydantic import BaseModel
@@ -186,8 +186,18 @@ def llm_plan(
     if not candidate:
         raise ValueError("Invalid plan generated: parse_failed")
     candidate = _ensure_llm_tool(candidate)
-    candidate = _ensure_task_intents(candidate, tools, goal_text=job.goal)
+    candidate = _ensure_task_intents(
+        candidate,
+        tools,
+        goal_text=job.goal,
+        goal_intent_sequence=_job_goal_intent_sequence(job),
+    )
     candidate = _ensure_job_inputs(candidate, job, tools)
+    candidate = _ensure_default_value_markers(candidate, job)
+    candidate = _ensure_resume_docspec_inputs(candidate)
+    candidate = _ensure_resume_converter_inputs(candidate)
+    candidate = _ensure_renderer_required_inputs(candidate)
+    candidate = _ensure_tool_input_dependencies(candidate)
     candidate = _ensure_renderer_output_extensions(candidate)
     candidate = _apply_max_depth(candidate)
     logger.info("llm_plan_candidate", plan=candidate.model_dump())
@@ -323,6 +333,18 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
     depth_hint = ""
     if max_depth:
         depth_hint = f"Max dependency chain depth: {max_depth}.\n"
+    intent_graph_block = ""
+    intent_graph = _job_goal_intent_graph(job)
+    if intent_graph:
+        intent_graph_json = json.dumps(
+            intent_graph, ensure_ascii=False, indent=2, default=_json_fallback
+        )
+        intent_graph_block = (
+            "Goal intent decomposition graph (ordered hints for planning):\n"
+            f"{intent_graph_json}\n"
+            "Prefer preserving this segment order in tasks/dependencies.\n"
+        )
+    intent_repair_block = _job_intent_mismatch_recovery_block(job)
     return (
         "You are a planner. Return ONLY valid JSON for a PlanCreate object (no prose).\n"
         "Required top-level fields: planner_version, tasks_summary, dag_edges, tasks.\n"
@@ -381,6 +403,8 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
         "criteria short bullets.\n"
         "\n"
         f"{depth_hint}"
+        f"{intent_graph_block}"
+        f"{intent_repair_block}"
         f"Allowed tool names: {tool_names}\n"
         f"Tool catalog (JSON): {tool_catalog_json}\n"
         f"Goal: {job.goal}\n"
@@ -520,12 +544,18 @@ def _ensure_task_intents(
     plan: models.PlanCreate,
     tools: List[models.ToolSpec],
     goal_text: str = "",
+    goal_intent_sequence: list[str] | None = None,
 ) -> models.PlanCreate:
     logger = core_logging.get_logger("planner")
     tool_map = {tool.name: tool for tool in tools}
     updated_tasks: list[models.TaskCreate] = []
     changed = False
-    for task in plan.tasks:
+    for index, task in enumerate(plan.tasks):
+        unique_tool_intents = {
+            tool_map[tool_name].tool_intent
+            for tool_name in (task.tool_requests or [])
+            if tool_name in tool_map
+        }
         inference = intent_contract.infer_task_intent_for_task_with_metadata(
             explicit_intent=task.intent,
             description=task.description,
@@ -538,15 +568,34 @@ def _ensure_task_intents(
         intent_confidence = float(inference.confidence)
         # If text inference falls back to generate, prefer known tool intent where unambiguous.
         if inferred == models.ToolIntent.generate.value and not task.intent:
-            unique_tool_intents = {
-                tool_map[tool_name].tool_intent
-                for tool_name in (task.tool_requests or [])
-                if tool_name in tool_map
-            }
             if len(unique_tool_intents) == 1:
                 inferred = next(iter(unique_tool_intents)).value
                 intent_source = "tool_intent"
                 intent_confidence = 0.9
+            elif goal_intent_sequence and index < len(goal_intent_sequence):
+                hinted = intent_contract.normalize_task_intent(goal_intent_sequence[index])
+                if hinted:
+                    inferred = hinted
+                    intent_source = "goal_graph"
+                    intent_confidence = max(intent_confidence, 0.88)
+        # LLM can emit explicit task intents that conflict with a task's only tool intent.
+        # Auto-repair to the single tool intent so plan validation does not fail hard.
+        if len(unique_tool_intents) == 1:
+            has_mismatch = any(
+                bool(
+                    intent_contract.validate_tool_intent_compatibility(
+                        inferred,
+                        tool_map[tool_name].tool_intent,
+                        tool_name,
+                    )
+                )
+                for tool_name in (task.tool_requests or [])
+                if tool_name in tool_map
+            )
+            if has_mismatch:
+                inferred = next(iter(unique_tool_intents)).value
+                intent_source = "tool_intent_repair"
+                intent_confidence = max(intent_confidence, 0.93)
         try:
             normalized = models.ToolIntent(inferred)
         except ValueError:
@@ -569,6 +618,113 @@ def _ensure_task_intents(
     return plan.model_copy(update={"tasks": updated_tasks})
 
 
+def _job_goal_intent_graph(job: models.Job) -> dict[str, Any] | None:
+    if not isinstance(job.metadata, dict):
+        return None
+    graph = job.metadata.get("goal_intent_graph")
+    if not isinstance(graph, dict):
+        return None
+    segments = graph.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return None
+    return graph
+
+
+def _job_goal_intent_sequence(job: models.Job) -> list[str]:
+    graph = _job_goal_intent_graph(job)
+    if not graph:
+        return []
+    sequence: list[str] = []
+    for segment in graph.get("segments", []):
+        if not isinstance(segment, dict):
+            continue
+        normalized = intent_contract.normalize_task_intent(segment.get("intent"))
+        if normalized:
+            sequence.append(normalized)
+    return sequence
+
+
+def _job_goal_intent_segments(job: models.Job) -> list[dict[str, Any]]:
+    graph = _job_goal_intent_graph(job)
+    if not graph:
+        return []
+    segments_raw = graph.get("segments")
+    if not isinstance(segments_raw, list):
+        return []
+    segments: list[dict[str, Any]] = []
+    for segment in segments_raw:
+        if isinstance(segment, dict):
+            segments.append(segment)
+    return segments
+
+
+def _select_goal_intent_segment_for_task(
+    *,
+    task: models.TaskCreate,
+    task_index: int,
+    task_intent: str,
+    goal_intent_segments: Sequence[dict[str, Any]],
+    total_tasks: int,
+) -> dict[str, Any] | None:
+    if not goal_intent_segments:
+        return None
+    has_suggested_capabilities = any(
+        isinstance(segment.get("suggested_capabilities"), list)
+        and bool(segment.get("suggested_capabilities"))
+        for segment in goal_intent_segments
+    )
+    task_requests = {str(name).strip().lower() for name in (task.tool_requests or []) if str(name).strip()}
+    if task_requests:
+        for segment in goal_intent_segments:
+            suggested = segment.get("suggested_capabilities")
+            if not isinstance(suggested, list):
+                continue
+            suggested_ids = {str(item).strip().lower() for item in suggested if str(item).strip()}
+            if suggested_ids & task_requests:
+                return segment
+    # If the intent graph already carries capability-level suggestions, avoid loose
+    # fallback matching that can bind unrelated slot requirements to a task.
+    if has_suggested_capabilities:
+        return None
+    for segment in goal_intent_segments:
+        if intent_contract.normalize_task_intent(segment.get("intent")) == task_intent:
+            return segment
+    # Index fallback is only safe when decomposition cardinality equals plan cardinality.
+    if (
+        not has_suggested_capabilities
+        and len(goal_intent_segments) == total_tasks
+        and task_index < len(goal_intent_segments)
+    ):
+        return goal_intent_segments[task_index]
+    return None
+
+
+def _job_intent_mismatch_recovery(job: models.Job) -> dict[str, Any] | None:
+    if not isinstance(job.metadata, dict):
+        return None
+    raw = job.metadata.get("intent_mismatch_recovery")
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _job_intent_mismatch_recovery_block(job: models.Job) -> str:
+    recovery = _job_intent_mismatch_recovery(job)
+    if not recovery:
+        return ""
+    payload = json.dumps(recovery, ensure_ascii=False, indent=2, default=_json_fallback)
+    guardrails = (
+        "Intent mismatch auto-repair context:\n"
+        f"{payload}\n"
+        "Recovery rules:\n"
+        "- Do not repeat the failing task/tool intent mismatch.\n"
+        "- Ensure each task.intent matches the selected tool/capability intent policy.\n"
+        "- If allowed_task_intents are provided, set task intent to one of them.\n"
+        "- Keep dependencies valid while minimally modifying the prior plan shape.\n"
+    )
+    return guardrails
+
+
 def _ensure_job_inputs(
     plan: models.PlanCreate, job: models.Job, tools: List[models.ToolSpec]
 ) -> models.PlanCreate:
@@ -586,9 +742,19 @@ def _ensure_job_inputs(
             if not _schema_requires_key(schema, "job"):
                 continue
             payload = tool_inputs.get(tool_name)
-            if isinstance(payload, dict) and "job" in payload:
-                continue
             payload = dict(payload) if isinstance(payload, dict) else {}
+            existing_job = payload.get("job")
+            if isinstance(existing_job, dict):
+                # Resolve planner placeholders so downstream contract checks can inspect actual context.
+                marker_keys = {str(key) for key in existing_job.keys()}
+                if "$default" in marker_keys and bool(existing_job.get("$default")):
+                    payload["job"] = job_payload
+                elif marker_keys and marker_keys.issubset({"$default", "$from"}):
+                    payload["job"] = job_payload
+                else:
+                    continue
+            elif existing_job is not None:
+                continue
             payload["job"] = job_payload
             tool_inputs[tool_name] = payload
             changed = True
@@ -597,6 +763,50 @@ def _ensure_job_inputs(
         else:
             updated_tasks.append(task)
     return plan.model_copy(update={"tasks": updated_tasks})
+
+
+def _ensure_default_value_markers(plan: models.PlanCreate, job: models.Job) -> models.PlanCreate:
+    job_context = job.context_json if isinstance(job.context_json, dict) else {}
+    if not job_context:
+        return plan
+    tasks = [task.model_copy(deep=True) for task in plan.tasks]
+    changed = False
+    for task in tasks:
+        if not isinstance(task.tool_inputs, dict):
+            continue
+        tool_inputs = dict(task.tool_inputs)
+        task_changed = False
+        for request_id, payload_raw in list(tool_inputs.items()):
+            if not isinstance(payload_raw, dict):
+                continue
+            payload = dict(payload_raw)
+            payload_changed = False
+            for key, value in list(payload.items()):
+                if not (isinstance(value, dict) and value.get("$default") is True):
+                    continue
+                replacement = job_context.get(key)
+                if isinstance(replacement, str):
+                    stripped = replacement.strip()
+                    if stripped:
+                        payload[key] = stripped
+                        payload_changed = True
+                        continue
+                if isinstance(replacement, (int, float, bool)):
+                    payload[key] = replacement
+                    payload_changed = True
+                    continue
+                # No usable default in context: drop marker and allow later fillers/validators.
+                payload.pop(key, None)
+                payload_changed = True
+            if payload_changed:
+                tool_inputs[request_id] = payload
+                task_changed = True
+        if task_changed:
+            task.tool_inputs = tool_inputs
+            changed = True
+    if not changed:
+        return plan
+    return plan.model_copy(update={"tasks": tasks})
 
 
 def _ensure_renderer_output_extensions(plan: models.PlanCreate) -> models.PlanCreate:
@@ -647,16 +857,62 @@ def _ensure_renderer_output_extensions(plan: models.PlanCreate) -> models.PlanCr
         tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
         payload = tool_inputs.get(derive_request_id)
         payload_dict = dict(payload) if isinstance(payload, dict) else {}
-        if _normalize_extension_hint(payload_dict.get("output_extension")) == extension:
+        task_changed = False
+        if _normalize_extension_hint(payload_dict.get("output_extension")) != extension:
+            payload_dict["output_extension"] = extension
+            task_changed = True
+        document_type = payload_dict.get("document_type")
+        if not isinstance(document_type, str) or not document_type.strip():
+            payload_dict["document_type"] = _infer_document_type_for_derive_task(
+                task,
+                task_by_name=task_by_name,
+                all_tasks=plan.tasks,
+            )
+            task_changed = True
+        if not task_changed:
             updated_tasks.append(task)
             continue
-        payload_dict["output_extension"] = extension
         tool_inputs[derive_request_id] = payload_dict
         updated_tasks.append(task.model_copy(update={"tool_inputs": tool_inputs}))
         changed = True
     if not changed:
         return plan
     return plan.model_copy(update={"tasks": updated_tasks})
+
+
+def _infer_document_type_for_derive_task(
+    task: models.TaskCreate,
+    *,
+    task_by_name: Mapping[str, models.TaskCreate],
+    all_tasks: Sequence[models.TaskCreate],
+) -> str:
+    def _is_resume_task(candidate: models.TaskCreate | None) -> bool:
+        if candidate is None:
+            return False
+        if "resume" in candidate.name.lower():
+            return True
+        requests = {str(item) for item in (candidate.tool_requests or [])}
+        return bool(
+            requests
+            & {
+                "llm_tailor_resume_text",
+                "llm_generate_resume_doc_spec",
+                "llm_generate_resume_doc_spec_from_text",
+                "resume_doc_spec_validate",
+                "resume_doc_spec_to_document_spec",
+                "document.docx.generate",
+            }
+        )
+
+    if "resume" in task.name.lower():
+        return "resume"
+    for dep_name in task.deps or []:
+        if _is_resume_task(task_by_name.get(str(dep_name))):
+            return "resume"
+    for candidate in all_tasks:
+        if _is_resume_task(candidate):
+            return "resume"
+    return "document"
 
 
 def _planner_renderer_hints() -> tuple[set[str], dict[str, str]]:
@@ -703,6 +959,284 @@ def _derive_task_name_from_path_reference(
     return str(segments[1])
 
 
+def _reference_task_name_from_from_spec(from_spec: Any) -> str | None:
+    segments: list[Any]
+    if isinstance(from_spec, list):
+        segments = list(from_spec)
+    elif isinstance(from_spec, str):
+        raw = from_spec.strip()
+        if not raw:
+            return None
+        segments = [segment for segment in raw.split(".") if segment]
+    else:
+        return None
+    if len(segments) < 2:
+        return None
+    if segments[0] not in ("dependencies_by_name", "dependencies"):
+        return None
+    task_name = str(segments[1]).strip()
+    return task_name or None
+
+
+def _collect_referenced_task_names(value: Any) -> set[str]:
+    names: set[str] = set()
+    if isinstance(value, dict):
+        if "$from" in value:
+            ref_name = _reference_task_name_from_from_spec(value.get("$from"))
+            if ref_name:
+                names.add(ref_name)
+        for child in value.values():
+            names.update(_collect_referenced_task_names(child))
+        return names
+    if isinstance(value, list):
+        for item in value:
+            names.update(_collect_referenced_task_names(item))
+    return names
+
+
+def _ensure_tool_input_dependencies(plan: models.PlanCreate) -> models.PlanCreate:
+    task_names = {task.name for task in plan.tasks}
+    tasks = [task.model_copy(deep=True) for task in plan.tasks]
+    changed = False
+    for task in tasks:
+        referenced = _collect_referenced_task_names(task.tool_inputs)
+        if not referenced:
+            continue
+        deps = list(task.deps or [])
+        dep_set = set(deps)
+        for dep_name in sorted(referenced):
+            if dep_name == task.name or dep_name not in task_names or dep_name in dep_set:
+                continue
+            deps.append(dep_name)
+            dep_set.add(dep_name)
+            changed = True
+        if deps != list(task.deps or []):
+            task.deps = deps
+    if not changed:
+        return plan
+
+    edges: list[list[str]] = []
+    existing_edges: set[tuple[str, str]] = set()
+    for edge in plan.dag_edges or []:
+        if not isinstance(edge, list) or len(edge) != 2:
+            continue
+        from_node = str(edge[0])
+        to_node = str(edge[1])
+        pair = (from_node, to_node)
+        if pair in existing_edges:
+            continue
+        existing_edges.add(pair)
+        edges.append([from_node, to_node])
+    for task in tasks:
+        for dep_name in task.deps or []:
+            pair = (dep_name, task.name)
+            if pair in existing_edges:
+                continue
+            existing_edges.add(pair)
+            edges.append([dep_name, task.name])
+    return plan.model_copy(update={"tasks": tasks, "dag_edges": edges})
+
+
+def _ensure_resume_docspec_inputs(plan: models.PlanCreate) -> models.PlanCreate:
+    tasks = [task.model_copy(deep=True) for task in plan.tasks]
+    changed = False
+    for index, task in enumerate(tasks):
+        if "llm_generate_resume_doc_spec_from_text" not in (task.tool_requests or []):
+            continue
+        tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
+        payload_raw = tool_inputs.get("llm_generate_resume_doc_spec_from_text")
+        payload = dict(payload_raw) if isinstance(payload_raw, dict) else {}
+        if any(key in payload for key in ("tailored_resume", "tailored_text")):
+            continue
+        source_task_name: str | None = None
+        deps = [str(dep) for dep in (task.deps or [])]
+        for dep_name in deps:
+            dep_task = next((candidate for candidate in tasks if candidate.name == dep_name), None)
+            if dep_task and "llm_tailor_resume_text" in (dep_task.tool_requests or []):
+                source_task_name = dep_task.name
+                break
+        if source_task_name is None:
+            for dep_task in tasks[:index]:
+                if "llm_tailor_resume_text" in (dep_task.tool_requests or []):
+                    source_task_name = dep_task.name
+                    break
+        if source_task_name is None:
+            continue
+        payload["tailored_resume"] = {
+            "$from": f"dependencies_by_name.{source_task_name}.llm_tailor_resume_text.tailored_resume"
+        }
+        tool_inputs["llm_generate_resume_doc_spec_from_text"] = payload
+        task.tool_inputs = tool_inputs
+        changed = True
+    if not changed:
+        return plan
+    return plan.model_copy(update={"tasks": tasks})
+
+
+def _ensure_resume_converter_inputs(plan: models.PlanCreate) -> models.PlanCreate:
+    tasks = [task.model_copy(deep=True) for task in plan.tasks]
+    changed = False
+    for index, task in enumerate(tasks):
+        if "resume_doc_spec_to_document_spec" not in (task.tool_requests or []):
+            continue
+        tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
+        payload_raw = tool_inputs.get("resume_doc_spec_to_document_spec")
+        payload = dict(payload_raw) if isinstance(payload_raw, dict) else {}
+        if "resume_doc_spec" in payload:
+            continue
+        source_task_name: str | None = None
+        deps = [str(dep) for dep in (task.deps or [])]
+        for dep_name in deps:
+            dep_task = next((candidate for candidate in tasks if candidate.name == dep_name), None)
+            if dep_task and "llm_generate_resume_doc_spec_from_text" in (dep_task.tool_requests or []):
+                source_task_name = dep_task.name
+                break
+        if source_task_name is None:
+            for dep_task in tasks[:index]:
+                if "llm_generate_resume_doc_spec_from_text" in (dep_task.tool_requests or []):
+                    source_task_name = dep_task.name
+                    break
+        if source_task_name is None:
+            # Final fallback: the planner can emit tasks out-of-order before DAG normalization.
+            # Use any available Resume DocSpec producer so contract validation can pass.
+            for dep_task in tasks:
+                if dep_task.name == task.name:
+                    continue
+                if "llm_generate_resume_doc_spec_from_text" in (dep_task.tool_requests or []):
+                    source_task_name = dep_task.name
+                    break
+        if source_task_name is None:
+            continue
+        payload["resume_doc_spec"] = {
+            "$from": (
+                "dependencies_by_name."
+                f"{source_task_name}.llm_generate_resume_doc_spec_from_text.resume_doc_spec"
+            )
+        }
+        tool_inputs["resume_doc_spec_to_document_spec"] = payload
+        task.tool_inputs = tool_inputs
+        changed = True
+    if not changed:
+        return plan
+    return plan.model_copy(update={"tasks": tasks})
+
+
+def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCreate:
+    tasks = [task.model_copy(deep=True) for task in plan.tasks]
+    task_by_name = {task.name: task for task in tasks}
+    changed = False
+    renderer_requests = {
+        "docx_generate_from_spec",
+        "pdf_generate_from_spec",
+        "document.docx.generate",
+        "document.pdf.generate",
+    }
+    document_spec_producers = {
+        "resume_doc_spec_to_document_spec",
+        "document.spec.generate",
+        "document_spec_generate",
+    }
+    derive_requests = {"derive_output_filename", "derive_output_path", "document.output.derive"}
+
+    def _ref_task_exists(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        ref_task = _reference_task_name_from_from_spec(value.get("$from"))
+        if not ref_task:
+            return False
+        return ref_task in task_by_name
+
+    def _find_source_task_name(
+        current_task: models.TaskCreate,
+        index: int,
+        producer_requests: set[str],
+    ) -> tuple[str | None, str | None]:
+        deps = [str(dep) for dep in (current_task.deps or [])]
+        for dep_name in deps:
+            dep_task = task_by_name.get(dep_name)
+            if not dep_task:
+                continue
+            for req in dep_task.tool_requests or []:
+                req_name = str(req)
+                if req_name in producer_requests:
+                    return dep_task.name, req_name
+        for dep_task in tasks[:index]:
+            for req in dep_task.tool_requests or []:
+                req_name = str(req)
+                if req_name in producer_requests:
+                    return dep_task.name, req_name
+        for dep_task in tasks:
+            if dep_task.name == current_task.name:
+                continue
+            for req in dep_task.tool_requests or []:
+                req_name = str(req)
+                if req_name in producer_requests:
+                    return dep_task.name, req_name
+        return None, None
+
+    for index, task in enumerate(tasks):
+        request_id = next(
+            (req for req in (task.tool_requests or []) if str(req) in renderer_requests),
+            None,
+        )
+        if request_id is None:
+            continue
+        request_id = str(request_id)
+        tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
+        payload_raw = tool_inputs.get(request_id)
+        payload = dict(payload_raw) if isinstance(payload_raw, dict) else {}
+
+        has_valid_document_spec_ref = _ref_task_exists(payload.get("document_spec"))
+        if ("document_spec" not in payload) or (
+            isinstance(payload.get("document_spec"), dict) and not has_valid_document_spec_ref
+        ):
+            source_task_name, source_request_id = _find_source_task_name(
+                task, index, document_spec_producers
+            )
+            if source_task_name and source_request_id:
+                payload["document_spec"] = {
+                    "$from": (
+                        f"dependencies_by_name.{source_task_name}."
+                        f"{source_request_id}.document_spec"
+                    )
+                }
+                changed = True
+
+        has_valid_path_ref = _ref_task_exists(payload.get("path"))
+        has_valid_output_path_ref = _ref_task_exists(payload.get("output_path"))
+        if (
+            ("path" not in payload and "output_path" not in payload)
+            or (
+                isinstance(payload.get("path"), dict)
+                and not has_valid_path_ref
+                and ("output_path" not in payload or not has_valid_output_path_ref)
+            )
+            or (
+                isinstance(payload.get("output_path"), dict)
+                and not has_valid_output_path_ref
+                and ("path" not in payload or not has_valid_path_ref)
+            )
+        ):
+            source_task_name, source_request_id = _find_source_task_name(
+                task, index, derive_requests
+            )
+            if source_task_name and source_request_id:
+                payload["path"] = {
+                    "$from": (
+                        f"dependencies_by_name.{source_task_name}."
+                        f"{source_request_id}.path"
+                    )
+                }
+                changed = True
+
+        tool_inputs[request_id] = payload
+        task.tool_inputs = tool_inputs
+
+    if not changed:
+        return plan
+    return plan.model_copy(update={"tasks": tasks})
+
+
 def _derive_request_id_for_task(
     task: models.TaskCreate, derive_request_ids: set[str]
 ) -> str | None:
@@ -729,15 +1263,49 @@ def _validate_plan(
     tool_map = {tool.name: tool for tool in tools}
     tool_schemas = {tool.name: tool.input_schema or {} for tool in tools}
     capabilities = _planner_capabilities()
-    for task in plan.tasks:
+    goal_intent_segments = _job_goal_intent_segments(job)
+    for task_index, task in enumerate(plan.tasks):
         if not task.tool_requests:
             continue
         task_intent = _resolve_task_intent_for_validation(task, tool_map, goal_text=job.goal)
         if not task_intent:
             return False, f"missing_task_intent:{task.name}"
+        goal_intent_segment = _select_goal_intent_segment_for_task(
+            task=task,
+            task_index=task_index,
+            task_intent=task_intent,
+            goal_intent_segments=goal_intent_segments,
+            total_tasks=len(plan.tasks),
+        )
         for tool_name in task.tool_requests:
             tool = tool_map.get(tool_name)
             capability = capabilities.get(tool_name)
+            raw_tool_inputs = {}
+            if isinstance(task.tool_inputs, dict) and tool_name in task.tool_inputs:
+                entry = task.tool_inputs.get(tool_name)
+                if not isinstance(entry, dict):
+                    return False, f"tool_inputs_invalid:{tool_name}:{task.name}:payload_not_object"
+                raw_tool_inputs = dict(entry)
+            segment_payload = raw_tool_inputs
+            if tool is not None:
+                segment_payload = _build_validation_payload(task, tool, job, raw_tool_inputs)
+            elif capability is not None:
+                segment_payload = _build_capability_validation_payload(
+                    task, raw_tool_inputs, job
+                )
+            segment_contract_error = intent_contract.validate_intent_segment_contract(
+                segment=goal_intent_segment,
+                task_intent=task_intent,
+                tool_name=tool_name,
+                payload=segment_payload,
+                capability_id=tool_name if capability is not None else None,
+                capability_risk_tier=capability.risk_tier if capability is not None else None,
+            )
+            if segment_contract_error:
+                return (
+                    False,
+                    f"intent_segment_invalid:{tool_name}:{task.name}:{segment_contract_error}",
+                )
             if tool is None and capability is None:
                 return False, f"unknown_tool_or_capability:{tool_name}"
             if tool is None and capability is not None:
@@ -748,15 +1316,6 @@ def _validate_plan(
                 )
                 if capability_mismatch:
                     return False, f"capability_intent_invalid:{tool_name}:{task.name}:{capability_mismatch}"
-                raw_tool_inputs = {}
-                if isinstance(task.tool_inputs, dict) and tool_name in task.tool_inputs:
-                    entry = task.tool_inputs.get(tool_name)
-                    if not isinstance(entry, dict):
-                        return (
-                            False,
-                            f"capability_inputs_invalid:{tool_name}:{task.name}:payload_not_object",
-                        )
-                    raw_tool_inputs = dict(entry)
                 validation_error = _validate_capability_inputs(
                     capability,
                     task,
@@ -806,12 +1365,6 @@ def _validate_plan(
             )
             if mismatch:
                 return False, f"{mismatch}:task={task.name}"
-            raw_tool_inputs = {}
-            if isinstance(task.tool_inputs, dict) and tool_name in task.tool_inputs:
-                entry = task.tool_inputs.get(tool_name)
-                if not isinstance(entry, dict):
-                    return False, f"tool_inputs_invalid:{tool_name}:{task.name}:payload_not_object"
-                raw_tool_inputs = dict(entry)
             validation_payload = _build_validation_payload(task, tool, job, raw_tool_inputs)
             validation_errors = payload_resolver.validate_tool_inputs(
                 {tool_name: validation_payload}, tool_schemas

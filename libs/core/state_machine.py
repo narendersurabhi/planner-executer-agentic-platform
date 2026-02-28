@@ -5,7 +5,7 @@ from typing import Dict, Set
 from .models import JobStatus, TaskStatus
 
 JOB_TRANSITIONS: Dict[JobStatus, Set[JobStatus]] = {
-    JobStatus.queued: {JobStatus.planning, JobStatus.canceled},
+    JobStatus.queued: {JobStatus.planning, JobStatus.failed, JobStatus.canceled},
     JobStatus.planning: {JobStatus.running, JobStatus.failed, JobStatus.canceled},
     JobStatus.running: {JobStatus.succeeded, JobStatus.failed, JobStatus.canceled},
     JobStatus.succeeded: set(),

@@ -204,6 +204,79 @@ const defaultJobContextTemplate = () => ({
   output_dir: "documents"
 });
 
+type ContextBuilderCoreField = {
+  key: string;
+  label: string;
+  placeholder: string;
+  schemaType: string;
+  multiline: boolean;
+  inputType?: string;
+};
+
+const CONTEXT_BUILDER_CORE_FIELDS: ContextBuilderCoreField[] = [
+  {
+    key: "instruction",
+    label: "Instruction",
+    placeholder: "Describe what to produce",
+    schemaType: "string",
+    multiline: true,
+  },
+  {
+    key: "topic",
+    label: "Topic",
+    placeholder: "Primary topic",
+    schemaType: "string",
+    multiline: false,
+  },
+  {
+    key: "audience",
+    label: "Audience",
+    placeholder: "Target audience",
+    schemaType: "string",
+    multiline: false,
+  },
+  {
+    key: "tone",
+    label: "Tone",
+    placeholder: "Tone (for example: practical, concise)",
+    schemaType: "string",
+    multiline: false,
+  },
+  {
+    key: "today",
+    label: "Today",
+    placeholder: "YYYY-MM-DD",
+    schemaType: "string",
+    multiline: false,
+    inputType: "date",
+  },
+  {
+    key: "output_dir",
+    label: "Output Dir",
+    placeholder: "documents",
+    schemaType: "string",
+    multiline: false,
+  },
+];
+
+const CONTEXT_BUILDER_CORE_FIELD_KEYS = new Set(
+  CONTEXT_BUILDER_CORE_FIELDS.map((field) => field.key)
+);
+
+const parseContextJsonObject = (
+  value: string
+): { context: Record<string, unknown>; invalid: boolean } => {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { context: parsed as Record<string, unknown>, invalid: false };
+    }
+    return { context: {}, invalid: true };
+  } catch {
+    return { context: {}, invalid: true };
+  }
+};
+
 const topLevelFieldFromPath = (path: string) =>
   path
     .split(/[.[\]]/)[0]
@@ -438,6 +511,34 @@ const parseContextInputForSchemaType = (raw: string, schemaType: string) => {
   }
 };
 
+const inferContextBuilderSchemaType = (value: unknown) => {
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  if (value && typeof value === "object") {
+    return "object";
+  }
+  if (typeof value === "boolean") {
+    return "boolean";
+  }
+  if (typeof value === "number") {
+    return "number";
+  }
+  return "string";
+};
+
+const summarizeContextValue = (value: unknown, schemaType: string) => {
+  const serialized = serializeContextInputForSchemaType(value, schemaType);
+  const normalized = serialized.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "(empty)";
+  }
+  if (normalized.length > 96) {
+    return `${normalized.slice(0, 96)}…`;
+  }
+  return normalized;
+};
+
 const outputPathSuggestionsForCapability = (
   capabilityId: string,
   preferredOutputPath?: string
@@ -541,6 +642,22 @@ type Plan = {
   planner_version: string;
   tasks_summary: string;
   dag_edges: string[][];
+};
+
+type JobDetailsPayload = {
+  job_id: string;
+  job_status?: string | null;
+  job_error?: string | null;
+  plan?: Plan | null;
+  tasks?: Task[];
+  task_results?: Record<string, TaskResult>;
+};
+
+type ContextBuilderFieldEditor = {
+  originalKey: string;
+  key: string;
+  schemaType: "string" | "number" | "boolean" | "object" | "array";
+  value: string;
 };
 
 type PlanCreateTaskPayload = {
@@ -712,6 +829,13 @@ type CapabilityCatalog = {
 type PlanPreflightResponse = {
   valid: boolean;
   errors: Record<string, string>;
+  diagnostics?: {
+    severity?: "error" | "warning";
+    code: string;
+    field?: string;
+    message: string;
+    slot_fields?: string[];
+  }[];
 };
 
 type CapabilitySubgroupSection = {
@@ -794,7 +918,70 @@ type ChainPreflightResult = {
   valid: boolean;
   localErrors: string[];
   serverErrors: Record<string, string>;
+  serverDiagnostics?: {
+    severity?: "error" | "warning";
+    code: string;
+    field?: string;
+    message: string;
+    slot_fields?: string[];
+  }[];
   checkedAt: string;
+};
+
+type GoalIntentAssessment = {
+  intent: string;
+  source: string;
+  confidence: number;
+  threshold: number;
+  needs_clarification: boolean;
+  questions: string[];
+};
+
+type IntentClarifyResponse = {
+  goal: string;
+  assessment: GoalIntentAssessment;
+};
+
+type GoalIntentSegment = {
+  id: string;
+  intent: string;
+  objective: string;
+  confidence: number;
+  source: string;
+  depends_on: string[];
+  required_inputs: string[];
+  suggested_capabilities: string[];
+  suggested_capability_rankings?: {
+    id: string;
+    score: number;
+    reason: string;
+    source: string;
+  }[];
+};
+
+type GoalIntentGraph = {
+  goal: string;
+  segments: GoalIntentSegment[];
+  summary: {
+    segment_count: number;
+    intent_order: string[];
+    fact_candidates: number;
+    fact_supported: number;
+    fact_stripped: number;
+    fact_support_rate: number;
+    capability_suggestions_total: number;
+    capability_suggestions_matched: number;
+    capability_suggestions_selected: number;
+    capability_suggestions_autofilled: number;
+    capability_match_rate: number;
+    has_interaction_summaries: boolean;
+  };
+  overall_confidence: number;
+};
+
+type IntentDecomposeResponse = {
+  goal: string;
+  intent_graph: GoalIntentGraph;
 };
 
 type ComposerValidationIssue = {
@@ -866,17 +1053,31 @@ const collectComposerValidationIssues = (
         field: _extractFieldHint(message) || undefined
       });
     });
-    Object.entries(preflightResult.serverErrors).forEach(([field, message]) => {
-      const nodeId = _findNodeIdByTaskName(field, nodes);
-      push({
-        severity: "error",
-        source: "preflight",
-        code: "preflight_error",
-        field,
-        nodeId,
-        message
+    if (Array.isArray(preflightResult.serverDiagnostics) && preflightResult.serverDiagnostics.length > 0) {
+      preflightResult.serverDiagnostics.forEach((diag) => {
+        const field = typeof diag.field === "string" ? diag.field : undefined;
+        push({
+          severity: diag.severity === "warning" ? "warning" : "error",
+          source: "preflight",
+          code: diag.code || "preflight_error",
+          field,
+          nodeId: _findNodeIdByTaskName(field, nodes),
+          message: diag.message || "Preflight validation failed."
+        });
       });
-    });
+    } else {
+      Object.entries(preflightResult.serverErrors).forEach(([field, message]) => {
+        const nodeId = _findNodeIdByTaskName(field, nodes);
+        push({
+          severity: "error",
+          source: "preflight",
+          code: "preflight_error",
+          field,
+          nodeId,
+          message
+        });
+      });
+    }
   }
 
   if (compileResult) {
@@ -1056,6 +1257,19 @@ const inferOutputExtensionForCapability = (capabilityId: string): string => {
     return "json";
   }
   return "txt";
+};
+
+const isPathOutputReference = (sourcePath: string): boolean => {
+  const normalized = sourcePath.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized === "path" ||
+    normalized === "output_path" ||
+    normalized.endsWith(".path") ||
+    normalized.endsWith(".output_path")
+  );
 };
 
 const taskNameFromCapability = (capabilityId: string) => {
@@ -1513,7 +1727,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Use llm_generate_document_spec to create a DocumentSpec about '{{topic}}' for '{{audience}}' in a '{{tone}}' tone. " +
       "Provide allowed_block_types as [text, paragraph, heading, bullets, spacer, optional_paragraph, repeat]. " +
       "Validate with document_spec_validate (strict). " +
-      "Derive a filesystem-safe output path with derive_output_filename using the topic and today's date, output_dir '{{output_dir}}'. " +
+      "Derive a filesystem-safe output path with document.output.derive (derive_output_path) using topic '{{topic}}', output_dir '{{output_dir}}', and today's date. " +
       "Render a DOCX with docx_generate_from_spec using the derived path.",
     contextJson:
       '{\n  "topic": "{{topic}}",\n  "audience": "{{audience}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
@@ -1815,10 +2029,19 @@ const buildDagLayout = (tasks: Task[]): DagLayout => {
 export default function Home() {
   const [goal, setGoal] = useState("");
   const [contextJson, setContextJson] = useState("{}");
+  const [showRawContextPreview, setShowRawContextPreview] = useState(false);
+  const [contextBuilderFieldEditor, setContextBuilderFieldEditor] = useState<ContextBuilderFieldEditor>({
+    originalKey: "",
+    key: "",
+    schemaType: "string",
+    value: "",
+  });
   const [priority, setPriority] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [selectedJobStatus, setSelectedJobStatus] = useState<string | null>(null);
+  const [selectedJobPlanError, setSelectedJobPlanError] = useState<string | null>(null);
   const [selectedPlan, setSelectedPlan] = useState<Plan | null>(null);
   const [selectedTasks, setSelectedTasks] = useState<Task[]>([]);
   const [taskResults, setTaskResults] = useState<Record<string, TaskResult>>({});
@@ -1829,11 +2052,20 @@ export default function Home() {
   const [jobDebuggerLoading, setJobDebuggerLoading] = useState(false);
   const [jobDebuggerError, setJobDebuggerError] = useState<string | null>(null);
   const [showDebugger, setShowDebugger] = useState(false);
+  const [jobDetailsIntentGraphCollapsed, setJobDetailsIntentGraphCollapsed] = useState(true);
   const [debuggerActionNotice, setDebuggerActionNotice] = useState<string | null>(null);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templateName, setTemplateName] = useState("");
   const [templateError, setTemplateError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [intentAssessment, setIntentAssessment] = useState<GoalIntentAssessment | null>(null);
+  const [intentClarificationAnswers, setIntentClarificationAnswers] = useState<string[]>([]);
+  const [intentClarificationLoading, setIntentClarificationLoading] = useState(false);
+  const [intentGraph, setIntentGraph] = useState<GoalIntentGraph | null>(null);
+  const [intentGraphGoal, setIntentGraphGoal] = useState("");
+  const [intentGraphLoading, setIntentGraphLoading] = useState(false);
+  const [intentGraphError, setIntentGraphError] = useState<string | null>(null);
+  const [intentGraphCollapsed, setIntentGraphCollapsed] = useState(true);
   const [capabilityCatalog, setCapabilityCatalog] = useState<CapabilityCatalog | null>(null);
   const [capabilityError, setCapabilityError] = useState<string | null>(null);
   const [templateDefaults, setTemplateDefaults] = useState<Record<string, string>>(
@@ -1868,6 +2100,16 @@ export default function Home() {
   const [memoryEntries, setMemoryEntries] = useState<Record<string, MemoryEntry[]>>({});
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryError, setMemoryError] = useState<string | null>(null);
+  const [semanticFactSubject, setSemanticFactSubject] = useState("");
+  const [semanticFactNamespace, setSemanticFactNamespace] = useState("general");
+  const [semanticFactText, setSemanticFactText] = useState("");
+  const [semanticFactKeywords, setSemanticFactKeywords] = useState("");
+  const [semanticFactConfidence, setSemanticFactConfidence] = useState("0.8");
+  const [semanticQuery, setSemanticQuery] = useState("");
+  const [semanticMatches, setSemanticMatches] = useState<Record<string, unknown>[]>([]);
+  const [semanticLoading, setSemanticLoading] = useState(false);
+  const [semanticError, setSemanticError] = useState<string | null>(null);
+  const [semanticNotice, setSemanticNotice] = useState<string | null>(null);
   const [showDlq, setShowDlq] = useState(false);
   const [dlqEntries, setDlqEntries] = useState<TaskDlqEntry[]>([]);
   const [dlqLoading, setDlqLoading] = useState(false);
@@ -1907,7 +2149,7 @@ export default function Home() {
     string | null
   >(null);
   const [llmCapabilityRecommendationLoading, setLlmCapabilityRecommendationLoading] = useState(false);
-  const [capabilityInputDrafts, setCapabilityInputDrafts] = useState<Record<string, string>>({});
+  const [capabilityFormsShowOptional, setCapabilityFormsShowOptional] = useState(false);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>({
     summary: "Chain composer preflight",
     nodes: [],
@@ -1960,6 +2202,7 @@ export default function Home() {
   const [composerCompileLoading, setComposerCompileLoading] = useState(false);
   const [isDesktop, setIsDesktop] = useState(false);
   const [hasSetInitialSidebar, setHasSetInitialSidebar] = useState(false);
+  const intentGraphRequestSeqRef = useRef(0);
   const devToolsEnabled = process.env.NEXT_PUBLIC_DEV_TOOLS === "true";
 
   const visualChainNodes = composerDraft.nodes;
@@ -2505,16 +2748,303 @@ export default function Home() {
   };
 
   function readContextObject() {
-    try {
-      const parsed = JSON.parse(contextJson || "{}");
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {
-      return {} as Record<string, unknown>;
-    }
-    return {} as Record<string, unknown>;
+    return parseContextJsonObject(contextJson).context;
   }
+
+  const contextBuilderSnapshot = useMemo(
+    () => parseContextJsonObject(contextJson),
+    [contextJson]
+  );
+  const contextBuilderObject = contextBuilderSnapshot.context;
+  const contextBuilderExtraFields = useMemo(
+    () =>
+      Object.entries(contextBuilderObject)
+        .filter(([key]) => !CONTEXT_BUILDER_CORE_FIELD_KEYS.has(key))
+        .map(([key, value]) => {
+          const schemaType = inferContextBuilderSchemaType(value);
+          return {
+            key,
+            schemaType,
+            valuePreview: summarizeContextValue(value, schemaType),
+          };
+        })
+        .sort((left, right) => left.key.localeCompare(right.key)),
+    [contextBuilderObject]
+  );
+
+  const updateContextBuilderField = (fieldKey: string, rawValue: string, schemaType: string) => {
+    const parsedValue = parseContextInputForSchemaType(rawValue, schemaType);
+    if (!parsedValue.ok) {
+      setComposeNotice(`Field '${fieldKey}': ${parsedValue.error}`);
+      return;
+    }
+    const next = { ...contextBuilderObject };
+    if (parsedValue.clear) {
+      delete next[fieldKey];
+    } else {
+      next[fieldKey] = parsedValue.value;
+    }
+    setContextJson(JSON.stringify(next, null, 2));
+    if (contextBuilderSnapshot.invalid) {
+      setComposeNotice("Context JSON was invalid and has been replaced by Context Builder values.");
+    }
+  };
+
+  const resetContextBuilderFieldEditor = () => {
+    setContextBuilderFieldEditor({
+      originalKey: "",
+      key: "",
+      schemaType: "string",
+      value: "",
+    });
+  };
+
+  const editContextBuilderField = (fieldKey: string) => {
+    const value = contextBuilderObject[fieldKey];
+    const schemaType = inferContextBuilderSchemaType(value) as ContextBuilderFieldEditor["schemaType"];
+    setContextBuilderFieldEditor({
+      originalKey: fieldKey,
+      key: fieldKey,
+      schemaType,
+      value: serializeContextInputForSchemaType(value, schemaType),
+    });
+  };
+
+  const removeContextBuilderField = (fieldKey: string) => {
+    const next = { ...contextBuilderObject };
+    delete next[fieldKey];
+    setContextJson(JSON.stringify(next, null, 2));
+    if (contextBuilderFieldEditor.originalKey === fieldKey) {
+      resetContextBuilderFieldEditor();
+    }
+  };
+
+  const applyContextBuilderFieldEditor = () => {
+    const key = contextBuilderFieldEditor.key.trim();
+    if (!key) {
+      setComposeNotice("Field name is required.");
+      return;
+    }
+    if (CONTEXT_BUILDER_CORE_FIELD_KEYS.has(key)) {
+      setComposeNotice(`'${key}' is a core field. Edit it in the core section.`);
+      return;
+    }
+    const parsedValue = parseContextInputForSchemaType(
+      contextBuilderFieldEditor.value,
+      contextBuilderFieldEditor.schemaType
+    );
+    if (!parsedValue.ok) {
+      setComposeNotice(`Field '${key}': ${parsedValue.error}`);
+      return;
+    }
+
+    const next = { ...contextBuilderObject };
+    const originalKey = contextBuilderFieldEditor.originalKey.trim();
+    if (originalKey && originalKey !== key) {
+      delete next[originalKey];
+    }
+    if (parsedValue.clear) {
+      delete next[key];
+    } else {
+      next[key] = parsedValue.value;
+    }
+    setContextJson(JSON.stringify(next, null, 2));
+    resetContextBuilderFieldEditor();
+    if (contextBuilderSnapshot.invalid) {
+      setComposeNotice("Context JSON was invalid and has been replaced by Context Builder values.");
+    } else {
+      setComposeNotice(parsedValue.clear ? `Cleared '${key}'.` : `Saved '${key}'.`);
+    }
+  };
+
+  const normalizeIntentGraph = (value: unknown): GoalIntentGraph | null => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const raw = value as Record<string, unknown>;
+    const segments = Array.isArray(raw.segments)
+      ? raw.segments
+          .filter((segment) => segment && typeof segment === "object" && !Array.isArray(segment))
+          .map((segment) => {
+            const item = segment as Record<string, unknown>;
+            return {
+              id: String(item.id || "").trim(),
+              intent: String(item.intent || "").trim(),
+              objective: String(item.objective || "").trim(),
+              confidence: Number.isFinite(Number(item.confidence)) ? Number(item.confidence) : 0,
+              source: String(item.source || "").trim(),
+              depends_on: Array.isArray(item.depends_on)
+                ? item.depends_on.map((entry) => String(entry || "").trim()).filter(Boolean)
+                : [],
+              required_inputs: Array.isArray(item.required_inputs)
+                ? item.required_inputs.map((entry) => String(entry || "").trim()).filter(Boolean)
+                : [],
+              suggested_capabilities: Array.isArray(item.suggested_capabilities)
+                ? item.suggested_capabilities
+                    .map((entry) => String(entry || "").trim())
+                    .filter(Boolean)
+                : [],
+              suggested_capability_rankings: Array.isArray(item.suggested_capability_rankings)
+                ? item.suggested_capability_rankings
+                    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+                    .map((entry) => {
+                      const ranking = entry as Record<string, unknown>;
+                      return {
+                        id: String(ranking.id || "").trim(),
+                        score: Number.isFinite(Number(ranking.score)) ? Number(ranking.score) : 0,
+                        reason: String(ranking.reason || "").trim(),
+                        source: String(ranking.source || "").trim(),
+                      };
+                    })
+                    .filter((entry) => Boolean(entry.id))
+                : [],
+            };
+          })
+          .filter((segment) => segment.id && segment.intent)
+      : [];
+    if (segments.length === 0) {
+      return null;
+    }
+    const summaryRaw =
+      raw.summary && typeof raw.summary === "object" && !Array.isArray(raw.summary)
+        ? (raw.summary as Record<string, unknown>)
+        : {};
+    const summary = {
+      segment_count: Number.isFinite(Number(summaryRaw.segment_count))
+        ? Number(summaryRaw.segment_count)
+        : segments.length,
+      intent_order: Array.isArray(summaryRaw.intent_order)
+        ? summaryRaw.intent_order.map((entry) => String(entry || "").trim()).filter(Boolean)
+        : segments.map((segment) => segment.intent),
+      fact_candidates: Number.isFinite(Number(summaryRaw.fact_candidates))
+        ? Number(summaryRaw.fact_candidates)
+        : 0,
+      fact_supported: Number.isFinite(Number(summaryRaw.fact_supported))
+        ? Number(summaryRaw.fact_supported)
+        : 0,
+      fact_stripped: Number.isFinite(Number(summaryRaw.fact_stripped))
+        ? Number(summaryRaw.fact_stripped)
+        : 0,
+      fact_support_rate: Number.isFinite(Number(summaryRaw.fact_support_rate))
+        ? Number(summaryRaw.fact_support_rate)
+        : 1,
+      capability_suggestions_total: Number.isFinite(Number(summaryRaw.capability_suggestions_total))
+        ? Number(summaryRaw.capability_suggestions_total)
+        : 0,
+      capability_suggestions_matched: Number.isFinite(
+        Number(summaryRaw.capability_suggestions_matched)
+      )
+        ? Number(summaryRaw.capability_suggestions_matched)
+        : 0,
+      capability_suggestions_selected: Number.isFinite(
+        Number(summaryRaw.capability_suggestions_selected)
+      )
+        ? Number(summaryRaw.capability_suggestions_selected)
+        : Number.isFinite(Number(summaryRaw.capability_suggestions_matched))
+        ? Number(summaryRaw.capability_suggestions_matched)
+        : 0,
+      capability_suggestions_autofilled: Number.isFinite(
+        Number(summaryRaw.capability_suggestions_autofilled)
+      )
+        ? Number(summaryRaw.capability_suggestions_autofilled)
+        : 0,
+      capability_match_rate: Number.isFinite(Number(summaryRaw.capability_match_rate))
+        ? Number(summaryRaw.capability_match_rate)
+        : 1,
+      has_interaction_summaries:
+        typeof summaryRaw.has_interaction_summaries === "boolean"
+          ? summaryRaw.has_interaction_summaries
+          : false,
+    };
+    return {
+      goal: String(raw.goal || "").trim(),
+      segments,
+      summary,
+      overall_confidence: Number.isFinite(Number(raw.overall_confidence))
+        ? Number(raw.overall_confidence)
+        : 0,
+    };
+  };
+
+  const analyzeIntentGraph = async (goalText: string, options?: { silent?: boolean }) => {
+    const trimmedGoal = goalText.trim();
+    if (!trimmedGoal) {
+      setIntentGraph(null);
+      setIntentGraphGoal("");
+      setIntentGraphError(null);
+      return;
+    }
+    const seq = intentGraphRequestSeqRef.current + 1;
+    intentGraphRequestSeqRef.current = seq;
+    if (!options?.silent) {
+      setIntentGraphLoading(true);
+    }
+    setIntentGraphError(null);
+    try {
+      const contextObj = readContextObject();
+      const interactionSummaries = Array.isArray(contextObj.interaction_summaries)
+        ? contextObj.interaction_summaries
+        : undefined;
+      const response = await fetch(`${apiUrl}/intent/decompose`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          goal: trimmedGoal,
+          interaction_summaries: interactionSummaries
+        }),
+      });
+      const body = (await response.json()) as IntentDecomposeResponse | { detail?: unknown };
+      if (intentGraphRequestSeqRef.current !== seq) {
+        return;
+      }
+      if (!response.ok) {
+        const detail =
+          body && typeof body === "object" && "detail" in body
+            ? String((body as { detail?: unknown }).detail || "")
+            : "";
+        setIntentGraphError(detail || `Intent graph request failed (${response.status}).`);
+        setIntentGraph(null);
+        return;
+      }
+      const nextGraph = normalizeIntentGraph(
+        body && typeof body === "object" ? (body as IntentDecomposeResponse).intent_graph : null
+      );
+      if (!nextGraph) {
+        setIntentGraphError("Intent graph response was empty or invalid.");
+        setIntentGraph(null);
+        return;
+      }
+      setIntentGraph(nextGraph);
+      setIntentGraphGoal(trimmedGoal);
+    } catch (error) {
+      if (intentGraphRequestSeqRef.current !== seq) {
+        return;
+      }
+      setIntentGraphError(
+        error instanceof Error ? error.message : "Intent graph request failed due to network error."
+      );
+      setIntentGraph(null);
+    } finally {
+      if (intentGraphRequestSeqRef.current === seq) {
+        setIntentGraphLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    const trimmedGoal = goal.trim();
+    if (!trimmedGoal) {
+      setIntentGraph(null);
+      setIntentGraphGoal("");
+      setIntentGraphError(null);
+      setIntentGraphLoading(false);
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      analyzeIntentGraph(trimmedGoal, { silent: true });
+    }, 500);
+    return () => window.clearTimeout(handle);
+  }, [goal]);
 
   const recommendCapabilitiesWithLlm = async () => {
     setLlmCapabilityRecommendationLoading(true);
@@ -2581,86 +3111,54 @@ export default function Home() {
     }
   };
 
-  const contextFieldDraftKey = (capabilityId: string, field: string) =>
-    `${capabilityId}::${field}`;
-
-  const getCapabilityInputDraftValue = (
-    capabilityId: string,
-    field: string,
-    schemaType: string
-  ) => {
-    const key = contextFieldDraftKey(capabilityId, field);
-    if (Object.prototype.hasOwnProperty.call(capabilityInputDrafts, key)) {
-      return capabilityInputDrafts[key] || "";
-    }
+  const getCapabilityInputValue = (field: string, schemaType: string) => {
     const context = readContextObject();
     return serializeContextInputForSchemaType(context[field], schemaType);
   };
 
-  const setCapabilityInputDraftValue = (capabilityId: string, field: string, value: string) => {
-    const key = contextFieldDraftKey(capabilityId, field);
-    setCapabilityInputDrafts((prev) => ({ ...prev, [key]: value }));
-  };
-
-  const clearCapabilityInputField = (capabilityId: string, field: string) => {
-    try {
-      const parsed = JSON.parse(contextJson || "{}");
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        setComposeNotice("Context JSON must be an object before clearing fields.");
-        return;
-      }
-      const next = { ...(parsed as Record<string, unknown>) };
-      delete next[field];
-      setContextJson(JSON.stringify(next, null, 2));
-      setComposeNotice(`Cleared Context JSON field '${field}'.`);
-      const key = contextFieldDraftKey(capabilityId, field);
-      setCapabilityInputDrafts((prev) => {
-        const nextDrafts = { ...prev };
-        delete nextDrafts[key];
-        return nextDrafts;
-      });
-    } catch {
-      setComposeNotice("Context JSON is invalid. Fix it before clearing fields.");
-    }
-  };
-
-  const applyCapabilityInputDraft = (
-    capabilityId: string,
+  const applyCapabilityInputValue = (
     field: string,
-    schemaType: string
+    schemaType: string,
+    rawValue: string
   ) => {
-    const rawValue = getCapabilityInputDraftValue(capabilityId, field, schemaType);
     const parsedValue = parseContextInputForSchemaType(rawValue, schemaType);
     if (!parsedValue.ok) {
       setComposeNotice(`Field '${field}': ${parsedValue.error}`);
-      return;
+      return false;
     }
-    try {
-      const parsed = JSON.parse(contextJson || "{}");
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        setComposeNotice("Context JSON must be an object before applying field updates.");
-        return;
-      }
-      const next = { ...(parsed as Record<string, unknown>) };
-      if (parsedValue.clear) {
-        delete next[field];
-      } else {
-        next[field] = parsedValue.value;
-      }
-      setContextJson(JSON.stringify(next, null, 2));
-      const key = contextFieldDraftKey(capabilityId, field);
-      setCapabilityInputDrafts((prev) => {
-        const nextDrafts = { ...prev };
-        delete nextDrafts[key];
-        return nextDrafts;
-      });
+    const parsed = parseContextJsonObject(contextJson);
+    const next = parsed.invalid ? {} : { ...parsed.context };
+    if (parsedValue.clear) {
+      delete next[field];
+    } else {
+      next[field] = parsedValue.value;
+    }
+    setContextJson(JSON.stringify(next, null, 2));
+    if (parsed.invalid) {
+      setComposeNotice(
+        `Context JSON was invalid and replaced while applying field '${field}'.`
+      );
+    } else {
       setComposeNotice(
         parsedValue.clear
           ? `Cleared Context JSON field '${field}'.`
           : `Updated Context JSON field '${field}'.`
       );
-    } catch {
-      setComposeNotice("Context JSON is invalid. Fix it before applying field updates.");
+    }
+    return true;
+  };
+
+  const clearCapabilityInputField = (field: string) => {
+    const parsed = parseContextJsonObject(contextJson);
+    const next = parsed.invalid ? {} : { ...parsed.context };
+    delete next[field];
+    setContextJson(JSON.stringify(next, null, 2));
+    if (parsed.invalid) {
+      setComposeNotice(
+        `Context JSON was invalid and replaced while clearing field '${field}'.`
+      );
+    } else {
+      setComposeNotice(`Cleared Context JSON field '${field}'.`);
     }
   };
 
@@ -2750,6 +3248,22 @@ export default function Home() {
       };
     });
     setChainComposerNotice(`Added ${capabilityId} to visual chain builder.`);
+  };
+
+  const addIntentSuggestedCapabilityToVisualChain = (capabilityId: string) => {
+    const normalizedId = capabilityId.trim();
+    if (!normalizedId) {
+      return;
+    }
+    setVisualChainDraftCapability(normalizedId);
+    if (!capabilityById.has(normalizedId)) {
+      setChainCapabilityQuery(normalizedId);
+      setChainComposerNotice(
+        `Intent suggestion '${normalizedId}' is not in the current capability catalog.`
+      );
+      return;
+    }
+    addCapabilityNodeToVisualChain(normalizedId);
   };
 
   const buildDeriveOutputBindings = (
@@ -3792,6 +4306,9 @@ export default function Home() {
 
   const runChainPreflight = async () => {
     const localErrors: string[] = [];
+    const normalizedGoal = goal.trim();
+    const providedIntentGraph =
+      intentGraph && intentGraphGoal.trim() === normalizedGoal ? intentGraph : undefined;
     if (visualChainNodes.length === 0) {
       localErrors.push("No chain steps configured.");
     }
@@ -3835,6 +4352,11 @@ export default function Home() {
         }
         if (!binding.sourcePath.trim()) {
           localErrors.push(`Step ${node.taskName}: binding for '${field}' has empty source path.`);
+        }
+        if (field === "path" && binding.sourcePath.trim() && !isPathOutputReference(binding.sourcePath)) {
+          localErrors.push(
+            `Step ${node.taskName}: binding for 'path' should reference a path output (for example 'path').`
+          );
         }
         const sourceIndex = visualChainNodes.findIndex((candidate) => candidate.id === binding.sourceNodeId);
         if (sourceIndex < 0) {
@@ -3885,6 +4407,13 @@ export default function Home() {
     }
 
     let serverErrors: Record<string, string> = {};
+    let serverDiagnostics: {
+      severity?: "error" | "warning";
+      code: string;
+      field?: string;
+      message: string;
+      slot_fields?: string[];
+    }[] = [];
     let compiledPlan: PlanCreatePayload | null = null;
     if (localErrors.length === 0) {
       setComposerCompileLoading(true);
@@ -3901,7 +4430,9 @@ export default function Home() {
             })),
             edges: composerDraftEdges
           },
-          job_context: parsedContext
+          job_context: parsedContext,
+          goal: normalizedGoal || undefined,
+          goal_intent_graph: providedIntentGraph
         };
         const compileResponse = await fetch(`${apiUrl}/composer/compile`, {
           method: "POST",
@@ -3936,7 +4467,9 @@ export default function Home() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               plan: compiledPlan,
-              job_context: parsedContext
+              job_context: parsedContext,
+              goal: normalizedGoal || undefined,
+              goal_intent_graph: providedIntentGraph
             })
           });
           const body = (await response.json()) as PlanPreflightResponse | { detail?: unknown };
@@ -3954,6 +4487,9 @@ export default function Home() {
             typeof body.errors === "object"
           ) {
             serverErrors = { ...serverErrors, ...(body.errors as Record<string, string>) };
+            if (Array.isArray((body as PlanPreflightResponse).diagnostics)) {
+              serverDiagnostics = (body as PlanPreflightResponse).diagnostics || [];
+            }
           }
         } else if (Object.keys(serverErrors).length === 0 && localErrors.length === 0) {
           localErrors.push("Compile succeeded but returned no executable plan.");
@@ -3972,6 +4508,7 @@ export default function Home() {
       valid: localErrors.length === 0 && Object.keys(serverErrors).length === 0,
       localErrors,
       serverErrors,
+      serverDiagnostics,
       checkedAt: new Date().toISOString()
     });
 
@@ -4517,6 +5054,20 @@ export default function Home() {
       !composerCompileLoading &&
       composerValidationIssues.filter((issue) => issue.severity === "error").length === 0);
 
+  const unresolvedIntentQuestions = useMemo(() => {
+    if (!intentAssessment?.needs_clarification) {
+      return 0;
+    }
+    const questions = Array.isArray(intentAssessment.questions) ? intentAssessment.questions : [];
+    if (questions.length === 0) {
+      return 0;
+    }
+    return questions.reduce((missing, _question, index) => {
+      const answer = intentClarificationAnswers[index];
+      return answer && answer.trim() ? missing : missing + 1;
+    }, 0);
+  }, [intentAssessment, intentClarificationAnswers]);
+
   const submitDisabledReason = useMemo(() => {
     if (!goal.trim()) {
       return "Goal is required.";
@@ -4533,17 +5084,43 @@ export default function Home() {
     if (!chainValidationReady) {
       return "Run Compile + Preflight and fix all chain issues.";
     }
+    if (intentClarificationLoading) {
+      return "Intent clarification check is running.";
+    }
+    if (intentAssessment?.needs_clarification && unresolvedIntentQuestions > 0) {
+      return `Answer ${unresolvedIntentQuestions} intent clarification question(s).`;
+    }
     return null;
   }, [
     chainPreflightLoading,
     chainValidationReady,
     composerCompileLoading,
     goal,
+    intentAssessment,
+    intentClarificationLoading,
     missingCapabilityInputs.length,
-    parsedContextForCapabilities
+    parsedContextForCapabilities,
+    unresolvedIntentQuestions
   ]);
 
   const isSubmitDisabled = Boolean(submitDisabledReason);
+
+  useEffect(() => {
+    if (!intentAssessment?.needs_clarification) {
+      setIntentClarificationAnswers([]);
+      return;
+    }
+    const questions = Array.isArray(intentAssessment.questions) ? intentAssessment.questions : [];
+    setIntentClarificationAnswers((prev) => {
+      const next = Array.from({ length: questions.length }, (_unused, index) => prev[index] || "");
+      return next;
+    });
+  }, [intentAssessment]);
+
+  useEffect(() => {
+    setIntentAssessment(null);
+    setIntentClarificationAnswers([]);
+  }, [goal]);
 
   useEffect(() => {
     loadJobs();
@@ -4818,18 +5395,129 @@ export default function Home() {
         return;
       }
     }
+    const normalizeAssessment = (value: unknown): GoalIntentAssessment | null => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return null;
+      }
+      const raw = value as Record<string, unknown>;
+      const intent = typeof raw.intent === "string" ? raw.intent.trim() : "";
+      const source = typeof raw.source === "string" ? raw.source.trim() : "";
+      const confidence =
+        typeof raw.confidence === "number" && Number.isFinite(raw.confidence)
+          ? raw.confidence
+          : 0;
+      const threshold =
+        typeof raw.threshold === "number" && Number.isFinite(raw.threshold)
+          ? raw.threshold
+          : 0.7;
+      const needsClarification = Boolean(raw.needs_clarification);
+      const questions = Array.isArray(raw.questions)
+        ? raw.questions.filter((entry): entry is string => typeof entry === "string")
+        : [];
+      if (!intent) {
+        return null;
+      }
+      return {
+        intent,
+        source,
+        confidence,
+        threshold,
+        needs_clarification: needsClarification,
+        questions
+      };
+    };
+    const normalizedAnswers = intentClarificationAnswers.map((answer) => answer.trim());
+    const areClarificationsAnswered = (assessment: GoalIntentAssessment | null): boolean => {
+      if (!assessment?.needs_clarification) {
+        return true;
+      }
+      if (!Array.isArray(assessment.questions) || assessment.questions.length === 0) {
+        return false;
+      }
+      return assessment.questions.every((_question, index) => Boolean(normalizedAnswers[index]));
+    };
+
     try {
-      const response = await fetch(`${apiUrl}/jobs`, {
+      setIntentClarificationLoading(true);
+      let assessmentForSubmit = intentAssessment;
+      const clarifyResponse = await fetch(`${apiUrl}/intent/clarify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ goal: goal.trim() })
+      });
+      if (clarifyResponse.ok) {
+        const clarifyBody = (await clarifyResponse.json()) as IntentClarifyResponse;
+        const assessed = normalizeAssessment(clarifyBody?.assessment);
+        if (assessed) {
+          assessmentForSubmit = assessed;
+          setIntentAssessment(assessed);
+        }
+      }
+
+      if (assessmentForSubmit?.needs_clarification && !areClarificationsAnswered(assessmentForSubmit)) {
+        setSubmitError(
+          "Goal needs clarification before submit. Answer the questions shown under Compose Job."
+        );
+        return;
+      }
+
+      let submissionGoal = goal.trim();
+      const submissionContext = { ...(parsedContext as Record<string, unknown>) };
+      if (assessmentForSubmit?.needs_clarification && areClarificationsAnswered(assessmentForSubmit)) {
+        const clarificationLines = assessmentForSubmit.questions.map(
+          (question, index) => `- ${question}: ${normalizedAnswers[index]}`
+        );
+        submissionGoal = `${submissionGoal}\n\nIntent Clarifications:\n${clarificationLines.join("\n")}`;
+        submissionContext.intent_clarification = {
+          intent: assessmentForSubmit.intent,
+          confidence: assessmentForSubmit.confidence,
+          threshold: assessmentForSubmit.threshold,
+          questions: assessmentForSubmit.questions,
+          answers: normalizedAnswers,
+          source: assessmentForSubmit.source,
+          captured_at: new Date().toISOString()
+        };
+      }
+
+      const response = await fetch(`${apiUrl}/jobs?require_clarification=true`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          goal,
-          context_json: parsedContext,
+          goal: submissionGoal,
+          context_json: submissionContext,
           priority
         })
       });
       if (!response.ok) {
         const text = await response.text();
+        let parsedBody: unknown = null;
+        try {
+          parsedBody = text ? JSON.parse(text) : null;
+        } catch (_error) {
+          parsedBody = null;
+        }
+        const detail =
+          parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+            ? (parsedBody as { detail?: unknown }).detail
+            : null;
+        if (
+          response.status === 422 &&
+          detail &&
+          typeof detail === "object" &&
+          !Array.isArray(detail) &&
+          (detail as { error?: unknown }).error === "intent_clarification_required"
+        ) {
+          const profile = normalizeAssessment(
+            (detail as { goal_intent_profile?: unknown }).goal_intent_profile
+          );
+          if (profile) {
+            setIntentAssessment(profile);
+          }
+          setSubmitError(
+            "Goal needs clarification before submit. Answer the questions shown under Compose Job."
+          );
+          return;
+        }
         setSubmitError(
           text ? `Failed to submit job (${response.status}): ${text}` : `Failed to submit job (${response.status}).`
         );
@@ -4838,10 +5526,13 @@ export default function Home() {
       setGoal("");
       setContextJson("{}");
       setPriority(0);
-      setCapabilityInputDrafts({});
+      setIntentAssessment(null);
+      setIntentClarificationAnswers([]);
       loadJobs();
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "Network error while submitting job.");
+    } finally {
+      setIntentClarificationLoading(false);
     }
   };
 
@@ -5172,22 +5863,33 @@ const openTemplateModal = (template: Template) => {
 
   const loadJobDetails = async (jobId: string) => {
     setSelectedJobId(jobId);
+    setSelectedJobStatus(null);
+    setSelectedJobPlanError(null);
     setDetailsLoading(true);
     setDetailsError(null);
-    setShowDebugger(true);
+    setJobDetailsIntentGraphCollapsed(true);
+    setShowDebugger(false);
     setDebuggerActionNotice(null);
 
     const detailsResult = await fetchJson(`${apiUrl}/jobs/${jobId}/details`);
     if (detailsResult.ok && detailsResult.data && typeof detailsResult.data === "object") {
-      const payload = detailsResult.data as {
-        plan?: Plan | null;
-        tasks?: Task[];
-        task_results?: Record<string, TaskResult>;
-      };
+      const payload = detailsResult.data as JobDetailsPayload;
+      setSelectedJobStatus(
+        typeof payload.job_status === "string" && payload.job_status.trim()
+          ? payload.job_status.trim()
+          : null
+      );
+      setSelectedJobPlanError(
+        typeof payload.job_error === "string" && payload.job_error.trim()
+          ? payload.job_error.trim()
+          : null
+      );
       setSelectedPlan(payload.plan ?? null);
       setSelectedTasks(Array.isArray(payload.tasks) ? payload.tasks : []);
       setTaskResults(payload.task_results && typeof payload.task_results === "object" ? payload.task_results : {});
     } else {
+      setSelectedJobStatus(null);
+      setSelectedJobPlanError(null);
       setSelectedPlan(null);
       setSelectedTasks([]);
       setTaskResults({});
@@ -5245,6 +5947,108 @@ const openTemplateModal = (template: Template) => {
       }
     }
     setMemoryLoading(false);
+  };
+
+  const searchSemanticMemory = async (
+    queryOverride?: string,
+    options?: { silentWhenEmpty?: boolean }
+  ) => {
+    const query = (queryOverride ?? semanticQuery).trim();
+    if (!query) {
+      if (!options?.silentWhenEmpty) {
+        setSemanticError("Enter a semantic query first.");
+      }
+      return;
+    }
+    setSemanticLoading(true);
+    setSemanticError(null);
+    const searchBody: Record<string, unknown> = {
+      query,
+      limit: 10,
+      include_payload: true,
+    };
+    try {
+      const response = await fetch(`${apiUrl}/memory/semantic/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(searchBody),
+      });
+      if (!response.ok) {
+        setSemanticMatches([]);
+        setSemanticError(`Semantic search failed (${response.status}).`);
+        setSemanticLoading(false);
+        return;
+      }
+      const payload = await response.json();
+      const matches = Array.isArray(payload?.matches)
+        ? (payload.matches as Record<string, unknown>[])
+        : [];
+      setSemanticMatches(matches);
+      setSemanticLoading(false);
+    } catch (error) {
+      setSemanticMatches([]);
+      setSemanticError(
+        `Semantic search failed (${error instanceof Error ? error.message : "network error"}).`
+      );
+      setSemanticLoading(false);
+    }
+  };
+
+  const writeSemanticFact = async () => {
+    if (!selectedJobId) {
+      setSemanticError("Select a job before writing semantic memory.");
+      return;
+    }
+    const fact = semanticFactText.trim();
+    if (!fact) {
+      setSemanticError("Semantic fact is required.");
+      return;
+    }
+    const confidenceValue = Number(semanticFactConfidence);
+    if (!Number.isFinite(confidenceValue) || confidenceValue < 0 || confidenceValue > 1) {
+      setSemanticError("Confidence must be a number between 0 and 1.");
+      return;
+    }
+    const keywords = semanticFactKeywords
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    setSemanticLoading(true);
+    setSemanticError(null);
+    setSemanticNotice(null);
+    const body: Record<string, unknown> = {
+      job_id: selectedJobId,
+      fact,
+      subject: semanticFactSubject.trim() || undefined,
+      namespace: semanticFactNamespace.trim() || undefined,
+      keywords,
+      confidence: confidenceValue,
+      source: "ui_manual",
+    };
+    try {
+      const response = await fetch(`${apiUrl}/memory/semantic/write`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        setSemanticError(`Semantic write failed (${response.status}).`);
+        setSemanticLoading(false);
+        return;
+      }
+    } catch (error) {
+      setSemanticError(
+        `Semantic write failed (${error instanceof Error ? error.message : "network error"}).`
+      );
+      setSemanticLoading(false);
+      return;
+    }
+    setSemanticNotice("Semantic fact stored.");
+    setSemanticFactText("");
+    await searchSemanticMemory(`${semanticFactSubject.trim()} ${fact}`.trim(), {
+      silentWhenEmpty: true,
+    });
+    setSemanticLoading(false);
   };
 
   const loadDlqEntries = async (jobId: string, limit = 25) => {
@@ -5315,6 +6119,8 @@ const openTemplateModal = (template: Template) => {
 
   const closeDetails = () => {
     setSelectedJobId(null);
+    setSelectedJobStatus(null);
+    setSelectedJobPlanError(null);
     setSelectedPlan(null);
     setSelectedTasks([]);
     setTaskResults({});
@@ -5323,10 +6129,20 @@ const openTemplateModal = (template: Template) => {
     setJobDebuggerLoading(false);
     setJobDebuggerError(null);
     setShowDebugger(false);
+    setJobDetailsIntentGraphCollapsed(true);
     setDebuggerActionNotice(null);
     setMemoryEntries({});
     setMemoryError(null);
     setMemoryLoading(false);
+    setSemanticMatches([]);
+    setSemanticError(null);
+    setSemanticNotice(null);
+    setSemanticQuery("");
+    setSemanticFactSubject("");
+    setSemanticFactNamespace("general");
+    setSemanticFactText("");
+    setSemanticFactKeywords("");
+    setSemanticFactConfidence("0.8");
     setDlqEntries([]);
     setDlqError(null);
     setDlqLoading(false);
@@ -7067,6 +7883,9 @@ const openTemplateModal = (template: Template) => {
                 {submitError ? (
                   <div className="mt-3 text-sm text-rose-600">{submitError}</div>
                 ) : null}
+                {intentClarificationLoading ? (
+                  <div className="mt-3 text-xs text-slate-500">Checking goal intent clarity...</div>
+                ) : null}
                 <div className="mt-4 grid gap-4">
                   <div>
                     <label className="text-sm font-medium text-slate-700">Goal</label>
@@ -7077,18 +7896,370 @@ const openTemplateModal = (template: Template) => {
                       placeholder="Generate an implementation checklist"
                     />
                   </div>
-                  <div>
-                    <label className="text-sm font-medium text-slate-700">Context JSON</label>
-                    <textarea
-                      className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                      rows={6}
-                      value={contextJson}
-                      onChange={(event) => setContextJson(event.target.value)}
-                    />
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-sm font-medium text-slate-700">Intent Graph</div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          className="rounded-md border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700"
+                          onClick={() => setIntentGraphCollapsed((previous) => !previous)}
+                        >
+                          {intentGraphCollapsed ? "Expand" : "Collapse"}
+                        </button>
+                        <button
+                          className="rounded-md border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700 disabled:opacity-50"
+                          onClick={() => analyzeIntentGraph(goal)}
+                          disabled={!goal.trim() || intentGraphLoading}
+                        >
+                          {intentGraphLoading ? "Analyzing..." : "Analyze"}
+                        </button>
+                      </div>
+                    </div>
+                    {intentGraphCollapsed ? (
+                      <div className="mt-2 text-[11px] text-slate-500">
+                        Collapsed. Click Expand to view intent segments.
+                      </div>
+                    ) : (
+                      <>
+                        {intentGraphError ? (
+                          <div className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] text-rose-700">
+                            {intentGraphError}
+                          </div>
+                        ) : null}
+                        {!intentGraphError && intentGraphLoading ? (
+                          <div className="mt-2 text-[11px] text-slate-500">Inferring intent graph from goal...</div>
+                        ) : null}
+                        {!intentGraphError && !intentGraphLoading && intentGraph ? (
+                          <div className="mt-2 space-y-2">
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-600">
+                              <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                segments: {intentGraph.summary.segment_count}
+                              </span>
+                              <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                confidence: {intentGraph.overall_confidence.toFixed(2)}
+                              </span>
+                              <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                source goal: {intentGraphGoal === goal.trim() ? "current" : "stale"}
+                              </span>
+                              <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                summaries: {intentGraph.summary.has_interaction_summaries ? "yes" : "no"}
+                              </span>
+                              {intentGraph.summary.fact_candidates > 0 ? (
+                                <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                  fact support: {(intentGraph.summary.fact_support_rate * 100).toFixed(0)}%
+                                </span>
+                              ) : null}
+                              {intentGraph.summary.capability_suggestions_total > 0 ? (
+                                <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                  cap match: {(intentGraph.summary.capability_match_rate * 100).toFixed(0)}%
+                                </span>
+                              ) : null}
+                              <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                cap selected: {intentGraph.summary.capability_suggestions_selected}
+                              </span>
+                              {intentGraph.summary.capability_suggestions_autofilled > 0 ? (
+                                <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700">
+                                  cap autofilled: {intentGraph.summary.capability_suggestions_autofilled}
+                                </span>
+                              ) : null}
+                            </div>
+                            <div className="space-y-2">
+                              {intentGraph.segments.map((segment) => (
+                                <div
+                                  key={`intent-segment-${segment.id}`}
+                                  className="rounded-lg border border-slate-200 bg-white px-2 py-2"
+                                >
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <div className="text-xs font-semibold text-slate-800">
+                                      {segment.id}: {segment.intent}
+                                    </div>
+                                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
+                                      confidence {segment.confidence.toFixed(2)}
+                                    </span>
+                                  </div>
+                                  {segment.objective ? (
+                                    <div className="mt-1 text-[11px] text-slate-600">{segment.objective}</div>
+                                  ) : null}
+                                  <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-slate-500">
+                                    {segment.depends_on.length > 0 ? (
+                                      <span className="rounded-full bg-slate-100 px-2 py-0.5">
+                                        depends_on: {segment.depends_on.join(", ")}
+                                      </span>
+                                    ) : (
+                                      <span className="rounded-full bg-slate-100 px-2 py-0.5">depends_on: none</span>
+                                    )}
+                                    {segment.required_inputs.slice(0, 4).map((entry) => (
+                                      <span
+                                        key={`intent-required-${segment.id}-${entry}`}
+                                        className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800"
+                                      >
+                                        required: {entry}
+                                      </span>
+                                    ))}
+                                  </div>
+                                  {segment.suggested_capabilities.length > 0 ? (
+                                    <div className="mt-2 flex flex-wrap gap-1">
+                                      {segment.suggested_capabilities.map((capabilityId) => {
+                                        const ranking = segment.suggested_capability_rankings?.find(
+                                          (entry) => entry.id === capabilityId
+                                        );
+                                        const title = ranking?.reason
+                                          ? `${ranking.reason} (source: ${ranking.source || "n/a"}, score: ${ranking.score.toFixed(3)})`
+                                          : "Add to chain and auto-connect to previous step";
+                                        return (
+                                        <button
+                                          key={`intent-capability-${segment.id}-${capabilityId}`}
+                                          className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] text-sky-700 hover:bg-sky-100"
+                                          onClick={() =>
+                                            addIntentSuggestedCapabilityToVisualChain(capabilityId)
+                                          }
+                                          title={title}
+                                        >
+                                          {capabilityId}
+                                        </button>
+                                        );
+                                      })}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                        {!intentGraphError && !intentGraphLoading && !intentGraph ? (
+                          <div className="mt-2 text-[11px] text-slate-500">
+                            Enter a goal and click Analyze to view segmented intent flow.
+                          </div>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                  {intentAssessment?.needs_clarification ? (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-amber-900">
+                          Goal needs clarification
+                        </div>
+                        <div className="text-[11px] text-amber-800">
+                          intent={intentAssessment.intent} | confidence=
+                          {intentAssessment.confidence.toFixed(2)} | threshold=
+                          {intentAssessment.threshold.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="mt-2 text-xs text-amber-900">
+                        Answer all questions to continue. Answers are appended to Goal and Context.
+                      </div>
+                      <div className="mt-3 space-y-2">
+                        {intentAssessment.questions.map((question, index) => (
+                          <div
+                            key={`intent-question-${index}`}
+                            className="rounded-lg border border-amber-200 bg-white px-2 py-2"
+                          >
+                            <div className="text-[11px] font-semibold text-slate-700">{question}</div>
+                            <input
+                              className="mt-1 w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-xs shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                              value={intentClarificationAnswers[index] || ""}
+                              onChange={(event) =>
+                                setIntentClarificationAnswers((prev) => {
+                                  const next = [...prev];
+                                  next[index] = event.target.value;
+                                  return next;
+                                })
+                              }
+                              placeholder="Provide clarification"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="text-sm font-medium text-slate-700">Context Builder</label>
+                      <div className="flex items-center gap-2">
+                        <button
+                          className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700"
+                          onClick={() => setShowRawContextPreview((prev) => !prev)}
+                        >
+                          {showRawContextPreview ? "Hide Raw" : "Show Raw"}
+                        </button>
+                        <button
+                          className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700"
+                          onClick={resetContextBuilderFieldEditor}
+                        >
+                          New Field
+                        </button>
+                      </div>
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      Use form fields instead of editing JSON directly.
+                    </div>
+                    {contextBuilderSnapshot.invalid ? (
+                      <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-800">
+                        Existing context was invalid JSON. Saving any field will replace it with a valid object.
+                      </div>
+                    ) : null}
+
+                    <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
+                      {CONTEXT_BUILDER_CORE_FIELDS.map((field) => {
+                        const currentValue = serializeContextInputForSchemaType(
+                          contextBuilderObject[field.key],
+                          field.schemaType
+                        );
+                        const inputType = field.inputType || "text";
+                        return (
+                          <div key={`context-core-${field.key}`} className="space-y-1">
+                            <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">
+                              {field.label}
+                            </div>
+                            {field.multiline ? (
+                              <textarea
+                                className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                rows={3}
+                                placeholder={field.placeholder}
+                                value={currentValue}
+                                onChange={(event) =>
+                                  updateContextBuilderField(
+                                    field.key,
+                                    event.target.value,
+                                    field.schemaType
+                                  )
+                                }
+                              />
+                            ) : (
+                              <input
+                                className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                type={inputType}
+                                placeholder={field.placeholder}
+                                value={currentValue}
+                                onChange={(event) =>
+                                  updateContextBuilderField(
+                                    field.key,
+                                    event.target.value,
+                                    field.schemaType
+                                  )
+                                }
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="mt-4 border-t border-slate-200 pt-3">
+                      <div className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">
+                        Additional Fields
+                      </div>
+                      {contextBuilderExtraFields.length === 0 ? (
+                        <div className="mt-2 text-xs text-slate-500">
+                          No additional fields yet.
+                        </div>
+                      ) : (
+                        <div className="mt-2 space-y-1">
+                          {contextBuilderExtraFields.map((entry) => (
+                            <div
+                              key={`context-extra-${entry.key}`}
+                              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-2 py-1"
+                            >
+                              <div className="min-w-0">
+                                <span className="text-xs font-semibold text-slate-700">
+                                  {entry.key}
+                                </span>
+                                <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
+                                  {entry.schemaType}
+                                </span>
+                                <div className="truncate text-[11px] text-slate-500">
+                                  {entry.valuePreview}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  className="rounded-md border border-slate-300 px-2 py-0.5 text-[11px] text-slate-700"
+                                  onClick={() => editContextBuilderField(entry.key)}
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  className="rounded-md border border-rose-300 px-2 py-0.5 text-[11px] text-rose-700"
+                                  onClick={() => removeContextBuilderField(entry.key)}
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-[1.5fr_0.8fr]">
+                        <input
+                          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                          placeholder="field_name"
+                          value={contextBuilderFieldEditor.key}
+                          onChange={(event) =>
+                            setContextBuilderFieldEditor((prev) => ({
+                              ...prev,
+                              key: event.target.value,
+                            }))
+                          }
+                        />
+                        <select
+                          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                          value={contextBuilderFieldEditor.schemaType}
+                          onChange={(event) =>
+                            setContextBuilderFieldEditor((prev) => ({
+                              ...prev,
+                              schemaType:
+                                event.target.value as ContextBuilderFieldEditor["schemaType"],
+                            }))
+                          }
+                        >
+                          <option value="string">string</option>
+                          <option value="number">number</option>
+                          <option value="boolean">boolean</option>
+                          <option value="object">object</option>
+                          <option value="array">array</option>
+                        </select>
+                      </div>
+                      <textarea
+                        className="mt-2 w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                        rows={2}
+                        placeholder="value"
+                        value={contextBuilderFieldEditor.value}
+                        onChange={(event) =>
+                          setContextBuilderFieldEditor((prev) => ({
+                            ...prev,
+                            value: event.target.value,
+                          }))
+                        }
+                      />
+                      <div className="mt-2 flex items-center gap-2">
+                        <button
+                          className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700"
+                          onClick={applyContextBuilderFieldEditor}
+                        >
+                          Save Field
+                        </button>
+                        <button
+                          className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700"
+                          onClick={resetContextBuilderFieldEditor}
+                        >
+                          Clear Editor
+                        </button>
+                      </div>
+                    </div>
+
+                    {showRawContextPreview ? (
+                      <pre className="mt-3 max-h-44 overflow-auto rounded-lg border border-slate-200 bg-white px-2 py-2 text-[11px] text-slate-600">
+                        {contextJson}
+                      </pre>
+                    ) : null}
                   </div>
                   <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
                     <div className="flex items-center justify-between gap-2">
-                      <div className="text-sm font-medium text-slate-700">Capability Inputs</div>
+                      <div className="text-sm font-medium text-slate-700">
+                        Capability Context Forms
+                      </div>
                       <div className="flex items-center gap-2">
                         <button
                           className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700"
@@ -7104,6 +8275,19 @@ const openTemplateModal = (template: Template) => {
                     {composeNotice ? (
                       <div className="mt-2 text-[11px] text-slate-600">{composeNotice}</div>
                     ) : null}
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <label className="inline-flex items-center gap-2 text-[11px] text-slate-600">
+                        <input
+                          type="checkbox"
+                          className="h-3 w-3"
+                          checked={capabilityFormsShowOptional}
+                          onChange={(event) =>
+                            setCapabilityFormsShowOptional(event.target.checked)
+                          }
+                        />
+                        Show optional fields
+                      </label>
+                    </div>
                     {requiredContextCapabilities.length === 0 ? (
                       <div className="mt-2 text-xs text-slate-500">
                         Mention a capability id in Goal (for example: <code>github.repo.list</code>)
@@ -7114,19 +8298,25 @@ const openTemplateModal = (template: Template) => {
                         {requiredContextCapabilities.map((item) => {
                           const required = getCapabilityRequiredInputs(item);
                           const schemaProperties = capabilityInputSchemaProperties(item);
+                          const editableFields = capabilityFormsShowOptional
+                            ? Array.from(
+                                new Set([...required, ...Object.keys(schemaProperties)])
+                              ).sort((a, b) => a.localeCompare(b))
+                            : required;
                           return (
                             <div key={item.id} className="rounded-lg border border-slate-200 bg-white px-3 py-2">
                               <div className="text-xs font-semibold text-slate-800">{item.id}</div>
                               <div className="mt-1 text-xs text-slate-600">{item.description}</div>
-                              {required.length > 0 ? (
+                              {editableFields.length > 0 ? (
                                 <div className="mt-2 space-y-2">
                                   <div className="flex flex-wrap gap-2">
-                                    {required.map((field) => {
+                                    {editableFields.map((field) => {
                                       const isMissing = missingCapabilityInputs.some(
                                         (entry) => entry.capabilityId === item.id && entry.field === field
                                       );
                                       const property = schemaProperties[field];
                                       const schemaType = schemaPropertyTypeLabel(property);
+                                      const isRequiredField = required.includes(field);
                                       return (
                                         <span
                                           key={`${item.id}-${field}`}
@@ -7138,26 +8328,26 @@ const openTemplateModal = (template: Template) => {
                                         >
                                           {field}
                                           <span className="ml-1 opacity-80">({schemaType})</span>
+                                          <span className="ml-1 opacity-80">
+                                            {isRequiredField ? "[required]" : "[optional]"}
+                                          </span>
                                         </span>
                                       );
                                     })}
                                   </div>
                                   <div className="space-y-2">
-                                    {required.map((field) => {
+                                    {editableFields.map((field) => {
                                       const property = schemaProperties[field];
                                       const schemaType = schemaPropertyTypeLabel(property);
                                       const isMissing = missingCapabilityInputs.some(
                                         (entry) => entry.capabilityId === item.id && entry.field === field
                                       );
+                                      const isRequiredField = required.includes(field);
                                       const description =
                                         property && typeof property.description === "string"
                                           ? property.description
                                           : "";
-                                      const draftValue = getCapabilityInputDraftValue(
-                                        item.id,
-                                        field,
-                                        schemaType
-                                      );
+                                      const currentValue = getCapabilityInputValue(field, schemaType);
                                       const normalizedType = schemaType.toLowerCase();
                                       const isStructured =
                                         normalizedType.includes("object") ||
@@ -7171,6 +8361,9 @@ const openTemplateModal = (template: Template) => {
                                           <div className="flex items-center justify-between gap-2">
                                             <div className="text-[11px] font-semibold text-slate-700">
                                               {field}
+                                              <span className="ml-1 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+                                                {isRequiredField ? "required" : "optional"}
+                                              </span>
                                             </div>
                                             <span
                                               className={`rounded-full px-2 py-0.5 text-[10px] ${
@@ -7191,11 +8384,11 @@ const openTemplateModal = (template: Template) => {
                                             {isBoolean ? (
                                               <select
                                                 className="w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-900"
-                                                value={draftValue}
+                                                value={currentValue}
                                                 onChange={(event) =>
-                                                  setCapabilityInputDraftValue(
-                                                    item.id,
+                                                  applyCapabilityInputValue(
                                                     field,
+                                                    schemaType,
                                                     event.target.value
                                                   )
                                                 }
@@ -7206,13 +8399,14 @@ const openTemplateModal = (template: Template) => {
                                               </select>
                                             ) : isStructured ? (
                                               <textarea
+                                                key={`${item.id}-${field}-structured-${currentValue}`}
                                                 className="w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-900"
                                                 rows={3}
-                                                value={draftValue}
-                                                onChange={(event) =>
-                                                  setCapabilityInputDraftValue(
-                                                    item.id,
+                                                defaultValue={currentValue}
+                                                onBlur={(event) =>
+                                                  applyCapabilityInputValue(
                                                     field,
+                                                    schemaType,
                                                     event.target.value
                                                   )
                                                 }
@@ -7222,12 +8416,13 @@ const openTemplateModal = (template: Template) => {
                                               />
                                             ) : (
                                               <input
+                                                key={`${item.id}-${field}-scalar-${currentValue}`}
                                                 className="w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-900"
-                                                value={draftValue}
-                                                onChange={(event) =>
-                                                  setCapabilityInputDraftValue(
-                                                    item.id,
+                                                defaultValue={currentValue}
+                                                onBlur={(event) =>
+                                                  applyCapabilityInputValue(
                                                     field,
+                                                    schemaType,
                                                     event.target.value
                                                   )
                                                 }
@@ -7237,21 +8432,7 @@ const openTemplateModal = (template: Template) => {
                                             <div className="flex flex-wrap gap-2">
                                               <button
                                                 className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700"
-                                                onClick={() =>
-                                                  applyCapabilityInputDraft(
-                                                    item.id,
-                                                    field,
-                                                    schemaType
-                                                  )
-                                                }
-                                              >
-                                                Apply to Context
-                                              </button>
-                                              <button
-                                                className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700"
-                                                onClick={() =>
-                                                  clearCapabilityInputField(item.id, field)
-                                                }
+                                                onClick={() => clearCapabilityInputField(field)}
                                               >
                                                 Clear
                                               </button>
@@ -7268,7 +8449,9 @@ const openTemplateModal = (template: Template) => {
                                   ) : null}
                                 </div>
                               ) : (
-                                <div className="mt-2 text-[11px] text-slate-500">No required inputs.</div>
+                                <div className="mt-2 text-[11px] text-slate-500">
+                                  No schema fields found for this capability.
+                                </div>
                               )}
                             </div>
                           );
@@ -7296,7 +8479,7 @@ const openTemplateModal = (template: Template) => {
                   <button
                     className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-md transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={submitJob}
-                    disabled={isSubmitDisabled}
+                    disabled={isSubmitDisabled || intentClarificationLoading}
                     title={submitDisabledReason || ""}
                   >
                     Submit Job
@@ -7474,11 +8657,16 @@ const openTemplateModal = (template: Template) => {
             <div className="rounded-xl border border-slate-100 bg-slate-50 p-4 text-sm text-slate-700">
               <div className="font-medium">Job ID</div>
               <div className="break-all text-xs text-slate-500">{selectedJobId}</div>
+              <div className="mt-2 text-xs text-slate-600">
+                Status: {selectedJobStatus || selectedJob?.status || "unknown"}
+              </div>
               <div className="mt-3 font-medium">Plan</div>
               {selectedPlan ? (
                 <div className="text-xs text-slate-600">
                   {selectedPlan.tasks_summary || "Plan available."}
                 </div>
+              ) : selectedJobPlanError ? (
+                <div className="text-xs text-rose-600">Plan failed: {selectedJobPlanError}</div>
               ) : selectedJob?.status === "failed" &&
                 typeof selectedJob.metadata?.plan_error === "string" ? (
                 <div className="text-xs text-rose-600">
@@ -7486,6 +8674,110 @@ const openTemplateModal = (template: Template) => {
                 </div>
               ) : (
                 <div className="text-xs text-slate-600">Plan not created yet.</div>
+              )}
+              <div className="mt-3 flex items-center justify-between gap-2">
+                <div className="font-medium">Intent Graph</div>
+                <button
+                  className="rounded-md border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700"
+                  onClick={() =>
+                    setJobDetailsIntentGraphCollapsed((previous) => !previous)
+                  }
+                >
+                  {jobDetailsIntentGraphCollapsed ? "Expand" : "Collapse"}
+                </button>
+              </div>
+              {jobDetailsIntentGraphCollapsed ? (
+                <div className="text-xs text-slate-600">
+                  Collapsed. Click Expand to view this job's intent graph.
+                </div>
+              ) : selectedJob &&
+                selectedJob.metadata &&
+                typeof selectedJob.metadata === "object" &&
+                !Array.isArray(selectedJob.metadata) &&
+                selectedJob.metadata.goal_intent_graph &&
+                typeof selectedJob.metadata.goal_intent_graph === "object" &&
+                !Array.isArray(selectedJob.metadata.goal_intent_graph) ? (
+                <div className="mt-2 space-y-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
+                  {(() => {
+                    const rawGraph = selectedJob.metadata?.goal_intent_graph as Record<string, unknown>;
+                    const segments = Array.isArray(rawGraph.segments)
+                      ? rawGraph.segments.filter(
+                          (entry) => entry && typeof entry === "object" && !Array.isArray(entry)
+                        )
+                      : [];
+                    const summaryRaw =
+                      rawGraph.summary && typeof rawGraph.summary === "object" && !Array.isArray(rawGraph.summary)
+                        ? (rawGraph.summary as Record<string, unknown>)
+                        : {};
+                    const overallConfidence = Number(rawGraph.overall_confidence);
+                    const capabilityMatchRate = Number(summaryRaw.capability_match_rate);
+                    const capabilitySuggestionsSelected = Number(summaryRaw.capability_suggestions_selected);
+                    const capabilitySuggestionsAutofilled = Number(summaryRaw.capability_suggestions_autofilled);
+                    return (
+                      <>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] text-slate-600">
+                            segments: {segments.length}
+                          </span>
+                          <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] text-slate-600">
+                            confidence:{" "}
+                            {Number.isFinite(overallConfidence) ? overallConfidence.toFixed(2) : "n/a"}
+                          </span>
+                          {Number.isFinite(capabilityMatchRate) ? (
+                            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] text-slate-600">
+                              cap match: {(capabilityMatchRate * 100).toFixed(0)}%
+                            </span>
+                          ) : null}
+                          {Number.isFinite(capabilitySuggestionsSelected) ? (
+                            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] text-slate-600">
+                              cap selected: {Math.max(0, Math.trunc(capabilitySuggestionsSelected))}
+                            </span>
+                          ) : null}
+                          {Number.isFinite(capabilitySuggestionsAutofilled) &&
+                          capabilitySuggestionsAutofilled > 0 ? (
+                            <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] text-amber-700">
+                              cap autofilled: {Math.max(0, Math.trunc(capabilitySuggestionsAutofilled))}
+                            </span>
+                          ) : null}
+                        </div>
+                        {segments.length === 0 ? (
+                          <div>No segments available.</div>
+                        ) : (
+                          <ul className="space-y-1">
+                            {segments.map((entry, index) => {
+                              const segment = entry as Record<string, unknown>;
+                              const segId = String(segment.id || `s${index + 1}`);
+                              const intent = String(segment.intent || "unknown");
+                              const objective = String(segment.objective || "").trim();
+                              const suggested = Array.isArray(segment.suggested_capabilities)
+                                ? segment.suggested_capabilities
+                                    .map((item) => String(item || "").trim())
+                                    .filter(Boolean)
+                                : [];
+                              return (
+                                <li key={`job-intent-segment-${segId}`} className="rounded border border-slate-200 px-2 py-1">
+                                  <div className="font-semibold text-slate-700">
+                                    {segId}: {intent}
+                                  </div>
+                                  {objective ? <div className="text-slate-600">{objective}</div> : null}
+                                  {suggested.length > 0 ? (
+                                    <div className="mt-1 text-[11px] text-slate-500">
+                                      suggested: {suggested.join(", ")}
+                                    </div>
+                                  ) : null}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <div className="text-xs text-slate-600">
+                  No intent graph stored for this job.
+                </div>
               )}
               <div className="mt-3 font-medium">Downloads</div>
               {jobDownloadPaths.length > 0 ? (
@@ -8146,6 +9438,98 @@ const openTemplateModal = (template: Template) => {
                   <div className="mt-3 text-xs text-rose-600">{memoryError}</div>
                 ) : showMemory ? (
                   <div className="mt-4 space-y-3">
+                    <div className="rounded-xl border border-slate-100 bg-slate-50 p-3">
+                      <div className="text-sm font-semibold text-slate-900">Semantic Memory</div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        Distilled facts for lookup and reasoning.
+                      </div>
+                      <div className="mt-3 grid gap-2 md:grid-cols-2">
+                        <input
+                          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700"
+                          placeholder="Subject (e.g., memory architecture)"
+                          value={semanticFactSubject}
+                          onChange={(event) => setSemanticFactSubject(event.target.value)}
+                        />
+                        <input
+                          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700"
+                          placeholder="Namespace (default: general)"
+                          value={semanticFactNamespace}
+                          onChange={(event) => setSemanticFactNamespace(event.target.value)}
+                        />
+                        <input
+                          className="md:col-span-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700"
+                          placeholder="Fact to store"
+                          value={semanticFactText}
+                          onChange={(event) => setSemanticFactText(event.target.value)}
+                        />
+                        <input
+                          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700"
+                          placeholder="Keywords (comma separated)"
+                          value={semanticFactKeywords}
+                          onChange={(event) => setSemanticFactKeywords(event.target.value)}
+                        />
+                        <input
+                          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700"
+                          placeholder="Confidence (0-1)"
+                          value={semanticFactConfidence}
+                          onChange={(event) => setSemanticFactConfidence(event.target.value)}
+                        />
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <button
+                          className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-600"
+                          onClick={writeSemanticFact}
+                          disabled={semanticLoading}
+                        >
+                          Store fact
+                        </button>
+                        <input
+                          className="min-w-[220px] flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700"
+                          placeholder="Search semantic memory"
+                          value={semanticQuery}
+                          onChange={(event) => setSemanticQuery(event.target.value)}
+                        />
+                        <button
+                          className="rounded-full border border-slate-200 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-600"
+                          onClick={() => searchSemanticMemory()}
+                          disabled={semanticLoading}
+                        >
+                          Search
+                        </button>
+                      </div>
+                      {semanticError ? (
+                        <div className="mt-2 text-xs text-rose-600">{semanticError}</div>
+                      ) : null}
+                      {semanticNotice ? (
+                        <div className="mt-2 text-xs text-emerald-700">{semanticNotice}</div>
+                      ) : null}
+                      {semanticMatches.length > 0 ? (
+                        <div className="mt-3 space-y-2">
+                          {semanticMatches.map((match, index) => (
+                            <div
+                              key={`semantic-match-${index}`}
+                              className="rounded-lg border border-slate-200 bg-white px-3 py-2"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="text-xs font-semibold text-slate-800">
+                                  {String(match.subject || "subject")}
+                                </div>
+                                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
+                                  score {Number(match.score || 0).toFixed(2)}
+                                </span>
+                              </div>
+                              <div className="mt-1 text-xs text-slate-700">
+                                {String(match.fact || "")}
+                              </div>
+                              <div className="mt-1 text-[10px] text-slate-500">
+                                namespace: {String(match.namespace || "general")} | key:{" "}
+                                {String(match.key || "—")}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
                     {["job_context", "task_outputs"].map((name) => {
                       const entries = memoryEntries[name] || [];
                       const filteredEntries = filterMemoryEntries(entries);

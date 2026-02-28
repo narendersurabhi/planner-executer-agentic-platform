@@ -366,7 +366,37 @@ def _walk_path(root: Any, segments: list[Any]) -> Any:
     for segment in segments:
         if isinstance(current, dict):
             if segment not in current:
-                raise ToolInputReferenceError(f"missing key '{segment}'")
+                # Backward compatibility:
+                # Some plans reference
+                # "...document_spec_validate.validation_report"
+                # even though document_spec_validate already returns
+                # the report object directly.
+                if segment == "validation_report" and _is_validation_report_dict(current):
+                    continue
+                # Some plans/reference templates use output_path while
+                # path-derivation tools emit {"path": "..."}.
+                if segment == "output_path" and "path" in current:
+                    segment = "path"
+                elif segment == "path" and "output_path" in current:
+                    segment = "output_path"
+                # Some plans point directly to task output, e.g.
+                # "dependencies_by_name.TaskName.path", while runtime context stores
+                # "dependencies_by_name.TaskName.<tool_name>.path".
+                elif segment in {"path", "output_path"}:
+                    nested = [
+                        value
+                        for value in current.values()
+                        if isinstance(value, dict)
+                        and (segment in value or (segment == "path" and "output_path" in value))
+                    ]
+                    if len(nested) == 1:
+                        current = nested[0]
+                        if segment == "path" and "path" not in current and "output_path" in current:
+                            segment = "output_path"
+                    else:
+                        raise ToolInputReferenceError(f"missing key '{segment}'")
+                else:
+                    raise ToolInputReferenceError(f"missing key '{segment}'")
             current = current[segment]
             continue
         if isinstance(current, list):
@@ -384,6 +414,16 @@ def _walk_path(root: Any, segments: list[Any]) -> Any:
             f"cannot traverse segment '{segment}' on non-container value"
         )
     return current
+
+
+def _is_validation_report_dict(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        isinstance(value.get("valid"), bool)
+        and isinstance(value.get("errors"), list)
+        and isinstance(value.get("warnings"), list)
+    )
 
 
 def _extract_json_from_context(context: dict) -> dict | None:

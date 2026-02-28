@@ -13,6 +13,16 @@ GenerateDocumentSpecFn = Callable[[dict[str, Any], LLMProvider], dict[str, Any]]
 ImproveDocumentSpecFn = Callable[[dict[str, Any], LLMProvider], dict[str, Any]]
 SanitizeDocumentSpecFn = Callable[[dict[str, Any]], dict[str, Any]]
 
+_DEFAULT_ALLOWED_BLOCK_TYPES = [
+    "text",
+    "paragraph",
+    "heading",
+    "bullets",
+    "spacer",
+    "optional_paragraph",
+    "repeat",
+]
+
 
 def register_document_spec_iterative_tools(
     registry,
@@ -29,7 +39,7 @@ def register_document_spec_iterative_tools(
                 name="llm_iterative_improve_document_spec",
                 description="Iteratively generate/improve a DocumentSpec until it validates",
                 usage_guidance=(
-                    "Provide job (to generate) or document_spec (to improve), plus allowed_block_types. "
+                    "Provide job (to generate) or document_spec (to improve), plus optional allowed_block_types. "
                     "The tool validates with document_spec_validate and calls the LLM to fix errors "
                     "until valid or max_iterations is reached."
                 ),
@@ -44,7 +54,6 @@ def register_document_spec_iterative_tools(
                         "max_iterations": {"type": "integer", "minimum": 1, "maximum": 10},
                         "ats_mode": {"type": "boolean"},
                     },
-                    "required": ["allowed_block_types"],
                     "anyOf": [{"required": ["job"]}, {"required": ["document_spec"]}],
                 },
                 output_schema={
@@ -103,7 +112,7 @@ def register_document_spec_iterative_tools(
                 name="llm_iterative_improve_runbook_spec",
                 description="Generate and iteratively improve a runbook DocumentSpec",
                 usage_guidance=(
-                    "Provide job and allowed_block_types. The tool generates a runbook as a DocumentSpec, "
+                    "Provide job and optional allowed_block_types. The tool generates a runbook as a DocumentSpec, "
                     "validates it, and iteratively improves until valid or max_iterations is reached."
                 ),
                 input_schema={
@@ -117,7 +126,7 @@ def register_document_spec_iterative_tools(
                         "max_iterations": {"type": "integer", "minimum": 1, "maximum": 10},
                         "ats_mode": {"type": "boolean"},
                     },
-                    "required": ["job", "allowed_block_types"],
+                    "required": ["job"],
                 },
                 output_schema={
                     "type": "object",
@@ -178,14 +187,12 @@ def llm_iterative_improve_document_spec(
 ) -> dict[str, Any]:
     job = payload.get("job")
     document_spec = payload.get("document_spec")
-    allowed = payload.get("allowed_block_types")
+    allowed = _resolve_allowed_block_types(payload.get("allowed_block_types"))
     render_context = payload.get("render_context", {})
     strict = payload.get("strict", True)
     max_iterations = payload.get("max_iterations", 3)
     ats_mode = payload.get("ats_mode", False)
 
-    if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
-        raise ToolExecutionError("allowed_block_types must be an array of strings")
     if render_context is None:
         render_context = {}
     if not isinstance(render_context, dict):
@@ -264,7 +271,7 @@ def llm_iterative_improve_runbook_spec(
 ) -> dict[str, Any]:
     job = payload.get("job")
     document_spec = payload.get("document_spec")
-    allowed = payload.get("allowed_block_types")
+    allowed = _resolve_allowed_block_types(payload.get("allowed_block_types"))
     render_context = payload.get("render_context", {})
     strict = payload.get("strict", True)
     max_iterations = payload.get("max_iterations", 3)
@@ -272,8 +279,6 @@ def llm_iterative_improve_runbook_spec(
 
     if not isinstance(job, dict):
         raise ToolExecutionError("job must be an object")
-    if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
-        raise ToolExecutionError("allowed_block_types must be an array of strings")
     if render_context is None:
         render_context = {}
     if not isinstance(render_context, dict):
@@ -354,11 +359,9 @@ def _llm_generate_runbook_document_spec(
     sanitize_document_spec: SanitizeDocumentSpecFn,
 ) -> dict[str, Any]:
     job = payload.get("job")
-    allowed = payload.get("allowed_block_types")
+    allowed = _resolve_allowed_block_types(payload.get("allowed_block_types"))
     if not isinstance(job, dict):
         raise ToolExecutionError("job must be an object")
-    if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
-        raise ToolExecutionError("allowed_block_types must be an array of strings")
     prompt = prompts.runbook_document_spec_prompt(job, allowed)
     response = provider.generate(prompt)
     json_text = _extract_json(response.content)
@@ -450,3 +453,14 @@ def _extract_json(text: str) -> str:
     if start == -1 or end == -1 or end <= start:
         return ""
     return content[start : end + 1]
+
+
+def _resolve_allowed_block_types(raw: Any) -> list[str]:
+    if raw is None:
+        return list(_DEFAULT_ALLOWED_BLOCK_TYPES)
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ToolExecutionError("allowed_block_types must be an array of strings")
+    normalized = [item.strip() for item in raw if item.strip()]
+    if not normalized:
+        raise ToolExecutionError("allowed_block_types must contain at least one value")
+    return normalized

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SemanticMemorySearchCapabilityInput",
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "minLength": 1},
+    "namespace": {"type": "string"},
+    "subject": {"type": "string"},
+    "key": {"type": "string"},
+    "user_id": {"type": "string"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+    "min_score": {"type": "number", "minimum": 0},
+    "include_payload": {"type": "boolean"}
+  },
+  "required": ["query"],
+  "additionalProperties": true
+}

@@ -1,0 +1,148 @@
+version: 1
+description: >
+  Small gold set for intent decomposition regression tracking.
+  This set is intentionally diverse across docs, github, memory, openapi, and codegen flows.
+cases:
+  - id: github_repo_pdf_report
+    goal: Fetch GitHub repositories, summarize findings, and render a PDF report.
+    expected_intents: [io, transform, render]
+    expected_capabilities:
+      - github.repo.list
+      - utility.json.transform
+      - document.pdf.generate
+      - document.output.derive
+    expected_capabilities_by_segment:
+      - [github.repo.list]
+      - [utility.json.transform]
+      - [document.pdf.generate, document.output.derive]
+
+  - id: runbook_docx_pipeline
+    goal: Generate an implementation runbook, validate the document spec, then render a DOCX.
+    expected_intents: [generate, validate, render]
+    expected_capabilities:
+      - document.spec.generate
+      - document.spec.validate
+      - document.docx.generate
+      - document.output.derive
+    expected_capabilities_by_segment:
+      - [document.spec.generate, llm.text.generate]
+      - [document.spec.validate]
+      - [document.docx.generate, document.output.derive]
+
+  - id: memory_to_summary
+    goal: Read prior memory notes and generate a concise project summary.
+    expected_intents: [io, generate]
+    expected_capabilities:
+      - memory.read
+      - llm.text.generate
+      - document.spec.generate
+    expected_capabilities_by_segment:
+      - [memory.read]
+      - [llm.text.generate, document.spec.generate]
+
+  - id: workspace_transform_validate
+    goal: Search workspace files, transform the extracted JSON, and validate the output.
+    expected_intents: [io, transform, validate]
+    expected_capabilities:
+      - filesystem.workspace.search_text
+      - utility.json.transform
+      - document.spec.validate
+    expected_capabilities_by_segment:
+      - [filesystem.workspace.search_text]
+      - [utility.json.transform]
+      - [document.spec.validate]
+
+  - id: runbook_pdf_pipeline
+    goal: Create a runbook draft and render a PDF artifact.
+    expected_intents: [generate, render]
+    expected_capabilities:
+      - llm.text.generate
+      - document.spec.generate
+      - document.pdf.generate
+      - document.output.derive
+    expected_capabilities_by_segment:
+      - [llm.text.generate, document.spec.generate]
+      - [document.pdf.generate, document.output.derive]
+
+  - id: github_branches_release_notes
+    goal: List GitHub branches and generate release notes.
+    expected_intents: [io, generate]
+    expected_capabilities:
+      - github.branch.list
+      - llm.text.generate
+      - document.spec.generate
+    expected_capabilities_by_segment:
+      - [github.branch.list, github.repo.list]
+      - [llm.text.generate, document.spec.generate]
+
+  - id: validate_repair_render_pdf
+    goal: Validate the document schema, repair invalid fields, and render PDF.
+    expected_intents: [validate, transform, render]
+    expected_capabilities:
+      - document.spec.validate
+      - document.spec.repair
+      - document.pdf.generate
+      - document.output.derive
+    expected_capabilities_by_segment:
+      - [document.spec.validate]
+      - [document.spec.repair, utility.json.transform]
+      - [document.pdf.generate, document.output.derive]
+
+  - id: semantic_memory_brief
+    goal: Search semantic memory for user preferences and generate a personalization brief.
+    expected_intents: [io, generate]
+    expected_capabilities:
+      - memory.semantic.search
+      - llm.text.generate
+      - document.spec.generate
+    expected_capabilities_by_segment:
+      - [memory.semantic.search, memory.read]
+      - [llm.text.generate, document.spec.generate]
+
+  - id: openapi_generation_iterative
+    goal: Generate an OpenAPI specification for a payment API and iteratively improve it.
+    expected_intents: [generate, transform]
+    expected_capabilities:
+      - openapi.spec.generate_iterative
+      - openapi.spec.improve_iterative
+    expected_capabilities_by_segment:
+      - [openapi.spec.generate_iterative, llm.text.generate]
+      - [openapi.spec.improve_iterative, utility.json.transform]
+
+  - id: codegen_publish_flow
+    goal: Generate code changes, push files to GitHub, and create a pull request.
+    expected_intents: [generate, io, io]
+    expected_capabilities:
+      - codegen.generate
+      - github.files.push
+      - github.pull_request.create
+    expected_capabilities_by_segment:
+      - [codegen.generate]
+      - [github.files.push]
+      - [github.pull_request.create]
+
+  - id: context_docx_pipeline
+    goal: Load source context, compose a document spec, validate it, and render DOCX.
+    expected_intents: [io, generate, validate, render]
+    expected_capabilities:
+      - memory.read
+      - document.spec.generate
+      - document.spec.validate
+      - document.docx.generate
+      - document.output.derive
+    expected_capabilities_by_segment:
+      - [memory.read]
+      - [document.spec.generate, llm.text.generate]
+      - [document.spec.validate]
+      - [document.docx.generate, document.output.derive]
+
+  - id: artifacts_error_summary
+    goal: Search artifact files for errors and produce a summary.
+    expected_intents: [io, generate]
+    expected_capabilities:
+      - filesystem.artifacts.search_text
+      - llm.text.generate
+      - document.spec.generate
+    expected_capabilities_by_segment:
+      - [filesystem.artifacts.search_text]
+      - [llm.text.generate, document.spec.generate]

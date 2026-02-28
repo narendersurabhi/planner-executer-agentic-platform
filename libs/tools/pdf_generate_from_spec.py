@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
+from libs.tools.output_path_derivation import (
+    OutputPathDerivationError,
+    resolve_or_derive_output_path,
+)
 
 
 def _artifacts_dir() -> Path:
@@ -22,7 +26,8 @@ def register_pdf_tools(registry) -> None:
                 name="pdf_generate_from_spec",
                 description="Generate a .pdf document from a DocumentSpec JSON",
                 usage_guidance=(
-                    "Provide path (relative .pdf filename). document_spec is resolved from memory "
+                    "Provide path (relative .pdf filename). If omitted, a safe path is auto-derived "
+                    "from topic/date/output_dir context. document_spec is resolved from memory "
                     "(document_spec:latest) unless explicitly provided. "
                     "render_context is merged into tokens, strict defaults to true. "
                     "Supported blocks: text, paragraph, heading, bullets, spacer, "
@@ -76,10 +81,11 @@ def _pdf_generate_from_spec(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(document_spec, dict):
         _tool_error("document_spec missing (not found in memory). Provide document_spec explicitly.")
 
-    path = payload.get("path")
-    if not isinstance(path, str) or not path:
-        _tool_error("path must be a non-empty string")
-    if not path.endswith(".pdf"):
+    try:
+        path = resolve_or_derive_output_path(payload, extension="pdf")
+    except OutputPathDerivationError as exc:
+        _tool_error(str(exc))
+    if not path.lower().endswith(".pdf"):
         _tool_error("path must end with .pdf")
     if Path(path).is_absolute():
         _tool_error("path must be relative to /shared/artifacts")
@@ -430,4 +436,3 @@ def _tool_error(message: str) -> None:
     from libs.core.tool_registry import ToolExecutionError
 
     raise ToolExecutionError(message)
-

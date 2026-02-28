@@ -619,8 +619,48 @@ capabilities:
         tool_name: memory_write
         arg_map: {}
         enabled: true
+  - id: memory.semantic.write
+    description: Persist distilled semantic facts (user/domain/environment knowledge) for later lookup and reasoning.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: memory
+    subgroup: semantic
+    input_schema_ref: memory_semantic_write_capability_input
+    output_schema_ref: ""
+    tags:
+      - memory
+      - semantic
+      - knowledge
+      - write
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: memory_semantic_write
+        arg_map: {}
+        enabled: true
+  - id: memory.semantic.search
+    description: Retrieve ranked semantic facts by natural-language query for grounding and reasoning.
+    risk_tier: read_only
+    idempotency: read
+    group: memory
+    subgroup: semantic
+    input_schema_ref: memory_semantic_search_capability_input
+    output_schema_ref: ""
+    tags:
+      - memory
+      - semantic
+      - knowledge
+      - search
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: memory_semantic_search
+        arg_map: {}
+        enabled: true
   - id: document.output.derive
-    description: Derive a generic safe relative output path for generated document artifacts (set output_extension for pdf/md/etc.).
+    description: Derive a generic safe relative output path for generated document artifacts (preferred for non-resume document flows; set output_extension for pdf/md/etc.).
     risk_tier: read_only
     idempotency: read
     group: documents
@@ -898,6 +938,26 @@ capabilities:
       - type: tool
         server_id: local_worker
         tool_name: llm_generate
+        arg_map: {}
+        enabled: true
+  - id: llm.resume.tailor
+    description: Tailor resume content against a target job and return structured `tailored_resume` JSON.
+    risk_tier: bounded_write
+    idempotency: read
+    group: llm
+    subgroup: resume
+    input_schema_ref: llm_resume_tailor_capability_input
+    output_schema_ref: ""
+    tags:
+      - llm
+      - resume
+      - tailoring
+      - generation
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_tailor_resume_text
         arg_map: {}
         enabled: true
   - id: codegen.generate

@@ -130,3 +130,38 @@ Refactor `page.tsx` into composable units:
 - Errors are actionable in one click (focus node/field).
 - Submit is impossible when compile/preflight is stale or invalid.
 - Time to first successful run is reduced vs. current flow.
+
+## Intent Engineering Roadmap (Phased)
+
+### Phase 1: Intent Decomposition Foundation
+- Add `POST /intent/decompose` to return `goal_intent_graph` with ordered segments.
+- Persist `goal_intent_graph` in job metadata at create time.
+- Segment schema:
+  - `id`, `intent`, `objective`, `confidence`, `source`
+  - `depends_on`, `required_inputs`, `suggested_capabilities`
+- Status: implemented.
+
+### Phase 2: Planner Consumption
+- Inject `goal_intent_graph` into planner prompt as an ordering hint.
+- Use graph intent sequence to fill missing task intents deterministically.
+- Keep fallback behavior when metadata graph is absent.
+- Status: implemented.
+
+### Phase 3: Composer/Submit Clarification
+- Add submit-time intent clarification gate based on confidence threshold.
+- Collect clarification answers and append to goal/context on submit.
+- Block submit until required clarification is answered.
+- Status: implemented.
+
+### Phase 4: Runtime Enforcement
+- Enforce capability intent compatibility in worker for capability-backed execution.
+- Fail fast with `contract.intent_mismatch` on graph/intent policy violations.
+- Status: implemented.
+
+### Phase 5: Observability and Rollout
+- Track decomposition and mismatch rates by model/version.
+- Add feature flags for staged rollout:
+  - `INTENT_CLARIFICATION_ON_CREATE`
+  - `INTENT_MIN_CONFIDENCE`
+  - `INTENT_DECOMPOSE_ENABLED`
+- Status: in progress.

@@ -1,6 +1,7 @@
 import json
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -314,6 +315,27 @@ def test_derive_output_path_uses_generic_slug_naming() -> None:
         == "documents/latency_in_distributed_systems_2026_02_25.pdf"
     )
     assert call.output_or_error["output_extension"] == "pdf"
+
+
+def test_derive_output_path_defaults_document_type_when_missing() -> None:
+    registry = default_registry()
+    call = registry.execute(
+        "derive_output_path",
+        {
+            "topic": "Latency in Distributed Systems",
+            "today": "2026-02-25",
+            "output_dir": "documents",
+        },
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    assert (
+        call.output_or_error["path"]
+        == "documents/latency_in_distributed_systems_2026_02_25.docx"
+    )
+    assert call.output_or_error["document_type"] == "document"
+    assert call.output_or_error["output_extension"] == "docx"
 
 
 def test_derive_output_path_rejects_invalid_output_dir() -> None:
@@ -1010,6 +1032,31 @@ def test_llm_iterative_improve_document_spec_stops_when_valid() -> None:
     assert out["validation_report"]["valid"] is True
 
 
+def test_llm_iterative_improve_document_spec_defaults_allowed_block_types() -> None:
+    provider = _SequenceLLMStub(
+        [
+            {
+                "blocks": [
+                    {"type": "heading", "level": 1, "text": "Title"},
+                    {"type": "paragraph", "text": "Hello"},
+                ]
+            }
+        ]
+    )
+    registry = default_registry(llm_enabled=True, llm_provider=provider)
+    call = registry.execute(
+        "llm_iterative_improve_document_spec",
+        {"job": {"goal": "Generate a short doc"}, "max_iterations": 2},
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    out = call.output_or_error
+    assert out["iterations"] == 1
+    assert out["reached_threshold"] is True
+    assert out["validation_report"]["valid"] is True
+
+
 def test_llm_iterative_improve_openapi_spec_stops_when_valid() -> None:
     provider = _SequenceLLMStub(
         [
@@ -1059,14 +1106,6 @@ def test_llm_iterative_improve_runbook_spec_generates_document_spec() -> None:
         "llm_iterative_improve_runbook_spec",
         {
             "job": {"goal": "Create a runbook"},
-            "allowed_block_types": [
-                "heading",
-                "paragraph",
-                "bullets",
-                "text",
-                "optional_paragraph",
-                "repeat",
-            ],
             "max_iterations": 3,
         },
         "id",
@@ -1077,6 +1116,28 @@ def test_llm_iterative_improve_runbook_spec_generates_document_spec() -> None:
     assert out["iterations"] == 1
     assert out["reached_threshold"] is True
     assert out["validation_report"]["valid"] is True
+
+
+def test_docx_generate_from_spec_auto_derives_path_when_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ARTIFACTS_DIR", str(tmp_path))
+    registry = default_registry()
+    call = registry.execute(
+        "docx_generate_from_spec",
+        {
+            "document_spec": {"blocks": [{"type": "paragraph", "text": "Hello"}]},
+            "topic": "Latency in Distributed Systems",
+            "today": "2026-02-25",
+            "output_dir": "documents",
+        },
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    output_path = Path(call.output_or_error["path"])
+    assert output_path.exists()
+    assert output_path.suffix == ".docx"
 
 
 def test_normalize_skills_definition_separators_uses_commas() -> None:

@@ -43,6 +43,7 @@ _ALIGNMENT_FEEDBACK_KEYS = (
     "missing_evidence",
     "recommended_edits",
 )
+_URL_SCHEME_SPACING_RE = re.compile(r"\b(https?):\s+//", flags=re.IGNORECASE)
 
 
 def _parse_optional_float(value: str | None) -> float | None:
@@ -253,6 +254,7 @@ def tailor_resume(job: Dict[str, Any], memory: Any, provider: Any) -> Dict[str, 
                 detail = f"{detail}:{missing_fields}"
             raise TailorError(detail)
 
+    payload = _normalize_url_spacing_in_object(payload)
     _normalize_top_level_sections(payload)
     _enforce_certifications_from_source(payload, job_payload)
     _apply_header_title_fallback(payload, job_payload)
@@ -273,6 +275,20 @@ def tailor_resume(job: Dict[str, Any], memory: Any, provider: Any) -> Dict[str, 
         _apply_header_title_fallback(payload, job_payload)
         ensure_required_resume_sections(payload)
     return payload
+
+
+def _normalize_url_spacing_text(value: str) -> str:
+    return _URL_SCHEME_SPACING_RE.sub(lambda m: f"{m.group(1)}://", value)
+
+
+def _normalize_url_spacing_in_object(value: Any) -> Any:
+    if isinstance(value, str):
+        return _normalize_url_spacing_text(value)
+    if isinstance(value, list):
+        return [_normalize_url_spacing_in_object(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _normalize_url_spacing_in_object(v) for k, v in value.items()}
+    return value
 
 
 def _is_missing_required_fields_error(payload: Dict[str, Any]) -> bool:
@@ -373,7 +389,7 @@ def _parse_certification_entry(cert: Any) -> dict[str, Any] | None:
 
 
 def _parse_certification_line(line: str) -> dict[str, Any] | None:
-    cleaned = re.sub(r"^[*•\-]\s*", "", line).strip()
+    cleaned = _normalize_url_spacing_text(re.sub(r"^[*•\-]\s*", "", line).strip())
     if not cleaned:
         return None
 
@@ -422,7 +438,7 @@ def _extract_cert_url(cert: Dict[str, Any]) -> str:
     for key in ("url", "credential_url", "public_url", "link"):
         value = cert.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return _normalize_url_spacing_text(value.strip())
     return ""
 
 
@@ -818,6 +834,7 @@ def _run_improve_once(
         raise TailorError("alignment_summary must be a non-empty string")
     applied_changes = _normalize_applied_changes(payload.get("applied_changes"))
     _normalize_top_level_sections(improved)
+    improved = _normalize_url_spacing_in_object(improved)
     _enforce_certifications_from_source(improved, job_payload)
     _apply_header_title_fallback(improved, job_payload)
     ensure_required_resume_sections(improved)

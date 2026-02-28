@@ -10,6 +10,16 @@ from libs.framework.tool_runtime import Tool, ToolExecutionError
 
 SanitizeDocumentSpecFn = Callable[[dict[str, Any]], dict[str, Any]]
 
+_DEFAULT_ALLOWED_BLOCK_TYPES = [
+    "text",
+    "paragraph",
+    "heading",
+    "bullets",
+    "spacer",
+    "optional_paragraph",
+    "repeat",
+]
+
 
 def register_document_spec_llm_tools(
     registry,
@@ -61,7 +71,7 @@ def register_document_spec_llm_tools(
                 usage_guidance=(
                     "Provide either a full job object OR explicit fields "
                     "(instruction, topic, audience, tone, today, output_dir), "
-                    "plus allowed_block_types. Returns a document_spec object."
+                    "plus optional allowed_block_types. Returns a document_spec object."
                 ),
                 input_schema={
                     "type": "object",
@@ -75,7 +85,6 @@ def register_document_spec_llm_tools(
                         "output_dir": {"type": "string", "minLength": 1},
                         "allowed_block_types": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["allowed_block_types"],
                     "anyOf": [
                         {"required": ["job"]},
                         {
@@ -197,13 +206,11 @@ def llm_generate_document_spec(
                 explicit_job[key] = value.strip()
         if explicit_job:
             job = explicit_job
-    allowed = payload.get("allowed_block_types")
+    allowed = _resolve_allowed_block_types(payload.get("allowed_block_types"))
     if not isinstance(job, dict):
         raise ToolExecutionError(
             "Provide either job object or explicit fields: instruction, topic, audience, tone, today, output_dir"
         )
-    if not isinstance(allowed, list):
-        raise ToolExecutionError("allowed_block_types must be an array")
     prompt = prompts.document_spec_prompt(job, allowed)
     response = provider.generate(prompt)
     json_text = _extract_json(response.content)
@@ -267,3 +274,14 @@ def _extract_json(text: str) -> str:
     if start == -1 or end == -1 or end <= start:
         return ""
     return content[start : end + 1]
+
+
+def _resolve_allowed_block_types(raw: Any) -> list[str]:
+    if raw is None:
+        return list(_DEFAULT_ALLOWED_BLOCK_TYPES)
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ToolExecutionError("allowed_block_types must be an array of strings")
+    normalized = [item.strip() for item in raw if item.strip()]
+    if not normalized:
+        raise ToolExecutionError("allowed_block_types must contain at least one value")
+    return normalized

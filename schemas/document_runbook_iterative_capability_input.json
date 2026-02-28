@@ -18,6 +18,6 @@
     },
     "ats_mode": {"type": "boolean"}
   },
-  "required": ["job", "allowed_block_types"],
+  "required": ["job"],
   "additionalProperties": true
 }

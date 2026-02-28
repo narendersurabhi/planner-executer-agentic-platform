@@ -1,4 +1,4 @@
-.PHONY: up up-workers down lint format typecheck test schemas \
+.PHONY: up up-workers down lint format typecheck test schemas eval-intent eval-intent-gate \
 	k8s-apply k8s-delete k8s-apply-local k8s-delete-local \
 	k8s-apply-observability k8s-delete-observability \
 	k8s-apply-keda-worker k8s-delete-keda-worker \
@@ -118,3 +118,9 @@ typecheck:
 
 schemas:
 	python -c "from pathlib import Path; from libs.core.schemas import export_schemas; export_schemas(Path('schemas'))"
+
+eval-intent:
+	PYTHONPATH=. python3 scripts/eval_intent_decompose.py --gold eval/intent_gold.yaml --mode heuristic --top-k 3 --verbose
+
+eval-intent-gate:
+	PYTHONPATH=. python3 scripts/eval_intent_decompose.py --gold eval/intent_gold.yaml --mode heuristic --top-k 3 --min-intent-f1 0.80 --min-capability-f1 0.60 --min-segment-hit-rate 0.30

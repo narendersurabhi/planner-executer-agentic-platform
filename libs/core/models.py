@@ -214,6 +214,8 @@ class Task(BaseModel):
     expected_output_schema_ref: str
     status: TaskStatus
     intent: Optional[ToolIntent] = None
+    intent_source: Optional[str] = None
+    intent_confidence: Optional[float] = None
     deps: List[str]
     attempts: int
     max_attempts: int
@@ -230,6 +232,8 @@ class Task(BaseModel):
 
 class JobDetails(BaseModel):
     job_id: str
+    job_status: Optional[JobStatus] = None
+    job_error: Optional[str] = None
     plan: Optional[Plan] = None
     tasks: List[Task] = Field(default_factory=list)
     task_results: Dict[str, Any] = Field(default_factory=dict)

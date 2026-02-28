@@ -735,6 +735,8 @@ def default_registry(
             search_text=_search_text,
             memory_read=_memory_read,
             memory_write=_memory_write,
+            memory_semantic_write=_memory_semantic_write,
+            memory_semantic_search=_memory_semantic_search,
             docx_render=_docx_render,
             sleep=_sleep,
             http_fetch=_http_fetch,
@@ -1219,10 +1221,12 @@ def _derive_output_path(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if not topic:
         raise ToolExecutionError("Missing topic")
-    if not document_type:
-        raise ToolExecutionError("Missing document_type")
 
-    normalized_doc_type = document_type.lower().replace("-", "_")
+    normalized_doc_type = (
+        document_type.lower().replace("-", "_")
+        if isinstance(document_type, str) and document_type
+        else "document"
+    )
     known_format_types = {
         "pdf",
         "docx",
@@ -1674,6 +1678,75 @@ def _memory_write(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(written, dict):
         raise ToolExecutionError("memory_write_failed:empty_response")
     return {"entry": written}
+
+
+def _memory_semantic_write(payload: Dict[str, Any]) -> Dict[str, Any]:
+    fact = payload.get("fact")
+    if not isinstance(fact, str) or not fact.strip():
+        raise ToolExecutionError("fact is required")
+    request: Dict[str, Any] = {"fact": fact.strip()}
+    for field in ("subject", "namespace", "source", "source_ref", "reasoning", "key", "user_id"):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            request[field] = value.strip()
+    for list_field in ("aliases", "keywords"):
+        value = payload.get(list_field)
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ToolExecutionError(f"{list_field} must be an array of strings")
+        request[list_field] = [item.strip() for item in value if item.strip()]
+    confidence = payload.get("confidence")
+    if confidence is not None:
+        if not isinstance(confidence, (int, float)):
+            raise ToolExecutionError("confidence must be a number between 0 and 1")
+        confidence_f = float(confidence)
+        if confidence_f < 0 or confidence_f > 1:
+            raise ToolExecutionError("confidence must be a number between 0 and 1")
+        request["confidence"] = confidence_f
+    metadata = payload.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise ToolExecutionError("metadata must be an object")
+        request["metadata"] = metadata
+    try:
+        written = _memory_client().semantic_write(request)
+    except MemoryClientError as exc:
+        raise ToolExecutionError(f"memory_semantic_write_failed:{exc}") from exc
+    if not isinstance(written, dict):
+        raise ToolExecutionError("memory_semantic_write_failed:empty_response")
+    return written
+
+
+def _memory_semantic_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ToolExecutionError("query is required")
+    request: Dict[str, Any] = {"query": query.strip()}
+    for field in ("namespace", "subject", "key", "user_id"):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            request[field] = value.strip()
+    limit = payload.get("limit")
+    if limit is not None:
+        if not isinstance(limit, int):
+            raise ToolExecutionError("limit must be an integer")
+        request["limit"] = max(1, min(limit, 50))
+    min_score = payload.get("min_score")
+    if min_score is not None:
+        if not isinstance(min_score, (int, float)):
+            raise ToolExecutionError("min_score must be a number")
+        request["min_score"] = max(0.0, float(min_score))
+    include_payload = payload.get("include_payload")
+    if include_payload is not None:
+        request["include_payload"] = bool(include_payload)
+    try:
+        result = _memory_client().semantic_search(request)
+    except MemoryClientError as exc:
+        raise ToolExecutionError(f"memory_semantic_search_failed:{exc}") from exc
+    if not isinstance(result, dict):
+        raise ToolExecutionError("memory_semantic_search_failed:empty_response")
+    return result
 
 
 def _resolve_template_path(template_path: str, template_id: str) -> Path:

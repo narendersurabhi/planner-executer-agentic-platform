@@ -151,6 +151,7 @@ make up
 make test
 make lint
 make typecheck
+make eval-intent
 ```
 
 ## Configuration
@@ -169,12 +170,52 @@ make typecheck
 - `make images-list`
 - `make images-build`
 - `make images-push`
+- `make eval-intent`
 - `make k8s-up-local`
 - `make k8s-apply-local`
 - `make k8s-down-local`
 - `make k8s-sync-workspace`
 - `make k8s-sync-artifacts`
 - `make k8s-sync-shared`
+
+## Intent Eval Harness
+
+Use the gold-set harness to track intent decomposition quality over time.
+
+Gold cases:
+
+- `eval/intent_gold.yaml`
+
+Run locally:
+
+```bash
+make eval-intent
+```
+
+CI gate (thresholded):
+
+```bash
+make eval-intent-gate
+```
+
+Direct script usage:
+
+```bash
+PYTHONPATH=. python3 scripts/eval_intent_decompose.py \
+  --gold eval/intent_gold.yaml \
+  --mode heuristic \
+  --top-k 3 \
+  --verbose
+```
+
+Optional gates:
+
+```bash
+PYTHONPATH=. python3 scripts/eval_intent_decompose.py \
+  --min-intent-f1 0.80 \
+  --min-capability-f1 0.60 \
+  --min-segment-hit-rate 0.30
+```
 
 ## Kubernetes
 
