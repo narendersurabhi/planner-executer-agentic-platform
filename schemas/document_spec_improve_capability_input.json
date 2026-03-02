@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentSpecImproveCapabilityInput",
+  "type": "object",
+  "properties": {
+    "document_spec": {"type": "object"},
+    "validation_report": {"type": "object"},
+    "allowed_block_types": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": ["document_spec", "validation_report"],
+  "additionalProperties": true
+}

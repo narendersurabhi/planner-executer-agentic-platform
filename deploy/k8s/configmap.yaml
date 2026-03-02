@@ -21,6 +21,9 @@ data:
   TOOL_HTTP_FETCH_ENABLED: "false"
   TOOL_OUTPUT_SIZE_CAP: "50000"
   WORKER_MODE: llm
+  CAPABILITY_MODE: "enabled"
+  CAPABILITY_REGISTRY_PATH: /app/config/capability_registry.yaml
+  MCP_SERVERS_CONFIG_PATH: /app/config/mcp_servers.yaml
   WORKER_GROUP: workers
   WORKER_READ_COUNT: "1"
   WORKER_BLOCK_MS: "1000"
@@ -33,12 +36,10 @@ data:
   WORKER_DEFAULT_MAX_ATTEMPTS: "3"
   WORKER_DLQ_ENABLED: "true"
   CODER_API_URL: http://coder:8000
-  RESUME_TAILOR_API_URL: http://tailor:8000
   WORKSPACE_DIR: /shared/workspace
   CRITIC_ENABLED: "false"
   CRITIC_MAX_REWORKS: "2"
   POLICY_MODE: dev
   PLANNER_MODE: llm
   NEXT_PUBLIC_API_URL: http://api:8000
-  DEV_RESUME_RENDER_ENABLED: "true"
   NEXT_PUBLIC_DEV_TOOLS: "true"

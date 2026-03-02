@@ -8,7 +8,6 @@ def _contract_dirs() -> list[Path]:
     root = Path(__file__).resolve().parents[2]
     return [
         root / "services" / "coder" / "contracts" / "v1",
-        root / "services" / "tailor" / "contracts" / "v1",
     ]
 
 

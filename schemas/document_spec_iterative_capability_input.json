@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentSpecIterativeCapabilityInput",
+  "type": "object",
+  "properties": {
+    "job": {"type": "object"},
+    "document_spec": {"type": "object"},
+    "allowed_block_types": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "render_context": {"type": "object"},
+    "strict": {"type": "boolean"},
+    "max_iterations": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10
+    },
+    "ats_mode": {"type": "boolean"}
+  },
+  "anyOf": [
+    {"required": ["job"]},
+    {"required": ["document_spec"]}
+  ],
+  "additionalProperties": true
+}

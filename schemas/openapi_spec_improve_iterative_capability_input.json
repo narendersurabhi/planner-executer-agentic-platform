@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenApiSpecImproveIterativeCapabilityInput",
+  "type": "object",
+  "properties": {
+    "openapi_spec": {"type": "object"},
+    "job": {"type": "object"},
+    "max_iterations": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10
+    }
+  },
+  "required": ["openapi_spec"],
+  "additionalProperties": true
+}

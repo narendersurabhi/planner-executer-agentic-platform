@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentDocxGenerateCapabilityInput",
+  "type": "object",
+  "properties": {
+    "document_spec": {"type": "object"},
+    "path": {"type": "string", "minLength": 1},
+    "render_context": {"type": "object"},
+    "strict": {"type": "boolean"}
+  },
+  "required": ["document_spec"],
+  "additionalProperties": true
+}

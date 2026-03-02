@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GitHubPushFilesCapabilityInput",
+  "type": "object",
+  "properties": {
+    "owner": {"type": "string", "minLength": 1},
+    "repo": {"type": "string", "minLength": 1},
+    "branch": {"type": "string", "minLength": 1},
+    "message": {"type": "string", "minLength": 1},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "content": {"type": "string"}
+        },
+        "required": ["path", "content"],
+        "additionalProperties": true
+      },
+      "minItems": 1
+    }
+  },
+  "required": ["owner", "repo", "branch", "files", "message"],
+  "additionalProperties": true
+}

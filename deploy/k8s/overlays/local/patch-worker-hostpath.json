@@ -21,6 +21,18 @@
     "path": "/spec/template/spec/volumes",
     "value": [
       {
+        "name": "capability-registry-config",
+        "configMap": {
+          "name": "capability-registry"
+        }
+      },
+      {
+        "name": "mcp-servers-config",
+        "configMap": {
+          "name": "mcp-servers-config"
+        }
+      },
+      {
         "name": "shared-data",
         "hostPath": {
           "path": "/var/awe-shared",

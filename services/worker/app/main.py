@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any, Mapping
@@ -13,15 +15,20 @@ import redis
 from jsonschema import Draft202012Validator
 
 from libs.core import (
+    capability_registry,
     document_store,
     events,
+    intent_contract,
     llm_provider,
     logging as core_logging,
+    mcp_gateway,
     models,
+    payload_resolver,
     tool_registry,
     tracing as core_tracing,
 )
 from libs.core.memory_client import MemoryClient
+from libs.framework.tool_runtime import classify_tool_error
 from services.worker.app.memory_semantics import (
     apply_memory_defaults,
     missing_memory_only_inputs,
@@ -51,6 +58,12 @@ TOOL_OUTPUT_SIZE_CAP = os.getenv("TOOL_OUTPUT_SIZE_CAP", "50000")
 PROMPT_VERSION = os.getenv("PROMPT_VERSION", "unknown")
 POLICY_VERSION = os.getenv("POLICY_VERSION", "unknown")
 TOOL_VERSION = os.getenv("TOOL_VERSION", "unknown")
+CAPABILITY_INPUT_VALIDATION_ENABLED = (
+    os.getenv("CAPABILITY_INPUT_VALIDATION_ENABLED", "true").lower() == "true"
+)
+CAPABILITY_ENFORCE_SCHEMA_PROPERTIES = (
+    os.getenv("CAPABILITY_ENFORCE_SCHEMA_PROPERTIES", "false").lower() == "true"
+)
 
 LLM_ENABLED = WORKER_MODE == "llm"
 
@@ -65,15 +78,6 @@ DEFAULT_ALLOWED_BLOCK_TYPES = [
     "optional_paragraph",
     "repeat",
 ]
-
-TASK_INTENTS = {
-    "transform",
-    "generate",
-    "validate",
-    "render",
-    "io",
-}
-
 
 def _parse_optional_float(value: str | None) -> float | None:
     if value is None or value == "":
@@ -94,14 +98,33 @@ def _parse_optional_int(value: str | None) -> int | None:
 
 
 OUTPUT_SIZE_CAP = _parse_optional_int(TOOL_OUTPUT_SIZE_CAP) or 50000
-LOG_CANDIDATE_RESUME = os.getenv("LOG_CANDIDATE_RESUME", "false").lower() == "true"
-LOG_CANDIDATE_RESUME_FULL = os.getenv("LOG_CANDIDATE_RESUME_FULL", "false").lower() == "true"
-LOG_CANDIDATE_RESUME_PREVIEW_CHARS = (
-    _parse_optional_int(os.getenv("LOG_CANDIDATE_RESUME_PREVIEW_CHARS", "200")) or 200
-)
 MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://api:8000")
 MEMORY_READ_ENABLED = os.getenv("MEMORY_READ_ENABLED", "true").lower() == "true"
 MEMORY_WRITE_ENABLED = os.getenv("MEMORY_WRITE_ENABLED", "true").lower() == "true"
+SEMANTIC_MEMORY_AUTO_WRITE_ENABLED = (
+    os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_ENABLED", "true").lower() == "true"
+)
+SEMANTIC_MEMORY_AUTO_WRITE_TOOL_PATTERNS = [
+    value.strip().lower()
+    for value in os.getenv(
+        "SEMANTIC_MEMORY_AUTO_WRITE_TOOLS",
+        "llm.text.generate,document.spec.generate,document.spec.improve,"
+        "document.spec.generate_iterative,llm_generate,llm_generate_document_spec,"
+        "llm_improve_document_spec,llm_iterative_improve_document_spec,openapi.iterative.improve",
+    ).split(",")
+    if value.strip()
+]
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS = (
+    _parse_optional_int(os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS", "3")) or 3
+)
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS = max(1, min(SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS, 8))
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS = (
+    _parse_optional_int(os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS", "280")) or 280
+)
+SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS = max(80, min(SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS, 1200))
+SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE = (
+    os.getenv("SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE", "runtime").strip() or "runtime"
+)
 MEMORY_CLIENT = MemoryClient(MEMORY_API_URL)
 WORKER_GROUP = os.getenv("WORKER_GROUP", "workers")
 WORKER_CONSUMER = os.getenv("WORKER_CONSUMER", str(uuid.uuid4()))
@@ -119,6 +142,8 @@ WORKER_DEFAULT_MAX_ATTEMPTS = (
     _parse_optional_int(os.getenv("WORKER_DEFAULT_MAX_ATTEMPTS", "3")) or 3
 )
 WORKER_DLQ_ENABLED = os.getenv("WORKER_DLQ_ENABLED", "true").lower() == "true"
+_SEMANTIC_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s+|\n+")
+_SEMANTIC_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
 
 
 LLM_PROVIDER_INSTANCE = None
@@ -135,6 +160,111 @@ if LLM_ENABLED:
     )
 
 
+def _capability_mode() -> str:
+    return capability_registry.resolve_capability_mode()
+
+
+def _resolve_enabled_capability_request(
+    capability_id: str,
+) -> capability_registry.CapabilitySpec | None:
+    mode = _capability_mode()
+    if mode == "disabled":
+        return None
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception as exc:  # noqa: BLE001
+        core_logging.log_event(
+            LOGGER,
+            "capability_registry_load_failed",
+            {"capability_id": capability_id, "mode": mode, "error": str(exc)},
+        )
+        return None
+    spec = registry.get(capability_id)
+    if spec is None or not spec.enabled:
+        return None
+    if mode == "dry_run":
+        core_logging.log_event(
+            LOGGER,
+            "capability_mode_dry_run",
+            {"capability_id": capability_id},
+        )
+    return spec
+
+
+def _execute_capability_request(
+    *,
+    capability_id: str,
+    payload: dict[str, Any],
+    trace_id: str,
+    idempotency_key: str,
+    registry: tool_registry.ToolRegistry,
+    task_payload: dict[str, Any] | None = None,
+) -> models.ToolCall:
+    started_at = datetime.utcnow()
+    task_payload = task_payload if isinstance(task_payload, dict) else {}
+    task_id = task_payload.get("task_id")
+
+    def _execute_native_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            tool = registry.get(tool_name)
+        except KeyError as exc:
+            raise tool_registry.ToolExecutionError(f"unknown_tool:{tool_name}") from exc
+        tool_payload = dict(arguments)
+        memory_payload = _load_memory_inputs(tool, task_payload, trace_id)
+        if memory_payload:
+            existing_memory = tool_payload.get("memory")
+            merged_memory = dict(existing_memory) if isinstance(existing_memory, dict) else {}
+            merged_memory.update(memory_payload)
+            tool_payload["memory"] = merged_memory
+        tool_payload = apply_memory_defaults(tool.spec.name, tool_payload)
+        missing = missing_memory_only_inputs(tool.spec.name, tool_payload)
+        if missing:
+            raise tool_registry.ToolExecutionError(
+                f"contract.input_missing:memory_only_inputs_missing:{','.join(missing)}"
+            )
+        tool_payload["_registry"] = registry
+        call = registry.execute(
+            tool_name,
+            payload=tool_payload,
+            idempotency_key=str(uuid.uuid4()),
+            trace_id=trace_id,
+            max_output_bytes=OUTPUT_SIZE_CAP,
+        )
+        if call.status != "completed":
+            output = call.output_or_error if isinstance(call.output_or_error, dict) else {}
+            error_text = output.get("error", "capability_native_tool_failed")
+            raise tool_registry.ToolExecutionError(str(error_text))
+        _persist_memory_outputs(tool, task_payload, call, trace_id)
+        output = call.output_or_error
+        if isinstance(output, dict):
+            return output
+        return {"result": output}
+
+    try:
+        result = mcp_gateway.invoke_capability(
+            capability_id,
+            payload,
+            execute_tool=_execute_native_tool,
+        )
+        output = result if isinstance(result, dict) else {"result": result}
+        status = "completed"
+    except Exception as exc:  # noqa: BLE001
+        error_text = str(exc)
+        output = {"error": error_text, "error_code": classify_tool_error(error_text)}
+        status = "failed"
+    finished_at = datetime.utcnow()
+    return models.ToolCall(
+        tool_name=capability_id,
+        input=payload,
+        idempotency_key=idempotency_key,
+        trace_id=trace_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        status=status,
+        output_or_error=output,
+    )
+
+
 def execute_task(task_payload: dict) -> models.TaskResult:
     task_id = task_payload.get("task_id")
     trace_id = str(task_payload.get("correlation_id", ""))
@@ -147,14 +277,30 @@ def execute_task(task_payload: dict) -> models.TaskResult:
         TOOL_HTTP_FETCH_ENABLED,
         llm_enabled=LLM_ENABLED,
         llm_provider=LLM_PROVIDER_INSTANCE,
+        service_name="worker",
     )
     tool_calls = []
     started_at = datetime.utcnow()
     outputs = {}
     tool_error = None
-    task_intent = _infer_task_intent(task_payload)
+    task_intent_inference = _infer_task_intent_inference(task_payload)
+    task_intent = task_intent_inference.intent
+    task_intent_segment = _intent_segment_from_payload(task_payload)
     task_attempt, task_max_attempts = _task_attempt_limits(task_payload)
     artifacts: list[dict[str, Any]] = []
+    core_logging.log_event(
+        LOGGER,
+        "task_intent_inferred",
+        {
+            "run_id": run_id,
+            "job_id": job_id,
+            "task_id": task_id,
+            "task_intent": task_intent,
+            "intent_source": task_intent_inference.source,
+            "intent_confidence": round(float(task_intent_inference.confidence), 3),
+            "trace_id": trace_id,
+        },
+    )
     with core_tracing.start_span(
         "worker.execute_task",
         attributes={
@@ -164,6 +310,8 @@ def execute_task(task_payload: dict) -> models.TaskResult:
             "run.id": run_id,
             "task.tool_request_count": len(tool_requests),
             "task.intent": task_intent,
+            "task.intent_source": task_intent_inference.source,
+            "task.intent_confidence": float(task_intent_inference.confidence),
             "task.attempt": task_attempt,
             "task.max_attempts": task_max_attempts,
             "model.provider": LLM_PROVIDER,
@@ -192,12 +340,376 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                     "tool.version": TOOL_VERSION,
                 },
             ) as tool_span:
+                capability_spec = _resolve_enabled_capability_request(tool_name)
+                if capability_spec is not None:
+                    capability_allow_decision = capability_registry.evaluate_capability_allowlist(
+                        capability_spec.capability_id,
+                        "worker",
+                    )
+                    if (
+                        capability_allow_decision.violated
+                        and capability_allow_decision.mode == "dry_run"
+                    ):
+                        core_logging.log_event(
+                            LOGGER,
+                            "capability_governance_violation_dry_run",
+                            {
+                                "run_id": run_id,
+                                "job_id": job_id,
+                                "task_id": task_id,
+                                "tool_name": tool_name,
+                                "capability_id": capability_spec.capability_id,
+                                "reason": capability_allow_decision.reason,
+                                "mode": capability_allow_decision.mode,
+                                "trace_id": trace_id,
+                            },
+                        )
+                    if not capability_allow_decision.allowed:
+                        tool_error = (
+                            "policy.capability_not_allowed:"
+                            f"{capability_spec.capability_id}:"
+                            f"{capability_allow_decision.reason}"
+                        )
+                        outputs[tool_name] = {
+                            "error": tool_error,
+                            "error_code": "policy.capability_not_allowed",
+                        }
+                        tool_calls.append(
+                            models.ToolCall(
+                                tool_name=tool_name,
+                                input={},
+                                idempotency_key=str(uuid.uuid4()),
+                                trace_id=trace_id,
+                                started_at=started_at,
+                                finished_at=datetime.utcnow(),
+                                status="failed",
+                                output_or_error={
+                                    "error": tool_error,
+                                    "error_code": "policy.capability_not_allowed",
+                                },
+                            )
+                        )
+                        core_tracing.set_span_attributes(
+                            tool_span,
+                            {
+                                "tool.error": tool_error,
+                                "tool.error_code": "policy.capability_not_allowed",
+                                "capability.id": capability_spec.capability_id,
+                                "capability.governance_mode": capability_allow_decision.mode,
+                                "capability.allowlist_reason": capability_allow_decision.reason,
+                            },
+                        )
+                        break
+                    capability_mismatch = _capability_intent_mismatch(task_intent, capability_spec)
+                    if capability_mismatch:
+                        tool_error = f"contract.intent_mismatch:{capability_mismatch}"
+                        outputs[tool_name] = {
+                            "error": tool_error,
+                            "error_code": "contract.intent_mismatch",
+                        }
+                        tool_calls.append(
+                            models.ToolCall(
+                                tool_name=tool_name,
+                                input={},
+                                idempotency_key=str(uuid.uuid4()),
+                                trace_id=trace_id,
+                                started_at=started_at,
+                                finished_at=datetime.utcnow(),
+                                status="failed",
+                                output_or_error={
+                                    "error": tool_error,
+                                    "error_code": "contract.intent_mismatch",
+                                },
+                            )
+                        )
+                        core_tracing.set_span_attributes(
+                            tool_span,
+                            {
+                                "tool.error": tool_error,
+                                "tool.error_code": "contract.intent_mismatch",
+                                "capability.id": capability_spec.capability_id,
+                            },
+                        )
+                        break
+                    payload = _tool_payload(
+                        tool_name,
+                        task_payload.get("instruction", ""),
+                        context,
+                        task_payload,
+                        tool_inputs,
+                    )
+                    payload, capability_payload_error, dropped_payload_keys = (
+                        _enforce_capability_input_contract(
+                            capability_spec,
+                            payload,
+                        )
+                    )
+                    if dropped_payload_keys:
+                        core_logging.log_event(
+                            LOGGER,
+                            "capability_payload_pruned",
+                            {
+                                "run_id": run_id,
+                                "job_id": job_id,
+                                "task_id": task_id,
+                                "tool_name": tool_name,
+                                "capability_id": capability_spec.capability_id,
+                                "dropped_keys": dropped_payload_keys,
+                                "trace_id": trace_id,
+                            },
+                        )
+                    if capability_payload_error:
+                        tool_error = capability_payload_error
+                        outputs[tool_name] = {
+                            "error": tool_error,
+                            "error_code": "contract.input_invalid",
+                        }
+                        tool_calls.append(
+                            models.ToolCall(
+                                tool_name=tool_name,
+                                input=payload,
+                                idempotency_key=str(uuid.uuid4()),
+                                trace_id=trace_id,
+                                started_at=started_at,
+                                finished_at=datetime.utcnow(),
+                                status="failed",
+                                output_or_error={
+                                    "error": tool_error,
+                                    "error_code": "contract.input_invalid",
+                                },
+                            )
+                        )
+                        core_tracing.set_span_attributes(
+                            tool_span,
+                            {
+                                "tool.error": tool_error,
+                                "tool.error_code": "contract.input_invalid",
+                                "capability.id": capability_spec.capability_id,
+                            },
+                        )
+                        break
+                    segment_contract_error = intent_contract.validate_intent_segment_contract(
+                        segment=task_intent_segment,
+                        task_intent=task_intent,
+                        tool_name=tool_name,
+                        payload=payload,
+                        capability_id=capability_spec.capability_id,
+                        capability_risk_tier=capability_spec.risk_tier,
+                    )
+                    if segment_contract_error:
+                        tool_error = f"contract.intent_mismatch:{segment_contract_error}"
+                        outputs[tool_name] = {
+                            "error": tool_error,
+                            "error_code": "contract.intent_mismatch",
+                        }
+                        tool_calls.append(
+                            models.ToolCall(
+                                tool_name=tool_name,
+                                input=payload,
+                                idempotency_key=str(uuid.uuid4()),
+                                trace_id=trace_id,
+                                started_at=started_at,
+                                finished_at=datetime.utcnow(),
+                                status="failed",
+                                output_or_error={
+                                    "error": tool_error,
+                                    "error_code": "contract.intent_mismatch",
+                                },
+                            )
+                        )
+                        core_tracing.set_span_attributes(
+                            tool_span,
+                            {
+                                "tool.error": tool_error,
+                                "tool.error_code": "contract.intent_mismatch",
+                                "capability.id": capability_spec.capability_id,
+                            },
+                        )
+                        break
+                    idempotency_key = str(uuid.uuid4())
+                    tool_started_at = time.monotonic()
+                    core_logging.log_event(
+                        LOGGER,
+                        "tool_call_started",
+                        {
+                            "run_id": run_id,
+                            "job_id": job_id,
+                            "task_id": task_id,
+                            "tool_sequence": tool_index + 1,
+                            "task_attempt": task_attempt,
+                            "task_max_attempts": task_max_attempts,
+                            "tool_name": tool_name,
+                            "tool_intent": f"capability:{capability_spec.idempotency}",
+                            "tool_timeout_s": capability_spec.adapters[0].timeout_s
+                            if capability_spec.adapters
+                            and capability_spec.adapters[0].timeout_s is not None
+                            else None,
+                            "trace_id": trace_id,
+                            "idempotency_key": idempotency_key,
+                            "model_provider": LLM_PROVIDER,
+                            "model_name": OPENAI_MODEL,
+                            "prompt_version": PROMPT_VERSION,
+                            "policy_version": POLICY_VERSION,
+                            "tool_version": TOOL_VERSION,
+                            "payload_keys": sorted(payload.keys()),
+                            "capability_id": capability_spec.capability_id,
+                            "task_intent": task_intent,
+                            "intent_source": task_intent_inference.source,
+                            "intent_confidence": round(
+                                float(task_intent_inference.confidence), 3
+                            ),
+                        },
+                    )
+                    call = _execute_capability_request(
+                        capability_id=capability_spec.capability_id,
+                        payload=payload,
+                        trace_id=trace_id,
+                        idempotency_key=idempotency_key,
+                        registry=registry,
+                        task_payload=task_payload,
+                    )
+                    core_logging.log_event(
+                        LOGGER,
+                        "tool_call_finished",
+                        {
+                            "run_id": run_id,
+                            "job_id": job_id,
+                            "task_id": task_id,
+                            "tool_sequence": tool_index + 1,
+                            "task_attempt": task_attempt,
+                            "task_max_attempts": task_max_attempts,
+                            "tool_name": tool_name,
+                            "trace_id": trace_id,
+                            "idempotency_key": idempotency_key,
+                            "status": call.status,
+                            "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                            "error_code": call.output_or_error.get("error_code"),
+                            "error": call.output_or_error.get("error"),
+                            "capability_id": capability_spec.capability_id,
+                        },
+                    )
+                    core_tracing.set_span_attributes(
+                        tool_span,
+                        {
+                            "tool.status": call.status,
+                            "tool.idempotency_key": idempotency_key,
+                            "tool.error": call.output_or_error.get("error", ""),
+                            "tool.error_code": call.output_or_error.get("error_code", ""),
+                            "tool.duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                            "tool.is_capability": True,
+                            "capability.id": capability_spec.capability_id,
+                        },
+                    )
+                    tool_calls.append(call)
+                    outputs[tool_name] = call.output_or_error
+                    if call.status == "completed":
+                        _sync_output_artifact(call.output_or_error, task_id, tool_name, trace_id)
+                        if isinstance(call.output_or_error, Mapping):
+                            _auto_persist_semantic_facts(
+                                tool_name=tool_name,
+                                task_payload=task_payload,
+                                output=call.output_or_error,
+                                trace_id=trace_id,
+                                run_id=run_id,
+                            )
+                        continue
+                    tool_error = call.output_or_error.get("error", "capability_failed")
+                    if isinstance(tool_error, str):
+                        lowered = tool_error.lower()
+                        if (
+                            "timed out" in lowered
+                            or "timeout" in lowered
+                            or "mcp_sdk_timeout:" in lowered
+                        ):
+                            if not tool_error.startswith("tool_call_timed_out"):
+                                tool_error = f"tool_call_timed_out:{tool_error}"
+                                call.output_or_error["error"] = tool_error
+                                outputs[tool_name] = call.output_or_error
+                    if isinstance(tool_error, str):
+                        core_logging.log_event(
+                            LOGGER,
+                            "tool_call_failed",
+                            {
+                                "run_id": run_id,
+                                "job_id": job_id,
+                                "task_id": task_id,
+                                "tool_sequence": tool_index + 1,
+                                "task_attempt": task_attempt,
+                                "task_max_attempts": task_max_attempts,
+                                "tool_name": tool_name,
+                                "trace_id": trace_id,
+                                "idempotency_key": idempotency_key,
+                                "error": tool_error,
+                                "error_code": call.output_or_error.get("error_code"),
+                                "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                                "capability_id": capability_spec.capability_id,
+                            },
+                        )
+                    break
                 try:
                     tool = registry.get(tool_name)
                 except KeyError:
                     tool_error = f"contract.tool_not_found:unknown_tool:{tool_name}"
                     outputs[tool_name] = {"error": tool_error}
                     core_tracing.set_span_attributes(tool_span, {"tool.error": tool_error})
+                    break
+                governance_context = {
+                    "job_id": job_id,
+                    "tenant_id": task_payload.get("tenant_id"),
+                    "org_id": task_payload.get("org_id"),
+                    "job_type": task_payload.get("job_type"),
+                    "context": context,
+                    "job_context": context.get("job_context")
+                    if isinstance(context, dict)
+                    else None,
+                }
+                allow_decision = tool_registry.evaluate_tool_allowlist(
+                    tool_name,
+                    "worker",
+                    context=governance_context,
+                    tool_spec=tool.spec,
+                )
+                if allow_decision.violated and allow_decision.mode == "dry_run":
+                    core_logging.log_event(
+                        LOGGER,
+                        "tool_governance_violation_dry_run",
+                        {
+                            "run_id": run_id,
+                            "job_id": job_id,
+                            "task_id": task_id,
+                            "tool_name": tool_name,
+                            "reason": allow_decision.reason,
+                            "mode": allow_decision.mode,
+                            "trace_id": trace_id,
+                        },
+                    )
+                if not allow_decision.allowed:
+                    tool_error = f"policy.tool_not_allowed:{tool_name}:{allow_decision.reason}"
+                    outputs[tool_name] = {"error": tool_error, "error_code": "policy.tool_not_allowed"}
+                    tool_calls.append(
+                        models.ToolCall(
+                            tool_name=tool_name,
+                            input={},
+                            idempotency_key=str(uuid.uuid4()),
+                            trace_id=trace_id,
+                            started_at=started_at,
+                            finished_at=datetime.utcnow(),
+                            status="failed",
+                            output_or_error={
+                                "error": tool_error,
+                                "error_code": "policy.tool_not_allowed",
+                            },
+                        )
+                    )
+                    core_tracing.set_span_attributes(
+                        tool_span,
+                        {
+                            "tool.error": tool_error,
+                            "tool.error_code": "policy.tool_not_allowed",
+                            "tool.allowlist_reason": allow_decision.reason,
+                            "tool.governance_mode": allow_decision.mode,
+                        },
+                    )
                     break
                 mismatch = _intent_mismatch(task_intent, tool.spec.tool_intent, tool_name)
                 if mismatch:
@@ -248,7 +760,43 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                         )
                         core_tracing.set_span_attributes(tool_span, {"tool.error": tool_error})
                         break
-                _log_candidate_resume(tool.spec.name, payload, task_id, trace_id)
+                segment_contract_error = intent_contract.validate_intent_segment_contract(
+                    segment=task_intent_segment,
+                    task_intent=task_intent,
+                    tool_name=tool_name,
+                    payload=payload,
+                    capability_id=None,
+                    capability_risk_tier=None,
+                )
+                if segment_contract_error:
+                    tool_error = f"contract.intent_mismatch:{segment_contract_error}"
+                    outputs[tool_name] = {
+                        "error": tool_error,
+                        "error_code": "contract.intent_mismatch",
+                    }
+                    tool_calls.append(
+                        models.ToolCall(
+                            tool_name=tool_name,
+                            input=payload,
+                            idempotency_key=str(uuid.uuid4()),
+                            trace_id=trace_id,
+                            started_at=started_at,
+                            finished_at=datetime.utcnow(),
+                            status="failed",
+                            output_or_error={
+                                "error": tool_error,
+                                "error_code": "contract.intent_mismatch",
+                            },
+                        )
+                    )
+                    core_tracing.set_span_attributes(
+                        tool_span,
+                        {
+                            "tool.error": tool_error,
+                            "tool.error_code": "contract.intent_mismatch",
+                        },
+                    )
+                    break
                 payload["_registry"] = registry
                 idempotency_key = str(uuid.uuid4())
                 tool_started_at = time.monotonic()
@@ -273,6 +821,9 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                         "policy_version": POLICY_VERSION,
                         "tool_version": TOOL_VERSION,
                         "payload_keys": sorted(payload.keys()),
+                        "task_intent": task_intent,
+                        "intent_source": task_intent_inference.source,
+                        "intent_confidence": round(float(task_intent_inference.confidence), 3),
                     },
                 )
                 call = registry.execute(
@@ -316,6 +867,14 @@ def execute_task(task_payload: dict) -> models.TaskResult:
                 if call.status == "completed":
                     _sync_output_artifact(call.output_or_error, task_id, tool_name, trace_id)
                     _persist_memory_outputs(tool, task_payload, call, trace_id)
+                    if isinstance(call.output_or_error, Mapping):
+                        _auto_persist_semantic_facts(
+                            tool_name=tool_name,
+                            task_payload=task_payload,
+                            output=call.output_or_error,
+                            trace_id=trace_id,
+                            run_id=run_id,
+                        )
                 if call.status != "completed":
                     tool_error = call.output_or_error.get("error", "tool_failed")
                     error_code = call.output_or_error.get("error_code")
@@ -531,41 +1090,77 @@ def _float_metric(value: Any) -> float:
 
 
 def _infer_task_intent(task_payload: dict) -> str:
-    for key in ("intent", "task_intent"):
-        value = task_payload.get(key)
-        if isinstance(value, str) and value in TASK_INTENTS:
-            return value
-    parts: list[str] = []
-    for key in ("description", "instruction"):
-        value = task_payload.get(key)
-        if isinstance(value, str):
-            parts.append(value)
-    criteria = task_payload.get("acceptance_criteria")
-    if isinstance(criteria, list):
-        parts.extend([item for item in criteria if isinstance(item, str)])
-    text = " ".join(parts).lower()
-    keyword_map = [
-        ("validate", ["validate", "verify", "check", "lint", "schema"]),
-        ("render", ["render", "rendering", "docx", "pdf"]),
-        (
-            "transform",
-            ["transform", "reshape", "wrap", "convert", "derive", "summarize", "repair"],
-        ),
-        ("generate", ["generate", "create", "draft", "write", "compose", "produce", "build"]),
-        ("io", ["read", "fetch", "list", "search", "load", "save", "download", "upload"]),
-    ]
-    for intent, keywords in keyword_map:
-        if any(keyword in text for keyword in keywords):
-            return intent
-    return "generate"
+    return _infer_task_intent_inference(task_payload).intent
+
+
+def _intent_segment_from_payload(task_payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    segment = task_payload.get("intent_segment")
+    if isinstance(segment, Mapping):
+        return segment
+    profile = task_payload.get("intent_profile")
+    if isinstance(profile, Mapping):
+        maybe_segment = profile.get("segment")
+        if isinstance(maybe_segment, Mapping):
+            return maybe_segment
+    return None
+
+
+def _infer_task_intent_inference(task_payload: dict) -> intent_contract.TaskIntentInference:
+    explicit_intent = intent_contract.normalize_task_intent(
+        task_payload.get("intent")
+    ) or intent_contract.normalize_task_intent(task_payload.get("task_intent"))
+    source = task_payload.get("intent_source")
+    confidence = task_payload.get("intent_confidence")
+    if (
+        explicit_intent
+        and isinstance(source, str)
+        and source.strip()
+        and isinstance(confidence, (int, float))
+    ):
+        return intent_contract.TaskIntentInference(
+            intent=explicit_intent,
+            source=source.strip(),
+            confidence=max(0.0, min(1.0, float(confidence))),
+        )
+    return intent_contract.infer_task_intent_for_payload_with_metadata(task_payload)
 
 
 def _intent_mismatch(
     task_intent: str, tool_intent: models.ToolIntent, tool_name: str
 ) -> str | None:
-    if task_intent == "generate" and tool_intent == models.ToolIntent.transform:
-        return f"tool_intent_mismatch:{tool_name}:{tool_intent.value}:{task_intent}"
-    return None
+    return intent_contract.validate_tool_intent_compatibility(
+        task_intent,
+        tool_intent,
+        tool_name,
+    )
+
+
+def _capability_intent_mismatch(
+    task_intent: str,
+    capability_spec: capability_registry.CapabilitySpec,
+) -> str | None:
+    hints = (
+        capability_spec.planner_hints
+        if isinstance(capability_spec.planner_hints, dict)
+        else {}
+    )
+    raw_allowed = hints.get("task_intents")
+    if not isinstance(raw_allowed, list) or not raw_allowed:
+        return None
+    allowed = {
+        normalized
+        for item in raw_allowed
+        for normalized in [intent_contract.normalize_task_intent(item)]
+        if normalized
+    }
+    if not allowed:
+        return None
+    if task_intent in allowed:
+        return None
+    return (
+        f"task_intent_mismatch:{capability_spec.capability_id}:{task_intent}:"
+        f"allowed={','.join(sorted(allowed))}"
+    )
 
 
 def _load_memory_inputs(tool, task_payload: dict, trace_id: str) -> dict:
@@ -689,65 +1284,187 @@ def _sync_output_artifact(
         )
 
 
-def _extract_candidate_resume(payload: Mapping[str, Any]) -> str | None:
-    if not isinstance(payload, Mapping):
-        return None
-    job = payload.get("job")
-    if not isinstance(job, Mapping):
-        return None
-    context_json = job.get("context_json")
-    if isinstance(context_json, Mapping):
-        candidate = context_json.get("candidate_resume")
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate
-    candidate = job.get("candidate_resume")
-    if isinstance(candidate, str) and candidate.strip():
-        return candidate
-    return None
+def _semantic_should_capture(tool_name: str) -> bool:
+    if not SEMANTIC_MEMORY_AUTO_WRITE_ENABLED:
+        return False
+    normalized = (tool_name or "").strip().lower()
+    if not normalized:
+        return False
+    patterns = SEMANTIC_MEMORY_AUTO_WRITE_TOOL_PATTERNS
+    if not patterns:
+        return True
+    return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
 
 
-def _log_candidate_resume(
-    tool_name: str, payload: Mapping[str, Any], task_id: str | None, trace_id: str
+def _semantic_tokens(text: str) -> set[str]:
+    if not isinstance(text, str):
+        return set()
+    return set(_SEMANTIC_TOKEN_RE.findall(text.lower()))
+
+
+def _semantic_split_facts(text: str) -> list[str]:
+    if not isinstance(text, str):
+        return []
+    candidates: list[str] = []
+    for part in _SEMANTIC_SENTENCE_SPLIT_RE.split(text):
+        sentence = " ".join(part.strip().split())
+        if len(sentence) < 30:
+            continue
+        if sentence.startswith("{") or sentence.startswith("["):
+            continue
+        if sentence.count("/") > 3:
+            # likely file path / URL blob, not a semantic fact sentence
+            continue
+        if len(sentence) > SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS:
+            sentence = sentence[:SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACT_CHARS].strip()
+        candidates.append(sentence)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for sentence in candidates:
+        key = sentence.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(sentence)
+        if len(deduped) >= SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS:
+            break
+    return deduped
+
+
+def _semantic_collect_candidate_texts(output: Mapping[str, Any]) -> list[str]:
+    if not isinstance(output, Mapping):
+        return []
+    preferred_keys = [
+        "fact",
+        "facts",
+        "summary",
+        "alignment_summary",
+        "text",
+        "content",
+        "objective",
+        "analysis",
+        "reasoning",
+    ]
+    texts: list[str] = []
+    for key in preferred_keys:
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    texts.append(item.strip())
+    if texts:
+        return texts
+    # Fallback: shallow scan for string leaves in unknown output shapes.
+    for value in output.values():
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+            if len(texts) >= 6:
+                break
+        elif isinstance(value, Mapping):
+            for nested in value.values():
+                if isinstance(nested, str) and nested.strip():
+                    texts.append(nested.strip())
+                    if len(texts) >= 6:
+                        break
+            if len(texts) >= 6:
+                break
+    return texts
+
+
+def _semantic_confidence_from_output(output: Mapping[str, Any]) -> float:
+    if not isinstance(output, Mapping):
+        return 0.75
+    confidence = output.get("confidence")
+    if isinstance(confidence, (int, float)):
+        return min(1.0, max(0.0, float(confidence)))
+    alignment_score = output.get("alignment_score")
+    if isinstance(alignment_score, (int, float)):
+        score = float(alignment_score)
+        if score > 1.0:
+            score = score / 100.0
+        return min(1.0, max(0.0, score))
+    return 0.75
+
+
+def _auto_persist_semantic_facts(
+    *,
+    tool_name: str,
+    task_payload: Mapping[str, Any],
+    output: Mapping[str, Any],
+    trace_id: str,
+    run_id: str,
 ) -> None:
-    if tool_name != "llm_tailor_resume_text":
+    if not _semantic_should_capture(tool_name):
         return
-    if not LOG_CANDIDATE_RESUME:
+    job_id = str(task_payload.get("job_id") or "").strip()
+    user_id = str(task_payload.get("user_id") or "").strip() or None
+    task_id = str(task_payload.get("task_id") or "").strip()
+    task_name = str(task_payload.get("name") or tool_name).strip() or tool_name
+    subject = task_name
+    namespace = str(task_payload.get("intent") or SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE).strip()
+    if not namespace:
+        namespace = SEMANTIC_MEMORY_AUTO_WRITE_NAMESPACE
+    confidence = _semantic_confidence_from_output(output)
+    candidate_texts = _semantic_collect_candidate_texts(output)
+    facts: list[str] = []
+    for text in candidate_texts:
+        facts.extend(_semantic_split_facts(text))
+        if len(facts) >= SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS:
+            break
+    deduped_facts: list[str] = []
+    seen_fact_tokens: set[str] = set()
+    for fact in facts:
+        token_fingerprint = " ".join(sorted(_semantic_tokens(fact))[:20])
+        if token_fingerprint in seen_fact_tokens:
+            continue
+        seen_fact_tokens.add(token_fingerprint)
+        deduped_facts.append(fact)
+        if len(deduped_facts) >= SEMANTIC_MEMORY_AUTO_WRITE_MAX_FACTS:
+            break
+    if not deduped_facts:
         return
-    resume = _extract_candidate_resume(payload)
-    if not resume:
+    for fact in deduped_facts:
+        digest = hashlib.sha1(f"{namespace}|{subject}|{fact}".encode("utf-8")).hexdigest()[:12]
+        key = (
+            f"{re.sub(r'[^a-z0-9]+', '_', namespace.lower()).strip('_') or 'runtime'}:"
+            f"{re.sub(r'[^a-z0-9]+', '_', subject.lower()).strip('_') or 'task'}:{digest}"
+        )
+        write_payload: dict[str, Any] = {
+            "fact": fact,
+            "subject": subject,
+            "namespace": namespace,
+            "key": key,
+            "confidence": confidence,
+            "source": "worker_auto",
+            "source_ref": f"tool:{tool_name}",
+            "metadata": {
+                "trace_id": trace_id,
+                "run_id": run_id,
+                "job_id": job_id,
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "auto_distilled": True,
+            },
+        }
+        if user_id:
+            write_payload["user_id"] = user_id
+        if job_id:
+            write_payload["job_id"] = job_id
+        written = MEMORY_CLIENT.semantic_write(write_payload)
         core_logging.log_event(
             LOGGER,
-            "candidate_resume_log",
-            {"task_id": task_id, "tool_name": tool_name, "status": "missing", "trace_id": trace_id},
+            "semantic_memory_auto_write",
+            {
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "job_id": job_id,
+                "key": key,
+                "status": "ok" if isinstance(written, dict) else "failed",
+                "trace_id": trace_id,
+            },
         )
-        return
-    resume_len = len(resume)
-    resume_hash = hashlib.sha256(resume.encode("utf-8")).hexdigest()
-    if LOG_CANDIDATE_RESUME_FULL:
-        payload_out = {
-            "task_id": task_id,
-            "tool_name": tool_name,
-            "status": "full",
-            "length": resume_len,
-            "sha256": resume_hash,
-            "resume": resume,
-            "trace_id": trace_id,
-        }
-    else:
-        preview = LOG_CANDIDATE_RESUME_PREVIEW_CHARS
-        head = resume[:preview]
-        tail = resume[-preview:] if resume_len > preview else ""
-        payload_out = {
-            "task_id": task_id,
-            "tool_name": tool_name,
-            "status": "preview",
-            "length": resume_len,
-            "sha256": resume_hash,
-            "head": head,
-            "tail": tail,
-            "trace_id": trace_id,
-        }
-    core_logging.log_event(LOGGER, "candidate_resume_log", payload_out)
 
 
 def _tool_payload(
@@ -757,39 +1474,13 @@ def _tool_payload(
     task_payload: dict,
     tool_inputs: dict,
 ) -> dict:
-    if task_payload.get("tool_inputs_resolved"):
-        resolved = tool_inputs.get(tool_name) if isinstance(tool_inputs, dict) else None
-        if isinstance(resolved, dict):
-            return resolved
-    has_tool_inputs = False
-    payload = {}
-    if isinstance(tool_inputs, dict) and tool_name in tool_inputs:
-        tool_payload = tool_inputs.get(tool_name)
-        if isinstance(tool_payload, dict):
-            payload = dict(tool_payload)
-            has_tool_inputs = True
-    payload = _merge_payload_from_task(payload, task_payload, instruction)
-    payload = _fill_payload_from_context(payload, context)
-    if tool_name == "llm_generate":
-        base_text = payload.get("text") or payload.get("prompt") or instruction
-        if context:
-            try:
-                context_blob = json.dumps(context, indent=2, ensure_ascii=True)
-            except (TypeError, ValueError):
-                context_blob = str(context)
-            base_text = f"{base_text}\n\nContext (JSON):\n{context_blob}"
-        return {"text": base_text}
-    if has_tool_inputs:
-        return payload
-    if payload:
-        return payload
-    if not context:
-        return {"text": instruction}
-    try:
-        context_blob = json.dumps(context, indent=2, ensure_ascii=True)
-    except (TypeError, ValueError):
-        context_blob = str(context)
-    return {"text": f"{instruction}\n\nContext (JSON):\n{context_blob}"}
+    return payload_resolver.resolve_tool_payload(
+        tool_name,
+        instruction,
+        context if isinstance(context, dict) else {},
+        task_payload if isinstance(task_payload, dict) else {},
+        tool_inputs if isinstance(tool_inputs, dict) else {},
+    )
 
 
 def _merge_payload_from_task(payload: dict, task_payload: dict, instruction: str) -> dict:
@@ -853,26 +1544,6 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
         doc = _extract_json_from_context(context)
         if isinstance(doc, dict):
             filled["original_spec"] = doc
-    if "tailored_resume" not in filled:
-        resume = _extract_resume_content_from_context(context)
-        if resume is not None:
-            filled["tailored_resume"] = resume
-    if "resume_content" not in filled:
-        resume = _extract_resume_content_from_context(context)
-        if resume is not None:
-            filled["resume_content"] = resume
-    if "resume_doc_spec" not in filled:
-        resume_spec = _extract_resume_doc_spec_from_context(context)
-        if isinstance(resume_spec, dict):
-            filled["resume_doc_spec"] = resume_spec
-    if "coverletter_doc_spec" not in filled:
-        coverletter_spec = _extract_coverletter_doc_spec_from_context(context)
-        if isinstance(coverletter_spec, dict):
-            filled["coverletter_doc_spec"] = coverletter_spec
-    if "tailored_text" not in filled:
-        text = _extract_text_from_context(context)
-        if isinstance(text, str):
-            filled["tailored_text"] = text
     if "content" not in filled:
         text = _extract_text_from_context(context)
         if isinstance(text, str):
@@ -916,38 +1587,6 @@ def _extract_document_spec_from_context(context: dict) -> dict | None:
     return None
 
 
-def _extract_resume_doc_spec_from_context(context: dict) -> dict | None:
-    if not isinstance(context, dict):
-        return None
-    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for output in group.values():
-            if not isinstance(output, dict):
-                continue
-            resume_spec = _extract_resume_doc_spec_from_outputs(output)
-            if isinstance(resume_spec, dict):
-                return resume_spec
-    return None
-
-
-def _extract_coverletter_doc_spec_from_context(context: dict) -> dict | None:
-    if not isinstance(context, dict):
-        return None
-    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for output in group.values():
-            if not isinstance(output, dict):
-                continue
-            coverletter_spec = _extract_coverletter_doc_spec_from_outputs(output)
-            if isinstance(coverletter_spec, dict):
-                return coverletter_spec
-    return None
-
-
 def _extract_validation_errors_from_context(context: dict) -> list[dict] | None:
     if not isinstance(context, dict):
         return None
@@ -982,53 +1621,12 @@ def _extract_validation_report_from_context(context: dict) -> dict | None:
     return None
 
 
-def _extract_resume_content_from_context(context: dict) -> dict | str | None:
-    if not isinstance(context, dict):
-        return None
-    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for output in group.values():
-            if not isinstance(output, dict):
-                continue
-            value = _extract_resume_content_from_outputs(output)
-            if value is not None:
-                return value
-    return None
-
-
 def _extract_json_from_outputs(outputs: dict) -> dict | None:
     if not isinstance(outputs, dict):
         return None
     spec_output = outputs.get("llm_generate_document_spec")
     if isinstance(spec_output, dict):
         document_spec = spec_output.get("document_spec")
-        if isinstance(document_spec, dict):
-            return document_spec
-    resume_spec_output = outputs.get("llm_generate_resume_doc_spec")
-    if isinstance(resume_spec_output, dict):
-        resume_doc_spec = resume_spec_output.get("resume_doc_spec")
-        if isinstance(resume_doc_spec, dict):
-            return resume_doc_spec
-    resume_spec_text_output = outputs.get("llm_generate_resume_doc_spec_from_text")
-    if isinstance(resume_spec_text_output, dict):
-        resume_doc_spec = resume_spec_text_output.get("resume_doc_spec")
-        if isinstance(resume_doc_spec, dict):
-            return resume_doc_spec
-    coverletter_spec_output = outputs.get("llm_generate_coverletter_doc_spec_from_text")
-    if isinstance(coverletter_spec_output, dict):
-        coverletter_doc_spec = coverletter_spec_output.get("coverletter_doc_spec")
-        if isinstance(coverletter_doc_spec, dict):
-            return coverletter_doc_spec
-    converted = outputs.get("resume_doc_spec_to_document_spec")
-    if isinstance(converted, dict):
-        document_spec = converted.get("document_spec")
-        if isinstance(document_spec, dict):
-            return document_spec
-    converted_coverletter = outputs.get("coverletter_doc_spec_to_document_spec")
-    if isinstance(converted_coverletter, dict):
-        document_spec = converted_coverletter.get("document_spec")
         if isinstance(document_spec, dict):
             return document_spec
     llm_output = outputs.get("llm_generate")
@@ -1068,8 +1666,6 @@ def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
     if not isinstance(outputs, dict):
         return None
     for key in (
-        "resume_doc_spec_to_document_spec",
-        "coverletter_doc_spec_to_document_spec",
         "llm_generate_document_spec",
         "llm_repair_document_spec",
         "llm_repair_json",
@@ -1083,75 +1679,6 @@ def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
     direct = outputs.get("document_spec")
     if isinstance(direct, dict):
         return direct
-    return None
-
-
-def _extract_resume_doc_spec_from_outputs(outputs: dict) -> dict | None:
-    if not isinstance(outputs, dict):
-        return None
-    for key in (
-        "llm_generate_resume_doc_spec",
-        "llm_generate_resume_doc_spec_from_text",
-    ):
-        candidate = outputs.get(key)
-        if isinstance(candidate, dict):
-            resume_doc_spec = candidate.get("resume_doc_spec")
-            if isinstance(resume_doc_spec, dict):
-                return resume_doc_spec
-    direct = outputs.get("resume_doc_spec")
-    if isinstance(direct, dict):
-        return direct
-    return None
-
-
-def _extract_coverletter_doc_spec_from_outputs(outputs: dict) -> dict | None:
-    if not isinstance(outputs, dict):
-        return None
-    candidate = outputs.get("llm_generate_coverletter_doc_spec_from_text")
-    if isinstance(candidate, dict):
-        coverletter_doc_spec = candidate.get("coverletter_doc_spec")
-        if isinstance(coverletter_doc_spec, dict):
-            return coverletter_doc_spec
-    direct = outputs.get("coverletter_doc_spec")
-    if isinstance(direct, dict):
-        return direct
-    return None
-
-
-def _extract_resume_content_from_outputs(outputs: dict) -> dict | str | None:
-    if not isinstance(outputs, dict):
-        return None
-    for key in ("tailored_resume", "resume_content"):
-        value = outputs.get(key)
-        if isinstance(value, (dict, str)):
-            return value
-    llm_output = outputs.get("llm_generate")
-    if isinstance(llm_output, dict):
-        text = llm_output.get("text")
-        if isinstance(text, str):
-            json_text = _extract_json(text)
-            if json_text:
-                try:
-                    data = json.loads(json_text)
-                except json.JSONDecodeError:
-                    return None
-                if isinstance(data, dict):
-                    for key in ("tailored_resume", "resume_content"):
-                        value = data.get(key)
-                        if isinstance(value, (dict, str)):
-                            return value
-                    return data
-    json_transform = outputs.get("json_transform")
-    if isinstance(json_transform, dict):
-        result = json_transform.get("result")
-        if isinstance(result, dict):
-            for key in ("tailored_resume", "resume_content"):
-                value = result.get(key)
-                if isinstance(value, (dict, str)):
-                    return value
-            return result
-        if isinstance(result, str):
-            return result
     return None
 
 
@@ -1296,9 +1823,6 @@ def _extract_text_from_context(context: dict) -> str | None:
 def _extract_text_from_outputs(outputs: dict) -> str | None:
     if not isinstance(outputs, dict):
         return None
-    direct = outputs.get("tailored_text")
-    if isinstance(direct, str) and direct:
-        return direct
     for tool_key in ("llm_generate", "text_summarize", "json_transform"):
         entry = outputs.get(tool_key)
         if not isinstance(entry, dict):
@@ -1321,13 +1845,63 @@ def _extract_text_from_outputs(outputs: dict) -> str | None:
                 return result
     for entry in outputs.values():
         if isinstance(entry, dict):
-            value = entry.get("tailored_text")
-            if isinstance(value, str) and value:
-                return value
             text = entry.get("text")
             if isinstance(text, str) and text:
                 return text
     return None
+
+
+def _load_schema_from_ref(schema_ref: str) -> dict[str, Any] | None:
+    schema_path = _resolve_schema_path(schema_ref)
+    if schema_path is None or not schema_path.exists():
+        return None
+    try:
+        parsed = json.loads(schema_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _prune_capability_payload_by_schema(
+    payload: dict[str, Any],
+    schema: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not CAPABILITY_ENFORCE_SCHEMA_PROPERTIES:
+        return dict(payload), []
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        return dict(payload), []
+    allowed_keys = set(properties.keys())
+    pruned = {key: value for key, value in payload.items() if key in allowed_keys}
+    dropped = sorted(key for key in payload.keys() if key not in allowed_keys)
+    return pruned, dropped
+
+
+def _enforce_capability_input_contract(
+    capability: capability_registry.CapabilitySpec,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], str | None, list[str]]:
+    normalized_payload = dict(payload) if isinstance(payload, dict) else {}
+    if not CAPABILITY_INPUT_VALIDATION_ENABLED or not capability.input_schema_ref:
+        return normalized_payload, None, []
+    schema = _load_schema_from_ref(capability.input_schema_ref)
+    if schema is None:
+        return (
+            normalized_payload,
+            f"contract.input_schema_not_found:{capability.input_schema_ref}",
+            [],
+        )
+    normalized_payload, dropped = _prune_capability_payload_by_schema(normalized_payload, schema)
+    validation_errors = payload_resolver.validate_tool_inputs(
+        {capability.capability_id: normalized_payload},
+        {capability.capability_id: schema},
+    )
+    error = validation_errors.get(capability.capability_id)
+    if error:
+        return normalized_payload, f"contract.input_invalid:{error}", dropped
+    return normalized_payload, None, dropped
 
 
 def _validate_expected_output(task_payload: dict, outputs: dict) -> str | None:

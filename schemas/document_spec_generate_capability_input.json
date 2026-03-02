@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentSpecGenerateCapabilityInput",
+  "type": "object",
+  "properties": {
+    "instruction": {"type": "string", "minLength": 1},
+    "topic": {"type": "string", "minLength": 1},
+    "audience": {"type": "string", "minLength": 1},
+    "tone": {"type": "string", "minLength": 1},
+    "today": {"type": "string", "minLength": 4},
+    "output_dir": {"type": "string", "minLength": 1},
+    "allowed_block_types": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": [
+    "instruction",
+    "topic",
+    "audience",
+    "tone",
+    "today",
+    "output_dir"
+  ],
+  "additionalProperties": true
+}

@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-mcp
+  namespace: awe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: github-mcp
+  template:
+    metadata:
+      labels:
+        app: github-mcp
+    spec:
+      containers:
+        - name: github-mcp
+          image: ghcr.io/github/github-mcp-server:latest
+          args:
+            - http
+            - --port
+            - "8082"
+            - --read-only
+            - --toolsets=repos,users
+          env:
+            - name: GITHUB_PERSONAL_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: GITHUB_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: GITHUB_TOKEN
+          ports:
+            - containerPort: 8082
+              name: http
+          readinessProbe:
+            tcpSocket:
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8082
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-mcp
+  namespace: awe
+spec:
+  selector:
+    app: github-mcp
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082

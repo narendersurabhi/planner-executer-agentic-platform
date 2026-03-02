@@ -1,0 +1,1003 @@
+capabilities:
+  - id: github.repo.list
+    description: Search/list repositories visible to the authenticated GitHub user.
+    risk_tier: read_only
+    idempotency: read
+    group: github
+    subgroup: repositories
+    input_schema_ref: github_repo_list_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - repository
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: search_repositories
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.user.me
+    description: Return the authenticated GitHub user profile.
+    risk_tier: read_only
+    idempotency: read
+    group: github
+    subgroup: users
+    input_schema_ref: ""
+    output_schema_ref: ""
+    tags:
+      - github
+      - user
+      - identity
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: get_me
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 20
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.issue.search
+    description: Search issues and pull requests visible to the authenticated GitHub user.
+    risk_tier: read_only
+    idempotency: read
+    group: github
+    subgroup: issues
+    input_schema_ref: github_search_issues_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - issues
+      - pull-requests
+      - search
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: search_issues
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.user.search
+    description: Search GitHub users by query.
+    risk_tier: read_only
+    idempotency: read
+    group: github
+    subgroup: users
+    input_schema_ref: github_search_users_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - users
+      - search
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: search_users
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.branch.create
+    description: Create a branch in a GitHub repository.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: github
+    subgroup: branches
+    input_schema_ref: github_create_branch_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - branch
+      - create
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: create_branch
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.branch.list
+    description: List repository branches.
+    risk_tier: read_only
+    idempotency: read
+    group: github
+    subgroup: branches
+    input_schema_ref: github_list_branches_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - branch
+      - list
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: list_branches
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.files.push
+    description: Push multiple files to a repository branch in one commit.
+    risk_tier: high_risk
+    idempotency: unsafe_write
+    group: github
+    subgroup: files
+    input_schema_ref: github_push_files_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - files
+      - push
+      - commit
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: push_files
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 45
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.file.create_or_update
+    description: Create or update a single file in a repository.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: github
+    subgroup: files
+    input_schema_ref: github_create_or_update_file_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - file
+      - create
+      - update
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: create_or_update_file
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.file.delete
+    description: Delete a file from a repository branch.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: github
+    subgroup: files
+    input_schema_ref: github_delete_file_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - file
+      - delete
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: delete_file
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: github.pull_request.create
+    description: Create a pull request in a repository.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: github
+    subgroup: pull_requests
+    input_schema_ref: github_create_pull_request_capability_input
+    output_schema_ref: ""
+    tags:
+      - github
+      - pull_request
+      - create
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: github_local
+        tool_name: create_pull_request
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.list
+    description: List files under shared artifacts storage.
+    risk_tier: read_only
+    idempotency: read
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_list_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - list
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: list_files
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.read_text
+    description: Read a UTF-8 text file from shared artifacts storage.
+    risk_tier: read_only
+    idempotency: read
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_read_text_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - read
+      - text
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: file_read_text
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.write_text
+    description: Write text to shared artifacts storage at a specific path.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_write_text_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - write
+      - text
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: file_write_text
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.write_content
+    description: Write text content to shared artifacts storage with optional path.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_write_artifact_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - write
+      - content
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: file_write_artifact
+        arg_map: {}
+        enabled: true
+  - id: filesystem.workspace.list
+    description: List files under workspace storage.
+    risk_tier: read_only
+    idempotency: read
+    group: filesystem
+    subgroup: workspace
+    input_schema_ref: filesystem_list_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - workspace
+      - list
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: workspace_list_files
+        arg_map: {}
+        enabled: true
+  - id: filesystem.workspace.read_text
+    description: Read a UTF-8 text file from workspace storage.
+    risk_tier: read_only
+    idempotency: read
+    group: filesystem
+    subgroup: workspace
+    input_schema_ref: filesystem_read_text_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - workspace
+      - read
+      - text
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: workspace_read_text
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.move_to_workspace
+    description: Move a file from shared artifacts to workspace.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: transfer
+    input_schema_ref: filesystem_artifact_move_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - workspace
+      - move
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: artifact_move
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.search_text
+    description: Search text within shared artifacts files.
+    risk_tier: read_only
+    idempotency: read
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_search_text_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - search
+      - text
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: search_text
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.mkdir
+    description: Create a directory under shared artifacts storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_mkdir_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - mkdir
+      - directory
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: artifact_mkdir
+        arg_map: {}
+        enabled: true
+  - id: filesystem.workspace.mkdir
+    description: Create a directory under workspace storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: workspace
+    input_schema_ref: filesystem_mkdir_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - workspace
+      - mkdir
+      - directory
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: workspace_mkdir
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.delete
+    description: Delete a file or directory under shared artifacts storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_delete_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - delete
+      - directory
+      - file
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: artifact_delete
+        arg_map: {}
+        enabled: true
+  - id: filesystem.workspace.delete
+    description: Delete a file or directory under workspace storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: workspace
+    input_schema_ref: filesystem_delete_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - workspace
+      - delete
+      - directory
+      - file
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: workspace_delete
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.rename
+    description: Rename or move a file/directory within shared artifacts storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_rename_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - rename
+      - move
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: artifact_rename
+        arg_map: {}
+        enabled: true
+  - id: filesystem.workspace.rename
+    description: Rename or move a file/directory within workspace storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: workspace
+    input_schema_ref: filesystem_rename_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - workspace
+      - rename
+      - move
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: workspace_rename
+        arg_map: {}
+        enabled: true
+  - id: filesystem.artifacts.copy
+    description: Copy a file/directory within shared artifacts storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: artifacts
+    input_schema_ref: filesystem_copy_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - artifacts
+      - copy
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: artifact_copy
+        arg_map: {}
+        enabled: true
+  - id: filesystem.workspace.copy
+    description: Copy a file/directory within workspace storage.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: filesystem
+    subgroup: workspace
+    input_schema_ref: filesystem_copy_capability_input
+    output_schema_ref: ""
+    tags:
+      - filesystem
+      - workspace
+      - copy
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: workspace_copy
+        arg_map: {}
+        enabled: true
+  - id: memory.read
+    description: Read memory entries for pointer resolution and context hydration.
+    risk_tier: read_only
+    idempotency: read
+    group: memory
+    subgroup: retrieval
+    input_schema_ref: memory_read_capability_input
+    output_schema_ref: ""
+    tags:
+      - memory
+      - read
+      - pointer
+      - context
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: memory_read
+        arg_map: {}
+        enabled: true
+  - id: memory.write
+    description: Write memory entries for reuse across tasks, jobs, and scopes.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: memory
+    subgroup: mutation
+    input_schema_ref: memory_write_capability_input
+    output_schema_ref: ""
+    tags:
+      - memory
+      - write
+      - pointer
+      - context
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: memory_write
+        arg_map: {}
+        enabled: true
+  - id: memory.semantic.write
+    description: Persist distilled semantic facts (user/domain/environment knowledge) for later lookup and reasoning.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: memory
+    subgroup: semantic
+    input_schema_ref: memory_semantic_write_capability_input
+    output_schema_ref: ""
+    tags:
+      - memory
+      - semantic
+      - knowledge
+      - write
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: memory_semantic_write
+        arg_map: {}
+        enabled: true
+  - id: memory.semantic.search
+    description: Retrieve ranked semantic facts by natural-language query for grounding and reasoning.
+    risk_tier: read_only
+    idempotency: read
+    group: memory
+    subgroup: semantic
+    input_schema_ref: memory_semantic_search_capability_input
+    output_schema_ref: ""
+    tags:
+      - memory
+      - semantic
+      - knowledge
+      - search
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: memory_semantic_search
+        arg_map: {}
+        enabled: true
+  - id: document.output.derive
+    description: Derive a generic safe relative output path for generated document artifacts (set output_extension for pdf/md/etc.).
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: output
+    input_schema_ref: document_derive_output_path_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - path
+      - artifacts
+    planner_hints:
+      derives_output_path: true
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: derive_output_path
+        arg_map: {}
+        enabled: true
+  - id: document.spec.generate
+    description: Generate a DocumentSpec from instruction/topic/audience/tone/date/output_dir using the LLM.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: generation
+    input_schema_ref: document_spec_generate_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - spec
+      - generation
+      - llm
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_generate_document_spec
+        arg_map: {}
+        enabled: true
+  - id: document.spec.improve
+    description: Improve an existing DocumentSpec using validation feedback.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: generation
+    input_schema_ref: document_spec_improve_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - spec
+      - improve
+      - llm
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_improve_document_spec
+        arg_map: {}
+        enabled: true
+  - id: document.spec.repair
+    description: Repair an invalid DocumentSpec JSON object using validation errors.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: generation
+    input_schema_ref: document_spec_repair_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - spec
+      - repair
+      - llm
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_repair_document_spec
+        arg_map: {}
+        enabled: true
+  - id: document.spec.generate_iterative
+    description: Iteratively generate or improve a DocumentSpec until validation passes.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: generation
+    input_schema_ref: document_spec_iterative_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - spec
+      - iterative
+      - llm
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_iterative_improve_document_spec
+        arg_map: {}
+        enabled: true
+  - id: document.runbook.generate_iterative
+    description: Iteratively generate and improve a runbook-style DocumentSpec.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: generation
+    input_schema_ref: document_runbook_iterative_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - runbook
+      - iterative
+      - llm
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_iterative_improve_runbook_spec
+        arg_map: {}
+        enabled: true
+  - id: document.spec.validate
+    description: Validate a DocumentSpec before rendering.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: specs
+    input_schema_ref: document_spec_validate_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - spec
+      - validation
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: document_spec_validate
+        arg_map: {}
+        enabled: true
+  - id: document.docx.generate
+    description: Generate a DOCX artifact directly from a DocumentSpec.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: documents
+    subgroup: rendering
+    input_schema_ref: document_docx_generate_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - docx
+      - render
+    planner_hints:
+      required_output_extension: docx
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: docx_generate_from_spec
+        arg_map: {}
+        enabled: true
+  - id: document.docx.render_template
+    description: Render a DOCX using a template and structured data.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: documents
+    subgroup: rendering
+    input_schema_ref: document_docx_render_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - docx
+      - template
+      - render
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: docx_render
+        arg_map: {}
+        enabled: true
+  - id: document.pdf.generate
+    description: Generate a PDF artifact directly from a DocumentSpec.
+    risk_tier: bounded_write
+    idempotency: safe_write
+    group: documents
+    subgroup: rendering
+    input_schema_ref: document_pdf_generate_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - pdf
+      - render
+    planner_hints:
+      required_output_extension: pdf
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: pdf_generate_from_spec
+        arg_map: {}
+        enabled: true
+  - id: openapi.spec.generate_iterative
+    description: Generate and iteratively improve an OpenAPI specification from job context.
+    risk_tier: read_only
+    idempotency: read
+    group: api-specs
+    subgroup: openapi
+    input_schema_ref: openapi_spec_generate_iterative_capability_input
+    output_schema_ref: ""
+    tags:
+      - openapi
+      - api-specs
+      - llm
+      - iterative
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_iterative_improve_openapi_spec
+        arg_map: {}
+        enabled: true
+  - id: openapi.spec.improve_iterative
+    description: Iteratively improve an existing OpenAPI specification.
+    risk_tier: read_only
+    idempotency: read
+    group: api-specs
+    subgroup: openapi
+    input_schema_ref: openapi_spec_improve_iterative_capability_input
+    output_schema_ref: ""
+    tags:
+      - openapi
+      - api-specs
+      - llm
+      - iterative
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_iterative_improve_openapi_spec
+        arg_map: {}
+        enabled: true
+  - id: utility.json.transform
+    description: Pass through or reshape JSON payloads between tasks.
+    risk_tier: read_only
+    idempotency: read
+    group: utility
+    subgroup: transforms
+    input_schema_ref: utility_json_transform_capability_input
+    output_schema_ref: ""
+    tags:
+      - utility
+      - json
+      - transform
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: json_transform
+        arg_map: {}
+        enabled: true
+  - id: llm.text.generate
+    description: Generate free-form text with the configured LLM.
+    risk_tier: read_only
+    idempotency: read
+    group: llm
+    subgroup: text
+    input_schema_ref: llm_text_generate_capability_input
+    output_schema_ref: ""
+    tags:
+      - llm
+      - text
+      - generation
+      - high_cost
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_generate
+        arg_map: {}
+        enabled: true
+  - id: codegen.generate
+    description: Generate code changes using the coding agent service.
+    risk_tier: high_risk
+    idempotency: safe_write
+    group: codegen
+    subgroup: generation
+    input_schema_ref: codegen_generate_capability_input
+    output_schema_ref: ""
+    tags:
+      - codegen
+      - coding-agent
+      - generation
+      - write
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: coding_agent_generate
+        arg_map: {}
+        enabled: true
+  - id: codegen.autonomous
+    description: Plan and implement code changes autonomously in the workspace.
+    risk_tier: high_risk
+    idempotency: unsafe_write
+    group: codegen
+    subgroup: generation
+    input_schema_ref: codegen_autonomous_capability_input
+    output_schema_ref: ""
+    tags:
+      - codegen
+      - coding-agent
+      - autonomous
+      - write
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: coding_agent_autonomous
+        arg_map: {}
+        enabled: true
+  - id: codegen.publish_pr
+    description: Publish workspace codegen changes to GitHub by creating branch, pushing files, and opening a PR.
+    risk_tier: high_risk
+    idempotency: unsafe_write
+    group: codegen
+    subgroup: publish
+    input_schema_ref: codegen_publish_pr_capability_input
+    output_schema_ref: ""
+    tags:
+      - codegen
+      - github
+      - pull-request
+      - publish
+      - write
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: coding_agent_publish_pr
+        arg_map: {}
+        enabled: true

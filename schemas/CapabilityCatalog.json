@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CapabilityCatalog",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "type": "array",
+      "items": {"$ref": "CapabilitySpec.json"}
+    }
+  },
+  "required": ["capabilities"],
+  "additionalProperties": false
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentDeriveOutputPathCapabilityInput",
+  "type": "object",
+  "properties": {
+    "topic": {"type": "string", "minLength": 1},
+    "today": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "output_dir": {"type": "string", "minLength": 1},
+    "document_type": {"type": "string", "minLength": 1},
+    "output_extension": {"type": "string", "pattern": "^\\.?[A-Za-z0-9]{1,16}$"}
+  },
+  "required": ["topic", "output_dir"],
+  "additionalProperties": true
+}

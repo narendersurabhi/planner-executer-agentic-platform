@@ -13,6 +13,10 @@ from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
+from libs.tools.output_path_derivation import (
+    OutputPathDerivationError,
+    resolve_or_derive_output_path,
+)
 
 
 def _artifacts_dir() -> Path:
@@ -28,9 +32,10 @@ def register_docx_tools(registry) -> None:
                 name="docx_generate_from_spec",
                 description="Generate an ATS-friendly .docx document from a DocumentSpec JSON",
                 usage_guidance=(
-                    "Provide path (relative .docx filename). document_spec is "
+                    "Provide path (relative .docx filename). If omitted, a safe path is auto-derived "
+                    "from topic/date/output_dir context. document_spec is "
                     "resolved from memory (document_spec:latest) unless explicitly provided. "
-                    "path can be resolved from memory (docx_path:latest) when using derive_output_filename. "
+                    "path can be resolved from memory (docx_path:latest) when using derive_output_path or derive_output_filename. "
                     "render_context (merged into tokens), and strict (default true). "
                     "Supported blocks: text, paragraph, heading, bullets, spacer, "
                     "optional_paragraph, repeat. "
@@ -71,10 +76,11 @@ def _docx_generate_from_spec(payload: Dict[str, Any]) -> Dict[str, Any]:
             "document_spec missing (not found in memory). Provide document_spec explicitly."
         )
 
-    path = payload.get("path")
-    if not isinstance(path, str) or not path:
-        _tool_error("path must be a non-empty string")
-    if not path.endswith(".docx"):
+    try:
+        path = resolve_or_derive_output_path(payload, extension="docx")
+    except OutputPathDerivationError as exc:
+        _tool_error(str(exc))
+    if not path.lower().endswith(".docx"):
         _tool_error("path must end with .docx")
     if Path(path).is_absolute():
         _tool_error("path must be relative to /shared/artifacts")

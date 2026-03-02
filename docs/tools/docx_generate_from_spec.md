@@ -9,7 +9,7 @@ Generate an ATS-friendly single-column `.docx` document from a `DocumentSpec` JS
 ```json
 {
   "document_spec": {"theme": {}, "tokens": {}, "blocks": []},
-  "path": "resume.docx",
+  "path": "document.docx",
   "render_context": {},
   "strict": true
 }
@@ -52,7 +52,7 @@ Generate an ATS-friendly single-column `.docx` document from a `DocumentSpec` JS
       }
     ]
   },
-  "path": "resume.docx"
+  "path": "document.docx"
 }
 ```
 
@@ -60,7 +60,7 @@ Generate an ATS-friendly single-column `.docx` document from a `DocumentSpec` JS
 
 ```json
 {
-  "path": "/shared/artifacts/resume.docx",
+  "path": "/shared/artifacts/document.docx",
   "bytes_written": 12345
 }
 ```

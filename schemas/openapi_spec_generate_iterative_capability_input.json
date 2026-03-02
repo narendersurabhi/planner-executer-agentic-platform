@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenApiSpecGenerateIterativeCapabilityInput",
+  "type": "object",
+  "properties": {
+    "job": {"type": "object"},
+    "max_iterations": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10
+    }
+  },
+  "required": ["job"],
+  "additionalProperties": true
+}

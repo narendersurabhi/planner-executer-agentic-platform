@@ -105,7 +105,6 @@ def classify_tool_error(error_text: str) -> str:
         return "contract.intent_mismatch"
     if (
         "missing_required_fields" in lowered
-        or "tailored_resume_missing_fields" in lowered
         or "invalid_json" in lowered
         or "coder_response_missing_files" in lowered
     ):

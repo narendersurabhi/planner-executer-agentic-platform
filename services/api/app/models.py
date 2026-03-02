@@ -67,6 +67,20 @@ class TaskRecord(Base):
     plan: Mapped[PlanRecord] = relationship("PlanRecord", back_populates="tasks")
 
 
+class EventOutboxRecord(Base):
+    __tablename__ = "event_outbox"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    stream: Mapped[str] = mapped_column(String, index=True)
+    event_type: Mapped[str] = mapped_column(String, index=True)
+    envelope_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
 class MemoryRecord(Base):
     __tablename__ = "memory"
 

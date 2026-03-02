@@ -4,25 +4,6 @@ from typing import Any, Mapping, Sequence
 
 
 MEMORY_OUTPUT_KEYS = {
-    "llm_tailor_resume_text": ["tailored_resume"],
-    "llm_improve_tailored_resume_text": [
-        "tailored_resume",
-        "alignment_score",
-        "alignment_summary",
-    ],
-    "llm_iterative_improve_tailored_resume_text": [
-        "tailored_resume",
-        "alignment_score",
-        "alignment_summary",
-        "iterations",
-        "reached_threshold",
-    ],
-    "llm_generate_resume_doc_spec_from_text": ["resume_doc_spec", "validation"],
-    "llm_generate_coverletter_doc_spec_from_text": ["coverletter_doc_spec"],
-    "llm_generate_resume_doc_spec": ["resume_doc_spec"],
-    "llm_generate_cover_letter_from_resume": ["cover_letter"],
-    "resume_doc_spec_to_document_spec": ["document_spec"],
-    "coverletter_doc_spec_to_document_spec": ["document_spec"],
     "llm_generate_document_spec": ["document_spec"],
     "llm_improve_document_spec": ["document_spec"],
     "llm_iterative_improve_document_spec": [
@@ -47,18 +28,8 @@ MEMORY_OUTPUT_KEYS = {
 }
 
 MEMORY_INPUT_KEYS = {
-    "llm_improve_tailored_resume_text": ["tailored_resume"],
-    "llm_iterative_improve_tailored_resume_text": ["tailored_resume"],
-    "llm_generate_resume_doc_spec_from_text": ["tailored_resume", "tailored_text"],
-    "llm_generate_coverletter_doc_spec_from_text": ["tailored_resume", "tailored_text"],
-    "llm_generate_resume_doc_spec": ["tailored_resume"],
-    "llm_generate_cover_letter_from_resume": ["tailored_resume", "tailored_text"],
-    "resume_doc_spec_validate": ["resume_doc_spec"],
-    "resume_doc_spec_to_document_spec": ["resume_doc_spec"],
-    "coverletter_doc_spec_to_document_spec": ["coverletter_doc_spec"],
     "document_spec_validate": ["document_spec"],
     "docx_generate_from_spec": ["document_spec", "path"],
-    "cover_letter_generate_ats_docx": ["cover_letter", "path"],
     "llm_improve_document_spec": ["document_spec"],
     "llm_iterative_improve_document_spec": ["document_spec"],
     "llm_iterative_improve_runbook_spec": ["document_spec"],
@@ -66,24 +37,17 @@ MEMORY_INPUT_KEYS = {
 }
 
 MEMORY_ONLY_INPUTS = {tool_name: list(keys) for tool_name, keys in MEMORY_INPUT_KEYS.items()}
-MEMORY_ONLY_INPUTS.pop("llm_generate_resume_doc_spec_from_text", None)
-MEMORY_ONLY_INPUTS.pop("llm_generate_coverletter_doc_spec_from_text", None)
-MEMORY_ONLY_INPUTS.pop("llm_generate_cover_letter_from_resume", None)
 MEMORY_ONLY_INPUTS.pop("document_spec_validate", None)
 MEMORY_ONLY_INPUTS.pop("docx_generate_from_spec", None)
-MEMORY_ONLY_INPUTS.pop("cover_letter_generate_ats_docx", None)
+# Iterative generators support either seed spec (from memory/dependency) OR job input.
+# Do not enforce memory-only for these tools.
+MEMORY_ONLY_INPUTS.pop("llm_iterative_improve_document_spec", None)
+MEMORY_ONLY_INPUTS.pop("llm_iterative_improve_runbook_spec", None)
+MEMORY_ONLY_INPUTS.pop("llm_iterative_improve_openapi_spec", None)
 
 MEMORY_PREFERRED_KEYS = {
-    "tailored_resume": "tailored_resume:latest",
-    "tailored_text": "tailored_text:latest",
-    "alignment_score": "alignment_score:latest",
-    "alignment_summary": "alignment_summary:latest",
-    "resume_doc_spec": "resume_doc_spec:latest",
-    "coverletter_doc_spec": "coverletter_doc_spec:latest",
-    "validation": "resume_doc_spec_validation:latest",
     "document_spec": "document_spec:latest",
     "openapi_spec": "openapi_spec:latest",
-    "cover_letter": "cover_letter:latest",
     "path": "docx_path:latest",
 }
 
@@ -93,12 +57,8 @@ def stable_memory_keys(tool_name: str, payload: Mapping[str, Any]) -> list[str]:
     for field, alias in MEMORY_PREFERRED_KEYS.items():
         if field in payload:
             keys.append(alias)
-    if tool_name == "derive_output_filename" and "path" in payload:
-        document_type = _normalize_document_type(payload.get("document_type"))
-        if document_type == "cover_letter":
-            keys.append("docx_path:cover_letter:latest")
-        else:
-            keys.append("docx_path:resume:latest")
+    if tool_name in {"derive_output_filename", "derive_output_path"} and "path" in payload:
+        keys.append("docx_path:document:latest")
     return keys
 
 
@@ -162,33 +122,10 @@ def apply_memory_defaults(tool_name: str, payload: Mapping[str, Any]) -> dict:
     return output
 
 
-def _normalize_document_type(value: Any) -> str:
-    if not isinstance(value, str):
-        return "resume"
-    normalized = value.strip().lower().replace("-", "_")
-    if normalized in {"cover_letter", "coverletter"}:
-        return "cover_letter"
-    return "resume"
-
-
-def _is_cover_letter_document_spec(document_spec: Any) -> bool:
-    if not isinstance(document_spec, Mapping):
-        return False
-    doc_type = document_spec.get("doc_type")
-    if not isinstance(doc_type, str):
-        return False
-    normalized = doc_type.strip().lower().replace("-", "_")
-    return "cover" in normalized
-
-
 def _extract_docx_path_for_document(
     entries: Sequence[Mapping[str, Any]], document_spec: Any
 ) -> Any:
-    preferred_alias = (
-        "docx_path:cover_letter:latest"
-        if _is_cover_letter_document_spec(document_spec)
-        else "docx_path:resume:latest"
-    )
+    preferred_alias = "docx_path:document:latest"
     for entry in entries:
         if not isinstance(entry, Mapping):
             continue

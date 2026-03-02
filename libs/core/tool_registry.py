@@ -6,14 +6,20 @@ import math
 import os
 import re
 import shutil
+import inspect
 import time
+from datetime import UTC, datetime
 from subprocess import CompletedProcess, run
+from importlib import import_module
+from importlib import metadata as importlib_metadata
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from .llm_provider import LLMProvider
 from . import prompts, tracing as core_tracing
+from libs.core import mcp_gateway
 from .models import RiskLevel, ToolIntent, ToolSpec
 from libs.framework.tool_runtime import (
     Tool,
@@ -22,14 +28,10 @@ from libs.framework.tool_runtime import (
     classify_tool_error as _classify_tool_error,
     validate_schema as _validate_schema,
 )
+from libs.core.memory_client import MemoryClient, MemoryClientError
 from libs.tools.docx_generate_from_spec import register_docx_tools
+from libs.tools.pdf_generate_from_spec import register_pdf_tools
 from libs.tools.document_spec_validate import register_document_spec_tools
-from libs.tools.resume_doc_spec_validate import register_resume_doc_spec_tools
-from libs.tools.resume_doc_spec_to_document_spec import register_resume_doc_spec_convert_tools
-from libs.tools.coverletter_doc_spec_to_document_spec import (
-    register_coverletter_doc_spec_convert_tools,
-)
-from libs.tools.cover_letter_generate_ats_docx import register_cover_letter_generate_tools
 from libs.tools.document_spec_iterative import register_document_spec_iterative_tools
 from libs.tools.document_spec_llm import (
     llm_generate_document_spec as _llm_generate_document_spec_external,
@@ -40,16 +42,50 @@ from libs.tools.core_ops import CoreOpsHandlers, register_core_ops_tools
 from libs.tools.llm_tool_groups import (
     register_coding_agent_tools,
     register_llm_text_tool,
-    register_resume_llm_tools,
-    register_tailor_mcp_tools,
 )
 from libs.tools import mcp_client
-from libs.tools import resume_llm
 from libs.tools import coder_tools
 from libs.tools.github_tools import register_github_tools
 from libs.tools.openapi_iterative import register_openapi_iterative_tools
 
+try:  # Optional at import-time; policy service already depends on PyYAML.
+    import yaml
+except Exception:  # noqa: BLE001
+    yaml = None
+
 LOGGER = logging.getLogger(__name__)
+
+
+class ToolPluginLoadError(ToolExecutionError):
+    pass
+
+
+@dataclass
+class ToolAllowDecision:
+    allowed: bool
+    reason: str
+    mode: str = "enforce"
+    violated: bool = False
+
+
+@dataclass
+class _Ruleset:
+    allow: set[str]
+    deny: set[str]
+
+
+@dataclass
+class _GovernanceConfig:
+    mode: str
+    global_rules: _Ruleset
+    service_rules: dict[str, _Ruleset]
+    tenant_rules: dict[str, _Ruleset]
+    job_type_rules: dict[str, _Ruleset]
+    blocked_risk_by_service: dict[str, set[str]]
+
+
+_GOVERNANCE_CACHE_KEY: tuple[str, float] | None = None
+_GOVERNANCE_CACHE_VALUE: _GovernanceConfig | None = None
 
 
 def _extract_mcp_error_phase(error_text: str) -> str | None:
@@ -215,10 +251,420 @@ def _host_allowed(host: str, allowlist: List[str]) -> bool:
     return False
 
 
+def _parse_csv_values(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _tool_governance_enabled() -> bool:
+    return os.getenv("TOOL_GOVERNANCE_ENABLED", "true").lower() == "true"
+
+
+def _tool_governance_mode_env() -> str | None:
+    raw = os.getenv("TOOL_GOVERNANCE_MODE", "").strip().lower()
+    if raw in {"enforce", "dry_run"}:
+        return raw
+    return None
+
+
+def _normalize_rule_key(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).lower().strip("_")
+
+
+def _resolve_tool_governance_config_path() -> Path:
+    raw = os.getenv("TOOL_GOVERNANCE_CONFIG_PATH", "config/tool_governance.yaml").strip()
+    return Path(raw).expanduser()
+
+
+def _ruleset_from_raw(raw: Any) -> _Ruleset:
+    if not isinstance(raw, dict):
+        return _Ruleset(allow=set(), deny=set())
+    allow = (
+        {str(item).strip() for item in raw.get("allow", []) if str(item).strip()}
+        if isinstance(raw.get("allow"), list)
+        else set()
+    )
+    deny = (
+        {str(item).strip() for item in raw.get("deny", []) if str(item).strip()}
+        if isinstance(raw.get("deny"), list)
+        else set()
+    )
+    return _Ruleset(allow=allow, deny=deny)
+
+
+def _rules_map_from_raw(raw: Any) -> dict[str, _Ruleset]:
+    if not isinstance(raw, dict):
+        return {}
+    mapped: dict[str, _Ruleset] = {}
+    for key, value in raw.items():
+        norm_key = _normalize_rule_key(str(key))
+        if not norm_key:
+            continue
+        mapped[norm_key] = _ruleset_from_raw(value)
+    return mapped
+
+
+def _blocked_risk_by_service_from_raw(raw: Any) -> dict[str, set[str]]:
+    if not isinstance(raw, dict):
+        return {}
+    mapped: dict[str, set[str]] = {}
+    for key, value in raw.items():
+        norm_key = _normalize_rule_key(str(key))
+        if not norm_key:
+            continue
+        if isinstance(value, list):
+            mapped[norm_key] = {
+                str(entry).strip().lower() for entry in value if str(entry).strip()
+            }
+    return mapped
+
+
+def _default_governance_config() -> _GovernanceConfig:
+    mode = _tool_governance_mode_env() or "enforce"
+    return _GovernanceConfig(
+        mode=mode,
+        global_rules=_Ruleset(allow=set(), deny=set()),
+        service_rules={},
+        tenant_rules={},
+        job_type_rules={},
+        blocked_risk_by_service={},
+    )
+
+
+def _load_governance_config() -> _GovernanceConfig:
+    global _GOVERNANCE_CACHE_KEY, _GOVERNANCE_CACHE_VALUE
+    config = _default_governance_config()
+    if not _tool_governance_enabled():
+        config.mode = "enforce"
+        return config
+    config_path = _resolve_tool_governance_config_path()
+    try:
+        mtime = config_path.stat().st_mtime
+    except OSError:
+        mtime = -1.0
+    cache_key = (str(config_path), mtime)
+    if _GOVERNANCE_CACHE_KEY == cache_key and _GOVERNANCE_CACHE_VALUE is not None:
+        return _GOVERNANCE_CACHE_VALUE
+    loaded = config
+    if mtime >= 0 and yaml is not None:
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("tool_governance_config_load_failed path=%s error=%s", config_path, exc)
+            data = {}
+        gov = data.get("tool_governance", {}) if isinstance(data, dict) else {}
+        if isinstance(gov, dict):
+            mode = _tool_governance_mode_env() or str(gov.get("mode", "")).strip().lower() or "enforce"
+            if mode not in {"enforce", "dry_run"}:
+                mode = "enforce"
+            loaded = _GovernanceConfig(
+                mode=mode,
+                global_rules=_ruleset_from_raw(gov.get("global", {})),
+                service_rules=_rules_map_from_raw(gov.get("services", {})),
+                tenant_rules=_rules_map_from_raw(gov.get("tenants", {})),
+                job_type_rules=_rules_map_from_raw(gov.get("job_types", {})),
+                blocked_risk_by_service=_blocked_risk_by_service_from_raw(
+                    (gov.get("risk", {}) or {}).get("blocked_levels_by_service", {})
+                    if isinstance(gov.get("risk", {}), dict)
+                    else {}
+                ),
+            )
+    _GOVERNANCE_CACHE_KEY = cache_key
+    _GOVERNANCE_CACHE_VALUE = loaded
+    return loaded
+
+
+def _plugin_fail_fast() -> bool:
+    return os.getenv("TOOL_PLUGIN_FAIL_FAST", "true").lower() == "true"
+
+
+def _normalize_service_name(service_name: str | None) -> str:
+    if not service_name:
+        return ""
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", service_name.strip())
+    return normalized.upper().strip("_")
+
+
+def _service_env_name(service_name: str, suffix: str) -> str:
+    return f"{service_name}_{suffix}"
+
+
+def _context_lookup(context: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = context.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    nested = context.get("job_context")
+    if isinstance(nested, dict):
+        for key in keys:
+            value = nested.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _resolve_allowlist_sets(
+    service_name: str | None, context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    gov = _load_governance_config()
+    normalized_service_key = _normalize_rule_key(service_name)
+    service_rules = gov.service_rules.get(normalized_service_key, _Ruleset(set(), set()))
+    context = context if isinstance(context, dict) else {}
+    tenant_key = _normalize_rule_key(
+        _context_lookup(context, "tenant_id", "org_id", "organization_id")
+    )
+    job_type_key = _normalize_rule_key(_context_lookup(context, "job_type", "workflow_type"))
+    tenant_rules = gov.tenant_rules.get(tenant_key, _Ruleset(set(), set()))
+    job_type_rules = gov.job_type_rules.get(job_type_key, _Ruleset(set(), set()))
+    normalized_service = _normalize_service_name(service_name)
+    global_enabled = _parse_csv_values(os.getenv("ENABLED_TOOLS"))
+    global_disabled = _parse_csv_values(os.getenv("DISABLED_TOOLS"))
+    service_enabled = set()
+    service_disabled = set()
+    if normalized_service:
+        service_enabled = _parse_csv_values(
+            os.getenv(_service_env_name(normalized_service, "ENABLED_TOOLS"))
+        )
+        service_disabled = _parse_csv_values(
+            os.getenv(_service_env_name(normalized_service, "DISABLED_TOOLS"))
+        )
+    return {
+        "mode": gov.mode,
+        "global_enabled": global_enabled,
+        "global_disabled": global_disabled,
+        "service_enabled": service_enabled,
+        "service_disabled": service_disabled,
+        "config_global_allow": gov.global_rules.allow,
+        "config_global_deny": gov.global_rules.deny,
+        "config_service_allow": service_rules.allow,
+        "config_service_deny": service_rules.deny,
+        "config_tenant_allow": tenant_rules.allow,
+        "config_tenant_deny": tenant_rules.deny,
+        "config_job_type_allow": job_type_rules.allow,
+        "config_job_type_deny": job_type_rules.deny,
+        "blocked_risk_levels": gov.blocked_risk_by_service.get(normalized_service_key, set()),
+    }
+
+
+def _deny_decision(mode: str, reason: str) -> ToolAllowDecision:
+    if mode == "dry_run":
+        return ToolAllowDecision(True, f"dry_run:{reason}", mode=mode, violated=True)
+    return ToolAllowDecision(False, reason, mode=mode, violated=True)
+
+
+def evaluate_tool_allowlist(
+    tool_name: str,
+    service_name: str | None = None,
+    *,
+    context: dict[str, Any] | None = None,
+    tool_spec: ToolSpec | None = None,
+) -> ToolAllowDecision:
+    sets = _resolve_allowlist_sets(service_name, context=context)
+    mode = str(sets.get("mode") or "enforce")
+
+    deny_checks = (
+        ("global_disabled", sets["global_disabled"]),
+        ("service_disabled", sets["service_disabled"]),
+        ("config_global_deny", sets["config_global_deny"]),
+        ("config_service_deny", sets["config_service_deny"]),
+        ("config_tenant_deny", sets["config_tenant_deny"]),
+        ("config_job_type_deny", sets["config_job_type_deny"]),
+    )
+    for reason, denied_set in deny_checks:
+        if denied_set and tool_name in denied_set:
+            return _deny_decision(mode, reason)
+
+    blocked_risk_levels = sets.get("blocked_risk_levels", set())
+    if blocked_risk_levels and tool_spec is not None:
+        risk_level = (
+            tool_spec.risk_level.value
+            if isinstance(tool_spec.risk_level, RiskLevel)
+            else str(tool_spec.risk_level).lower()
+        )
+        if risk_level in blocked_risk_levels:
+            return _deny_decision(mode, f"risk_blocked:{risk_level}")
+
+    allow_checks = (
+        ("not_in_global_enabled", sets["global_enabled"]),
+        ("not_in_service_enabled", sets["service_enabled"]),
+        ("not_in_config_global_allow", sets["config_global_allow"]),
+        ("not_in_config_service_allow", sets["config_service_allow"]),
+        ("not_in_config_tenant_allow", sets["config_tenant_allow"]),
+        ("not_in_config_job_type_allow", sets["config_job_type_allow"]),
+    )
+    for reason, allowed_set in allow_checks:
+        if allowed_set and tool_name not in allowed_set:
+            return _deny_decision(mode, reason)
+    return ToolAllowDecision(True, "allowed", mode=mode, violated=False)
+
+
+def _tool_enabled(
+    name: str, service_name: str | None = None, tool_spec: ToolSpec | None = None
+) -> bool:
+    return evaluate_tool_allowlist(name, service_name, tool_spec=tool_spec).allowed
+
+
+def _filter_registry_tools(registry: ToolRegistry, service_name: str | None = None) -> None:
+    sets = _resolve_allowlist_sets(service_name)
+    effective_lists = [
+        sets.get("global_enabled", set()),
+        sets.get("global_disabled", set()),
+        sets.get("service_enabled", set()),
+        sets.get("service_disabled", set()),
+        sets.get("config_global_allow", set()),
+        sets.get("config_global_deny", set()),
+        sets.get("config_service_allow", set()),
+        sets.get("config_service_deny", set()),
+        sets.get("blocked_risk_levels", set()),
+    ]
+    if not any(effective_lists):
+        return
+    kept: dict[str, Tool] = {}
+    for tool_name in list(registry._tools.keys()):
+        tool = registry._tools[tool_name]
+        if _tool_enabled(tool_name, service_name, tool.spec):
+            kept[tool_name] = registry._tools[tool_name]
+    registry._tools = kept
+
+
+def _parse_plugin_spec(spec: str) -> tuple[str, str]:
+    value = spec.strip()
+    if not value:
+        raise ToolPluginLoadError("Empty plugin spec in TOOL_PLUGIN_MODULES")
+    if ":" not in value:
+        return value, "register_tools"
+    module_path, attr_name = value.split(":", 1)
+    module_path = module_path.strip()
+    attr_name = attr_name.strip() or "register_tools"
+    if not module_path:
+        raise ToolPluginLoadError(f"Invalid plugin spec: {spec}")
+    return module_path, attr_name
+
+
+def _resolve_module_register_fn(module: Any, attr_name: str) -> Callable[..., None]:
+    candidates = [attr_name]
+    if attr_name == "register_tools":
+        candidates.append("register")
+    for candidate in candidates:
+        register_fn = getattr(module, candidate, None)
+        if callable(register_fn):
+            return register_fn
+    raise ToolPluginLoadError(
+        f"Tool plugin module '{module.__name__}' missing callable '{attr_name}'"
+    )
+
+
+def _call_register_fn(
+    register_fn: Callable[..., None],
+    registry: ToolRegistry,
+    *,
+    llm_enabled: bool,
+    llm_provider: Optional[LLMProvider],
+    http_fetch_enabled: bool,
+) -> None:
+    signature = inspect.signature(register_fn)
+    kwargs: dict[str, Any] = {}
+    if "context" in signature.parameters:
+        kwargs["context"] = {
+            "llm_enabled": llm_enabled,
+            "llm_provider": llm_provider,
+            "http_fetch_enabled": http_fetch_enabled,
+        }
+    if "llm_enabled" in signature.parameters:
+        kwargs["llm_enabled"] = llm_enabled
+    if "llm_provider" in signature.parameters:
+        kwargs["llm_provider"] = llm_provider
+    if "http_fetch_enabled" in signature.parameters:
+        kwargs["http_fetch_enabled"] = http_fetch_enabled
+    if "provider" in signature.parameters and "llm_provider" not in signature.parameters:
+        kwargs["provider"] = llm_provider
+    try:
+        register_fn(registry, **kwargs)
+    except TypeError as exc:
+        raise ToolPluginLoadError(f"Invalid tool plugin signature for {register_fn}: {exc}") from exc
+
+
+def _load_module_plugins(
+    registry: ToolRegistry,
+    *,
+    llm_enabled: bool,
+    llm_provider: Optional[LLMProvider],
+    http_fetch_enabled: bool,
+) -> None:
+    plugin_specs = _parse_csv_values(os.getenv("TOOL_PLUGIN_MODULES"))
+    for plugin_spec in sorted(plugin_specs):
+        try:
+            module_path, attr_name = _parse_plugin_spec(plugin_spec)
+            module = import_module(module_path)
+            register_fn = _resolve_module_register_fn(module, attr_name)
+            _call_register_fn(
+                register_fn,
+                registry,
+                llm_enabled=llm_enabled,
+                llm_provider=llm_provider,
+                http_fetch_enabled=http_fetch_enabled,
+            )
+            LOGGER.info("tool_plugin_loaded source=module plugin=%s", plugin_spec)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error(
+                "tool_plugin_load_failed source=module plugin=%s error=%s",
+                plugin_spec,
+                exc,
+            )
+            if _plugin_fail_fast():
+                raise
+
+
+def _iter_entry_points(group: str) -> list[Any]:
+    eps = importlib_metadata.entry_points()
+    if hasattr(eps, "select"):
+        return list(eps.select(group=group))
+    return list(eps.get(group, []))
+
+
+def _load_entrypoint_plugins(
+    registry: ToolRegistry,
+    *,
+    llm_enabled: bool,
+    llm_provider: Optional[LLMProvider],
+    http_fetch_enabled: bool,
+) -> None:
+    if os.getenv("TOOL_PLUGIN_DISCOVERY_ENABLED", "false").lower() != "true":
+        return
+    group = os.getenv("TOOL_PLUGIN_ENTRYPOINT_GROUP", "awe.tools")
+    for entry_point in _iter_entry_points(group):
+        try:
+            loaded = entry_point.load()
+            if callable(loaded):
+                register_fn = loaded
+            else:
+                register_fn = _resolve_module_register_fn(loaded, "register_tools")
+            _call_register_fn(
+                register_fn,
+                registry,
+                llm_enabled=llm_enabled,
+                llm_provider=llm_provider,
+                http_fetch_enabled=http_fetch_enabled,
+            )
+            LOGGER.info("tool_plugin_loaded source=entry_point plugin=%s", entry_point.name)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error(
+                "tool_plugin_load_failed source=entry_point plugin=%s error=%s",
+                entry_point.name,
+                exc,
+            )
+            if _plugin_fail_fast():
+                raise
+
+
 def default_registry(
     http_fetch_enabled: bool = False,
     llm_enabled: bool = False,
     llm_provider: Optional[LLMProvider] = None,
+    service_name: Optional[str] = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
 
@@ -265,10 +711,23 @@ def default_registry(
             workspace_write_code=_workspace_write_code,
             workspace_read_text=_workspace_read_text,
             workspace_list_files=_list_workspace_files,
+            artifact_mkdir=_artifact_mkdir,
+            workspace_mkdir=_workspace_mkdir,
+            artifact_delete=_artifact_delete,
+            workspace_delete=_workspace_delete,
+            artifact_rename=_artifact_rename,
+            workspace_rename=_workspace_rename,
+            artifact_copy=_artifact_copy,
+            workspace_copy=_workspace_copy,
             artifact_move=_artifact_move_to_workspace,
+            derive_output_path=_derive_output_path,
             derive_output_filename=_derive_output_filename,
             run_tests=_run_tests,
             search_text=_search_text,
+            memory_read=_memory_read,
+            memory_write=_memory_write,
+            memory_semantic_write=_memory_semantic_write,
+            memory_semantic_search=_memory_semantic_search,
             docx_render=_docx_render,
             sleep=_sleep,
             http_fetch=_http_fetch,
@@ -277,11 +736,8 @@ def default_registry(
     )
 
     register_docx_tools(registry)
+    register_pdf_tools(registry)
     register_document_spec_tools(registry)
-    register_resume_doc_spec_tools(registry)
-    register_resume_doc_spec_convert_tools(registry)
-    register_coverletter_doc_spec_convert_tools(registry)
-    register_cover_letter_generate_tools(registry)
     register_github_tools(registry)
 
     if llm_enabled:
@@ -304,35 +760,7 @@ def default_registry(
             handler_autonomous=lambda payload, provider=llm_provider: _coding_agent_autonomous(
                 payload, provider
             ),
-        )
-        register_tailor_mcp_tools(
-            registry,
-            timeout_s=mcp_timeout_s,
-            handler_iterative_improve=lambda payload, provider=llm_provider: (
-                _llm_iterative_improve_tailored_resume_text(payload, provider)
-            ),
-            handler_tailor=lambda payload, provider=llm_provider: _llm_tailor_resume_text(
-                payload, provider
-            ),
-            handler_improve=lambda payload, provider=llm_provider: (
-                _llm_improve_tailored_resume_text(payload, provider)
-            ),
-        )
-        register_resume_llm_tools(
-            registry,
-            timeout_s=llm_timeout_s,
-            handler_generate_resume_doc_spec_from_text=lambda payload, provider=llm_provider: (
-                _llm_generate_resume_doc_spec_from_text(payload, provider)
-            ),
-            handler_generate_coverletter_doc_spec_from_text=lambda payload, provider=llm_provider: (
-                _llm_generate_coverletter_doc_spec_from_text(payload, provider)
-            ),
-            handler_generate_cover_letter_from_resume=lambda payload, provider=llm_provider: (
-                _llm_generate_cover_letter_from_resume(payload, provider)
-            ),
-            handler_generate_resume_doc_spec=lambda payload, provider=llm_provider: (
-                _llm_generate_resume_doc_spec(payload, provider)
-            ),
+            handler_publish_pr=_coding_agent_publish_pr,
         )
         register_document_spec_llm_tools(
             registry,
@@ -353,6 +781,20 @@ def default_registry(
             llm_provider,
             timeout_s=llm_iterative_timeout_s,
         )
+
+    _load_module_plugins(
+        registry,
+        llm_enabled=llm_enabled,
+        llm_provider=llm_provider,
+        http_fetch_enabled=http_fetch_enabled,
+    )
+    _load_entrypoint_plugins(
+        registry,
+        llm_enabled=llm_enabled,
+        llm_provider=llm_provider,
+        http_fetch_enabled=http_fetch_enabled,
+    )
+    _filter_registry_tools(registry, service_name)
 
     return registry
 
@@ -493,6 +935,174 @@ def _list_workspace_files(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"entries": entries}
 
 
+def _artifact_mkdir(payload: Dict[str, Any]) -> Dict[str, Any]:
+    path = payload.get("path", "")
+    if not path:
+        raise ToolExecutionError("Missing path")
+    parents = bool(payload.get("parents", True))
+    exist_ok = bool(payload.get("exist_ok", True))
+    candidate = _safe_artifact_path(path, "")
+    candidate.mkdir(parents=parents, exist_ok=exist_ok)
+    return {"path": str(candidate)}
+
+
+def _workspace_mkdir(payload: Dict[str, Any]) -> Dict[str, Any]:
+    path = payload.get("path", "")
+    if not path:
+        raise ToolExecutionError("Missing path")
+    parents = bool(payload.get("parents", True))
+    exist_ok = bool(payload.get("exist_ok", True))
+    candidate = _safe_workspace_path(path, "")
+    candidate.mkdir(parents=parents, exist_ok=exist_ok)
+    return {"path": str(candidate)}
+
+
+def _delete_path(target: Path, *, recursive: bool, missing_ok: bool) -> Dict[str, Any]:
+    if not target.exists():
+        if missing_ok:
+            return {"path": str(target), "deleted": False}
+        raise ToolExecutionError("Path not found")
+    if target.is_dir():
+        if recursive:
+            shutil.rmtree(target)
+        else:
+            target.rmdir()
+    else:
+        target.unlink()
+    return {"path": str(target), "deleted": True}
+
+
+def _artifact_delete(payload: Dict[str, Any]) -> Dict[str, Any]:
+    path = payload.get("path", "")
+    if not path:
+        raise ToolExecutionError("Missing path")
+    recursive = bool(payload.get("recursive", False))
+    missing_ok = bool(payload.get("missing_ok", False))
+    target = _safe_artifact_path(path, "")
+    return _delete_path(target, recursive=recursive, missing_ok=missing_ok)
+
+
+def _workspace_delete(payload: Dict[str, Any]) -> Dict[str, Any]:
+    path = payload.get("path", "")
+    if not path:
+        raise ToolExecutionError("Missing path")
+    recursive = bool(payload.get("recursive", False))
+    missing_ok = bool(payload.get("missing_ok", False))
+    target = _safe_workspace_path(path, "")
+    return _delete_path(target, recursive=recursive, missing_ok=missing_ok)
+
+
+def _replace_existing_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _rename_path(
+    source: Path,
+    destination: Path,
+    *,
+    overwrite: bool,
+) -> Dict[str, Any]:
+    if not source.exists():
+        raise ToolExecutionError("Source path not found")
+    if destination.exists():
+        if not overwrite:
+            raise ToolExecutionError("Destination already exists")
+        _replace_existing_path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(destination)
+    return {"path": str(destination)}
+
+
+def _artifact_rename(payload: Dict[str, Any]) -> Dict[str, Any]:
+    source_path = payload.get("source_path", "")
+    destination_path = payload.get("destination_path", "")
+    overwrite = bool(payload.get("overwrite", False))
+    if not source_path:
+        raise ToolExecutionError("Missing source_path")
+    if not destination_path:
+        raise ToolExecutionError("Missing destination_path")
+    if destination_path.endswith("/"):
+        raise ToolExecutionError("Missing file or directory name in destination_path")
+    source = _safe_artifact_path(source_path, "")
+    destination = _safe_artifact_path(destination_path, "")
+    return _rename_path(source, destination, overwrite=overwrite)
+
+
+def _workspace_rename(payload: Dict[str, Any]) -> Dict[str, Any]:
+    source_path = payload.get("source_path", "")
+    destination_path = payload.get("destination_path", "")
+    overwrite = bool(payload.get("overwrite", False))
+    if not source_path:
+        raise ToolExecutionError("Missing source_path")
+    if not destination_path:
+        raise ToolExecutionError("Missing destination_path")
+    if destination_path.endswith("/"):
+        raise ToolExecutionError("Missing file or directory name in destination_path")
+    source = _safe_workspace_path(source_path, "")
+    destination = _safe_workspace_path(destination_path, "")
+    return _rename_path(source, destination, overwrite=overwrite)
+
+
+def _copy_path(
+    source: Path,
+    destination: Path,
+    *,
+    overwrite: bool,
+    recursive: bool,
+) -> Dict[str, Any]:
+    if not source.exists():
+        raise ToolExecutionError("Source path not found")
+    if destination.exists():
+        if not overwrite:
+            raise ToolExecutionError("Destination already exists")
+        _replace_existing_path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        if not recursive:
+            raise ToolExecutionError("Source is a directory; set recursive=true")
+        shutil.copytree(source, destination)
+    else:
+        shutil.copy2(source, destination)
+    return {"path": str(destination)}
+
+
+def _artifact_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    source_path = payload.get("source_path", "")
+    destination_path = payload.get("destination_path", "")
+    overwrite = bool(payload.get("overwrite", False))
+    recursive = bool(payload.get("recursive", True))
+    if not source_path:
+        raise ToolExecutionError("Missing source_path")
+    if not destination_path:
+        raise ToolExecutionError("Missing destination_path")
+    if destination_path.endswith("/"):
+        raise ToolExecutionError("Missing file or directory name in destination_path")
+    source = _safe_artifact_path(source_path, "")
+    destination = _safe_artifact_path(destination_path, "")
+    return _copy_path(source, destination, overwrite=overwrite, recursive=recursive)
+
+
+def _workspace_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    source_path = payload.get("source_path", "")
+    destination_path = payload.get("destination_path", "")
+    overwrite = bool(payload.get("overwrite", False))
+    recursive = bool(payload.get("recursive", True))
+    if not source_path:
+        raise ToolExecutionError("Missing source_path")
+    if not destination_path:
+        raise ToolExecutionError("Missing destination_path")
+    if destination_path.endswith("/"):
+        raise ToolExecutionError("Missing file or directory name in destination_path")
+    source = _safe_workspace_path(source_path, "")
+    destination = _safe_workspace_path(destination_path, "")
+    return _copy_path(source, destination, overwrite=overwrite, recursive=recursive)
+
+
 def _artifact_move_to_workspace(payload: Dict[str, Any]) -> Dict[str, Any]:
     source_path = payload.get("source_path", "")
     destination_path = payload.get("destination_path", "")
@@ -512,6 +1122,124 @@ def _artifact_move_to_workspace(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ToolExecutionError("Destination already exists")
     shutil.move(str(source), str(destination))
     return {"path": str(destination)}
+
+
+def _derive_output_path(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def pick_str(*values: Any) -> str:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    memory_context = _select_job_context_from_memory(payload.get("memory"))
+    nested_context = memory_context.get("context_json")
+    if not isinstance(nested_context, dict):
+        nested_context = {}
+
+    topic = pick_str(
+        payload.get("topic"),
+        memory_context.get("topic"),
+        nested_context.get("topic"),
+    )
+    date_value = pick_str(
+        payload.get("date"),
+        payload.get("today"),
+        memory_context.get("date"),
+        memory_context.get("today"),
+        nested_context.get("date"),
+        nested_context.get("today"),
+    )
+    output_dir = (
+        pick_str(
+            payload.get("output_dir"),
+            memory_context.get("output_dir"),
+            nested_context.get("output_dir"),
+        )
+        or "documents"
+    )
+    document_type = pick_str(
+        payload.get("document_type"),
+        memory_context.get("document_type"),
+        nested_context.get("document_type"),
+    )
+    extension_hint = pick_str(
+        payload.get("output_extension"),
+        payload.get("file_extension"),
+        payload.get("extension"),
+        payload.get("format"),
+        memory_context.get("output_extension"),
+        memory_context.get("file_extension"),
+        memory_context.get("extension"),
+        memory_context.get("format"),
+        nested_context.get("output_extension"),
+        nested_context.get("file_extension"),
+        nested_context.get("extension"),
+        nested_context.get("format"),
+    )
+
+    if not topic:
+        raise ToolExecutionError("Missing topic")
+
+    normalized_doc_type = (
+        document_type.lower().replace("-", "_")
+        if isinstance(document_type, str) and document_type
+        else "document"
+    )
+    known_format_types = {
+        "pdf",
+        "docx",
+        "md",
+        "markdown",
+        "txt",
+        "html",
+        "htm",
+        "json",
+        "yaml",
+        "yml",
+        "xml",
+        "csv",
+    }
+
+    def normalize_extension(raw: str) -> str:
+        value = raw.strip().lower()
+        if value.startswith("."):
+            value = value[1:]
+        if value == "markdown":
+            value = "md"
+        if not value:
+            return ""
+        if not re.fullmatch(r"[a-z0-9]{1,16}", value):
+            raise ToolExecutionError("Invalid output_extension")
+        return value
+
+    output_extension = ""
+    if extension_hint:
+        output_extension = normalize_extension(extension_hint)
+    elif normalized_doc_type in known_format_types:
+        output_extension = normalize_extension(normalized_doc_type)
+    if not output_extension:
+        output_extension = "docx"
+
+    output_dir = output_dir.strip().strip("/")
+    if not output_dir:
+        output_dir = "documents"
+    if output_dir.startswith("/") or ".." in Path(output_dir).parts:
+        raise ToolExecutionError("Invalid output_dir")
+
+    date_source = date_value or datetime.now(UTC).date().isoformat()
+    topic_slug = re.sub(r"[^a-z0-9]+", "_", topic.lower())
+    topic_slug = re.sub(r"_+", "_", topic_slug).strip("_") or "document"
+    date_slug = re.sub(r"[^0-9]+", "_", date_source)
+    date_slug = re.sub(r"_+", "_", date_slug).strip("_")
+    if not date_slug:
+        raise ToolExecutionError("Invalid date")
+
+    filename = f"{topic_slug}_{date_slug}.{output_extension}"
+    return {
+        "path": f"{output_dir}/{filename}",
+        "document_type": normalized_doc_type,
+        "output_extension": output_extension,
+    }
 
 
 def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -565,16 +1293,6 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         memory_context.get("job_description"),
         nested_context.get("job_description"),
     )
-    candidate_resume = pick_str(
-        payload.get("candidate_resume"),
-        memory_context.get("candidate_resume"),
-        nested_context.get("candidate_resume"),
-    )
-    tailored_text = pick_str(
-        payload.get("tailored_text"),
-        memory_context.get("tailored_text"),
-        nested_context.get("tailored_text"),
-    )
     date_value = pick_str(
         payload.get("date"),
         payload.get("today"),
@@ -589,20 +1307,67 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
             memory_context.get("output_dir"),
             nested_context.get("output_dir"),
         )
-        or "resumes"
+        or "documents"
     )
     document_type = pick_str(
         payload.get("document_type"),
         memory_context.get("document_type"),
         nested_context.get("document_type"),
     )
+    extension_hint = pick_str(
+        payload.get("output_extension"),
+        payload.get("file_extension"),
+        payload.get("extension"),
+        payload.get("format"),
+        memory_context.get("output_extension"),
+        memory_context.get("file_extension"),
+        memory_context.get("extension"),
+        memory_context.get("format"),
+        nested_context.get("output_extension"),
+        nested_context.get("file_extension"),
+        nested_context.get("extension"),
+        nested_context.get("format"),
+    )
     normalized_doc_type = document_type.lower().replace("-", "_")
-    is_cover_letter = normalized_doc_type in {"cover_letter", "coverletter"}
+    known_format_types = {
+        "pdf",
+        "docx",
+        "md",
+        "markdown",
+        "txt",
+        "html",
+        "htm",
+        "json",
+        "yaml",
+        "yml",
+        "xml",
+        "csv",
+    }
+
+    def normalize_extension(raw: str) -> str:
+        value = raw.strip().lower()
+        if value.startswith("."):
+            value = value[1:]
+        if value == "markdown":
+            value = "md"
+        if not value:
+            return ""
+        if not re.fullmatch(r"[a-z0-9]{1,16}", value):
+            raise ToolExecutionError("Invalid output_extension")
+        return value
+
+    output_extension = ""
+    if extension_hint:
+        output_extension = normalize_extension(extension_hint)
+    elif normalized_doc_type in known_format_types:
+        output_extension = normalize_extension(normalized_doc_type)
+    if not output_extension:
+        output_extension = "docx"
     if not isinstance(output_dir, str):
-        output_dir = "resumes"
+        output_dir = "documents"
     output_dir = output_dir.strip().strip("/")
     if not output_dir:
-        output_dir = "resumes"
+        output_dir = "documents"
     if output_dir.startswith("/") or ".." in Path(output_dir).parts:
         raise ToolExecutionError("Invalid output_dir")
 
@@ -620,85 +1385,73 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = re.sub(r"_+", "_", cleaned).strip("_")
         return cleaned
 
-    if (not isinstance(role_name, str) or not role_name.strip()) and isinstance(
-        job_description, str
-    ):
+    if (not isinstance(role_name, str) or not role_name.strip()) and isinstance(job_description, str):
         role_name = _derive_role_name_from_jd(job_description)
-    if (not isinstance(company_name, str) or not company_name.strip()) and isinstance(
-        job_description, str
-    ):
-        company_name = _derive_company_name_from_jd(job_description)
-
-    if (not isinstance(candidate_name, str) or not candidate_name.strip()) and not (
-        isinstance(first_name, str)
-        and first_name.strip()
-        and isinstance(last_name, str)
-        and last_name.strip()
-    ):
-        candidate_name = _derive_candidate_name_from_texts(
-            candidate_resume, tailored_text, job_description
-        )
-
-    if (
-        (
-            (not isinstance(first_name, str) or not first_name.strip())
-            or (not isinstance(last_name, str) or not last_name.strip())
-        )
-        and isinstance(candidate_name, str)
-        and candidate_name.strip()
-    ):
-        tokens = [token for token in candidate_name.split() if token]
-        if len(tokens) >= 2:
-            if not isinstance(first_name, str) or not first_name.strip():
-                first_name = tokens[0]
-            if not isinstance(last_name, str) or not last_name.strip():
-                last_name = tokens[-1]
 
     role_label = clean_label(role_name)
-    company_label = clean_label(company_name)
-    if not isinstance(candidate_name, str) or not candidate_name.strip():
-        name_parts = [clean_label(first_name), clean_label(last_name)]
-        candidate_label = " ".join([part for part in name_parts if part]).strip()
-    else:
-        candidate_label = clean_label(candidate_name)
-
-    if candidate_label and role_label and company_label:
-        doc_label = "Cover Letter" if is_cover_letter else "Resume"
-        filename = f"{candidate_label} {doc_label} - {role_label} - {company_label}.docx"
-        return {
-            "path": f"{output_dir}/{filename}",
-            "document_type": "cover_letter" if is_cover_letter else "resume",
-        }
-
     if not role_label:
         raise ToolExecutionError("Missing target_role_name")
     if not isinstance(date_value, str) or not date_value.strip():
-        raise ToolExecutionError("Missing date")
+        # Fallback for plans that omit date/today in output-path derivation.
+        date_value = datetime.now(UTC).date().isoformat()
 
     role_slug = slugify(role_label or str(role_name), r"[^a-z0-9]+") or "document"
     date_slug = slugify(date_value, r"[^0-9]+")
     if not date_slug:
         raise ToolExecutionError("Invalid date")
-    if is_cover_letter:
-        filename = f"cover_letter_{role_slug}_{date_slug}.docx"
-    else:
-        filename = f"{role_slug}_{date_slug}.docx"
+    filename = f"{role_slug}_{date_slug}.{output_extension}"
     return {
         "path": f"{output_dir}/{filename}",
-        "document_type": "cover_letter" if is_cover_letter else "resume",
+        "document_type": normalized_doc_type or "document",
+        "output_extension": output_extension,
     }
 
 
 def _derive_role_name_from_jd(job_description: str) -> str:
-    return resume_llm.derive_role_name_from_jd(job_description)
+    patterns = (
+        r"(?im)^\s*title\s*:\s*(.+)$",
+        r"(?im)^\s*role\s*:\s*(.+)$",
+        r"(?im)^\s*position\s*:\s*(.+)$",
+        r"(?im)\bwe are hiring (?:a|an)\s+([^.\n]+)",
+        r"(?im)\bseeking (?:a|an)\s+([^.\n]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, job_description)
+        if match:
+            return match.group(1).strip(" -:,.")
+    first_line = next((line.strip() for line in job_description.splitlines() if line.strip()), "")
+    return first_line[:120].strip(" -:,.")
 
 
-def _derive_company_name_from_jd(job_description: str) -> str:
-    return resume_llm.derive_company_name_from_jd(job_description)
-
-
-def _derive_candidate_name_from_texts(*texts: Any) -> str:
-    return resume_llm.derive_candidate_name_from_texts(*texts)
+def _select_job_context_from_memory(memory: Any) -> Dict[str, Any]:
+    if not isinstance(memory, dict):
+        return {}
+    direct = memory.get("context_json")
+    if isinstance(direct, dict):
+        return direct
+    entries = memory.get("job_contexts")
+    if not isinstance(entries, list):
+        entries = memory.get("job_context")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                payload = entry.get("payload")
+                if isinstance(payload, dict):
+                    context_json = payload.get("context_json")
+                    if isinstance(context_json, dict):
+                        return context_json
+                    return payload
+    task_outputs = memory.get("task_outputs")
+    if isinstance(task_outputs, list):
+        for entry in task_outputs:
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("payload")
+            if isinstance(payload, dict):
+                context_json = payload.get("context_json")
+                if isinstance(context_json, dict):
+                    return context_json
+    return {}
 
 
 def _run_tests(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -778,6 +1531,151 @@ def _search_text(payload: Dict[str, Any]) -> Dict[str, Any]:
         except OSError:
             continue
     return {"matches": matches}
+
+
+def _memory_client() -> MemoryClient:
+    base_url = os.getenv("MEMORY_API_URL", "http://api:8000").strip() or "http://api:8000"
+    timeout_raw = os.getenv("MEMORY_API_TIMEOUT_S", "5.0").strip()
+    try:
+        timeout_s = float(timeout_raw)
+    except ValueError:
+        timeout_s = 5.0
+    timeout_s = max(0.5, min(timeout_s, 60.0))
+    return MemoryClient(base_url, timeout_s=timeout_s)
+
+
+def _memory_read(payload: Dict[str, Any]) -> Dict[str, Any]:
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ToolExecutionError("Missing name")
+    limit = payload.get("limit", 50)
+    if not isinstance(limit, int):
+        raise ToolExecutionError("limit must be an integer")
+    include_expired = bool(payload.get("include_expired", False))
+    try:
+        entries = _memory_client().read(
+            name=name.strip(),
+            scope=payload.get("scope") if isinstance(payload.get("scope"), str) else None,
+            key=payload.get("key") if isinstance(payload.get("key"), str) else None,
+            job_id=payload.get("job_id") if isinstance(payload.get("job_id"), str) else None,
+            user_id=payload.get("user_id") if isinstance(payload.get("user_id"), str) else None,
+            project_id=payload.get("project_id")
+            if isinstance(payload.get("project_id"), str)
+            else None,
+            limit=max(1, min(limit, 200)),
+            include_expired=include_expired,
+        )
+    except MemoryClientError as exc:
+        raise ToolExecutionError(f"memory_read_failed:{exc}") from exc
+    first = entries[0] if entries else None
+    output: Dict[str, Any] = {"entries": entries, "count": len(entries)}
+    if isinstance(first, dict):
+        output["entry"] = first
+        payload_obj = first.get("payload")
+        if isinstance(payload_obj, dict):
+            output["payload"] = payload_obj
+    return output
+
+
+def _memory_write(payload: Dict[str, Any]) -> Dict[str, Any]:
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ToolExecutionError("Missing name")
+    entry_payload = payload.get("payload")
+    if not isinstance(entry_payload, dict):
+        raise ToolExecutionError("payload must be an object")
+
+    request: Dict[str, Any] = {"name": name.strip(), "payload": entry_payload}
+    for field in ("scope", "key", "job_id", "user_id", "project_id"):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            request[field] = value.strip()
+    ttl_seconds = payload.get("ttl_seconds")
+    if ttl_seconds is not None:
+        if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+            raise ToolExecutionError("ttl_seconds must be a positive integer")
+        request["ttl_seconds"] = ttl_seconds
+    metadata = payload.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise ToolExecutionError("metadata must be an object")
+        request["metadata"] = metadata
+    try:
+        written = _memory_client().write(request)
+    except MemoryClientError as exc:
+        raise ToolExecutionError(f"memory_write_failed:{exc}") from exc
+    if not isinstance(written, dict):
+        raise ToolExecutionError("memory_write_failed:empty_response")
+    return {"entry": written}
+
+
+def _memory_semantic_write(payload: Dict[str, Any]) -> Dict[str, Any]:
+    fact = payload.get("fact")
+    if not isinstance(fact, str) or not fact.strip():
+        raise ToolExecutionError("fact is required")
+    request: Dict[str, Any] = {"fact": fact.strip()}
+    for field in ("subject", "namespace", "source", "source_ref", "reasoning", "key", "user_id"):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            request[field] = value.strip()
+    for list_field in ("aliases", "keywords"):
+        value = payload.get(list_field)
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ToolExecutionError(f"{list_field} must be an array of strings")
+        request[list_field] = [item.strip() for item in value if item.strip()]
+    confidence = payload.get("confidence")
+    if confidence is not None:
+        if not isinstance(confidence, (int, float)):
+            raise ToolExecutionError("confidence must be a number between 0 and 1")
+        confidence_f = float(confidence)
+        if confidence_f < 0 or confidence_f > 1:
+            raise ToolExecutionError("confidence must be a number between 0 and 1")
+        request["confidence"] = confidence_f
+    metadata = payload.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise ToolExecutionError("metadata must be an object")
+        request["metadata"] = metadata
+    try:
+        written = _memory_client().semantic_write(request)
+    except MemoryClientError as exc:
+        raise ToolExecutionError(f"memory_semantic_write_failed:{exc}") from exc
+    if not isinstance(written, dict):
+        raise ToolExecutionError("memory_semantic_write_failed:empty_response")
+    return written
+
+
+def _memory_semantic_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ToolExecutionError("query is required")
+    request: Dict[str, Any] = {"query": query.strip()}
+    for field in ("namespace", "subject", "key", "user_id"):
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            request[field] = value.strip()
+    limit = payload.get("limit")
+    if limit is not None:
+        if not isinstance(limit, int):
+            raise ToolExecutionError("limit must be an integer")
+        request["limit"] = max(1, min(limit, 50))
+    min_score = payload.get("min_score")
+    if min_score is not None:
+        if not isinstance(min_score, (int, float)):
+            raise ToolExecutionError("min_score must be a number")
+        request["min_score"] = max(0.0, float(min_score))
+    include_payload = payload.get("include_payload")
+    if include_payload is not None:
+        request["include_payload"] = bool(include_payload)
+    try:
+        result = _memory_client().semantic_search(request)
+    except MemoryClientError as exc:
+        raise ToolExecutionError(f"memory_semantic_search_failed:{exc}") from exc
+    if not isinstance(result, dict):
+        raise ToolExecutionError("memory_semantic_search_failed:empty_response")
+    return result
 
 
 def _resolve_template_path(template_path: str, template_id: str) -> Path:
@@ -873,12 +1771,14 @@ def _call_mcp_tool_sdk(
     tool_name: str,
     arguments: Dict[str, Any],
     timeout_s: float,
+    headers: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     return mcp_client.call_mcp_tool_sdk(
         mcp_url,
         tool_name,
         arguments,
         timeout_s,
+        headers=headers,
         tracing_module=core_tracing,
         logger=LOGGER,
     )
@@ -889,20 +1789,34 @@ def _call_mcp_tool_sdk_inproc(
     tool_name: str,
     arguments: Dict[str, Any],
     timeout_s: float,
+    headers: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     return mcp_client.call_mcp_tool_sdk_inproc(
         mcp_url,
         tool_name,
         arguments,
         timeout_s,
+        headers=headers,
         tracing_module=core_tracing,
     )
 
 
 def _mcp_process_entry(
-    queue: Any, mcp_url: str, tool_name: str, arguments: Dict[str, Any], timeout_s: float
+    queue: Any,
+    mcp_url: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    timeout_s: float,
+    headers: Dict[str, str] | None = None,
 ) -> None:
-    mcp_client.mcp_process_entry(queue, mcp_url, tool_name, arguments, timeout_s)
+    mcp_client.mcp_process_entry(
+        queue,
+        mcp_url,
+        tool_name,
+        arguments,
+        timeout_s,
+        headers,
+    )
 
 
 def _call_mcp_tool_sdk_process(
@@ -910,12 +1824,14 @@ def _call_mcp_tool_sdk_process(
     tool_name: str,
     arguments: Dict[str, Any],
     timeout_s: float,
+    headers: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     return mcp_client.call_mcp_tool_sdk_process(
         mcp_url,
         tool_name,
         arguments,
         timeout_s,
+        headers=headers,
         logger=LOGGER,
         tracing_module=core_tracing,
     )
@@ -960,6 +1876,14 @@ def _coding_agent_autonomous(payload: Dict[str, Any], provider: LLMProvider) -> 
         post_mcp_tool_call=_post_mcp_tool_call,
         write_workspace_text_file=_write_workspace_text_file,
         extract_json=_extract_json,
+    )
+
+
+def _coding_agent_publish_pr(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return coder_tools.coding_agent_publish_pr(
+        payload,
+        safe_workspace_path=_safe_workspace_path,
+        invoke_capability=mcp_gateway.invoke_capability,
     )
 
 
@@ -1031,190 +1955,19 @@ def _resolve_llm_iterative_tool_timeout_s(provider: LLMProvider) -> int:
     return min(900, max(60, base * 3))
 
 
-def _llm_tailor_resume_text(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:
-    return resume_llm.llm_tailor_resume_text(
-        payload,
-        provider,
-        post_mcp_tool_call=_post_mcp_tool_call,
-    )
-
-
-def _select_job_context_from_memory(memory: Any) -> Dict[str, Any]:
-    return resume_llm.select_job_context_from_memory(memory)
-
-
-def _merge_resume_job_context(
-    job: Dict[str, Any], memory_context: Dict[str, Any]
-) -> Dict[str, Any]:
-    return resume_llm.merge_resume_job_context(job, memory_context)
-
-
-def _build_resume_job_payload(job: Dict[str, Any] | None, memory: Any) -> Dict[str, Any]:
-    return resume_llm.build_resume_job_payload(job, memory)
-
-
-def _llm_improve_tailored_resume_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_improve_tailored_resume_text(
-        payload,
-        provider,
-        post_mcp_tool_call=_post_mcp_tool_call,
-    )
-
-
-def _llm_iterative_improve_tailored_resume_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_iterative_improve_tailored_resume_text(
-        payload,
-        provider,
-        post_mcp_tool_call=_post_mcp_tool_call,
-    )
-
-
-def _parse_target_pages(value: Any) -> int | None:
-    return resume_llm.parse_target_pages(value)
-
-
-def _resolve_target_pages(payload: Dict[str, Any], job: Any) -> int | None:
-    return resume_llm.resolve_target_pages(payload, job)
-
-
-def _apply_resume_target_pages_policy(
-    resume_doc_spec: Dict[str, Any], target_pages: int | None
-) -> None:
-    resume_llm.apply_resume_target_pages_policy(resume_doc_spec, target_pages)
-
-
-def _llm_generate_resume_doc_spec_from_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_resume_doc_spec_from_text(payload, provider)
-
-
-def _normalize_skills_definition_separators(resume_doc_spec: Dict[str, Any]) -> None:
-    resume_llm.normalize_skills_definition_separators(resume_doc_spec)
-
-
-def _llm_generate_cover_letter_from_resume(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_cover_letter_from_resume(payload, provider)
-
-
-def _llm_generate_coverletter_doc_spec_from_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_coverletter_doc_spec_from_text(payload, provider)
-
-
-def _build_coverletter_doc_spec(cover_letter: Dict[str, Any], date_text: str) -> Dict[str, Any]:
-    return resume_llm.build_coverletter_doc_spec(cover_letter, date_text)
-
-
-def _split_cover_letter_paragraphs(body_text: str) -> List[str]:
-    return resume_llm.split_cover_letter_paragraphs(body_text)
-
-
-def _validate_coverletter_doc_spec(spec: Dict[str, Any], strict: bool) -> Dict[str, Any]:
-    return resume_llm.validate_coverletter_doc_spec(spec, strict)
-
-
-def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:
-    return resume_llm.llm_generate_resume_doc_spec(payload, provider)
-
-
-def _ensure_required_resume_sections(content: Any) -> None:
-    resume_llm.ensure_required_resume_sections(content)
-
-
-def _has_required_headings(text: str, headings: list[str]) -> bool:
-    return resume_llm.has_required_headings(text, headings)
-
-
-def _fill_missing_dates_from_text(resume_doc_spec: Dict[str, Any], tailored_text: str) -> None:
-    resume_llm.fill_missing_dates_from_text(resume_doc_spec, tailored_text)
-
-
-def _ensure_certifications_section_content(
-    resume_doc_spec: Dict[str, Any],
-    tailored_resume: Dict[str, Any] | None,
-    tailored_text: str | None,
-    candidate_resume_text: str | None,
-) -> None:
-    resume_llm.ensure_certifications_section_content(
-        resume_doc_spec,
-        tailored_resume=tailored_resume,
-        tailored_text=tailored_text,
-        candidate_resume_text=candidate_resume_text,
-    )
-
-
-def _find_section_heading_block_index(
-    content: List[Dict[str, Any]],
-    headings: set[str],
-    start: int = 0,
-) -> int | None:
-    return resume_llm.find_section_heading_block_index(content, headings, start)
-
-
-def _find_next_section_heading_block_index(content: List[Dict[str, Any]], start: int) -> int:
-    return resume_llm.find_next_section_heading_block_index(content, start)
-
-
-def _extract_non_empty_cert_items(blocks: List[Any]) -> list[str]:
-    return resume_llm.extract_non_empty_cert_items(blocks)
-
-
-def _collect_fallback_certification_lines(
-    tailored_resume: Dict[str, Any] | None,
-    tailored_text: str | None,
-    candidate_resume_text: str | None,
-) -> list[str]:
-    return resume_llm.collect_fallback_certification_lines(
-        tailored_resume,
-        tailored_text,
-        candidate_resume_text,
-    )
-
-
-def _certification_lines_from_tailored_resume(tailored_resume: Dict[str, Any]) -> list[str]:
-    return resume_llm.certification_lines_from_tailored_resume(tailored_resume)
-
-
-def _certification_lines_from_text(text: str) -> list[str]:
-    return resume_llm.certification_lines_from_text(text)
-
-
-def _cert_section_is_removable(blocks: List[Any]) -> bool:
-    return resume_llm.cert_section_is_removable(blocks)
-
-
-def _extract_candidate_resume_text_from_job(job_payload: Any) -> str | None:
-    return resume_llm.extract_candidate_resume_text_from_job(job_payload)
-
-
-def _extract_dates_from_section(text: str, start_heading: str, end_heading: str) -> list[str]:
-    return resume_llm.extract_dates_from_section(text, start_heading, end_heading)
-
-
-def _find_heading_index(lines: list[str], heading: str, start: int = 0) -> int | None:
-    return resume_llm.find_heading_index(lines, heading, start)
-
-
-def _is_missing_value(value: Any) -> bool:
-    return resume_llm.is_missing_value(value)
-
-
-def _llm_generate_tailored_resume_content(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_tailored_resume_content(payload, provider)
-
-
 def _extract_json(text: str) -> str:
-    return resume_llm.extract_json(text)
+    fence_match = re.search(r"```(?:json)?\s*(.+?)```", text, flags=re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text.strip()
 
 
 def _llm_improve_document_spec(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:

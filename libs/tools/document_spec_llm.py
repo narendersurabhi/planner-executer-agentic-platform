@@ -10,6 +10,16 @@ from libs.framework.tool_runtime import Tool, ToolExecutionError
 
 SanitizeDocumentSpecFn = Callable[[dict[str, Any]], dict[str, Any]]
 
+_DEFAULT_ALLOWED_BLOCK_TYPES = [
+    "text",
+    "paragraph",
+    "heading",
+    "bullets",
+    "spacer",
+    "optional_paragraph",
+    "repeat",
+]
+
 
 def register_document_spec_llm_tools(
     registry,
@@ -59,16 +69,35 @@ def register_document_spec_llm_tools(
                 name="llm_generate_document_spec",
                 description="Generate a DocumentSpec JSON using an LLM",
                 usage_guidance=(
-                    "Provide job context and allowed_block_types. "
-                    "Returns a document_spec object."
+                    "Provide either a full job object OR explicit fields "
+                    "(instruction, topic, audience, tone, today, output_dir), "
+                    "plus optional allowed_block_types. Returns a document_spec object."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "job": {"type": "object"},
+                        "instruction": {"type": "string", "minLength": 1},
+                        "topic": {"type": "string", "minLength": 1},
+                        "audience": {"type": "string", "minLength": 1},
+                        "tone": {"type": "string", "minLength": 1},
+                        "today": {"type": "string", "minLength": 4},
+                        "output_dir": {"type": "string", "minLength": 1},
                         "allowed_block_types": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["job", "allowed_block_types"],
+                    "anyOf": [
+                        {"required": ["job"]},
+                        {
+                            "required": [
+                                "instruction",
+                                "topic",
+                                "audience",
+                                "tone",
+                                "today",
+                                "output_dir",
+                            ]
+                        },
+                    ],
                 },
                 output_schema={
                     "type": "object",
@@ -169,11 +198,19 @@ def llm_generate_document_spec(
     sanitize_document_spec: SanitizeDocumentSpecFn,
 ) -> dict[str, Any]:
     job = payload.get("job")
-    allowed = payload.get("allowed_block_types")
     if not isinstance(job, dict):
-        raise ToolExecutionError("job must be an object")
-    if not isinstance(allowed, list):
-        raise ToolExecutionError("allowed_block_types must be an array")
+        explicit_job: dict[str, Any] = {}
+        for key in ("instruction", "topic", "audience", "tone", "today", "output_dir"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                explicit_job[key] = value.strip()
+        if explicit_job:
+            job = explicit_job
+    allowed = _resolve_allowed_block_types(payload.get("allowed_block_types"))
+    if not isinstance(job, dict):
+        raise ToolExecutionError(
+            "Provide either job object or explicit fields: instruction, topic, audience, tone, today, output_dir"
+        )
     prompt = prompts.document_spec_prompt(job, allowed)
     response = provider.generate(prompt)
     json_text = _extract_json(response.content)
@@ -237,3 +274,14 @@ def _extract_json(text: str) -> str:
     if start == -1 or end == -1 or end <= start:
         return ""
     return content[start : end + 1]
+
+
+def _resolve_allowed_block_types(raw: Any) -> list[str]:
+    if raw is None:
+        return list(_DEFAULT_ALLOWED_BLOCK_TYPES)
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ToolExecutionError("allowed_block_types must be an array of strings")
+    normalized = [item.strip() for item in raw if item.strip()]
+    if not normalized:
+        raise ToolExecutionError("allowed_block_types must contain at least one value")
+    return normalized

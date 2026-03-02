@@ -49,6 +49,29 @@ DEFAULT_MEMORY_SPECS: List[MemorySpec] = [
         write_roles=["worker", "api"],
     ),
     MemorySpec(
+        name="interaction_summaries",
+        description=(
+            "Per-job interaction summaries captured from user sessions. "
+            "Intended for long-lived grounding and replay."
+        ),
+        scope=MemoryScope.session,
+        schema_def={"type": "object"},
+        ttl_seconds=30 * 24 * 60 * 60,
+        read_roles=["planner", "worker", "api"],
+        write_roles=["api"],
+    ),
+    MemorySpec(
+        name="interaction_summaries_compact",
+        description=(
+            "Compacted interaction summaries for token-efficient planning and intent inference."
+        ),
+        scope=MemoryScope.session,
+        schema_def={"type": "object"},
+        ttl_seconds=30 * 24 * 60 * 60,
+        read_roles=["planner", "worker", "api"],
+        write_roles=["api"],
+    ),
+    MemorySpec(
         name="user_profile",
         description="Stable user preferences and profile attributes.",
         scope=MemoryScope.user,
@@ -56,6 +79,18 @@ DEFAULT_MEMORY_SPECS: List[MemorySpec] = [
         ttl_seconds=None,
         read_roles=["planner", "worker", "api"],
         write_roles=["api"],
+    ),
+    MemorySpec(
+        name="semantic_memory",
+        description=(
+            "Distilled semantic facts (user/domain/environment knowledge) for direct lookup and "
+            "reasoning support."
+        ),
+        scope=MemoryScope.user,
+        schema_def={"type": "object"},
+        ttl_seconds=None,
+        read_roles=["planner", "worker", "api"],
+        write_roles=["api", "worker"],
     ),
     MemorySpec(
         name="project_preferences",

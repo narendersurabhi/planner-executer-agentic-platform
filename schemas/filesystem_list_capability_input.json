@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FilesystemListCapabilityInput",
+  "type": "object",
+  "properties": {
+    "path": {"type": "string"},
+    "recursive": {"type": "boolean"},
+    "max_files": {"type": "integer", "minimum": 1, "maximum": 2000}
+  },
+  "additionalProperties": true
+}

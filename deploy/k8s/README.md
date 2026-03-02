@@ -4,12 +4,10 @@ This directory provides a baseline Kubernetes deployment for AWE with autoscalin
 
 ## What is included
 
-- Core services: `api`, `planner`, `worker`, `coder`, `tailor`, `ui`
 - Data services: `postgres`, `redis`
 - Autoscaling:
   - `hpa-api.yaml` (CPU + memory)
   - `hpa-coder.yaml` (CPU + memory)
-  - `hpa-tailor.yaml` (CPU + memory)
   - `keda-worker-scaledobject.yaml` (queue-depth scaling for `worker`, optional)
 
 ## Prerequisites
@@ -28,7 +26,6 @@ Update image fields in:
 - `planner.yaml`
 - `worker.yaml`
 - `coder.yaml`
-- `tailor.yaml`
 - `ui.yaml`
 
 You can build and push matching images from repo root:

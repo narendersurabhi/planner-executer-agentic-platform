@@ -103,8 +103,82 @@ def resolve_mcp_isolation_mode() -> str:
     return "process" if mode == "process" else "thread"
 
 
+def resolve_mcp_route_paths() -> tuple[str, ...]:
+    raw = os.getenv("MCP_ROUTE_PATHS", "").strip()
+    if not raw:
+        return ("/mcp/rpc/mcp", "/mcp/rpc")
+    seen: set[str] = set()
+    paths: list[str] = []
+    for entry in raw.split(","):
+        token = entry.strip()
+        if not token:
+            continue
+        if token != "/" and not token.startswith("/"):
+            token = f"/{token}"
+        if token in seen:
+            continue
+        seen.add(token)
+        paths.append(token)
+    return tuple(paths) or ("/mcp/rpc/mcp", "/mcp/rpc")
+
+
+def resolve_mcp_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    bearer = os.getenv("MCP_AUTH_BEARER", "").strip()
+    bearer_env_name = os.getenv("MCP_AUTH_BEARER_ENV", "").strip()
+    if not bearer and bearer_env_name:
+        bearer = os.getenv(bearer_env_name, "").strip()
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    raw_extra = os.getenv("MCP_EXTRA_HEADERS_JSON", "").strip()
+    if raw_extra:
+        try:
+            parsed = json.loads(raw_extra)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if isinstance(key, str) and key.strip() and isinstance(value, str):
+                    headers[key.strip()] = value
+    return headers
+
+
+def merge_mcp_headers(*header_maps: dict[str, str] | None) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for header_map in header_maps:
+        if not isinstance(header_map, dict):
+            continue
+        for key, value in header_map.items():
+            if not isinstance(key, str) or not key.strip() or not isinstance(value, str):
+                continue
+            merged[key.strip()] = value
+    return merged
+
+
+def normalize_mcp_route_paths(
+    route_paths: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    if route_paths is None:
+        return resolve_mcp_route_paths()
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for entry in route_paths:
+        if not isinstance(entry, str):
+            continue
+        token = entry.strip()
+        if not token:
+            continue
+        if token != "/" and not token.startswith("/"):
+            token = f"/{token}"
+        if token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
+    return tuple(normalized) or resolve_mcp_route_paths()
+
+
 def streamable_http_client_kwargs(
-    client_factory: Callable[..., Any], timeout_s: float
+    client_factory: Callable[..., Any], timeout_s: float, headers: dict[str, str] | None = None
 ) -> dict[str, Any]:
     """Best-effort timeout kwargs for different MCP SDK versions."""
     transport_timeout = resolve_mcp_transport_timeout_s(timeout_s)
@@ -121,8 +195,27 @@ def streamable_http_client_kwargs(
         "connect_timeout": connect_timeout,
         "sse_read_timeout": transport_timeout,
         "http_timeout": transport_timeout,
+        "headers": headers,
+        "request_headers": headers,
     }
-    return {name: value for name, value in candidates.items() if name in params}
+    kwargs = {
+        name: value
+        for name, value in candidates.items()
+        if name in params and value is not None
+    }
+    # Newer MCP SDK versions only accept an httpx.AsyncClient for request headers/timeouts.
+    if "http_client" in params:
+        try:
+            import httpx
+
+            client_kwargs: dict[str, Any] = {"timeout": transport_timeout}
+            if headers:
+                client_kwargs["headers"] = headers
+            kwargs["http_client"] = httpx.AsyncClient(**client_kwargs)
+        except Exception:  # noqa: BLE001
+            # Fall back to SDK defaults when httpx client construction fails.
+            pass
+    return kwargs
 
 
 def is_retryable_mcp_error(message: str) -> bool:
@@ -135,21 +228,67 @@ def is_retryable_mcp_error(message: str) -> bool:
     )
 
 
+def _invoke_call_mcp_tool_sdk(
+    *,
+    call_mcp_tool_sdk: Callable[..., dict[str, Any]],
+    mcp_url: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout_s: float,
+    headers: dict[str, str] | None,
+) -> dict[str, Any]:
+    if headers:
+        try:
+            return call_mcp_tool_sdk(
+                mcp_url,
+                tool_name,
+                arguments,
+                timeout_s=timeout_s,
+                headers=headers,
+            )
+        except TypeError:
+            pass
+    return call_mcp_tool_sdk(
+        mcp_url,
+        tool_name,
+        arguments,
+        timeout_s=timeout_s,
+    )
+
+
 def post_mcp_tool_call(
     service_url: str,
     tool_name: str,
     arguments: dict[str, Any],
     *,
-    call_mcp_tool_sdk: Callable[[str, str, dict[str, Any], float], dict[str, Any]],
+    route_paths: tuple[str, ...] | list[str] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_s_override: float | None = None,
+    max_retries_override: int | None = None,
+    retry_sleep_s_override: float | None = None,
+    call_mcp_tool_sdk: Callable[..., dict[str, Any]],
     classify_tool_error: Callable[[str], str],
     logger: logging.Logger,
     tracing_module: Any,
 ) -> dict[str, Any]:
     base_url = service_url.rstrip("/")
-    attempts = ("/mcp/rpc/mcp", "/mcp/rpc")
-    timeout_s = resolve_mcp_timeout_s()
-    max_retries = resolve_mcp_max_retries()
-    retry_sleep_s = resolve_mcp_retry_sleep_s()
+    attempts = normalize_mcp_route_paths(route_paths)
+    timeout_s = (
+        max(1.0, float(timeout_s_override))
+        if timeout_s_override is not None
+        else resolve_mcp_timeout_s()
+    )
+    max_retries = (
+        max(0, int(max_retries_override))
+        if max_retries_override is not None
+        else resolve_mcp_max_retries()
+    )
+    retry_sleep_s = (
+        max(0.0, float(retry_sleep_s_override))
+        if retry_sleep_s_override is not None
+        else resolve_mcp_retry_sleep_s()
+    )
+    merged_headers = merge_mcp_headers(resolve_mcp_headers(), headers)
     isolation_mode = resolve_mcp_isolation_mode()
     first_attempt_reserve_s = resolve_mcp_first_attempt_reserve_s(timeout_s)
     started_at = time.monotonic()
@@ -164,6 +303,8 @@ def post_mcp_tool_call(
         "service_url": base_url,
         "mcp_timeout_s": timeout_s,
         "max_retries": max_retries,
+        "route_paths": list(attempts),
+        "has_headers": bool(merged_headers),
         "mcp_isolation_mode": isolation_mode,
         "prompt_version": prompt_version,
         "policy_version": policy_version,
@@ -291,11 +432,13 @@ def post_mcp_tool_call(
                                     "mcp.remaining_slots_after_current": remaining_slots_after_current,
                                 },
                             )
-                            result = call_mcp_tool_sdk(
-                                mcp_url,
-                                tool_name,
-                                arguments,
+                            result = _invoke_call_mcp_tool_sdk(
+                                call_mcp_tool_sdk=call_mcp_tool_sdk,
+                                mcp_url=mcp_url,
+                                tool_name=tool_name,
+                                arguments=arguments,
                                 timeout_s=per_attempt_timeout_s,
+                                headers=merged_headers or None,
                             )
                             elapsed_ms = int(max(0.0, time.monotonic() - attempt_started_at) * 1000)
                             _log_mcp_event(
@@ -439,6 +582,7 @@ def call_mcp_tool_sdk(
     tool_name: str,
     arguments: dict[str, Any],
     timeout_s: float,
+    headers: dict[str, str] | None = None,
     *,
     tracing_module: Any,
     logger: logging.Logger,
@@ -450,6 +594,7 @@ def call_mcp_tool_sdk(
             tool_name,
             arguments,
             timeout_s,
+            headers=headers,
             logger=logger,
             tracing_module=tracing_module,
         )
@@ -458,6 +603,7 @@ def call_mcp_tool_sdk(
         tool_name,
         arguments,
         timeout_s,
+        headers=headers,
         tracing_module=tracing_module,
     )
 
@@ -467,6 +613,7 @@ def call_mcp_tool_sdk_inproc(
     tool_name: str,
     arguments: dict[str, Any],
     timeout_s: float,
+    headers: dict[str, str] | None = None,
     *,
     tracing_module: Any,
 ) -> dict[str, Any]:
@@ -476,13 +623,19 @@ def call_mcp_tool_sdk_inproc(
     except Exception as exc:  # noqa: BLE001
         raise ToolExecutionError(f"mcp_sdk_unavailable:{exc}") from exc
 
-    streamable_kwargs = streamable_http_client_kwargs(streamable_http_client, timeout_s)
+    streamable_kwargs = streamable_http_client_kwargs(
+        streamable_http_client,
+        timeout_s,
+        headers=headers,
+    )
+    http_client = streamable_kwargs.get("http_client")
     with tracing_module.start_span(
         "tool_registry.mcp_sdk_call",
         attributes={
             "mcp.tool_name": tool_name,
             "mcp.url": mcp_url,
             "mcp.timeout_s": timeout_s,
+            "mcp.has_headers": bool(headers),
         },
     ) as sdk_span:
         sdk_started_at = time.monotonic()
@@ -544,6 +697,14 @@ def call_mcp_tool_sdk_inproc(
                 },
             )
             raise ToolExecutionError(f"mcp_sdk_error:{error_detail}") from exc
+        finally:
+            if http_client is not None:
+                close = getattr(http_client, "aclose", None)
+                if callable(close):
+                    try:
+                        asyncio.run(close())
+                    except Exception:  # noqa: BLE001
+                        pass
         tracing_module.set_span_attributes(sdk_span, {"mcp.status": "ok"})
         return extract_mcp_sdk_result(result)
 
@@ -554,6 +715,7 @@ def mcp_process_entry(
     tool_name: str,
     arguments: dict[str, Any],
     timeout_s: float,
+    headers: dict[str, str] | None,
 ) -> None:
     try:
         result = call_mcp_tool_sdk_inproc(
@@ -561,6 +723,7 @@ def mcp_process_entry(
             tool_name,
             arguments,
             timeout_s,
+            headers=headers,
             tracing_module=_NoopTracing,
         )
         queue.put({"ok": result})
@@ -579,6 +742,7 @@ def call_mcp_tool_sdk_process(
     tool_name: str,
     arguments: dict[str, Any],
     timeout_s: float,
+    headers: dict[str, str] | None = None,
     *,
     logger: logging.Logger,
     tracing_module: Any,
@@ -588,7 +752,7 @@ def call_mcp_tool_sdk_process(
     queue = ctx.Queue(maxsize=1)
     process = ctx.Process(
         target=mcp_process_entry,
-        args=(queue, mcp_url, tool_name, arguments, timeout_s),
+        args=(queue, mcp_url, tool_name, arguments, timeout_s, headers),
         daemon=True,
     )
     process.start()

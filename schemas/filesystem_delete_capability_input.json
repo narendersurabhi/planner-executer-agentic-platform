@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FilesystemDeleteCapabilityInput",
+  "type": "object",
+  "properties": {
+    "path": {"type": "string", "minLength": 1},
+    "recursive": {"type": "boolean"},
+    "missing_ok": {"type": "boolean"}
+  },
+  "required": ["path"],
+  "additionalProperties": true
+}

@@ -9,7 +9,7 @@ def test_validate_tool_inputs_missing_required() -> None:
             "required": ["path", "document_spec"],
         }
     }
-    tool_inputs = {"docx_generate_from_spec": {"path": "resumes/out.docx"}}
+    tool_inputs = {"docx_generate_from_spec": {"path": "documents/out.docx"}}
 
     errors = validate_tool_inputs(tool_inputs, schemas)
 
@@ -25,7 +25,7 @@ def test_validate_tool_inputs_ok() -> None:
             "required": ["path", "document_spec"],
         }
     }
-    tool_inputs = {"docx_generate_from_spec": {"path": "resumes/out.docx", "document_spec": {}}}
+    tool_inputs = {"docx_generate_from_spec": {"path": "documents/out.docx", "document_spec": {}}}
 
     errors = validate_tool_inputs(tool_inputs, schemas)
 

@@ -24,11 +24,11 @@ spec:
               mountPath: /data
           resources:
             requests:
-              cpu: 50m
-              memory: 128Mi
+              cpu: 100m
+              memory: 256Mi
             limits:
-              cpu: 500m
-              memory: 512Mi
+              cpu: "1"
+              memory: 2Gi
       volumes:
         - name: redis-data
           persistentVolumeClaim:

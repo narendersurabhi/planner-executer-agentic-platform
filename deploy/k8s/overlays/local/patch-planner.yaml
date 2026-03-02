@@ -4,3 +4,8 @@ metadata:
   name: planner
 spec:
   replicas: 1
+  template:
+    spec:
+      containers:
+        - name: planner
+          imagePullPolicy: Always

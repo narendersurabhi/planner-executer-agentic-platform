@@ -59,9 +59,23 @@ spec:
               cpu: "2"
               memory: 2Gi
           volumeMounts:
+            - name: capability-registry-config
+              mountPath: /app/config/capability_registry.yaml
+              subPath: capability_registry.yaml
+              readOnly: true
+            - name: mcp-servers-config
+              mountPath: /app/config/mcp_servers.yaml
+              subPath: mcp_servers.yaml
+              readOnly: true
             - name: shared-data
               mountPath: /shared
       volumes:
+        - name: capability-registry-config
+          configMap:
+            name: capability-registry
+        - name: mcp-servers-config
+          configMap:
+            name: mcp-servers-config
         - name: shared-data
           persistentVolumeClaim:
             claimName: shared-data

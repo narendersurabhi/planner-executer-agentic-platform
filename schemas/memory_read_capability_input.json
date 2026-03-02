@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryReadCapabilityInput",
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "scope": {
+      "type": "string",
+      "enum": ["request", "session", "user", "project", "global"]
+    },
+    "key": {"type": "string"},
+    "job_id": {"type": "string"},
+    "user_id": {"type": "string"},
+    "project_id": {"type": "string"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+    "include_expired": {"type": "boolean"}
+  },
+  "required": ["name"],
+  "additionalProperties": true
+}

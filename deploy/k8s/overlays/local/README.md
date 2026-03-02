@@ -2,7 +2,6 @@
 
 This overlay is tuned for local Kubernetes testing:
 
-- Single replica for core services (`api`, `planner`, `worker`, `coder`, `tailor`, `ui`)
 - `worker` mounts `/shared` from a node host path (`/var/awe-shared`)
 - `worker` mounts `/shared` from a node `hostPath` (`/var/awe-shared`)
 - `ui` Service type is `ClusterIP` (use `kubectl port-forward`)
@@ -24,7 +23,6 @@ Default local image tags are set to:
 - `ghcr.io/narendersurabhi/awe-planner:local`
 - `ghcr.io/narendersurabhi/awe-worker:local`
 - `ghcr.io/narendersurabhi/awe-coder:local`
-- `ghcr.io/narendersurabhi/awe-tailor:local`
 - `ghcr.io/narendersurabhi/awe-ui:local`
 
 Build images with matching tags from repo root:

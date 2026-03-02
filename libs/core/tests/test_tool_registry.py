@@ -1,11 +1,19 @@
 import json
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from libs.core.llm_provider import LLMProvider, LLMResponse
 from libs.core.models import RiskLevel, ToolSpec
-from libs.core.tool_registry import Tool, ToolExecutionError, ToolRegistry, default_registry
+from libs.core.tool_registry import (
+    Tool,
+    ToolExecutionError,
+    ToolRegistry,
+    default_registry,
+    evaluate_tool_allowlist,
+)
 from libs.core import tool_registry as tool_registry_module
 
 
@@ -146,6 +154,16 @@ def test_docx_render_tool_registered() -> None:
     assert "output_path" in schema["required"]
 
 
+def test_pdf_generate_tool_registered() -> None:
+    registry = default_registry()
+    tool = registry.get("pdf_generate_from_spec")
+    schema = tool.spec.input_schema
+    assert "document_spec" in schema["properties"]
+    assert "path" in schema["properties"]
+    assert "render_context" in schema["properties"]
+    assert "strict" in schema["properties"]
+
+
 def test_file_write_text_requires_path() -> None:
     registry = default_registry()
     call = registry.execute("file_write_text", {"content": "hello"}, "id", "trace")
@@ -187,17 +205,69 @@ def test_derive_output_filename() -> None:
         "trace",
     )
     assert call.status == "completed"
-    assert call.output_or_error["path"] == "resumes/senior_ai_ml_engineer_2026_02_09.docx"
+    assert call.output_or_error["path"] == "documents/senior_ai_ml_engineer_2026_02_09.docx"
 
 
-def test_derive_output_filename_resume_style() -> None:
+
+
+def test_derive_output_filename_with_output_extension_pdf() -> None:
     registry = default_registry()
     call = registry.execute(
         "derive_output_filename",
         {
-            "candidate_name": "Narender Surabhi",
-            "target_role_name": "Software Engineer AI",
-            "company_name": "Figma",
+            "target_role_name": "Senior AI/ML Engineer",
+            "date": "2026-02-09",
+            "output_extension": "pdf",
+        },
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    assert call.output_or_error["path"] == "documents/senior_ai_ml_engineer_2026_02_09.pdf"
+    assert call.output_or_error["output_extension"] == "pdf"
+
+
+def test_derive_output_filename_accepts_document_type_as_format_when_extension_missing() -> None:
+    registry = default_registry()
+    call = registry.execute(
+        "derive_output_filename",
+        {
+            "target_role_name": "Staff Platform Engineer",
+            "date": "2026-02-09",
+            "document_type": "md",
+        },
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    assert call.output_or_error["path"] == "documents/staff_platform_engineer_2026_02_09.md"
+    assert call.output_or_error["output_extension"] == "md"
+
+
+def test_derive_output_filename_defaults_to_today_when_missing_date() -> None:
+    registry = default_registry()
+    today_slug = datetime.now(UTC).date().isoformat().replace("-", "_")
+    call = registry.execute(
+        "derive_output_filename",
+        {"target_role_name": "Platform Engineer", "output_extension": "pdf"},
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    assert call.output_or_error["path"] == f"documents/platform_engineer_{today_slug}.pdf"
+    assert call.output_or_error["output_extension"] == "pdf"
+
+
+def test_derive_output_path_uses_generic_slug_naming() -> None:
+    registry = default_registry()
+    call = registry.execute(
+        "derive_output_path",
+        {
+            "topic": "Latency in Distributed Systems",
+            "today": "2026-02-25",
+            "output_dir": "documents",
+            "document_type": "document",
+            "output_extension": "pdf",
         },
         "id",
         "trace",
@@ -205,19 +275,19 @@ def test_derive_output_filename_resume_style() -> None:
     assert call.status == "completed"
     assert (
         call.output_or_error["path"]
-        == "resumes/Narender Surabhi Resume - Software Engineer AI - Figma.docx"
+        == "documents/latency_in_distributed_systems_2026_02_25.pdf"
     )
+    assert call.output_or_error["output_extension"] == "pdf"
 
 
-def test_derive_output_filename_cover_letter_style() -> None:
+def test_derive_output_path_defaults_document_type_when_missing() -> None:
     registry = default_registry()
     call = registry.execute(
-        "derive_output_filename",
+        "derive_output_path",
         {
-            "candidate_name": "Narender Surabhi",
-            "target_role_name": "Software Engineer AI",
-            "company_name": "Figma",
-            "document_type": "cover_letter",
+            "topic": "Latency in Distributed Systems",
+            "today": "2026-02-25",
+            "output_dir": "documents",
         },
         "id",
         "trace",
@@ -225,31 +295,200 @@ def test_derive_output_filename_cover_letter_style() -> None:
     assert call.status == "completed"
     assert (
         call.output_or_error["path"]
-        == "resumes/Narender Surabhi Cover Letter - Software Engineer AI - Figma.docx"
+        == "documents/latency_in_distributed_systems_2026_02_25.docx"
     )
-    assert call.output_or_error["document_type"] == "cover_letter"
+    assert call.output_or_error["document_type"] == "document"
+    assert call.output_or_error["output_extension"] == "docx"
 
 
-def test_derive_output_filename_derives_from_jd_and_resume() -> None:
+def test_derive_output_path_rejects_invalid_output_dir() -> None:
     registry = default_registry()
     call = registry.execute(
-        "derive_output_filename",
+        "derive_output_path",
         {
-            "job_description": (
-                "Staff Software Engineer, AI/ML\n"
-                "New York, NY; Remote, US\n"
-                "Maven is the world's largest virtual clinic for women and families.\n"
-            ),
-            "candidate_resume": "NARENDER SURABHI\nOkemos, MI, USA 48864\n",
+            "topic": "Latency in Distributed Systems",
+            "today": "2026-02-25",
+            "output_dir": "../documents",
+            "document_type": "document",
         },
         "id",
         "trace",
     )
-    assert call.status == "completed"
-    assert (
-        call.output_or_error["path"]
-        == "resumes/Narender Surabhi Resume - Staff Software Engineer AI ML - Maven.docx"
+    assert call.status == "failed"
+    assert "Invalid output_dir" in call.output_or_error["error"]
+
+
+def test_default_registry_loads_module_plugins(monkeypatch, tmp_path) -> None:
+    plugin_path = tmp_path / "demo_plugin.py"
+    plugin_path.write_text(
+        (
+            "from libs.core.models import ToolSpec, RiskLevel\n"
+            "from libs.framework.tool_runtime import Tool\n"
+            "\n"
+            "def register_tools(registry):\n"
+            "    registry.register(\n"
+            "        Tool(\n"
+            "            spec=ToolSpec(\n"
+            "                name='plugin_echo',\n"
+            "                description='plugin',\n"
+            "                input_schema={'type':'object'},\n"
+            "                output_schema={'type':'object','properties':{'ok':{'type':'boolean'}},'required':['ok']},\n"
+            "                timeout_s=1,\n"
+            "                risk_level=RiskLevel.low,\n"
+            "            ),\n"
+            "            handler=lambda payload: {'ok': True},\n"
+            "        )\n"
+            "    )\n"
+        ),
+        encoding="utf-8",
     )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("TOOL_PLUGIN_MODULES", "demo_plugin")
+    registry = default_registry()
+    call = registry.execute("plugin_echo", {}, "id", "trace")
+    assert call.status == "completed"
+    assert call.output_or_error["ok"] is True
+
+
+def test_default_registry_applies_enabled_disabled_tool_filters(monkeypatch) -> None:
+    monkeypatch.delenv("TOOL_PLUGIN_MODULES", raising=False)
+    monkeypatch.setenv("ENABLED_TOOLS", "math_eval,text_summarize")
+    monkeypatch.setenv("DISABLED_TOOLS", "text_summarize")
+    registry = default_registry()
+    specs = {spec.name for spec in registry.list_specs()}
+    assert specs == {"math_eval"}
+
+
+def test_tool_allowlist_precedence_service_and_global(monkeypatch) -> None:
+    monkeypatch.setenv("ENABLED_TOOLS", "math_eval,text_summarize")
+    monkeypatch.setenv("WORKER_ENABLED_TOOLS", "math_eval,sleep")
+    monkeypatch.setenv("DISABLED_TOOLS", "sleep")
+    monkeypatch.setenv("WORKER_DISABLED_TOOLS", "math_eval")
+    assert evaluate_tool_allowlist("math_eval", "worker").allowed is False
+    assert evaluate_tool_allowlist("math_eval", "worker").reason == "service_disabled"
+    assert evaluate_tool_allowlist("sleep", "worker").allowed is False
+    assert evaluate_tool_allowlist("sleep", "worker").reason == "global_disabled"
+    assert evaluate_tool_allowlist("text_summarize", "worker").allowed is False
+    assert evaluate_tool_allowlist("text_summarize", "worker").reason == "not_in_service_enabled"
+
+
+def test_default_registry_applies_service_specific_allowlist(monkeypatch) -> None:
+    monkeypatch.setenv("TOOL_GOVERNANCE_ENABLED", "false")
+    monkeypatch.setenv("ENABLED_TOOLS", "math_eval,text_summarize,file_write_text")
+    monkeypatch.setenv("WORKER_ENABLED_TOOLS", "math_eval,file_write_text")
+    monkeypatch.setenv("WORKER_DISABLED_TOOLS", "file_write_text")
+    registry = default_registry(service_name="worker")
+    specs = {spec.name for spec in registry.list_specs()}
+    assert specs == {"math_eval"}
+
+
+def test_evaluate_tool_allowlist_uses_governance_config_enforce(monkeypatch, tmp_path) -> None:
+    cfg_path = tmp_path / "tool_governance.yaml"
+    cfg_path.write_text(
+        (
+            "tool_governance:\n"
+            "  mode: enforce\n"
+            "  global:\n"
+            "    allow: []\n"
+            "    deny: []\n"
+            "  services:\n"
+            "    worker:\n"
+            "      allow: [math_eval]\n"
+            "      deny: [sleep]\n"
+            "  tenants:\n"
+            "    tenant_a:\n"
+            "      deny: [math_eval]\n"
+            "  job_types: {}\n"
+            "  risk:\n"
+            "    blocked_levels_by_service:\n"
+            "      worker: [high]\n"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TOOL_GOVERNANCE_CONFIG_PATH", str(cfg_path))
+    monkeypatch.setenv("TOOL_GOVERNANCE_ENABLED", "true")
+    monkeypatch.setenv("TOOL_GOVERNANCE_MODE", "enforce")
+    decision = evaluate_tool_allowlist("sleep", "worker")
+    assert decision.allowed is False
+    assert decision.reason == "config_service_deny"
+    decision = evaluate_tool_allowlist(
+        "math_eval",
+        "worker",
+        context={"tenant_id": "tenant_a"},
+    )
+    assert decision.allowed is False
+    assert decision.reason == "config_tenant_deny"
+    high_risk_tool = ToolSpec(
+        name="high_tool",
+        description="high",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        timeout_s=1,
+        risk_level=RiskLevel.high,
+    )
+    decision = evaluate_tool_allowlist(
+        "high_tool",
+        "worker",
+        tool_spec=high_risk_tool,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "risk_blocked:high"
+
+
+def test_evaluate_tool_allowlist_dry_run_does_not_block(monkeypatch, tmp_path) -> None:
+    cfg_path = tmp_path / "tool_governance.yaml"
+    cfg_path.write_text(
+        (
+            "tool_governance:\n"
+            "  mode: dry_run\n"
+            "  global:\n"
+            "    deny: [sleep]\n"
+            "  services: {}\n"
+            "  tenants: {}\n"
+            "  job_types: {}\n"
+            "  risk:\n"
+            "    blocked_levels_by_service: {}\n"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TOOL_GOVERNANCE_CONFIG_PATH", str(cfg_path))
+    monkeypatch.setenv("TOOL_GOVERNANCE_ENABLED", "true")
+    monkeypatch.setenv("TOOL_GOVERNANCE_MODE", "dry_run")
+    decision = evaluate_tool_allowlist("sleep", "worker")
+    assert decision.allowed is True
+    assert decision.violated is True
+    assert decision.reason.startswith("dry_run:")
+    assert decision.mode == "dry_run"
+
+
+def test_default_registry_plugin_fail_fast_toggle(monkeypatch, tmp_path) -> None:
+    plugin_path = tmp_path / "bad_plugin.py"
+    plugin_path.write_text(
+        "def register_tools(registry):\n"
+        "    raise RuntimeError('boom')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("TOOL_PLUGIN_MODULES", "bad_plugin")
+    monkeypatch.setenv("TOOL_PLUGIN_FAIL_FAST", "false")
+    registry = default_registry()
+    with pytest.raises(KeyError):
+        registry.get("bad_plugin_tool")
+
+
+def test_default_registry_plugin_fail_fast_raises(monkeypatch, tmp_path) -> None:
+    plugin_path = tmp_path / "bad_plugin_raise.py"
+    plugin_path.write_text(
+        "def register_tools(registry):\n"
+        "    raise RuntimeError('boom')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("TOOL_PLUGIN_MODULES", "bad_plugin_raise")
+    monkeypatch.setenv("TOOL_PLUGIN_FAIL_FAST", "true")
+    with pytest.raises(RuntimeError):
+        default_registry()
+
 
 
 def test_derive_output_filename_reads_from_job_context_memory() -> None:
@@ -261,9 +500,8 @@ def test_derive_output_filename_reads_from_job_context_memory() -> None:
                 "job_context": [
                     {
                         "payload": {
-                            "candidate_name": "Narender Surabhi",
                             "target_role_name": "Software Engineer AI",
-                            "company_name": "Figma",
+                            "today": "2026-02-13",
                         }
                     }
                 ]
@@ -273,10 +511,7 @@ def test_derive_output_filename_reads_from_job_context_memory() -> None:
         "trace",
     )
     assert call.status == "completed"
-    assert (
-        call.output_or_error["path"]
-        == "resumes/Narender Surabhi Resume - Software Engineer AI - Figma.docx"
-    )
+    assert call.output_or_error["path"] == "documents/software_engineer_ai_2026_02_13.docx"
 
 
 def test_derive_output_filename_derives_role_from_jd_for_date_fallback() -> None:
@@ -291,7 +526,7 @@ def test_derive_output_filename_derives_role_from_jd_for_date_fallback() -> None
         "trace",
     )
     assert call.status == "completed"
-    assert call.output_or_error["path"] == "resumes/principal_backend_engineer_2026_02_13.docx"
+    assert call.output_or_error["path"] == "documents/principal_backend_engineer_2026_02_13.docx"
 
 
 def test_post_mcp_tool_call_uses_mcp_subpath_first(monkeypatch) -> None:
@@ -304,12 +539,12 @@ def test_post_mcp_tool_call_uses_mcp_subpath_first(monkeypatch) -> None:
 
     monkeypatch.setattr(tool_registry_module, "_call_mcp_tool_sdk", fake_call)
     result = tool_registry_module._post_mcp_tool_call(
-        "http://tailor:8000",
-        "tailor_resume",
+        "http://service:8000",
+        "example_tool",
         {"job": {"id": "1"}},
     )
     assert result["ok"] is True
-    assert seen == ["http://tailor:8000/mcp/rpc/mcp"]
+    assert seen == ["http://service:8000/mcp/rpc/mcp"]
 
 
 def test_post_mcp_tool_call_biases_first_attempt_timeout(monkeypatch) -> None:
@@ -324,8 +559,8 @@ def test_post_mcp_tool_call_biases_first_attempt_timeout(monkeypatch) -> None:
     monkeypatch.setenv("MCP_TOOL_RETRY_SLEEP_S", "0")
     monkeypatch.setattr(tool_registry_module, "_call_mcp_tool_sdk", fake_call)
     result = tool_registry_module._post_mcp_tool_call(
-        "http://tailor:8000",
-        "tailor_resume",
+        "http://service:8000",
+        "example_tool",
         {"job": {"id": "1"}},
     )
     assert result["ok"] is True
@@ -370,14 +605,14 @@ def test_post_mcp_tool_call_falls_back_to_legacy_mcp_root(monkeypatch) -> None:
 
     monkeypatch.setattr(tool_registry_module, "_call_mcp_tool_sdk", fake_call)
     result = tool_registry_module._post_mcp_tool_call(
-        "http://tailor:8000",
-        "tailor_resume",
+        "http://service:8000",
+        "example_tool",
         {"job": {"id": "1"}},
     )
     assert result["ok"] is True
     assert seen == [
-        "http://tailor:8000/mcp/rpc/mcp",
-        "http://tailor:8000/mcp/rpc",
+        "http://service:8000/mcp/rpc/mcp",
+        "http://service:8000/mcp/rpc",
     ]
 
 
@@ -391,8 +626,8 @@ def test_post_mcp_tool_call_does_not_retry_on_tool_error(monkeypatch) -> None:
     monkeypatch.setattr(tool_registry_module, "_call_mcp_tool_sdk", fake_call)
     try:
         tool_registry_module._post_mcp_tool_call(
-            "http://tailor:8000",
-            "tailor_resume",
+            "http://service:8000",
+            "example_tool",
             {"job": {"id": "1"}},
         )
     except ToolExecutionError as exc:
@@ -416,14 +651,14 @@ def test_post_mcp_tool_call_retries_retryable_sdk_error(monkeypatch) -> None:
     monkeypatch.setenv("MCP_TOOL_RETRY_SLEEP_S", "0")
     monkeypatch.setattr(tool_registry_module, "_call_mcp_tool_sdk", fake_call)
     result = tool_registry_module._post_mcp_tool_call(
-        "http://tailor:8000",
-        "tailor_resume",
+        "http://service:8000",
+        "example_tool",
         {"job": {"id": "1"}},
     )
     assert result["ok"] is True
     assert seen == [
-        "http://tailor:8000/mcp/rpc/mcp",
-        "http://tailor:8000/mcp/rpc/mcp",
+        "http://service:8000/mcp/rpc/mcp",
+        "http://service:8000/mcp/rpc/mcp",
     ]
 
 
@@ -444,8 +679,8 @@ def test_post_mcp_tool_call_bounds_retries_by_deadline(monkeypatch) -> None:
     started = time.monotonic()
     with pytest.raises(ToolExecutionError) as exc:
         tool_registry_module._post_mcp_tool_call(
-            "http://tailor:8000",
-            "tailor_resume",
+            "http://service:8000",
+            "example_tool",
             {"job": {"id": "1"}},
         )
     elapsed = time.monotonic() - started
@@ -460,161 +695,11 @@ def test_resolve_mcp_isolation_mode_defaults_to_process(monkeypatch) -> None:
     assert tool_registry_module._resolve_mcp_isolation_mode() == "process"
 
 
-def test_mcp_backed_resume_tools_use_mcp_timeout(monkeypatch) -> None:
-    monkeypatch.setenv("MCP_TOOL_TIMEOUT_S", "120")
-    monkeypatch.delenv("MCP_TOOL_OUTER_TIMEOUT_HEADROOM_S", raising=False)
-    monkeypatch.setenv("OPENAI_TIMEOUT_S", "600")
-    registry = default_registry(llm_enabled=True, llm_provider=_CoverLetterLLMStub())
-    assert registry.get("llm_tailor_resume_text").spec.timeout_s == 135
-    assert registry.get("llm_improve_tailored_resume_text").spec.timeout_s == 135
-    assert registry.get("llm_iterative_improve_tailored_resume_text").spec.timeout_s == 135
-
-
-class _CoverLetterLLMStub(LLMProvider):
-    def generate(self, prompt: str) -> LLMResponse:
-        return LLMResponse(
-            content='{"body":"I am applying for this role and bring proven distributed systems experience."}'
-        )
-
-
-def test_llm_generate_cover_letter_from_resume_tool() -> None:
-    registry = default_registry(llm_enabled=True, llm_provider=_CoverLetterLLMStub())
-    payload = {
-        "tailored_resume": {
-            "schema_version": "1.0",
-            "header": {
-                "name": "Narender Surabhi",
-                "title": "Staff Software Engineer, AI/ML",
-                "location": "Okemos, MI, USA 48864",
-                "phone": "+1 (213) 254-8205",
-                "email": "surabhinarenderrao@gmail.com",
-                "links": {
-                    "linkedin": "linkedin.com/in/narendersurabhi",
-                    "github": "github.com/narendersurabhi",
-                },
-            },
-            "summary": "Summary",
-            "skills": [{"group_name": "Languages", "items": ["Python"]}],
-            "experience": [
-                {
-                    "company": "Acentra Health",
-                    "title": "Software Engineer, AI/ML",
-                    "location": "Okemos, MI",
-                    "dates": "Dec 2016 - Present",
-                    "bullets": ["Built and operated production systems."],
-                }
-            ],
-            "education": [],
-            "certifications": [],
-        },
-        "job": {
-            "context_json": {
-                "job_description": "Software Engineer, Distributed Systems\nFigma is the collaborative software platform for teams."
-            }
-        },
-    }
-    call = registry.execute(
-        "llm_generate_cover_letter_from_resume",
-        payload,
-        "id",
-        "trace",
-    )
-    assert call.status == "completed"
-    out = call.output_or_error["cover_letter"]
-    assert out["full_name"] == "Narender Surabhi"
-    assert out["company"] == "Figma"
-    assert out["role_title"] == "Software Engineer, Distributed Systems"
-    assert out["recipient_line"] == "Hiring Team"
-    assert out["salutation"] == "Dear Hiring Team,"
-
-
-def test_llm_generate_coverletter_doc_spec_from_text_tool() -> None:
-    registry = default_registry(llm_enabled=True, llm_provider=_CoverLetterLLMStub())
-    payload = {
-        "tailored_resume": {
-            "schema_version": "1.0",
-            "header": {
-                "name": "Narender Surabhi",
-                "title": "Staff Software Engineer, AI/ML",
-                "location": "Okemos, MI, USA 48864",
-                "phone": "+1 (213) 254-8205",
-                "email": "surabhinarenderrao@gmail.com",
-                "links": {
-                    "linkedin": "linkedin.com/in/narendersurabhi",
-                    "github": "github.com/narendersurabhi",
-                },
-            },
-            "summary": "Summary",
-            "skills": [{"group_name": "Languages", "items": ["Python"]}],
-            "experience": [
-                {
-                    "company": "Acentra Health",
-                    "title": "Software Engineer, AI/ML",
-                    "location": "Okemos, MI",
-                    "dates": "Dec 2016 - Present",
-                    "bullets": ["Built and operated production systems."],
-                }
-            ],
-            "education": [],
-            "certifications": [],
-        },
-        "job": {
-            "context_json": {
-                "job_description": "Software Engineer, Distributed Systems\nFigma is the collaborative software platform for teams."
-            }
-        },
-        "today_pretty": "February 13, 2026",
-    }
-    call = registry.execute(
-        "llm_generate_coverletter_doc_spec_from_text",
-        payload,
-        "id",
-        "trace",
-    )
-    assert call.status == "completed"
-    spec = call.output_or_error["coverletter_doc_spec"]
-    assert spec["doc_type"] == "cover_letter"
-    assert isinstance(spec["content"], list)
-    assert spec["content"][0]["type"] == "header"
-    assert spec["content"][1]["text"] == "February 13, 2026"
-
-
-def test_coverletter_doc_spec_to_document_spec_tool() -> None:
-    registry = default_registry()
-    call = registry.execute(
-        "coverletter_doc_spec_to_document_spec",
-        {
-            "coverletter_doc_spec": {
-                "schema_version": "1.0",
-                "doc_type": "cover_letter",
-                "title": "Example",
-                "page": {
-                    "size": "LETTER",
-                    "margins_in": {"top": 0.8, "right": 0.8, "bottom": 0.8, "left": 0.8},
-                },
-                "defaults": {"font_family": "Calibri", "font_size_pt": 11, "line_spacing": 1.15},
-                "styles": {"name": {"bold": True, "size_pt": 20}},
-                "content": [
-                    {
-                        "type": "header",
-                        "blocks": [{"type": "text", "style": "name", "text": "Narender Surabhi"}],
-                    },
-                    {"type": "paragraph", "text": "Dear Hiring Team,"},
-                ],
-            }
-        },
-        "id",
-        "trace",
-    )
-    assert call.status == "completed"
-    blocks = call.output_or_error["document_spec"]["blocks"]
-    assert blocks[0]["style"] == "cover_letter_name"
-    assert blocks[1]["type"] == "paragraph"
 
 
 def test_extract_mcp_sdk_result_includes_error_detail() -> None:
     class _TextItem:
-        text = "Error executing tool tailor_resume: invalid input"
+        text = "Error executing tool example_tool: invalid input"
 
     class _Result:
         isError = True
@@ -735,6 +820,31 @@ def test_llm_iterative_improve_document_spec_stops_when_valid() -> None:
     assert out["validation_report"]["valid"] is True
 
 
+def test_llm_iterative_improve_document_spec_defaults_allowed_block_types() -> None:
+    provider = _SequenceLLMStub(
+        [
+            {
+                "blocks": [
+                    {"type": "heading", "level": 1, "text": "Title"},
+                    {"type": "paragraph", "text": "Hello"},
+                ]
+            }
+        ]
+    )
+    registry = default_registry(llm_enabled=True, llm_provider=provider)
+    call = registry.execute(
+        "llm_iterative_improve_document_spec",
+        {"job": {"goal": "Generate a short doc"}, "max_iterations": 2},
+        "id",
+        "trace",
+    )
+    assert call.status == "completed"
+    out = call.output_or_error
+    assert out["iterations"] == 1
+    assert out["reached_threshold"] is True
+    assert out["validation_report"]["valid"] is True
+
+
 def test_llm_iterative_improve_openapi_spec_stops_when_valid() -> None:
     provider = _SequenceLLMStub(
         [
@@ -784,14 +894,6 @@ def test_llm_iterative_improve_runbook_spec_generates_document_spec() -> None:
         "llm_iterative_improve_runbook_spec",
         {
             "job": {"goal": "Create a runbook"},
-            "allowed_block_types": [
-                "heading",
-                "paragraph",
-                "bullets",
-                "text",
-                "optional_paragraph",
-                "repeat",
-            ],
             "max_iterations": 3,
         },
         "id",
@@ -804,437 +906,24 @@ def test_llm_iterative_improve_runbook_spec_generates_document_spec() -> None:
     assert out["validation_report"]["valid"] is True
 
 
-def test_normalize_skills_definition_separators_uses_commas() -> None:
-    spec = {
-        "content": [
-            {"type": "section_heading", "text": "SUMMARY"},
-            {
-                "type": "definition_list",
-                "items": [{"term": "Ignore", "definition": "alpha; beta"}],
-            },
-            {"type": "section_heading", "text": "SKILLS"},
-            {
-                "type": "definition_list",
-                "items": [
-                    {"term": "Languages", "definition": "Python; Java; SQL"},
-                    {"term": "Cloud", "definition": "AWS, Azure"},
-                ],
-            },
-        ]
-    }
-    tool_registry_module._normalize_skills_definition_separators(spec)
-    items = spec["content"][3]["items"]
-    assert items[0]["definition"] == "Python, Java, SQL"
-    assert items[1]["definition"] == "AWS, Azure"
-
-
-class _ResumeSpecLLMStub(LLMProvider):
-    def __init__(self, payload: dict) -> None:
-        self._content = json.dumps(payload)
-
-    def generate(self, prompt: str) -> LLMResponse:
-        return LLMResponse(content=self._content)
-
-
-def _base_resume_doc_spec() -> dict:
-    return {
-        "schema_version": "1.0",
-        "doc_type": "resume",
-        "title": "Narender Surabhi - Resume",
-        "page": {
-            "size": "LETTER",
-            "margins_in": {"top": 0.5, "right": 0.5, "bottom": 0.5, "left": 0.5},
-        },
-        "defaults": {"font_family": "Calibri", "font_size_pt": 11, "line_spacing": 1.05},
-        "styles": {},
-        "content": [
-            {
-                "type": "header",
-                "blocks": [
-                    {"type": "text", "text": "Narender Surabhi"},
-                    {"type": "text", "text": "Staff Software Engineer"},
-                    {"type": "text", "text": "Okemos, MI | +1 (213) 254-8205"},
-                ],
-            },
-            {"type": "section_heading", "text": "SUMMARY"},
-            {"type": "paragraph", "text": "Summary"},
-            {"type": "section_heading", "text": "SKILLS"},
-            {"type": "definition_list", "items": [{"term": "Languages", "definition": "Python"}]},
-            {"type": "section_heading", "text": "EXPERIENCE"},
-            {
-                "type": "role",
-                "company": "Acentra Health",
-                "location": "Okemos, MI",
-                "title": "Software Engineer, AI/ML",
-                "dates": "Dec 2016 - Present",
-                "bullets": ["Built production systems."],
-            },
-            {"type": "section_heading", "text": "EDUCATION"},
-            {
-                "type": "education",
-                "degree": "Bachelor of Science",
-                "school": "Nizam College",
-                "location": "Hyderabad, India",
-                "dates": "Sep 2003 - May 2007",
-            },
-            {"type": "section_heading", "text": "CERTIFICATIONS"},
-            {"type": "bullets", "items": []},
-        ],
-    }
-
-
-def _dense_resume_doc_spec_for_paging() -> dict:
-    return {
-        "schema_version": "1.0",
-        "doc_type": "resume",
-        "title": "Narender Surabhi - Resume",
-        "page": {
-            "size": "LETTER",
-            "margins_in": {"top": 0.6, "right": 0.6, "bottom": 0.6, "left": 0.6},
-        },
-        "defaults": {"font_family": "Calibri", "font_size_pt": 11.5, "line_spacing": 1.2},
-        "styles": {},
-        "content": [
-            {"type": "section_heading", "text": "SUMMARY"},
-            {
-                "type": "paragraph",
-                "text": (
-                    "Line one. Line two. Line three. Line four. Line five with additional details."
-                ),
-            },
-            {"type": "section_heading", "text": "SKILLS"},
-            {
-                "type": "definition_list",
-                "items": [
-                    {"term": "Languages", "definition": "Python, Java"},
-                    {"term": "Cloud", "definition": "AWS"},
-                    {"term": "MLOps", "definition": "SageMaker"},
-                    {"term": "Data", "definition": "PostgreSQL"},
-                    {"term": "Observability", "definition": "Grafana"},
-                    {"term": "Security", "definition": "IAM"},
-                ],
-            },
-            {"type": "section_heading", "text": "EXPERIENCE"},
-            {
-                "type": "role",
-                "company": "A",
-                "location": "X",
-                "title": "T1",
-                "dates": "2020 - Present",
-                "bullets": [
-                    "b1",
-                    "b2",
-                    "b3",
-                    "b4",
-                    "b5",
-                    "b6",
-                ],
-            },
-            {
-                "type": "role",
-                "company": "B",
-                "location": "Y",
-                "title": "T2",
-                "dates": "2018 - 2020",
-                "bullets": ["c1", "c2", "c3", "c4"],
-            },
-            {"type": "bullets", "items": ["g1", "g2", "g3", "g4"]},
-        ],
-    }
-
-
-def _base_tailored_resume() -> dict:
-    return {
-        "schema_version": "1.0",
-        "header": {
-            "name": "Narender Surabhi",
-            "title": "Staff Software Engineer, AI/ML",
-            "location": "Okemos, MI, USA 48864",
-            "phone": "+1 (213) 254-8205",
-            "email": "surabhinarenderrao@gmail.com",
-            "links": {
-                "linkedin": "linkedin.com/in/narendersurabhi",
-                "github": "github.com/narendersurabhi",
-            },
-        },
-        "summary": "Summary",
-        "skills": [{"group_name": "Languages", "items": ["Python"]}],
-        "experience": [
-            {
-                "company": "Acentra Health",
-                "title": "Software Engineer, AI/ML",
-                "location": "Okemos, MI",
-                "dates": "Dec 2016 - Present",
-                "bullets": ["Built production systems."],
-            }
-        ],
-        "education": [
-            {
-                "degree": "Bachelor of Science",
-                "school": "Nizam College",
-                "location": "Hyderabad, India",
-                "dates": "Sep 2003 - May 2007",
-            }
-        ],
-        "certifications": [],
-    }
-
-
-def test_resume_doc_spec_backfills_certifications_from_tailored_resume() -> None:
-    resume_doc_spec = _base_resume_doc_spec()
-    provider = _ResumeSpecLLMStub(resume_doc_spec)
-    tailored_resume = _base_tailored_resume()
-    tailored_resume["certifications"] = [
-        {
-            "name": "AWS Certified AI Practitioner (AIF-C01)",
-            "issuer": "AWS",
-            "year": 2025,
-            "url": "https://www.credly.com/badges/d91a3fa3-b52c-4b44-8b5d-5f75f13f58e1/public_url",
-        }
-    ]
-    out = tool_registry_module._llm_generate_resume_doc_spec_from_text(
-        {"tailored_resume": tailored_resume},
-        provider,
-    )
-    content = out["resume_doc_spec"]["content"]
-    cert_items = []
-    in_cert = False
-    for block in content:
-        if block.get("type") == "section_heading":
-            in_cert = str(block.get("text", "")).strip().upper() == "CERTIFICATIONS"
-            continue
-        if not in_cert:
-            continue
-        if block.get("type") == "bullets":
-            cert_items.extend(block.get("items") or [])
-    assert cert_items
-    assert "AWS Certified AI Practitioner (AIF-C01) - AWS (2025)" in cert_items[0]
-    assert "credly.com/badges" in cert_items[0]
-
-
-def test_apply_resume_target_pages_policy_one_page_compacts_content() -> None:
-    spec = _dense_resume_doc_spec_for_paging()
-    tool_registry_module._apply_resume_target_pages_policy(spec, 1)
-
-    assert spec["defaults"]["font_size_pt"] == 10.5
-    assert spec["defaults"]["line_spacing"] == 1.0
-    assert spec["page"]["margins_in"] == {"top": 0.45, "right": 0.45, "bottom": 0.45, "left": 0.45}
-
-    content = spec["content"]
-    skills_block = content[3]
-    assert len(skills_block["items"]) == 5
-
-    role1 = content[5]
-    role2 = content[6]
-    exp_group_bullets = content[7]
-    assert len(role1["bullets"]) == 4
-    assert len(role2["bullets"]) == 2
-    assert len(exp_group_bullets["items"]) == 2
-
-
-def test_apply_resume_target_pages_policy_two_page_still_caps_density() -> None:
-    spec = _dense_resume_doc_spec_for_paging()
-    tool_registry_module._apply_resume_target_pages_policy(spec, 2)
-
-    assert spec["defaults"]["font_size_pt"] == 10.75
-    assert spec["defaults"]["line_spacing"] == 1.0
-    assert spec["page"]["margins_in"] == {"top": 0.45, "right": 0.45, "bottom": 0.45, "left": 0.45}
-
-    content = spec["content"]
-    skills_block = content[3]
-    assert len(skills_block["items"]) == 6
-
-    role1 = content[5]
-    role2 = content[6]
-    exp_group_bullets = content[7]
-    assert len(role1["bullets"]) == 6
-    assert len(role2["bullets"]) == 3
-    assert len(exp_group_bullets["items"]) == 3
-
-
-def test_apply_resume_target_pages_policy_two_page_enforces_total_experience_bullet_budget() -> (
-    None
-):
-    spec = {
-        "defaults": {},
-        "page": {"margins_in": {}},
-        "content": [
-            {"type": "section_heading", "text": "EXPERIENCE"},
-            {
-                "type": "role",
-                "title": "A",
-                "bullets": [f"a{i}" for i in range(1, 10)],
-            },
-            {
-                "type": "role",
-                "title": "B",
-                "bullets": [f"b{i}" for i in range(1, 10)],
-            },
-            {
-                "type": "role",
-                "title": "C",
-                "bullets": [f"c{i}" for i in range(1, 10)],
-            },
-            {
-                "type": "bullets",
-                "items": [f"g{i}" for i in range(1, 10)],
-            },
-        ],
-    }
-    tool_registry_module._apply_resume_target_pages_policy(spec, 2)
-
-    total = 0
-    for block in spec["content"]:
-        if block.get("type") == "role":
-            total += len(block.get("bullets") or [])
-        if block.get("type") == "bullets":
-            total += len(block.get("items") or [])
-    assert total <= 16
-
-
-def test_parse_target_pages_accepts_page_phrases() -> None:
-    assert tool_registry_module._parse_target_pages("2 pages") == 2
-    assert tool_registry_module._parse_target_pages("page 1") == 1
-    assert tool_registry_module._parse_target_pages("target is 2 page resume") == 2
-    assert tool_registry_module._parse_target_pages("three pages") is None
-
-
-def test_llm_generate_resume_doc_spec_from_text_applies_target_pages_from_job_context() -> None:
-    provider = _ResumeSpecLLMStub(_dense_resume_doc_spec_for_paging())
-    out = tool_registry_module._llm_generate_resume_doc_spec_from_text(
-        {
-            "tailored_resume": _base_tailored_resume(),
-            "job": {"context_json": {"target_pages": 1}},
-        },
-        provider,
-    )
-    resume_doc_spec = out["resume_doc_spec"]
-    assert resume_doc_spec["defaults"]["font_size_pt"] == 10.5
-    assert resume_doc_spec["defaults"]["line_spacing"] == 1.0
-
-
-def test_resume_doc_spec_removes_empty_certifications_section_when_no_source() -> None:
-    resume_doc_spec = _base_resume_doc_spec()
-    provider = _ResumeSpecLLMStub(resume_doc_spec)
-    tailored_resume = _base_tailored_resume()
-    out = tool_registry_module._llm_generate_resume_doc_spec_from_text(
-        {"tailored_resume": tailored_resume},
-        provider,
-    )
-    content = out["resume_doc_spec"]["content"]
-    headings = [
-        str(block.get("text", "")).strip().upper()
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "section_heading"
-    ]
-    assert "CERTIFICATIONS" not in headings
-
-
-def test_resume_doc_spec_backfills_certifications_from_candidate_resume_context() -> None:
-    resume_doc_spec = _base_resume_doc_spec()
-    provider = _ResumeSpecLLMStub(resume_doc_spec)
-    tailored_resume = _base_tailored_resume()
-    out = tool_registry_module._llm_generate_resume_doc_spec_from_text(
-        {
-            "tailored_resume": tailored_resume,
-            "job": {
-                "context_json": {
-                    "candidate_resume": (
-                        "SUMMARY\n...\n"
-                        "CERTIFICATIONS\n"
-                        "AWS Certified AI Practitioner (AIF-C01), 2025\n"
-                        "MIT Data Science and Machine Learning, 2022\n"
-                    )
-                }
-            },
-        },
-        provider,
-    )
-    content = out["resume_doc_spec"]["content"]
-    cert_items = []
-    in_cert = False
-    for block in content:
-        if block.get("type") == "section_heading":
-            in_cert = str(block.get("text", "")).strip().upper() == "CERTIFICATIONS"
-            continue
-        if not in_cert:
-            continue
-        if block.get("type") == "bullets":
-            cert_items.extend(block.get("items") or [])
-    assert cert_items == [
-        "AWS Certified AI Practitioner (AIF-C01), 2025",
-        "MIT Data Science and Machine Learning, 2022",
-    ]
-
-
-def test_resume_doc_spec_to_document_spec_skips_empty_certifications_heading() -> None:
+def test_docx_generate_from_spec_auto_derives_path_when_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ARTIFACTS_DIR", str(tmp_path))
     registry = default_registry()
     call = registry.execute(
-        "resume_doc_spec_to_document_spec",
+        "docx_generate_from_spec",
         {
-            "resume_doc_spec": {
-                "schema_version": "1.0",
-                "doc_type": "resume",
-                "title": "Resume",
-                "page": {
-                    "size": "LETTER",
-                    "margins_in": {"top": 0.5, "right": 0.5, "bottom": 0.5, "left": 0.5},
-                },
-                "defaults": {"font_family": "Calibri", "font_size_pt": 11, "line_spacing": 1.05},
-                "styles": {},
-                "content": [
-                    {
-                        "type": "header",
-                        "blocks": [{"type": "text", "text": "Narender Surabhi"}],
-                    },
-                    {"type": "section_heading", "text": "SUMMARY"},
-                    {"type": "paragraph", "text": "Summary text"},
-                    {"type": "section_heading", "text": "CERTIFICATIONS"},
-                    {"type": "bullets", "items": []},
-                ],
-            }
+            "document_spec": {"blocks": [{"type": "paragraph", "text": "Hello"}]},
+            "topic": "Latency in Distributed Systems",
+            "today": "2026-02-25",
+            "output_dir": "documents",
         },
         "id",
         "trace",
     )
     assert call.status == "completed"
-    blocks = call.output_or_error["document_spec"]["blocks"]
-    headings = [b.get("text") for b in blocks if b.get("type") == "heading"]
-    assert "SUMMARY" in headings
-    assert "CERTIFICATIONS" not in headings
+    output_path = Path(call.output_or_error["path"])
+    assert output_path.exists()
+    assert output_path.suffix == ".docx"
 
-
-def test_resume_doc_spec_to_document_spec_keeps_non_empty_certifications_heading() -> None:
-    registry = default_registry()
-    call = registry.execute(
-        "resume_doc_spec_to_document_spec",
-        {
-            "resume_doc_spec": {
-                "schema_version": "1.0",
-                "doc_type": "resume",
-                "title": "Resume",
-                "page": {
-                    "size": "LETTER",
-                    "margins_in": {"top": 0.5, "right": 0.5, "bottom": 0.5, "left": 0.5},
-                },
-                "defaults": {"font_family": "Calibri", "font_size_pt": 11, "line_spacing": 1.05},
-                "styles": {},
-                "content": [
-                    {
-                        "type": "header",
-                        "blocks": [{"type": "text", "text": "Narender Surabhi"}],
-                    },
-                    {"type": "section_heading", "text": "SUMMARY"},
-                    {"type": "paragraph", "text": "Summary text"},
-                    {"type": "section_heading", "text": "CERTIFICATIONS"},
-                    {"type": "bullets", "items": ["AWS Certified AI Practitioner - AWS (2025)"]},
-                ],
-            }
-        },
-        "id",
-        "trace",
-    )
-    assert call.status == "completed"
-    blocks = call.output_or_error["document_spec"]["blocks"]
-    headings = [b.get("text") for b in blocks if b.get("type") == "heading"]
-    assert "CERTIFICATIONS" in headings

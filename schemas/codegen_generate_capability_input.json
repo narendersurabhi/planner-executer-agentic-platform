@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodegenGenerateCapabilityInput",
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string", "minLength": 1},
+    "files": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "constraints": {"type": "string"},
+    "workspace_path": {"type": "string"}
+  },
+  "required": ["goal"],
+  "additionalProperties": true
+}

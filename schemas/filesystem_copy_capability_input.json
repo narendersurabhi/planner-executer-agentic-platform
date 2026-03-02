@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FilesystemCopyCapabilityInput",
+  "type": "object",
+  "properties": {
+    "source_path": {"type": "string", "minLength": 1},
+    "destination_path": {"type": "string", "minLength": 1},
+    "overwrite": {"type": "boolean"},
+    "recursive": {"type": "boolean"}
+  },
+  "required": ["source_path", "destination_path"],
+  "additionalProperties": true
+}

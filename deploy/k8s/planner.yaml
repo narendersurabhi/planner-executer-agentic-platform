@@ -34,3 +34,12 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+          volumeMounts:
+            - name: capability-registry-config
+              mountPath: /app/config/capability_registry.yaml
+              subPath: capability_registry.yaml
+              readOnly: true
+      volumes:
+        - name: capability-registry-config
+          configMap:
+            name: capability-registry

@@ -1,0 +1,138 @@
+tool_governance:
+  mode: enforce
+  global:
+    allow: []
+    deny: []
+  services:
+    planner:
+      allow:
+        - json_transform
+        - llm_generate
+        - llm_generate_document_spec
+        - llm_improve_document_spec
+        - llm_repair_document_spec
+        - llm_iterative_improve_document_spec
+        - llm_iterative_improve_runbook_spec
+        - llm_iterative_improve_openapi_spec
+        - document_spec_validate
+        - docx_generate_from_spec
+        - pdf_generate_from_spec
+        - docx_render
+        - derive_output_path
+        - derive_output_filename
+        - file_read_text
+        - list_files
+        - search_text
+      deny:
+        - run_tests
+        - sleep
+        - http_fetch
+        - workspace_write_text
+        - workspace_write_code
+        - file_write_code
+        - coding_agent_generate
+        - coding_agent_autonomous
+        - github_repo_create
+        - github_repo_update
+        - github_repo_list
+        - github_branch_list
+        - github_file_write
+        - github_pr_create
+        - github_repo_push
+        - github_repo_clone_or_pull
+        - github_repo_push_pr
+    worker:
+      allow:
+        - json_transform
+        - llm_generate
+        - llm_generate_document_spec
+        - llm_improve_document_spec
+        - llm_repair_document_spec
+        - llm_iterative_improve_document_spec
+        - llm_iterative_improve_runbook_spec
+        - llm_iterative_improve_openapi_spec
+        - document_spec_validate
+        - docx_generate_from_spec
+        - pdf_generate_from_spec
+        - docx_render
+        - derive_output_path
+        - derive_output_filename
+        - file_read_text
+        - file_write_text
+        - file_write_artifact
+        - list_files
+        - search_text
+        - artifact_move
+        - artifact_mkdir
+        - workspace_mkdir
+        - artifact_delete
+        - workspace_delete
+        - artifact_rename
+        - workspace_rename
+        - artifact_copy
+        - workspace_copy
+        - workspace_read_text
+        - workspace_list_files
+        - coding_agent_generate
+        - coding_agent_autonomous
+        - coding_agent_publish_pr
+      deny:
+        - run_tests
+        - sleep
+        - http_fetch
+        - workspace_write_text
+        - workspace_write_code
+        - file_write_code
+        - github_repo_create
+        - github_repo_update
+        - github_repo_list
+        - github_branch_list
+        - github_file_write
+        - github_pr_create
+        - github_repo_push
+        - github_repo_clone_or_pull
+        - github_repo_push_pr
+    api:
+      allow:
+        - json_transform
+        - llm_generate
+        - llm_generate_document_spec
+        - llm_improve_document_spec
+        - llm_repair_document_spec
+        - llm_iterative_improve_document_spec
+        - llm_iterative_improve_runbook_spec
+        - llm_iterative_improve_openapi_spec
+        - document_spec_validate
+        - docx_generate_from_spec
+        - pdf_generate_from_spec
+        - docx_render
+        - derive_output_path
+        - derive_output_filename
+        - file_read_text
+        - list_files
+        - search_text
+      deny:
+        - run_tests
+        - sleep
+        - http_fetch
+        - workspace_write_text
+        - workspace_write_code
+        - file_write_code
+        - coding_agent_generate
+        - coding_agent_autonomous
+        - github_repo_create
+        - github_repo_update
+        - github_repo_list
+        - github_branch_list
+        - github_file_write
+        - github_pr_create
+        - github_repo_push
+        - github_repo_clone_or_pull
+        - github_repo_push_pr
+  tenants: {}
+  job_types: {}
+  risk:
+    blocked_levels_by_service:
+      planner: []
+      worker: []
+      api: []

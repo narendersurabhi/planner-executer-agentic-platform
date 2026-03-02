@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentSpecRepairCapabilityInput",
+  "type": "object",
+  "properties": {
+    "errors": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "original_spec": {"type": "object"},
+    "allowed_block_types": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": ["errors", "original_spec"],
+  "additionalProperties": true
+}

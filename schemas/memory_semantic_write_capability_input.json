@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SemanticMemoryWriteCapabilityInput",
+  "type": "object",
+  "properties": {
+    "fact": {"type": "string", "minLength": 1},
+    "subject": {"type": "string"},
+    "namespace": {"type": "string"},
+    "aliases": {"type": "array", "items": {"type": "string"}},
+    "keywords": {"type": "array", "items": {"type": "string"}},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "source": {"type": "string"},
+    "source_ref": {"type": "string"},
+    "reasoning": {"type": "string"},
+    "key": {"type": "string"},
+    "user_id": {"type": "string"},
+    "metadata": {"type": "object"}
+  },
+  "required": ["fact"],
+  "additionalProperties": true
+}

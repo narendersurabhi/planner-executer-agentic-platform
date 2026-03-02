@@ -2,6 +2,7 @@ FROM python:3.11-slim
 WORKDIR /app
 ENV PYTHONPATH=/app
 COPY libs/core /app/libs/core
+COPY libs/framework /app/libs/framework
 COPY libs/tools /app/libs/tools
 COPY config /app/config
 COPY services/policy /app/services/policy

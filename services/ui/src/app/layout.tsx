@@ -26,7 +26,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${displayFont.variable} ${bodyFont.variable} min-h-screen font-body`}>
-        <div className="mx-auto max-w-5xl px-6 py-8">{children}</div>
+        <div className="w-full px-6 py-8">{children}</div>
       </body>
     </html>
   );

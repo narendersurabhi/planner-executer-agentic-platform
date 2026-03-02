@@ -48,7 +48,6 @@ API -> Postgres
 - `planner`: goal -> plan DAG generation
 - `worker`: task execution, retries, DLQ, tool orchestration
 - `coder`: code-centric tool service (MCP)
-- `tailor`: resume/document tailoring service (MCP)
 - `policy`: policy gate checks
 - `critic`: optional rework checks
 - `ui`: Next.js frontend
@@ -64,10 +63,66 @@ Tool registration is centralized in `libs/core/tool_registry.py`, but implementa
 - `libs/tools/document_spec_iterative.py`: iterative DocumentSpec generation loops
 - `libs/tools/openapi_iterative.py`: iterative OpenAPI spec generation loops
 - `libs/tools/mcp_client.py`: MCP transport, retry, timeout budget, process/thread isolation
-- `libs/tools/resume_llm.py`: resume/cover-letter/tailor LLM logic and shaping policies
 - `libs/tools/coder_tools.py`: coding-agent request/plan/step execution logic
 
 This keeps `tool_registry` focused on wiring and composition while tool families evolve independently.
+
+### Plug-and-Play Tool Loading
+
+`default_registry()` now supports dynamic plugin loading and runtime tool filters:
+
+- `TOOL_PLUGIN_MODULES`: comma-separated module specs loaded at startup.
+  - Format: `module.path` (defaults to `register_tools`) or `module.path:callable_name`.
+  - Callable contract: `register_tools(registry, ...)` (first arg must be registry).
+- `TOOL_PLUGIN_DISCOVERY_ENABLED=true` enables Python entry-point discovery.
+- `TOOL_PLUGIN_ENTRYPOINT_GROUP` sets the entry-point group (default: `awe.tools`).
+- `TOOL_PLUGIN_FAIL_FAST=true|false` controls startup behavior on plugin load failure.
+- `ENABLED_TOOLS`: optional allowlist of final tool names.
+- `DISABLED_TOOLS`: optional denylist of final tool names.
+- Per-service allow/deny:
+  - `PLANNER_ENABLED_TOOLS` / `PLANNER_DISABLED_TOOLS`
+  - `WORKER_ENABLED_TOOLS` / `WORKER_DISABLED_TOOLS`
+  - `API_ENABLED_TOOLS` / `API_DISABLED_TOOLS`
+  - Deny wins over allow.
+- Governance policy config:
+  - `TOOL_GOVERNANCE_ENABLED=true|false`
+  - `TOOL_GOVERNANCE_MODE=enforce|dry_run`
+  - `TOOL_GOVERNANCE_CONFIG_PATH=config/tool_governance.yaml`
+  - Supports global/service/tenant/job_type rules and risk-level blocks.
+
+Example:
+
+```bash
+TOOL_PLUGIN_MODULES=my_tools.my_plugin
+ENABLED_TOOLS=llm_generate,my_custom_tool
+DISABLED_TOOLS=sleep
+WORKER_DISABLED_TOOLS=run_tests,workspace_write_code
+```
+
+In `dry_run`, violations are logged (`tool_governance_violation_dry_run`) but not blocked.
+
+### Capability Governance and Contracts
+
+Capability execution has separate controls so planner-selected capabilities can be governed independently from local tools:
+
+- `CAPABILITY_MODE=disabled|dry_run|enabled`
+- `CAPABILITY_REGISTRY_PATH=config/capability_registry.yaml`
+- `CAPABILITY_GOVERNANCE_ENABLED=true|false`
+- `CAPABILITY_GOVERNANCE_MODE=enforce|dry_run`
+- `ENABLED_CAPABILITIES` / `DISABLED_CAPABILITIES`
+- Per-service allow/deny (for worker runtime):
+  - `WORKER_ENABLED_CAPABILITIES` / `WORKER_DISABLED_CAPABILITIES`
+- Runtime input contract enforcement:
+  - `CAPABILITY_INPUT_VALIDATION_ENABLED=true|false`
+  - `CAPABILITY_ENFORCE_SCHEMA_PROPERTIES=true|false`
+
+When enabled, worker validates capability payloads against the capability input schema and can prune out undeclared top-level keys before execution.
+In `dry_run`, capability violations are logged (`capability_governance_violation_dry_run`) and execution continues.
+
+In-repo template:
+
+- `plugins/example_tool_plugin.py`
+- load with `TOOL_PLUGIN_MODULES=plugins.example_tool_plugin`
 
 ## Local Development (Docker Compose)
 
@@ -94,6 +149,7 @@ make up
 make test
 make lint
 make typecheck
+make eval-intent
 ```
 
 ## Configuration
@@ -112,6 +168,7 @@ make typecheck
 - `make images-list`
 - `make images-build`
 - `make images-push`
+- `make eval-intent`
 - `make k8s-up-local`
 - `make k8s-apply-local`
 - `make k8s-down-local`
@@ -119,12 +176,50 @@ make typecheck
 - `make k8s-sync-artifacts`
 - `make k8s-sync-shared`
 
+## Intent Eval Harness
+
+Use the gold-set harness to track intent decomposition quality over time.
+
+Gold cases:
+
+- `eval/intent_gold.yaml`
+
+Run locally:
+
+```bash
+make eval-intent
+```
+
+CI gate (thresholded):
+
+```bash
+make eval-intent-gate
+```
+
+Direct script usage:
+
+```bash
+PYTHONPATH=. python3 scripts/eval_intent_decompose.py \
+  --gold eval/intent_gold.yaml \
+  --mode heuristic \
+  --top-k 3 \
+  --verbose
+```
+
+Optional gates:
+
+```bash
+PYTHONPATH=. python3 scripts/eval_intent_decompose.py \
+  --min-intent-f1 0.80 \
+  --min-capability-f1 0.60 \
+  --min-segment-hit-rate 0.30
+```
+
 ## Kubernetes
 
 Kubernetes manifests live under `deploy/k8s`.
 
 - Baseline deployments/services for app + data services
-- HPA for `api`, `coder`, and `tailor`
 - Optional KEDA scaler for worker queue depth
 - Optional observability stack (Prometheus/Grafana/Loki/Jaeger)
 
@@ -243,24 +338,18 @@ OPENAI_MAX_RETRIES=2
 
 If `LLM_PROVIDER` is left as `mock`, external keys are not required.
 
-## Tailor Evaluator (Independent Scoring)
 
-Tailor scoring can be independent of generation:
 
 ```bash
-TAILOR_EVAL_MODE=llm        # llm | heuristic | self
-TAILOR_EVAL_PROVIDER=openai
-TAILOR_EVAL_OPENAI_MODEL=<model>
-TAILOR_EVAL_OPENAI_TIMEOUT_S=15
-TAILOR_EVAL_OPENAI_MAX_RETRIES=1
 ```
 
 ## Add a New Tool
 
-1. Add `ToolSpec` + handler in `libs/core/tool_registry.py`.
-2. Add/update tests in `libs/core/tests` and/or service tests.
-3. Wire tool usage into planner/task flow as needed.
-4. Update docs.
+1. Implement your tool module with `register_tools(registry, ...)`.
+2. Register one or more `Tool` objects with `ToolSpec` + handler.
+3. Load it via `TOOL_PLUGIN_MODULES` (or entry points).
+4. Add/update tests in `libs/core/tests` and/or service tests.
+5. Update planner prompts/tool usage guidance only if needed.
 
 ## Troubleshooting
 

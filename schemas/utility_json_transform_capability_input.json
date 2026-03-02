@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UtilityJsonTransformCapabilityInput",
+  "type": "object",
+  "properties": {
+    "input": {}
+  },
+  "required": ["input"],
+  "additionalProperties": true
+}
