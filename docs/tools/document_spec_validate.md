@@ -6,7 +6,7 @@ Example payload:
 ```json
 {
   "document_spec": {
-    "doc_type": "resume",
+    "doc_type": "document",
     "version": "v1",
     "tokens": {
       "full_name": "Ada Lovelace",

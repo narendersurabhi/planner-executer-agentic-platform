@@ -20,6 +20,7 @@ from prometheus_client import Counter, make_asgi_app
 from sqlalchemy.orm import Session
 
 from libs.core import (
+    capability_search,
     capability_registry,
     document_store,
     events,
@@ -111,7 +112,6 @@ SCHEMA_REGISTRY_PATH = os.getenv("SCHEMA_REGISTRY_PATH", "/app/schemas")
 ORCHESTRATOR_ENABLED = os.getenv("ORCHESTRATOR_ENABLED", "true").lower() == "true"
 POLICY_GATE_ENABLED = os.getenv("POLICY_GATE_ENABLED", "false").lower() == "true"
 JOB_RECOVERY_ENABLED = os.getenv("JOB_RECOVERY_ENABLED", "true").lower() == "true"
-DEV_RESUME_RENDER_ENABLED = os.getenv("DEV_RESUME_RENDER_ENABLED", "false").lower() == "true"
 LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER", "").strip()
 LLM_MODEL_NAME = os.getenv("OPENAI_MODEL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -1889,34 +1889,25 @@ def _intent_catalog_capability_ids() -> set[str]:
 def _intent_catalog_capability_entries() -> list[dict[str, str]]:
     try:
         registry = capability_registry.load_capability_registry()
-        items: list[dict[str, str]] = []
-        for capability_id, spec in sorted(registry.enabled_capabilities().items()):
-            description = str(spec.description or "").strip()
-            group = str(spec.group or "").strip()
-            subgroup = str(spec.subgroup or "").strip()
-            search_blob = " ".join(
-                entry
-                for entry in (
-                    capability_id.lower(),
-                    description.lower(),
-                    group.lower(),
-                    subgroup.lower(),
-                )
-                if entry
-            ).strip()
-            items.append(
-                {
-                    "id": capability_id,
-                    "description": description,
-                    "group": group,
-                    "subgroup": subgroup,
-                    "search_blob": search_blob,
-                }
-            )
-        return items
+        return capability_search.build_capability_search_entries(registry.enabled_capabilities())
     except Exception:  # noqa: BLE001
         logger.exception("intent_catalog_capability_registry_load_failed")
         return []
+
+
+def _semantic_goal_capability_hints(
+    *,
+    goal: str,
+    allowed_capability_catalog: list[dict[str, Any]],
+    limit: int = 8,
+    intent_hint: str | None = None,
+) -> list[dict[str, Any]]:
+    return capability_search.search_capabilities(
+        query=goal,
+        capability_entries=allowed_capability_catalog,
+        limit=limit,
+        intent_hint=intent_hint,
+    )
 
 
 _INTENT_CAPABILITY_HINTS: dict[str, tuple[str, ...]] = {
@@ -2010,6 +2001,19 @@ def _rank_default_capabilities_for_intent_segment(
 ) -> list[dict[str, Any]]:
     if not allowed_capability_ids:
         return []
+    semantic_ranked = _semantic_goal_capability_hints(
+        goal=objective,
+        allowed_capability_catalog=allowed_capability_catalog,
+        limit=limit,
+        intent_hint=intent,
+    )
+    semantic_filtered = [
+        item
+        for item in semantic_ranked
+        if str(item.get("id") or "").strip() in allowed_capability_ids
+    ]
+    if semantic_filtered:
+        return semantic_filtered[: max(1, limit)]
     intent_hints = _INTENT_CAPABILITY_HINTS.get(intent, ())
     objective_lower = objective.lower()
     objective_tokens = {
@@ -2280,6 +2284,7 @@ def _llm_decompose_goal_intent(
     capability_top_k: int,
     interaction_summaries: list[dict[str, Any]] | None = None,
     workflow_hints: list[dict[str, Any]] | None = None,
+    semantic_goal_capabilities: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     allowed_intents = ", ".join(member.value for member in models.ToolIntent)
     catalog_lines = [
@@ -2326,6 +2331,12 @@ def _llm_decompose_goal_intent(
         prompt += (
             "\nUse these as priors for segment ordering and suggested_capabilities "
             "only when they fit the current goal.\n"
+        )
+    if semantic_goal_capabilities:
+        prompt += "Most relevant capabilities for this goal from local semantic search:\n"
+        prompt += json.dumps(semantic_goal_capabilities[:8], ensure_ascii=True)
+        prompt += (
+            "\nPrefer these capability IDs when they fit the goal and segment objective.\n"
         )
     if interaction_summaries:
         prompt += "Interaction summaries (grounding evidence):\n"
@@ -2576,6 +2587,11 @@ def _decompose_goal_intent(
         user_id=normalized_user_id,
         limit=INTENT_MEMORY_RETRIEVAL_LIMIT,
     )
+    semantic_goal_capabilities = _semantic_goal_capability_hints(
+        goal=goal,
+        allowed_capability_catalog=allowed_capability_catalog,
+        limit=max(4, INTENT_CAPABILITY_TOP_K * 2),
+    )
     has_interaction_summaries = bool(interaction_summaries)
     result = "heuristic"
     graph = fallback_graph
@@ -2596,6 +2612,7 @@ def _decompose_goal_intent(
                 capability_top_k=INTENT_CAPABILITY_TOP_K,
                 interaction_summaries=interaction_summaries,
                 workflow_hints=workflow_hints,
+                semantic_goal_capabilities=semantic_goal_capabilities,
             )
             result = "llm"
         except (LLMProviderError, ValueError) as exc:
@@ -2625,6 +2642,7 @@ def _decompose_goal_intent(
     summary = dict(summary_raw) if isinstance(summary_raw, dict) else {}
     summary["memory_hints_used"] = len(workflow_hints)
     summary["memory_retrieval_enabled"] = bool(INTENT_MEMORY_RETRIEVAL_ENABLED)
+    summary["semantic_capability_hints_used"] = len(semantic_goal_capabilities)
     graph = {**graph, "summary": summary}
     if interaction_summaries:
         graph = _apply_supported_fact_filter(graph, interaction_summaries)
@@ -3920,8 +3938,6 @@ def _preflight_placeholder_for_key(key: str) -> Any:
         "first_name",
         "last_name",
         "job_description",
-        "candidate_resume",
-        "tailored_text",
         "date",
         "today",
         "document_type",
@@ -4273,6 +4289,10 @@ def _select_goal_intent_segment_for_task(
 ) -> dict[str, Any] | None:
     if not goal_intent_segments:
         return None
+    try:
+        capability_map = capability_registry.load_capability_registry().enabled_capabilities()
+    except Exception:  # noqa: BLE001
+        capability_map = {}
     has_suggested_capabilities = any(
         isinstance(segment.get("suggested_capabilities"), list)
         and bool(segment.get("suggested_capabilities"))
@@ -4290,7 +4310,16 @@ def _select_goal_intent_segment_for_task(
             if not isinstance(suggested, list):
                 continue
             suggested_ids = {str(item).strip().lower() for item in suggested if str(item).strip()}
-            if suggested_ids & task_requests:
+            expanded_ids = set(suggested_ids)
+            for capability_id in suggested_ids:
+                capability = capability_map.get(capability_id)
+                if capability is None:
+                    continue
+                for adapter in capability.adapters:
+                    tool_name = str(adapter.tool_name or "").strip().lower()
+                    if tool_name:
+                        expanded_ids.add(tool_name)
+            if expanded_ids & task_requests:
                 matching.append(segment)
         if matching:
             for segment in matching:
@@ -4298,6 +4327,10 @@ def _select_goal_intent_segment_for_task(
                     return segment
             return matching[0]
     if has_suggested_capabilities:
+        if len(goal_intent_segments) == 1:
+            only_segment = goal_intent_segments[0]
+            if intent_contract.normalize_task_intent(only_segment.get("intent")) == task_intent:
+                return only_segment
         return None
     for segment in goal_intent_segments:
         if intent_contract.normalize_task_intent(segment.get("intent")) == task_intent:
@@ -4588,45 +4621,6 @@ def _set_job_status(job: JobRecord, status: models.JobStatus) -> None:
     current = models.JobStatus(job.status)
     if state_machine.validate_job_transition(current, status):
         job.status = status.value
-
-
-def _read_resume_doc_spec_from_memory(db: Session, job_id: str) -> dict[str, Any] | None:
-    try:
-        entries = memory_store.read_memory(
-            db,
-            models.MemoryQuery(
-                name="task_outputs",
-                job_id=job_id,
-                key="resume_doc_spec:latest",
-                limit=1,
-            ),
-        )
-    except Exception:
-        entries = []
-    for entry in entries:
-        if not isinstance(entry, models.MemoryEntry):
-            continue
-        payload = entry.payload or {}
-        if isinstance(payload, dict) and payload:
-            spec = payload.get("resume_doc_spec") if "resume_doc_spec" in payload else payload
-            if isinstance(spec, dict):
-                return spec
-    try:
-        fallback = memory_store.read_memory(
-            db,
-            models.MemoryQuery(name="task_outputs", job_id=job_id, limit=50),
-        )
-    except Exception:
-        fallback = []
-    for entry in fallback:
-        if not isinstance(entry, models.MemoryEntry):
-            continue
-        payload = entry.payload or {}
-        if isinstance(payload, dict) and "resume_doc_spec" in payload:
-            spec = payload.get("resume_doc_spec")
-            if isinstance(spec, dict):
-                return spec
-    return None
 
 
 def _parse_task_dlq_entry(stream_id: str, record: Mapping[str, str]) -> models.TaskDlqEntry | None:
@@ -4958,9 +4952,6 @@ def create_job(
 
 def _seed_task_output_memory(db: Session, job_id: str, context_json: Dict[str, Any]) -> None:
     seed_map = {
-        "tailored_text": "tailored_text:latest",
-        "tailored_resume": "tailored_resume:latest",
-        "resume_doc_spec": "resume_doc_spec:latest",
         "document_spec": "document_spec:latest",
         "path": "docx_path:latest",
     }
@@ -5351,125 +5342,6 @@ def retry_task(
         plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
     if plan:
         _enqueue_ready_tasks(job_id, plan.id, None)
-    return _job_from_record(job)
-
-
-@app.post("/jobs/{job_id}/dev_resume_render", response_model=models.Job)
-def dev_resume_render_job(
-    job_id: str,
-    payload: dict[str, Any] = Body(default_factory=dict),
-    db: Session = Depends(get_db),
-) -> models.Job:
-    if not DEV_RESUME_RENDER_ENABLED:
-        raise HTTPException(status_code=404, detail="Dev endpoint disabled")
-    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        output_dir = None
-        if isinstance(job.context_json, dict):
-            output_dir = job.context_json.get("output_dir")
-        safe_dir = output_dir if isinstance(output_dir, str) and output_dir.strip() else "resumes"
-        path = f"{safe_dir}/dev_render_{job_id}.docx"
-    if not isinstance(path, str) or not path.endswith(".docx"):
-        raise HTTPException(status_code=400, detail="path must be a .docx filename")
-
-    resume_doc_spec = _read_resume_doc_spec_from_memory(db, job_id)
-    if not isinstance(resume_doc_spec, dict) or not resume_doc_spec:
-        raise HTTPException(
-            status_code=400,
-            detail="resume_doc_spec not found in memory for this job",
-        )
-
-    now = datetime.utcnow()
-    db.query(TaskRecord).filter(TaskRecord.job_id == job_id).delete(synchronize_session=False)
-    db.query(PlanRecord).filter(PlanRecord.job_id == job_id).delete(synchronize_session=False)
-
-    plan_id = str(uuid.uuid4())
-    tasks_summary = "Dev render: ResumeDocSpec -> DocumentSpec -> DOCX"
-    dag_edges = [["ConvertResumeDocSpec", "RenderResumeDocx"]]
-    plan_record = PlanRecord(
-        id=plan_id,
-        job_id=job_id,
-        planner_version="dev_resume_render_v1",
-        created_at=now,
-        tasks_summary=tasks_summary,
-        dag_edges=dag_edges,
-        policy_decision={},
-    )
-    db.add(plan_record)
-
-    tasks: list[models.TaskCreate] = []
-    tasks.append(
-        models.TaskCreate(
-            name="ConvertResumeDocSpec",
-            description="Convert ResumeDocSpec to DocumentSpec",
-            instruction="Convert resume_doc_spec from memory into DocumentSpec JSON.",
-            acceptance_criteria=["document_spec converted"],
-            expected_output_schema_ref="schemas/DocumentSpec",
-            intent=models.ToolIntent.transform,
-            deps=[],
-            tool_requests=["resume_doc_spec_to_document_spec"],
-            tool_inputs={"resume_doc_spec_to_document_spec": {"resume_doc_spec": resume_doc_spec}},
-            critic_required=False,
-        )
-    )
-    tasks.append(
-        models.TaskCreate(
-            name="RenderResumeDocx",
-            description="Render DOCX from DocumentSpec",
-            instruction=f"Render DOCX with docx_generate_from_spec to {path}.",
-            acceptance_criteria=["docx artifact written"],
-            expected_output_schema_ref="artifacts/docx",
-            intent=models.ToolIntent.render,
-            deps=["ConvertResumeDocSpec"],
-            tool_requests=["docx_generate_from_spec"],
-            tool_inputs={"docx_generate_from_spec": {"path": path, "strict": True}},
-            critic_required=False,
-        )
-    )
-
-    for task in tasks:
-        task_id = str(uuid.uuid4())
-        task_record = TaskRecord(
-            id=task_id,
-            job_id=job_id,
-            plan_id=plan_id,
-            name=task.name,
-            description=task.description,
-            instruction=task.instruction,
-            acceptance_criteria=task.acceptance_criteria,
-            expected_output_schema_ref=task.expected_output_schema_ref,
-            status=models.TaskStatus.pending.value,
-            deps=task.deps,
-            attempts=0,
-            max_attempts=3,
-            rework_count=0,
-            max_reworks=2,
-            assigned_to=None,
-            intent=task.intent.value if task.intent else None,
-            tool_requests=task.tool_requests,
-            tool_inputs=task.tool_inputs,
-            created_at=now,
-            updated_at=now,
-            critic_required=1 if task.critic_required else 0,
-        )
-        db.add(task_record)
-
-    job.status = models.JobStatus.planning.value
-    job.updated_at = now
-    db.commit()
-
-    plan_payload = models.PlanCreate(
-        planner_version="dev_resume_render_v1",
-        tasks_summary=tasks_summary,
-        dag_edges=dag_edges,
-        tasks=tasks,
-    )
-    payload_out = _plan_created_payload(plan_payload, job_id)
-    payload_out["correlation_id"] = str(uuid.uuid4())
-    _emit_event("plan.created", payload_out)
     return _job_from_record(job)
 
 

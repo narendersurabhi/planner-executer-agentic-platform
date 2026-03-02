@@ -38,21 +38,6 @@ class _FakeCoderProvider:
         return _FakeLLMResponse('{"files":[{"path":"hello.py","content":"print(\\"hello\\")"}]}')
 
 
-class _FakeTailorProvider:
-    def generate(self, _prompt: str) -> _FakeLLMResponse:
-        return _FakeLLMResponse(
-            (
-                '{"schema_version":"1.0","header":{"name":"A","title":"B","location":"C",'
-                '"phone":"D","email":"E","links":{"linkedin":"L","github":"G"}},'
-                '"summary":"S","skills":[{"group_name":"Core","items":["Python"]}],'
-                '"experience":[{"company":"X","title":"Y","location":"Z","dates":"2020 - Present",'
-                '"bullets":["Built services"]}],"education":[{"degree":"BS","school":"Uni",'
-                '"location":"Loc","dates":"2000 - 2004"}],"certifications":'
-                '[{"name":"Cert","issuer":"Org","year":"2024"}]}'
-            )
-        )
-
-
 def _pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -207,42 +192,5 @@ def test_coder_mcp_tools_and_call() -> None:
             {"goal": "make hello.py"},
         )
         assert payload["files"][0]["path"] == "hello.py"
-    finally:
-        _stop_server(server, thread)
-
-
-def test_tailor_mcp_tools_and_call() -> None:
-    root = Path(__file__).resolve().parents[2]
-    service_root = root / "services" / "tailor"
-    module = _load_module("tailor_mcp_test_module", service_root / "app" / "mcp.py", service_root)
-
-    mcp_app, session_manager = module.create_mcp_asgi_app(_FakeTailorProvider())
-
-    @asynccontextmanager
-    async def lifespan(_app: Any):
-        async with session_manager.run():
-            yield
-
-    app = FastAPI(lifespan=lifespan)
-    app.mount("/mcp/rpc", mcp_app)
-    server, thread, base_url = _start_server(app)
-    try:
-        tool_names = _mcp_list_tools(f"{base_url}/mcp/rpc")
-        assert "tailor_resume" in tool_names
-        payload = _mcp_call_tool(
-            f"{base_url}/mcp/rpc",
-            "tailor_resume",
-            {
-                "job": {
-                    "context_json": {
-                        "candidate_resume": "candidate",
-                        "job_description": "job",
-                        "target_role_name": "role",
-                        "seniority_level": "Senior",
-                    }
-                }
-            },
-        )
-        assert payload["tailored_resume"]["schema_version"] == "1.0"
     finally:
         _stop_server(server, thread)

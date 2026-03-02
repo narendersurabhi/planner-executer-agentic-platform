@@ -1900,7 +1900,7 @@ def test_task_payload_from_record_resolves_task_level_path_reference() -> None:
     context = {
         "dependencies_by_name": {
             "DeriveResumeOutputPath": {
-                "derive_output_filename": {"path": "artifacts/resume.docx"}
+                "derive_output_filename": {"path": "artifacts/output.docx"}
             }
         },
         "dependencies": {},
@@ -1909,7 +1909,7 @@ def test_task_payload_from_record_resolves_task_level_path_reference() -> None:
     payload = main._task_payload_from_record(record, correlation_id="corr", context=context)
     assert "tool_inputs_validation" not in payload
     resolved = payload["tool_inputs"]["docx_generate_from_spec"]
-    assert resolved["output_path"] == "artifacts/resume.docx"
+    assert resolved["output_path"] == "artifacts/output.docx"
 
 
 def test_task_payload_from_record_includes_intent_segment_profile() -> None:
@@ -2067,7 +2067,7 @@ def test_plan_preflight_ignores_non_matching_intent_segments_when_suggested_capa
                         "candidate_name": "Anjali Surabhi",
                         "target_role_name": "Associate Analyst",
                         "company_name": "Molina Healthcare",
-                        "document_type": "resume",
+                        "document_type": "document",
                         "output_extension": "docx",
                         "output_dir": "documents",
                         "today": "2026-02-28",

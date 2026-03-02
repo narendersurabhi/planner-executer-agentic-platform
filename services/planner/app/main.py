@@ -194,8 +194,6 @@ def llm_plan(
     )
     candidate = _ensure_job_inputs(candidate, job, tools)
     candidate = _ensure_default_value_markers(candidate, job)
-    candidate = _ensure_resume_docspec_inputs(candidate)
-    candidate = _ensure_resume_converter_inputs(candidate)
     candidate = _ensure_renderer_required_inputs(candidate)
     candidate = _ensure_tool_input_dependencies(candidate)
     candidate = _ensure_renderer_output_extensions(candidate)
@@ -394,10 +392,10 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
         "   Use specialized tools only if explicitly requested.\n"
         "7) If unsure, use llm_generate.\n"
         "8) Keep output compact. Do NOT copy or embed large raw text from Job JSON "
-        "(especially job_description or candidate_resume) into tasks, instructions, "
+        "(especially long context fields like job_description) into tasks, instructions, "
         "acceptance criteria, or tool_inputs.\n"
         "9) For tool_inputs include only minimal scalar params. Omit large/context fields "
-        "(e.g., job, memory, tailored_resume, tailored_text, resume_doc_spec, document_spec) "
+        "(e.g., job, memory, document_spec) "
         "and rely on runtime dependency/context injection.\n"
         "10) Keep each task instruction concise (one short paragraph) and keep acceptance "
         "criteria short bullets.\n"
@@ -668,6 +666,7 @@ def _select_goal_intent_segment_for_task(
 ) -> dict[str, Any] | None:
     if not goal_intent_segments:
         return None
+    capabilities = _planner_capabilities()
     has_suggested_capabilities = any(
         isinstance(segment.get("suggested_capabilities"), list)
         and bool(segment.get("suggested_capabilities"))
@@ -679,12 +678,28 @@ def _select_goal_intent_segment_for_task(
             suggested = segment.get("suggested_capabilities")
             if not isinstance(suggested, list):
                 continue
-            suggested_ids = {str(item).strip().lower() for item in suggested if str(item).strip()}
+            suggested_ids = set()
+            for item in suggested:
+                capability_id = str(item).strip().lower()
+                if not capability_id:
+                    continue
+                suggested_ids.add(capability_id)
+                capability = capabilities.get(capability_id)
+                if capability is None:
+                    continue
+                for adapter in capability.adapters:
+                    tool_name = str(adapter.tool_name or "").strip().lower()
+                    if tool_name:
+                        suggested_ids.add(tool_name)
             if suggested_ids & task_requests:
                 return segment
     # If the intent graph already carries capability-level suggestions, avoid loose
     # fallback matching that can bind unrelated slot requirements to a task.
     if has_suggested_capabilities:
+        if len(goal_intent_segments) == 1:
+            only_segment = goal_intent_segments[0]
+            if intent_contract.normalize_task_intent(only_segment.get("intent")) == task_intent:
+                return only_segment
         return None
     for segment in goal_intent_segments:
         if intent_contract.normalize_task_intent(segment.get("intent")) == task_intent:
@@ -886,32 +901,6 @@ def _infer_document_type_for_derive_task(
     task_by_name: Mapping[str, models.TaskCreate],
     all_tasks: Sequence[models.TaskCreate],
 ) -> str:
-    def _is_resume_task(candidate: models.TaskCreate | None) -> bool:
-        if candidate is None:
-            return False
-        if "resume" in candidate.name.lower():
-            return True
-        requests = {str(item) for item in (candidate.tool_requests or [])}
-        return bool(
-            requests
-            & {
-                "llm_tailor_resume_text",
-                "llm_generate_resume_doc_spec",
-                "llm_generate_resume_doc_spec_from_text",
-                "resume_doc_spec_validate",
-                "resume_doc_spec_to_document_spec",
-                "document.docx.generate",
-            }
-        )
-
-    if "resume" in task.name.lower():
-        return "resume"
-    for dep_name in task.deps or []:
-        if _is_resume_task(task_by_name.get(str(dep_name))):
-            return "resume"
-    for candidate in all_tasks:
-        if _is_resume_task(candidate):
-            return "resume"
     return "document"
 
 
@@ -1037,90 +1026,6 @@ def _ensure_tool_input_dependencies(plan: models.PlanCreate) -> models.PlanCreat
     return plan.model_copy(update={"tasks": tasks, "dag_edges": edges})
 
 
-def _ensure_resume_docspec_inputs(plan: models.PlanCreate) -> models.PlanCreate:
-    tasks = [task.model_copy(deep=True) for task in plan.tasks]
-    changed = False
-    for index, task in enumerate(tasks):
-        if "llm_generate_resume_doc_spec_from_text" not in (task.tool_requests or []):
-            continue
-        tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
-        payload_raw = tool_inputs.get("llm_generate_resume_doc_spec_from_text")
-        payload = dict(payload_raw) if isinstance(payload_raw, dict) else {}
-        if any(key in payload for key in ("tailored_resume", "tailored_text")):
-            continue
-        source_task_name: str | None = None
-        deps = [str(dep) for dep in (task.deps or [])]
-        for dep_name in deps:
-            dep_task = next((candidate for candidate in tasks if candidate.name == dep_name), None)
-            if dep_task and "llm_tailor_resume_text" in (dep_task.tool_requests or []):
-                source_task_name = dep_task.name
-                break
-        if source_task_name is None:
-            for dep_task in tasks[:index]:
-                if "llm_tailor_resume_text" in (dep_task.tool_requests or []):
-                    source_task_name = dep_task.name
-                    break
-        if source_task_name is None:
-            continue
-        payload["tailored_resume"] = {
-            "$from": f"dependencies_by_name.{source_task_name}.llm_tailor_resume_text.tailored_resume"
-        }
-        tool_inputs["llm_generate_resume_doc_spec_from_text"] = payload
-        task.tool_inputs = tool_inputs
-        changed = True
-    if not changed:
-        return plan
-    return plan.model_copy(update={"tasks": tasks})
-
-
-def _ensure_resume_converter_inputs(plan: models.PlanCreate) -> models.PlanCreate:
-    tasks = [task.model_copy(deep=True) for task in plan.tasks]
-    changed = False
-    for index, task in enumerate(tasks):
-        if "resume_doc_spec_to_document_spec" not in (task.tool_requests or []):
-            continue
-        tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
-        payload_raw = tool_inputs.get("resume_doc_spec_to_document_spec")
-        payload = dict(payload_raw) if isinstance(payload_raw, dict) else {}
-        if "resume_doc_spec" in payload:
-            continue
-        source_task_name: str | None = None
-        deps = [str(dep) for dep in (task.deps or [])]
-        for dep_name in deps:
-            dep_task = next((candidate for candidate in tasks if candidate.name == dep_name), None)
-            if dep_task and "llm_generate_resume_doc_spec_from_text" in (dep_task.tool_requests or []):
-                source_task_name = dep_task.name
-                break
-        if source_task_name is None:
-            for dep_task in tasks[:index]:
-                if "llm_generate_resume_doc_spec_from_text" in (dep_task.tool_requests or []):
-                    source_task_name = dep_task.name
-                    break
-        if source_task_name is None:
-            # Final fallback: the planner can emit tasks out-of-order before DAG normalization.
-            # Use any available Resume DocSpec producer so contract validation can pass.
-            for dep_task in tasks:
-                if dep_task.name == task.name:
-                    continue
-                if "llm_generate_resume_doc_spec_from_text" in (dep_task.tool_requests or []):
-                    source_task_name = dep_task.name
-                    break
-        if source_task_name is None:
-            continue
-        payload["resume_doc_spec"] = {
-            "$from": (
-                "dependencies_by_name."
-                f"{source_task_name}.llm_generate_resume_doc_spec_from_text.resume_doc_spec"
-            )
-        }
-        tool_inputs["resume_doc_spec_to_document_spec"] = payload
-        task.tool_inputs = tool_inputs
-        changed = True
-    if not changed:
-        return plan
-    return plan.model_copy(update={"tasks": tasks})
-
-
 def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCreate:
     tasks = [task.model_copy(deep=True) for task in plan.tasks]
     task_by_name = {task.name: task for task in tasks}
@@ -1132,7 +1037,6 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
         "document.pdf.generate",
     }
     document_spec_producers = {
-        "resume_doc_spec_to_document_spec",
         "document.spec.generate",
         "document_spec_generate",
     }
@@ -1457,8 +1361,6 @@ def _build_validation_payload(
         "first_name",
         "last_name",
         "job_description",
-        "candidate_resume",
-        "tailored_text",
         "output_dir",
         "document_type",
     ):
@@ -1483,11 +1385,6 @@ def _dependency_fill_defaults() -> dict[str, object]:
         "validation_report": {},
         "errors": [],
         "original_spec": {},
-        "tailored_resume": {},
-        "resume_content": "__dependency__",
-        "tailored_text": "__dependency__",
-        "resume_doc_spec": {},
-        "coverletter_doc_spec": {},
         "openapi_spec": {},
     }
 
@@ -1572,8 +1469,6 @@ def _build_capability_validation_payload(
         "first_name",
         "last_name",
         "job_description",
-        "candidate_resume",
-        "tailored_text",
         "output_dir",
         "document_type",
     ):

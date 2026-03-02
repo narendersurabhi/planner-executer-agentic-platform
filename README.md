@@ -48,7 +48,6 @@ API -> Postgres
 - `planner`: goal -> plan DAG generation
 - `worker`: task execution, retries, DLQ, tool orchestration
 - `coder`: code-centric tool service (MCP)
-- `tailor`: resume/document tailoring service (MCP)
 - `policy`: policy gate checks
 - `critic`: optional rework checks
 - `ui`: Next.js frontend
@@ -64,7 +63,6 @@ Tool registration is centralized in `libs/core/tool_registry.py`, but implementa
 - `libs/tools/document_spec_iterative.py`: iterative DocumentSpec generation loops
 - `libs/tools/openapi_iterative.py`: iterative OpenAPI spec generation loops
 - `libs/tools/mcp_client.py`: MCP transport, retry, timeout budget, process/thread isolation
-- `libs/tools/resume_llm.py`: resume/cover-letter/tailor LLM logic and shaping policies
 - `libs/tools/coder_tools.py`: coding-agent request/plan/step execution logic
 
 This keeps `tool_registry` focused on wiring and composition while tool families evolve independently.
@@ -222,7 +220,6 @@ PYTHONPATH=. python3 scripts/eval_intent_decompose.py \
 Kubernetes manifests live under `deploy/k8s`.
 
 - Baseline deployments/services for app + data services
-- HPA for `api`, `coder`, and `tailor`
 - Optional KEDA scaler for worker queue depth
 - Optional observability stack (Prometheus/Grafana/Loki/Jaeger)
 
@@ -341,16 +338,9 @@ OPENAI_MAX_RETRIES=2
 
 If `LLM_PROVIDER` is left as `mock`, external keys are not required.
 
-## Tailor Evaluator (Independent Scoring)
 
-Tailor scoring can be independent of generation:
 
 ```bash
-TAILOR_EVAL_MODE=llm        # llm | heuristic | self
-TAILOR_EVAL_PROVIDER=openai
-TAILOR_EVAL_OPENAI_MODEL=<model>
-TAILOR_EVAL_OPENAI_TIMEOUT_S=15
-TAILOR_EVAL_OPENAI_MAX_RETRIES=1
 ```
 
 ## Add a New Tool

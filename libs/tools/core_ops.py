@@ -737,20 +737,13 @@ def register_core_ops_tools(
         Tool(
             spec=ToolSpec(
                 name="derive_output_filename",
-                description="Derive a filesystem-safe output path for resumes or general documents",
+                description="Derive a filesystem-safe output path for generated documents",
                 usage_guidance=(
                     "Use to create a safe output path for render tools. "
-                    "Set document_type='cover_letter' for cover-letter naming. "
-                    "Resume format: provide candidate_name (or first_name+last_name), "
-                    "target_role_name (or role_name), and company_name (or company) to get "
-                    "'Firstname Lastname Resume - Target Role - Company.<ext>'. "
-                    "If target role/company/name are missing, the tool can derive them from "
-                    "job_description plus candidate_resume/tailored_text when provided. "
-                    "For general documents, 'topic' can be used in place of role name. "
-                    "Fallback format: provide target_role_name (or role_name or topic) and "
-                    "date/today (YYYY-MM-DD) to get role_date naming. If date/today is omitted, "
+                    "Provide target_role_name (or role_name or topic) and date/today (YYYY-MM-DD) "
+                    "to get role_date naming. If date/today is omitted, "
                     "the tool defaults to the current UTC date. "
-                    "Optionally provide 'output_dir' (default: resumes). "
+                    "Optionally provide 'output_dir' (default: documents). "
                     "Optionally provide output_extension (or file_extension/extension/format) "
                     "to control the file extension (default: docx)."
                 ),
@@ -766,8 +759,6 @@ def register_core_ops_tools(
                         "company_name": {"type": "string", "minLength": 1},
                         "company": {"type": "string", "minLength": 1},
                         "job_description": {"type": "string", "minLength": 1},
-                        "candidate_resume": {"type": "string", "minLength": 1},
-                        "tailored_text": {"type": "string", "minLength": 1},
                         "date": {"type": "string", "minLength": 4},
                         "today": {"type": "string", "minLength": 4},
                         "output_dir": {"type": "string"},
@@ -813,19 +804,8 @@ def register_core_ops_tools(
                                     ]
                                 },
                                 {
-                                    "allOf": [
-                                        {"required": ["job_description"]},
-                                        {
-                                            "anyOf": [
-                                                {"required": ["candidate_name"]},
-                                                {"required": ["first_name", "last_name"]},
-                                                {"required": ["candidate_resume"]},
-                                                {"required": ["tailored_text"]},
-                                            ]
-                                        },
-                                    ]
+                                    "required": ["memory"]
                                 },
-                                {"required": ["memory"]},
                             ]
                         }
                     ],

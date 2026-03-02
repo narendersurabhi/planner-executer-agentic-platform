@@ -29,7 +29,7 @@ const DAG_CANVAS_MIN_HEIGHT = 460;
 const AUTO_TEMPLATE_KEYS = new Set(["today", "today_pretty"]);
 const TEMPLATE_INPUT_DEFAULTS: Record<string, string> = {
   run_iterative_improve: "false",
-  generate_cover_letter: "false"
+  generate_document: "false"
 };
 
 const GUIDED_STARTER_TEMPLATES: Array<{
@@ -565,10 +565,6 @@ const outputPathSuggestionsForCapability = (
   if (normalized.includes("filename") || normalized.includes("output.derive")) {
     add("path");
     add("output_path");
-  }
-  if (normalized.includes("resume")) {
-    add("tailored_resume");
-    add("tailored_text");
   }
   if (normalized.includes("json.transform")) {
     add("result");
@@ -1184,6 +1180,48 @@ type Template = {
   variables?: TemplateVariable[];
 };
 
+const LEGACY_RESUME_TEMPLATE_NAME_TOKENS = [
+  "resume tailor",
+  "resume render",
+  "cover letter",
+  "coverletter",
+];
+
+const LEGACY_RESUME_TEMPLATE_GOAL_TOKENS = [
+  "llm_tailor_resume_text",
+  "llm_improve_tailored_resume_text",
+  "llm_iterative_improve_tailored_resume_text",
+  "llm_generate_resume_doc_spec",
+  "llm_generate_resume_doc_spec_from_text",
+  "llm_generate_coverletter_doc_spec_from_text",
+  "llm_generate_cover_letter_from_resume",
+  "resume_doc_spec_validate",
+  "resume_doc_spec_to_document_spec",
+  "coverletter_doc_spec_to_document_spec",
+  "resume_generate_ats_docx",
+  "cover_letter_generate_ats_docx",
+  "tailored_resume",
+  "tailored_text",
+];
+
+const isLegacyResumeTemplate = (template: Partial<Template> | null | undefined) => {
+  if (!template) {
+    return false;
+  }
+  const name = String(template.name || "").toLowerCase();
+  const description = String(template.description || "").toLowerCase();
+  const goal = String(template.goal || "").toLowerCase();
+  const contextJson = String(template.contextJson || "").toLowerCase();
+  return (
+    LEGACY_RESUME_TEMPLATE_NAME_TOKENS.some(
+      (token) => name.includes(token) || description.includes(token)
+    ) ||
+    LEGACY_RESUME_TEMPLATE_GOAL_TOKENS.some(
+      (token) => goal.includes(token) || contextJson.includes(token)
+    )
+  );
+};
+
 const CHAINABLE_REQUIRED_FIELDS = new Set([
   "document_spec",
   "validation_report",
@@ -1193,12 +1231,7 @@ const CHAINABLE_REQUIRED_FIELDS = new Set([
   "path",
   "text",
   "content",
-  "openapi_spec",
-  "resume_doc_spec",
-  "coverletter_doc_spec",
-  "tailored_text",
-  "tailored_resume",
-  "resume_content"
+  "openapi_spec"
 ]);
 
 const isContextInputPresent = (value: unknown) => {
@@ -1533,189 +1566,6 @@ const BUILT_IN_TEMPLATES: Template[] = [
         scope: "default",
         required: false,
         placeholder: "Optional PR description"
-      }
-    ]
-  },
-  {
-    id: "tpl-resume-tailor-docspec",
-    name: "Resume Tailor -> DOCX",
-    description:
-      "Tailor resume text, improve alignment iteratively, render resume DOCX, and optionally generate/render cover letter DOCX.",
-    goal:
-      "Use this base resume chain in order: " +
-      "llm_tailor_resume_text -> llm_generate_resume_doc_spec_from_text -> resume_doc_spec_to_document_spec -> derive_output_filename(document_type='resume', output_extension='docx') -> docx_generate_from_spec. " +
-      "If {{run_iterative_improve}} is true, insert llm_iterative_improve_tailored_resume_text between llm_tailor_resume_text and llm_generate_resume_doc_spec_from_text. " +
-      "Tailor against {{job_description}} and {{candidate_resume}} for {{target_role_name}}. " +
-      "When iterative improve is enabled, run until alignment >= {{min_alignment_score}} or {{max_iterations}} iterations. " +
-      "When improving, preserve factual claims and only add defendable skills/bullets. " +
-      "When deriving output path, use candidate_name, target_role_name, company_name, today, and output_dir='{{output_dir}}'. " +
-      "Render DOCX with the derived path and the converted DocumentSpec. " +
-      "If {{generate_cover_letter}} is true, run this exact chain after resume rendering: " +
-      "llm_generate_coverletter_doc_spec_from_text -> coverletter_doc_spec_to_document_spec -> derive_output_filename(document_type='cover_letter', output_extension='docx') -> docx_generate_from_spec. " +
-      "Do not use llm_generate_cover_letter_from_resume or cover_letter_generate_ats_docx.",
-    contextJson:
-      '{\n  "job_description": "{{job_description}}",\n  "candidate_resume": "{{candidate_resume}}",\n  "candidate_name": "{{candidate_name}}",\n  "target_role_name": "{{target_role_name}}",\n  "company_name": "{{company_name}}",\n  "today": "{{today}}",\n  "today_pretty": "{{today_pretty}}",\n  "output_dir": "{{output_dir}}",\n  "run_iterative_improve": "{{run_iterative_improve}}",\n  "generate_cover_letter": "{{generate_cover_letter}}",\n  "seniority_level": "{{seniority_level}}",\n  "min_alignment_score": "{{min_alignment_score}}",\n  "max_iterations": "{{max_iterations}}"\n}',
-    priority: 2,
-    builtIn: true,
-    variables: [
-      {
-        key: "job_description",
-        label: "Job Description",
-        scope: "per_run",
-        required: true,
-        placeholder: "Paste job description"
-      },
-      {
-        key: "candidate_resume",
-        label: "Candidate Resume",
-        scope: "default",
-        required: true,
-        placeholder: "Paste your current resume"
-      },
-      {
-        key: "target_role_name",
-        label: "Target Role Name",
-        scope: "per_run",
-        required: true,
-        placeholder: "e.g., Senior Backend Engineer"
-      },
-      {
-        key: "candidate_name",
-        label: "Candidate Name",
-        scope: "default",
-        required: false,
-        placeholder: "e.g., Narender Surabhi"
-      },
-      {
-        key: "company_name",
-        label: "Company Name",
-        scope: "per_run",
-        required: false,
-        placeholder: "e.g., Figma"
-      },
-      {
-        key: "today",
-        label: "Today (YYYY-MM-DD)",
-        scope: "per_run",
-        required: false,
-        placeholder: "2026-02-13"
-      },
-      {
-        key: "today_pretty",
-        label: "Cover Letter Date",
-        scope: "per_run",
-        required: false,
-        placeholder: "February 13, 2026"
-      },
-      {
-        key: "output_dir",
-        label: "Output Directory",
-        scope: "default",
-        required: false,
-        placeholder: "resumes"
-      },
-      {
-        key: "run_iterative_improve",
-        label: "Run Iterative Improve",
-        scope: "per_run",
-        required: false,
-        placeholder: "false"
-      },
-      {
-        key: "generate_cover_letter",
-        label: "Generate Cover Letter",
-        scope: "per_run",
-        required: false,
-        placeholder: "false"
-      },
-      {
-        key: "seniority_level",
-        label: "Seniority Level",
-        scope: "default",
-        required: false,
-        placeholder: "e.g., Senior"
-      },
-      {
-        key: "min_alignment_score",
-        label: "Min Alignment Score",
-        scope: "default",
-        required: false,
-        placeholder: "85"
-      },
-      {
-        key: "max_iterations",
-        label: "Max Iterations",
-        scope: "default",
-        required: false,
-        placeholder: "2"
-      }
-    ]
-  },
-  {
-    id: "tpl-resume-render-from-tailored",
-    name: "Resume Render (From Tailored Text)",
-    description: "Render a DOCX from an already tailored resume text.",
-    goal:
-      "Use llm_generate_resume_doc_spec_from_text on the provided tailored text to produce resume_doc_spec. " +
-      "This tool performs resume_doc_spec_validate (strict) internally. Convert with resume_doc_spec_to_document_spec. " +
-      "Derive a filesystem-safe output path with derive_output_filename using candidate_name, target_role_name, and company_name " +
-      "so the file is named 'Firstname Lastname Resume - Target Role - Company.docx'. " +
-      "If target role/company/name are omitted, allow derive_output_filename to infer them from job_description and resume text when available " +
-      "(fallback to date naming when needed), " +
-      "then render a DOCX with docx_generate_from_spec using the derived path.",
-    contextJson:
-      '{\n  "tailored_text": "{{tailored_text}}",\n  "job_description": "{{job_description}}",\n  "candidate_name": "{{candidate_name}}",\n  "target_role_name": "{{target_role_name}}",\n  "company_name": "{{company_name}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
-    priority: 2,
-    builtIn: true,
-    variables: [
-      {
-        key: "tailored_text",
-        label: "Tailored Resume (Text)",
-        scope: "per_run",
-        required: true,
-        placeholder: "Paste tailored resume text with SUMMARY, SKILLS, EXPERIENCE, EDUCATION, CERTIFICATIONS sections"
-      },
-      {
-        key: "job_description",
-        label: "Job Description",
-        scope: "per_run",
-        required: false,
-        placeholder: "Optional. Helps derive target role/company for filename"
-      },
-      {
-        key: "target_role_name",
-        label: "Target Role Name",
-        scope: "per_run",
-        required: true,
-        placeholder: "e.g., Senior Software Engineer, AI/ML"
-      },
-      {
-        key: "candidate_name",
-        label: "Candidate Name",
-        scope: "default",
-        required: false,
-        placeholder: "e.g., Narender Surabhi"
-      },
-      {
-        key: "company_name",
-        label: "Company Name",
-        scope: "per_run",
-        required: false,
-        placeholder: "e.g., Figma"
-      },
-      {
-        key: "today",
-        label: "Today (YYYY-MM-DD)",
-        scope: "per_run",
-        required: false,
-        placeholder: "2026-02-09"
-      },
-      {
-        key: "output_dir",
-        label: "Output Folder",
-        scope: "default",
-        required: false,
-        placeholder: "resumes"
       }
     ]
   },
@@ -5197,7 +5047,7 @@ export default function Home() {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         const custom = parsed
-          .filter((entry) => entry && entry.id && entry.name)
+          .filter((entry) => entry && entry.id && entry.name && !isLegacyResumeTemplate(entry))
           .map((entry) => {
             return {
               ...entry,
@@ -5342,9 +5192,11 @@ export default function Home() {
     if (templates.length === 0) {
       return;
     }
-    const custom = templates.filter((template) => !template.builtIn);
+    const custom = templates.filter((template) => !template.builtIn && !isLegacyResumeTemplate(template));
     window.localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(custom));
-    const order = templates.map((template) => template.id);
+    const order = templates
+      .filter((template) => !isLegacyResumeTemplate(template))
+      .map((template) => template.id);
     window.localStorage.setItem(TEMPLATE_ORDER_KEY, JSON.stringify(order));
   }, [templates]);
 
@@ -6160,7 +6012,7 @@ const openTemplateModal = (template: Template) => {
     }
   };
 
-  const resumeJob = async (jobId: string) => {
+  const resumeExecution = async (jobId: string) => {
     const response = await fetch(`${apiUrl}/jobs/${jobId}/resume`, { method: "POST" });
     if (response.ok) {
       loadJobs();
@@ -6304,33 +6156,6 @@ const openTemplateModal = (template: Template) => {
     const response = await fetch(`${apiUrl}/jobs/${jobId}/replan`, { method: "POST" });
     if (response.ok) {
       loadJobs();
-    }
-  };
-
-  const devRenderResumeDocx = async (jobId: string) => {
-    if (!devToolsEnabled) {
-      return;
-    }
-    const job = jobs.find((candidate) => candidate.id === jobId);
-    const outputDir =
-      typeof job?.context_json?.output_dir === "string" && job.context_json.output_dir.trim()
-        ? job.context_json.output_dir.trim()
-        : "resumes";
-    const suggested = `${outputDir}/dev_render_${jobId}.docx`;
-    const path = window.prompt("Output DOCX path (relative to /shared/artifacts)", suggested);
-    if (!path) {
-      return;
-    }
-    const response = await fetch(`${apiUrl}/jobs/${jobId}/dev_resume_render`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path })
-    });
-    if (response.ok) {
-      loadJobs();
-      if (selectedJobIdRef.current === jobId) {
-        loadJobDetails(jobId);
-      }
     }
   };
 
@@ -6685,7 +6510,7 @@ const openTemplateModal = (template: Template) => {
                       </label>
                       <textarea
                         className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900"
-                        rows={variable.key === "resume_text" ? 4 : 2}
+                        rows={2}
                         placeholder={variable.placeholder}
                         value={templateDefaults[variable.key] || ""}
                         onChange={(event) =>
@@ -7804,7 +7629,7 @@ const openTemplateModal = (template: Template) => {
                           ? "border-rose-400 focus:border-rose-400 focus:ring-rose-200"
                           : "border-slate-200 focus:border-slate-400 focus:ring-slate-200"
                       }`}
-                      rows={variable.key === "resume_text" ? 6 : 3}
+                      rows={3}
                       placeholder={variable.placeholder}
                       value={templateInputs[variable.key] || ""}
                       onChange={(event) =>
@@ -8584,9 +8409,9 @@ const openTemplateModal = (template: Template) => {
                   </button>
                   <button
                     className="rounded-full border border-slate-200 px-3 py-1 text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                    onClick={() => resumeJob(job.id)}
+                    onClick={() => resumeExecution(job.id)}
                   >
-                    Resume
+                    Resume Run
                   </button>
                   <button
                     className="rounded-full border border-slate-200 px-3 py-1 text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
@@ -8606,14 +8431,6 @@ const openTemplateModal = (template: Template) => {
                   >
                     Replan
                   </button>
-                  {devToolsEnabled ? (
-                    <button
-                      className="rounded-full border border-slate-200 px-3 py-1 text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                      onClick={() => devRenderResumeDocx(job.id)}
-                    >
-                      Dev render
-                    </button>
-                  ) : null}
                   <button
                     className="rounded-full border border-rose-200 px-3 py-1 text-rose-600 transition hover:border-rose-300 hover:text-rose-700"
                     onClick={() => clearJob(job.id)}

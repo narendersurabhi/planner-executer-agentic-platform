@@ -3,7 +3,7 @@ from libs.tools.document_spec_validate import _document_spec_validate
 
 def _base_spec():
     return {
-        "doc_type": "resume",
+        "doc_type": "document",
         "version": "v1",
         "tokens": {
             "full_name": "Ada Lovelace",

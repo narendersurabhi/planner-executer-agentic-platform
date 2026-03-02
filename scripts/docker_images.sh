@@ -32,7 +32,7 @@ if [[ -z "$owner" ]]; then
   exit 1
 fi
 
-services=(api planner worker coder tailor ui policy)
+services=(api planner worker coder ui policy)
 
 image_for() {
   local service="$1"

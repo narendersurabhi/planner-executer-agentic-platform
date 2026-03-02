@@ -28,7 +28,7 @@ def test_load_capability_registry_from_json(tmp_path: Path) -> None:
                     "adapters": [
                         {
                             "type": "mcp",
-                            "server_id": "tailor_local",
+                            "server_id": "local_docs",
                             "tool_name": "llm_generate_document_spec",
                             "route_paths": ["/mcp/rpc/mcp", "mcp/rpc"],
                         }

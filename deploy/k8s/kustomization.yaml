@@ -12,7 +12,6 @@ resources:
   - jaeger.yaml
   - github-mcp.yaml
   - coder.yaml
-  - tailor.yaml
   - planner.yaml
   - policy.yaml
   - worker.yaml
@@ -20,7 +19,6 @@ resources:
   - ui.yaml
   - hpa-api.yaml
   - hpa-coder.yaml
-  - hpa-tailor.yaml
 configMapGenerator:
   - name: capability-registry
     files:
@@ -42,9 +40,6 @@ images:
     newTag: latest
   - name: ghcr.io/your-org/awe-coder
     newName: localhost:5001/awe-coder
-    newTag: latest
-  - name: ghcr.io/your-org/awe-tailor
-    newName: localhost:5001/awe-tailor
     newTag: latest
   - name: ghcr.io/your-org/awe-ui
     newName: localhost:5001/awe-ui

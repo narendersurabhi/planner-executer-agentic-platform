@@ -142,97 +142,6 @@ def test_validate_intent_segment_contract_checks_output_format_hint() -> None:
     assert mismatch == "output_format_mismatch:document.docx.generate:expected=pdf:got=docx"
 
 
-def test_validate_intent_segment_contract_accepts_must_have_inputs_in_job_context_aliases() -> None:
-    segment = {
-        "intent": "generate",
-        "objective": "Tailor resume content",
-        "slots": {
-            "entity": "resume",
-            "artifact_type": "document",
-            "output_format": None,
-            "risk_level": "bounded_write",
-            "must_have_inputs": [
-                "company_name",
-                "job_posting_text",
-                "original_resume_text",
-            ],
-        },
-    }
-    mismatch = intent_contract.validate_intent_segment_contract(
-        segment=segment,
-        task_intent="generate",
-        tool_name="llm_tailor_resume_text",
-        payload={
-            "job": {
-                "context_json": {
-                    "company_name": "Qualified Health",
-                    "job_description": "Build agentic workflows",
-                    "candidate_resume": "Resume content",
-                }
-            }
-        },
-        capability_id="llm.tailor.resume",
-        capability_risk_tier="bounded_write",
-    )
-    assert mismatch is None
-
-
-def test_validate_intent_segment_contract_treats_company_name_as_logo_fallback() -> None:
-    segment = {
-        "intent": "generate",
-        "objective": "Tailor resume content with company branding",
-        "slots": {
-            "entity": "resume",
-            "artifact_type": "document",
-            "output_format": None,
-            "risk_level": "bounded_write",
-            "must_have_inputs": ["company_logo_image"],
-        },
-    }
-    mismatch = intent_contract.validate_intent_segment_contract(
-        segment=segment,
-        task_intent="generate",
-        tool_name="llm_tailor_resume_text",
-        payload={
-            "job": {
-                "context_json": {
-                    "company_name": "Molina Healthcare",
-                }
-            }
-        },
-        capability_id="llm.tailor.resume",
-        capability_risk_tier="bounded_write",
-    )
-    assert mismatch is None
-
-
-def test_validate_intent_segment_contract_accepts_payload_aliases_for_tailored_resume() -> None:
-    segment = {
-        "intent": "generate",
-        "objective": "Build resume doc spec",
-        "slots": {
-            "entity": "resume",
-            "artifact_type": "document",
-            "output_format": None,
-            "risk_level": "bounded_write",
-            "must_have_inputs": ["tailored_resume_text"],
-        },
-    }
-    mismatch = intent_contract.validate_intent_segment_contract(
-        segment=segment,
-        task_intent="generate",
-        tool_name="llm_generate_resume_doc_spec_from_text",
-        payload={
-            "tailored_resume": {
-                "$from": "dependencies_by_name.TailorResume.llm_tailor_resume_text.tailored_resume"
-            }
-        },
-        capability_id="llm.resume.docspec",
-        capability_risk_tier="bounded_write",
-    )
-    assert mismatch is None
-
-
 def test_validate_intent_segment_contract_allows_io_segment_for_transform_task() -> None:
     segment = {
         "intent": "io",
@@ -250,7 +159,7 @@ def test_validate_intent_segment_contract_allows_io_segment_for_transform_task()
         task_intent="transform",
         tool_name="derive_output_filename",
         payload={
-            "path": "resumes/engineer.docx",
+            "path": "documents/engineer.docx",
             "output_extension": "docx",
             "target_role_name": "Engineer",
         },

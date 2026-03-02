@@ -200,10 +200,6 @@ def _infer_segment_output_format(
 
 def _infer_segment_entity(objective: str, artifact_type: str) -> str:
     lowered = objective.lower()
-    if "resume" in lowered:
-        return "resume"
-    if "cover letter" in lowered or "cover_letter" in lowered or "coverletter" in lowered:
-        return "cover_letter"
     if "runbook" in lowered:
         return "runbook"
     if "repo" in lowered or "github" in lowered:
@@ -383,15 +379,7 @@ def _payload_has_required_input(payload_map: Mapping[str, Any], key: str) -> boo
         "path": ("output_path",),
         "output_path": ("path",),
         "job_posting_text": ("job_description",),
-        "original_resume_text": ("candidate_resume",),
-        "tailored_resume_text": ("tailored_resume", "tailored_text", "resume_content"),
-        "company_logo_image": (
-            "company_logo",
-            "company_logo_url",
-            "logo_url",
-            # Some resume flows only provide company_name and resolve branding downstream.
-            "company_name",
-        ),
+        "company_logo_image": ("company_logo", "company_logo_url", "logo_url"),
     }
     for candidate in (key,) + aliases.get(key, ()):
         if candidate in payload_map and _value_present(payload_map.get(candidate), key=candidate):

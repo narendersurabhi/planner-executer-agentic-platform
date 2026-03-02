@@ -178,8 +178,6 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
             "first_name",
             "last_name",
             "job_description",
-            "candidate_resume",
-            "tailored_text",
             "output_dir",
             "document_type",
         ):
@@ -208,26 +206,6 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
         doc = _extract_json_from_context(context)
         if isinstance(doc, dict):
             filled["original_spec"] = doc
-    if "tailored_resume" not in filled:
-        resume = _extract_resume_content_from_context(context)
-        if resume is not None:
-            filled["tailored_resume"] = resume
-    if "resume_content" not in filled:
-        resume = _extract_resume_content_from_context(context)
-        if resume is not None:
-            filled["resume_content"] = resume
-    if "resume_doc_spec" not in filled:
-        resume_spec = _extract_resume_doc_spec_from_context(context)
-        if isinstance(resume_spec, dict):
-            filled["resume_doc_spec"] = resume_spec
-    if "coverletter_doc_spec" not in filled:
-        coverletter_spec = _extract_coverletter_doc_spec_from_context(context)
-        if isinstance(coverletter_spec, dict):
-            filled["coverletter_doc_spec"] = coverletter_spec
-    if "tailored_text" not in filled:
-        text = _extract_text_from_context(context)
-        if isinstance(text, str):
-            filled["tailored_text"] = text
     if "content" not in filled:
         text = _extract_text_from_context(context)
         if isinstance(text, str):
@@ -458,38 +436,6 @@ def _extract_document_spec_from_context(context: dict) -> dict | None:
     return None
 
 
-def _extract_resume_doc_spec_from_context(context: dict) -> dict | None:
-    if not isinstance(context, dict):
-        return None
-    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for output in group.values():
-            if not isinstance(output, dict):
-                continue
-            resume_spec = _extract_resume_doc_spec_from_outputs(output)
-            if isinstance(resume_spec, dict):
-                return resume_spec
-    return None
-
-
-def _extract_coverletter_doc_spec_from_context(context: dict) -> dict | None:
-    if not isinstance(context, dict):
-        return None
-    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for output in group.values():
-            if not isinstance(output, dict):
-                continue
-            coverletter_spec = _extract_coverletter_doc_spec_from_outputs(output)
-            if isinstance(coverletter_spec, dict):
-                return coverletter_spec
-    return None
-
-
 def _extract_validation_errors_from_context(context: dict) -> list[dict] | None:
     if not isinstance(context, dict):
         return None
@@ -535,22 +481,6 @@ def _extract_validation_report_from_context(context: dict) -> dict | None:
     return None
 
 
-def _extract_resume_content_from_context(context: dict) -> dict | str | None:
-    if not isinstance(context, dict):
-        return None
-    groups = [context.get("dependencies_by_name"), context.get("dependencies")]
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for output in group.values():
-            if not isinstance(output, dict):
-                continue
-            value = _extract_resume_content_from_outputs(output)
-            if value is not None:
-                return value
-    return None
-
-
 def _extract_text_from_context(context: dict) -> str | None:
     if not isinstance(context, dict):
         return None
@@ -573,31 +503,6 @@ def _extract_json_from_outputs(outputs: dict) -> dict | None:
     spec_output = outputs.get("llm_generate_document_spec")
     if isinstance(spec_output, dict):
         document_spec = spec_output.get("document_spec")
-        if isinstance(document_spec, dict):
-            return document_spec
-    resume_spec_output = outputs.get("llm_generate_resume_doc_spec")
-    if isinstance(resume_spec_output, dict):
-        resume_doc_spec = resume_spec_output.get("resume_doc_spec")
-        if isinstance(resume_doc_spec, dict):
-            return resume_doc_spec
-    resume_spec_text_output = outputs.get("llm_generate_resume_doc_spec_from_text")
-    if isinstance(resume_spec_text_output, dict):
-        resume_doc_spec = resume_spec_text_output.get("resume_doc_spec")
-        if isinstance(resume_doc_spec, dict):
-            return resume_doc_spec
-    coverletter_spec_output = outputs.get("llm_generate_coverletter_doc_spec_from_text")
-    if isinstance(coverletter_spec_output, dict):
-        coverletter_doc_spec = coverletter_spec_output.get("coverletter_doc_spec")
-        if isinstance(coverletter_doc_spec, dict):
-            return coverletter_doc_spec
-    converted = outputs.get("resume_doc_spec_to_document_spec")
-    if isinstance(converted, dict):
-        document_spec = converted.get("document_spec")
-        if isinstance(document_spec, dict):
-            return document_spec
-    converted_coverletter = outputs.get("coverletter_doc_spec_to_document_spec")
-    if isinstance(converted_coverletter, dict):
-        document_spec = converted_coverletter.get("document_spec")
         if isinstance(document_spec, dict):
             return document_spec
     llm_output = outputs.get("llm_generate")
@@ -637,8 +542,6 @@ def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
     if not isinstance(outputs, dict):
         return None
     for key in (
-        "resume_doc_spec_to_document_spec",
-        "coverletter_doc_spec_to_document_spec",
         "llm_generate_document_spec",
         "llm_repair_document_spec",
         "llm_repair_json",
@@ -666,81 +569,9 @@ def _extract_document_spec_from_outputs(outputs: dict) -> dict | None:
     return None
 
 
-def _extract_resume_doc_spec_from_outputs(outputs: dict) -> dict | None:
-    if not isinstance(outputs, dict):
-        return None
-    for key in (
-        "llm_generate_resume_doc_spec",
-        "llm_generate_resume_doc_spec_from_text",
-    ):
-        candidate = outputs.get(key)
-        if isinstance(candidate, dict):
-            resume_doc_spec = candidate.get("resume_doc_spec")
-            if isinstance(resume_doc_spec, dict):
-                return resume_doc_spec
-    direct = outputs.get("resume_doc_spec")
-    if isinstance(direct, dict):
-        return direct
-    return None
-
-
-def _extract_coverletter_doc_spec_from_outputs(outputs: dict) -> dict | None:
-    if not isinstance(outputs, dict):
-        return None
-    candidate = outputs.get("llm_generate_coverletter_doc_spec_from_text")
-    if isinstance(candidate, dict):
-        coverletter_doc_spec = candidate.get("coverletter_doc_spec")
-        if isinstance(coverletter_doc_spec, dict):
-            return coverletter_doc_spec
-    direct = outputs.get("coverletter_doc_spec")
-    if isinstance(direct, dict):
-        return direct
-    return None
-
-
-def _extract_resume_content_from_outputs(outputs: dict) -> dict | str | None:
-    if not isinstance(outputs, dict):
-        return None
-    for key in ("tailored_resume", "resume_content"):
-        value = outputs.get(key)
-        if isinstance(value, (dict, str)):
-            return value
-    llm_output = outputs.get("llm_generate")
-    if isinstance(llm_output, dict):
-        text = llm_output.get("text")
-        if isinstance(text, str):
-            json_text = _extract_json(text)
-            if json_text:
-                try:
-                    data = json.loads(json_text)
-                except json.JSONDecodeError:
-                    return None
-                if isinstance(data, dict):
-                    for key in ("tailored_resume", "resume_content"):
-                        value = data.get(key)
-                        if isinstance(value, (dict, str)):
-                            return value
-                    return data
-    json_transform = outputs.get("json_transform")
-    if isinstance(json_transform, dict):
-        result = json_transform.get("result")
-        if isinstance(result, dict):
-            for key in ("tailored_resume", "resume_content"):
-                value = result.get(key)
-                if isinstance(value, (dict, str)):
-                    return value
-            return result
-        if isinstance(result, str):
-            return result
-    return None
-
-
 def _extract_text_from_outputs(outputs: dict) -> str | None:
     if not isinstance(outputs, dict):
         return None
-    direct = outputs.get("tailored_text")
-    if isinstance(direct, str) and direct:
-        return direct
     for tool_key in ("llm_generate", "text_summarize", "json_transform"):
         entry = outputs.get(tool_key)
         if not isinstance(entry, dict):
@@ -763,9 +594,6 @@ def _extract_text_from_outputs(outputs: dict) -> str | None:
                 return result
     for entry in outputs.values():
         if isinstance(entry, dict):
-            value = entry.get("tailored_text")
-            if isinstance(value, str) and value:
-                return value
             text = entry.get("text")
             if isinstance(text, str) and text:
                 return text

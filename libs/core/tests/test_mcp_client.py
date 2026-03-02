@@ -45,7 +45,7 @@ def test_post_mcp_tool_call_uses_primary_route_first(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setenv("MCP_TOOL_TIMEOUT_S", "10")
     result = mcp_client.post_mcp_tool_call(
-        "http://tailor:8000",
+        "http://service:8000",
         "improve_iterative",
         {"x": 1},
         call_mcp_tool_sdk=fake_call,
@@ -54,7 +54,7 @@ def test_post_mcp_tool_call_uses_primary_route_first(monkeypatch: pytest.MonkeyP
         tracing_module=_Tracing,
     )
     assert result["ok"] is True
-    assert seen == ["http://tailor:8000/mcp/rpc/mcp"]
+    assert seen == ["http://service:8000/mcp/rpc/mcp"]
 
 
 def test_post_mcp_tool_call_falls_back_to_legacy_route(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -70,8 +70,8 @@ def test_post_mcp_tool_call_falls_back_to_legacy_route(monkeypatch: pytest.Monke
     monkeypatch.setenv("MCP_TOOL_TIMEOUT_S", "10")
     monkeypatch.setenv("MCP_TOOL_MAX_RETRIES", "0")
     out = mcp_client.post_mcp_tool_call(
-        "http://tailor:8000",
-        "tailor_resume",
+        "http://service:8000",
+        "example_tool",
         {},
         call_mcp_tool_sdk=fake_call,
         classify_tool_error=_classify,
@@ -79,7 +79,7 @@ def test_post_mcp_tool_call_falls_back_to_legacy_route(monkeypatch: pytest.Monke
         tracing_module=_Tracing,
     )
     assert out["ok"] is True
-    assert seen == ["http://tailor:8000/mcp/rpc/mcp", "http://tailor:8000/mcp/rpc"]
+    assert seen == ["http://service:8000/mcp/rpc/mcp", "http://service:8000/mcp/rpc"]
 
 
 def test_post_mcp_tool_call_retries_retryable_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,8 +96,8 @@ def test_post_mcp_tool_call_retries_retryable_error(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("MCP_TOOL_MAX_RETRIES", "1")
     monkeypatch.setenv("MCP_TOOL_RETRY_SLEEP_S", "0")
     out = mcp_client.post_mcp_tool_call(
-        "http://tailor:8000",
-        "tailor_resume",
+        "http://service:8000",
+        "example_tool",
         {},
         call_mcp_tool_sdk=fake_call,
         classify_tool_error=_classify,
@@ -120,8 +120,8 @@ def test_post_mcp_tool_call_does_not_retry_tool_error(monkeypatch: pytest.Monkey
     monkeypatch.setenv("MCP_TOOL_MAX_RETRIES", "2")
     with pytest.raises(ToolExecutionError) as exc:
         mcp_client.post_mcp_tool_call(
-            "http://tailor:8000",
-            "tailor_resume",
+            "http://service:8000",
+            "example_tool",
             {},
             call_mcp_tool_sdk=fake_call,
             classify_tool_error=_classify,
@@ -164,8 +164,8 @@ def test_post_mcp_tool_call_with_custom_route_and_headers(monkeypatch: pytest.Mo
 
     monkeypatch.setenv("MCP_TOOL_TIMEOUT_S", "10")
     out = mcp_client.post_mcp_tool_call(
-        "http://tailor:8000",
-        "tailor_resume",
+        "http://service:8000",
+        "example_tool",
         {"x": 1},
         route_paths=("/",),
         headers={"Authorization": "Bearer test"},
@@ -175,7 +175,7 @@ def test_post_mcp_tool_call_with_custom_route_and_headers(monkeypatch: pytest.Mo
         tracing_module=_Tracing,
     )
     assert out["ok"] is True
-    assert observed[0]["url"] == "http://tailor:8000/"
+    assert observed[0]["url"] == "http://service:8000/"
     assert observed[0]["headers"] == {"Authorization": "Bearer test"}
 
 

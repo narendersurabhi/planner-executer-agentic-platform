@@ -32,12 +32,6 @@ from libs.core.memory_client import MemoryClient, MemoryClientError
 from libs.tools.docx_generate_from_spec import register_docx_tools
 from libs.tools.pdf_generate_from_spec import register_pdf_tools
 from libs.tools.document_spec_validate import register_document_spec_tools
-from libs.tools.resume_doc_spec_validate import register_resume_doc_spec_tools
-from libs.tools.resume_doc_spec_to_document_spec import register_resume_doc_spec_convert_tools
-from libs.tools.coverletter_doc_spec_to_document_spec import (
-    register_coverletter_doc_spec_convert_tools,
-)
-from libs.tools.cover_letter_generate_ats_docx import register_cover_letter_generate_tools
 from libs.tools.document_spec_iterative import register_document_spec_iterative_tools
 from libs.tools.document_spec_llm import (
     llm_generate_document_spec as _llm_generate_document_spec_external,
@@ -48,15 +42,11 @@ from libs.tools.core_ops import CoreOpsHandlers, register_core_ops_tools
 from libs.tools.llm_tool_groups import (
     register_coding_agent_tools,
     register_llm_text_tool,
-    register_resume_llm_tools,
-    register_tailor_mcp_tools,
 )
 from libs.tools import mcp_client
-from libs.tools import resume_llm
 from libs.tools import coder_tools
 from libs.tools.github_tools import register_github_tools
 from libs.tools.openapi_iterative import register_openapi_iterative_tools
-from libs.tools.resume_analysis_tools import register_resume_analysis_tools
 
 try:  # Optional at import-time; policy service already depends on PyYAML.
     import yaml
@@ -748,10 +738,6 @@ def default_registry(
     register_docx_tools(registry)
     register_pdf_tools(registry)
     register_document_spec_tools(registry)
-    register_resume_doc_spec_tools(registry)
-    register_resume_doc_spec_convert_tools(registry)
-    register_coverletter_doc_spec_convert_tools(registry)
-    register_cover_letter_generate_tools(registry)
     register_github_tools(registry)
 
     if llm_enabled:
@@ -776,35 +762,6 @@ def default_registry(
             ),
             handler_publish_pr=_coding_agent_publish_pr,
         )
-        register_tailor_mcp_tools(
-            registry,
-            timeout_s=mcp_timeout_s,
-            handler_iterative_improve=lambda payload, provider=llm_provider: (
-                _llm_iterative_improve_tailored_resume_text(payload, provider)
-            ),
-            handler_tailor=lambda payload, provider=llm_provider: _llm_tailor_resume_text(
-                payload, provider
-            ),
-            handler_improve=lambda payload, provider=llm_provider: (
-                _llm_improve_tailored_resume_text(payload, provider)
-            ),
-        )
-        register_resume_llm_tools(
-            registry,
-            timeout_s=llm_timeout_s,
-            handler_generate_resume_doc_spec_from_text=lambda payload, provider=llm_provider: (
-                _llm_generate_resume_doc_spec_from_text(payload, provider)
-            ),
-            handler_generate_coverletter_doc_spec_from_text=lambda payload, provider=llm_provider: (
-                _llm_generate_coverletter_doc_spec_from_text(payload, provider)
-            ),
-            handler_generate_cover_letter_from_resume=lambda payload, provider=llm_provider: (
-                _llm_generate_cover_letter_from_resume(payload, provider)
-            ),
-            handler_generate_resume_doc_spec=lambda payload, provider=llm_provider: (
-                _llm_generate_resume_doc_spec(payload, provider)
-            ),
-        )
         register_document_spec_llm_tools(
             registry,
             llm_provider,
@@ -823,11 +780,6 @@ def default_registry(
             registry,
             llm_provider,
             timeout_s=llm_iterative_timeout_s,
-        )
-        register_resume_analysis_tools(
-            registry,
-            llm_provider,
-            timeout_s=llm_timeout_s,
         )
 
     _load_module_plugins(
@@ -1341,16 +1293,6 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         memory_context.get("job_description"),
         nested_context.get("job_description"),
     )
-    candidate_resume = pick_str(
-        payload.get("candidate_resume"),
-        memory_context.get("candidate_resume"),
-        nested_context.get("candidate_resume"),
-    )
-    tailored_text = pick_str(
-        payload.get("tailored_text"),
-        memory_context.get("tailored_text"),
-        nested_context.get("tailored_text"),
-    )
     date_value = pick_str(
         payload.get("date"),
         payload.get("today"),
@@ -1365,7 +1307,7 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
             memory_context.get("output_dir"),
             nested_context.get("output_dir"),
         )
-        or "resumes"
+        or "documents"
     )
     document_type = pick_str(
         payload.get("document_type"),
@@ -1387,7 +1329,6 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         nested_context.get("format"),
     )
     normalized_doc_type = document_type.lower().replace("-", "_")
-    is_cover_letter = normalized_doc_type in {"cover_letter", "coverletter"}
     known_format_types = {
         "pdf",
         "docx",
@@ -1423,10 +1364,10 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not output_extension:
         output_extension = "docx"
     if not isinstance(output_dir, str):
-        output_dir = "resumes"
+        output_dir = "documents"
     output_dir = output_dir.strip().strip("/")
     if not output_dir:
-        output_dir = "resumes"
+        output_dir = "documents"
     if output_dir.startswith("/") or ".." in Path(output_dir).parts:
         raise ToolExecutionError("Invalid output_dir")
 
@@ -1444,60 +1385,10 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = re.sub(r"_+", "_", cleaned).strip("_")
         return cleaned
 
-    if (not isinstance(role_name, str) or not role_name.strip()) and isinstance(
-        job_description, str
-    ):
+    if (not isinstance(role_name, str) or not role_name.strip()) and isinstance(job_description, str):
         role_name = _derive_role_name_from_jd(job_description)
-    if (not isinstance(company_name, str) or not company_name.strip()) and isinstance(
-        job_description, str
-    ):
-        company_name = _derive_company_name_from_jd(job_description)
-
-    if (not isinstance(candidate_name, str) or not candidate_name.strip()) and not (
-        isinstance(first_name, str)
-        and first_name.strip()
-        and isinstance(last_name, str)
-        and last_name.strip()
-    ):
-        candidate_name = _derive_candidate_name_from_texts(
-            candidate_resume, tailored_text, job_description
-        )
-
-    if (
-        (
-            (not isinstance(first_name, str) or not first_name.strip())
-            or (not isinstance(last_name, str) or not last_name.strip())
-        )
-        and isinstance(candidate_name, str)
-        and candidate_name.strip()
-    ):
-        tokens = [token for token in candidate_name.split() if token]
-        if len(tokens) >= 2:
-            if not isinstance(first_name, str) or not first_name.strip():
-                first_name = tokens[0]
-            if not isinstance(last_name, str) or not last_name.strip():
-                last_name = tokens[-1]
 
     role_label = clean_label(role_name)
-    company_label = clean_label(company_name)
-    if not isinstance(candidate_name, str) or not candidate_name.strip():
-        name_parts = [clean_label(first_name), clean_label(last_name)]
-        candidate_label = " ".join([part for part in name_parts if part]).strip()
-    else:
-        candidate_label = clean_label(candidate_name)
-
-    if candidate_label and role_label and company_label:
-        doc_label = "Cover Letter" if is_cover_letter else "Resume"
-        filename = (
-            f"{candidate_label} {doc_label} - {role_label} - {company_label}"
-            f".{output_extension}"
-        )
-        return {
-            "path": f"{output_dir}/{filename}",
-            "document_type": "cover_letter" if is_cover_letter else "resume",
-            "output_extension": output_extension,
-        }
-
     if not role_label:
         raise ToolExecutionError("Missing target_role_name")
     if not isinstance(date_value, str) or not date_value.strip():
@@ -1508,27 +1399,59 @@ def _derive_output_filename(payload: Dict[str, Any]) -> Dict[str, Any]:
     date_slug = slugify(date_value, r"[^0-9]+")
     if not date_slug:
         raise ToolExecutionError("Invalid date")
-    if is_cover_letter:
-        filename = f"cover_letter_{role_slug}_{date_slug}.{output_extension}"
-    else:
-        filename = f"{role_slug}_{date_slug}.{output_extension}"
+    filename = f"{role_slug}_{date_slug}.{output_extension}"
     return {
         "path": f"{output_dir}/{filename}",
-        "document_type": "cover_letter" if is_cover_letter else "resume",
+        "document_type": normalized_doc_type or "document",
         "output_extension": output_extension,
     }
 
 
 def _derive_role_name_from_jd(job_description: str) -> str:
-    return resume_llm.derive_role_name_from_jd(job_description)
+    patterns = (
+        r"(?im)^\s*title\s*:\s*(.+)$",
+        r"(?im)^\s*role\s*:\s*(.+)$",
+        r"(?im)^\s*position\s*:\s*(.+)$",
+        r"(?im)\bwe are hiring (?:a|an)\s+([^.\n]+)",
+        r"(?im)\bseeking (?:a|an)\s+([^.\n]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, job_description)
+        if match:
+            return match.group(1).strip(" -:,.")
+    first_line = next((line.strip() for line in job_description.splitlines() if line.strip()), "")
+    return first_line[:120].strip(" -:,.")
 
 
-def _derive_company_name_from_jd(job_description: str) -> str:
-    return resume_llm.derive_company_name_from_jd(job_description)
-
-
-def _derive_candidate_name_from_texts(*texts: Any) -> str:
-    return resume_llm.derive_candidate_name_from_texts(*texts)
+def _select_job_context_from_memory(memory: Any) -> Dict[str, Any]:
+    if not isinstance(memory, dict):
+        return {}
+    direct = memory.get("context_json")
+    if isinstance(direct, dict):
+        return direct
+    entries = memory.get("job_contexts")
+    if not isinstance(entries, list):
+        entries = memory.get("job_context")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                payload = entry.get("payload")
+                if isinstance(payload, dict):
+                    context_json = payload.get("context_json")
+                    if isinstance(context_json, dict):
+                        return context_json
+                    return payload
+    task_outputs = memory.get("task_outputs")
+    if isinstance(task_outputs, list):
+        for entry in task_outputs:
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("payload")
+            if isinstance(payload, dict):
+                context_json = payload.get("context_json")
+                if isinstance(context_json, dict):
+                    return context_json
+    return {}
 
 
 def _run_tests(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2032,190 +1955,19 @@ def _resolve_llm_iterative_tool_timeout_s(provider: LLMProvider) -> int:
     return min(900, max(60, base * 3))
 
 
-def _llm_tailor_resume_text(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:
-    return resume_llm.llm_tailor_resume_text(
-        payload,
-        provider,
-        post_mcp_tool_call=_post_mcp_tool_call,
-    )
-
-
-def _select_job_context_from_memory(memory: Any) -> Dict[str, Any]:
-    return resume_llm.select_job_context_from_memory(memory)
-
-
-def _merge_resume_job_context(
-    job: Dict[str, Any], memory_context: Dict[str, Any]
-) -> Dict[str, Any]:
-    return resume_llm.merge_resume_job_context(job, memory_context)
-
-
-def _build_resume_job_payload(job: Dict[str, Any] | None, memory: Any) -> Dict[str, Any]:
-    return resume_llm.build_resume_job_payload(job, memory)
-
-
-def _llm_improve_tailored_resume_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_improve_tailored_resume_text(
-        payload,
-        provider,
-        post_mcp_tool_call=_post_mcp_tool_call,
-    )
-
-
-def _llm_iterative_improve_tailored_resume_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_iterative_improve_tailored_resume_text(
-        payload,
-        provider,
-        post_mcp_tool_call=_post_mcp_tool_call,
-    )
-
-
-def _parse_target_pages(value: Any) -> int | None:
-    return resume_llm.parse_target_pages(value)
-
-
-def _resolve_target_pages(payload: Dict[str, Any], job: Any) -> int | None:
-    return resume_llm.resolve_target_pages(payload, job)
-
-
-def _apply_resume_target_pages_policy(
-    resume_doc_spec: Dict[str, Any], target_pages: int | None
-) -> None:
-    resume_llm.apply_resume_target_pages_policy(resume_doc_spec, target_pages)
-
-
-def _llm_generate_resume_doc_spec_from_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_resume_doc_spec_from_text(payload, provider)
-
-
-def _normalize_skills_definition_separators(resume_doc_spec: Dict[str, Any]) -> None:
-    resume_llm.normalize_skills_definition_separators(resume_doc_spec)
-
-
-def _llm_generate_cover_letter_from_resume(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_cover_letter_from_resume(payload, provider)
-
-
-def _llm_generate_coverletter_doc_spec_from_text(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_coverletter_doc_spec_from_text(payload, provider)
-
-
-def _build_coverletter_doc_spec(cover_letter: Dict[str, Any], date_text: str) -> Dict[str, Any]:
-    return resume_llm.build_coverletter_doc_spec(cover_letter, date_text)
-
-
-def _split_cover_letter_paragraphs(body_text: str) -> List[str]:
-    return resume_llm.split_cover_letter_paragraphs(body_text)
-
-
-def _validate_coverletter_doc_spec(spec: Dict[str, Any], strict: bool) -> Dict[str, Any]:
-    return resume_llm.validate_coverletter_doc_spec(spec, strict)
-
-
-def _llm_generate_resume_doc_spec(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:
-    return resume_llm.llm_generate_resume_doc_spec(payload, provider)
-
-
-def _ensure_required_resume_sections(content: Any) -> None:
-    resume_llm.ensure_required_resume_sections(content)
-
-
-def _has_required_headings(text: str, headings: list[str]) -> bool:
-    return resume_llm.has_required_headings(text, headings)
-
-
-def _fill_missing_dates_from_text(resume_doc_spec: Dict[str, Any], tailored_text: str) -> None:
-    resume_llm.fill_missing_dates_from_text(resume_doc_spec, tailored_text)
-
-
-def _ensure_certifications_section_content(
-    resume_doc_spec: Dict[str, Any],
-    tailored_resume: Dict[str, Any] | None,
-    tailored_text: str | None,
-    candidate_resume_text: str | None,
-) -> None:
-    resume_llm.ensure_certifications_section_content(
-        resume_doc_spec,
-        tailored_resume=tailored_resume,
-        tailored_text=tailored_text,
-        candidate_resume_text=candidate_resume_text,
-    )
-
-
-def _find_section_heading_block_index(
-    content: List[Dict[str, Any]],
-    headings: set[str],
-    start: int = 0,
-) -> int | None:
-    return resume_llm.find_section_heading_block_index(content, headings, start)
-
-
-def _find_next_section_heading_block_index(content: List[Dict[str, Any]], start: int) -> int:
-    return resume_llm.find_next_section_heading_block_index(content, start)
-
-
-def _extract_non_empty_cert_items(blocks: List[Any]) -> list[str]:
-    return resume_llm.extract_non_empty_cert_items(blocks)
-
-
-def _collect_fallback_certification_lines(
-    tailored_resume: Dict[str, Any] | None,
-    tailored_text: str | None,
-    candidate_resume_text: str | None,
-) -> list[str]:
-    return resume_llm.collect_fallback_certification_lines(
-        tailored_resume,
-        tailored_text,
-        candidate_resume_text,
-    )
-
-
-def _certification_lines_from_tailored_resume(tailored_resume: Dict[str, Any]) -> list[str]:
-    return resume_llm.certification_lines_from_tailored_resume(tailored_resume)
-
-
-def _certification_lines_from_text(text: str) -> list[str]:
-    return resume_llm.certification_lines_from_text(text)
-
-
-def _cert_section_is_removable(blocks: List[Any]) -> bool:
-    return resume_llm.cert_section_is_removable(blocks)
-
-
-def _extract_candidate_resume_text_from_job(job_payload: Any) -> str | None:
-    return resume_llm.extract_candidate_resume_text_from_job(job_payload)
-
-
-def _extract_dates_from_section(text: str, start_heading: str, end_heading: str) -> list[str]:
-    return resume_llm.extract_dates_from_section(text, start_heading, end_heading)
-
-
-def _find_heading_index(lines: list[str], heading: str, start: int = 0) -> int | None:
-    return resume_llm.find_heading_index(lines, heading, start)
-
-
-def _is_missing_value(value: Any) -> bool:
-    return resume_llm.is_missing_value(value)
-
-
-def _llm_generate_tailored_resume_content(
-    payload: Dict[str, Any], provider: LLMProvider
-) -> Dict[str, Any]:
-    return resume_llm.llm_generate_tailored_resume_content(payload, provider)
-
-
 def _extract_json(text: str) -> str:
-    return resume_llm.extract_json(text)
+    fence_match = re.search(r"```(?:json)?\s*(.+?)```", text, flags=re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text.strip()
 
 
 def _llm_improve_document_spec(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:

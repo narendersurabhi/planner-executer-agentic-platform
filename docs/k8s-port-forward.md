@@ -41,8 +41,6 @@ kubectl port-forward -n awe svc/ui 8510:80
 # Coder
 kubectl port-forward -n awe svc/coder 18001:8000
 
-# Tailor
-kubectl port-forward -n awe svc/tailor 18002:8000
 ```
 
 ## Observability services

@@ -27,8 +27,7 @@ def test_should_retry_transient_error(monkeypatch) -> None:
     assert (
         worker_main._should_retry_task(
             task_payload,
-            "mcp_tool_error:Error executing tool tailor_resume: "
-            "tailored_resume_missing_fields:experience,education,certifications",
+            "mcp_tool_error:Error executing tool llm_generate_document_spec: invalid_json",
         )
         is False
     )
@@ -47,8 +46,8 @@ def test_should_retry_any_policy(monkeypatch) -> None:
     assert (
         worker_main._should_retry_task(
             task_payload,
-            "contract.output_invalid:mcp_tool_error:Error executing tool tailor_resume:"
-            " tailored_resume_missing_fields:experience",
+            "contract.output_invalid:mcp_tool_error:Error executing tool llm_generate_document_spec:"
+            " invalid_json",
         )
         is False
     )

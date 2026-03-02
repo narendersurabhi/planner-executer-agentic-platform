@@ -1,1 +1,0 @@
-"""Resume tailoring service package."""

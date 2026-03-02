@@ -1,1 +1,0 @@
-"""Tailor service application package."""
