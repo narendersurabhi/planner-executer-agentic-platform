@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 
 import redis
+from prometheus_client import start_http_server
 
 from libs.core import events, logging as core_logging, models, policy_engine
 
@@ -16,12 +17,18 @@ POLICY_GATE_ENABLED = os.getenv("POLICY_GATE_ENABLED", "false").lower() == "true
 POLICY_MODE = os.getenv("POLICY_MODE", "dev")
 TOOL_HTTP_FETCH_ENABLED = os.getenv("TOOL_HTTP_FETCH_ENABLED", "false").lower() == "true"
 POLICY_CONFIG_PATH = os.getenv("POLICY_CONFIG_PATH", "/app/config/policy.yaml")
+METRICS_PORT = int(os.getenv("POLICY_METRICS_PORT", "9103"))
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 engine = policy_engine.PolicyEngine(POLICY_MODE, POLICY_CONFIG_PATH)
+_METRICS_SERVER_STARTED = False
 
 
 def run() -> None:
+    global _METRICS_SERVER_STARTED
+    if not _METRICS_SERVER_STARTED:
+        start_http_server(METRICS_PORT)
+        _METRICS_SERVER_STARTED = True
     if not POLICY_GATE_ENABLED:
         return
     group = "policy"

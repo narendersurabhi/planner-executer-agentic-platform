@@ -11,4 +11,6 @@ spec:
           imagePullPolicy: Always
           env:
             - name: NEXT_PUBLIC_API_URL
-              value: http://localhost:18000
+              value: /api
+            - name: API_PROXY_TARGET
+              value: http://api.awe.svc.cluster.local:8000

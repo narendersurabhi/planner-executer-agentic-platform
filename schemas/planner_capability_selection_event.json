@@ -1,0 +1,16 @@
+{
+  "$id": "planner_capability_selection_event",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string", "minLength": 1 },
+    "goal": { "type": "string", "minLength": 1 },
+    "planner_version": { "type": "string", "minLength": 1 },
+    "selected_capabilities": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "task_count": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["job_id", "goal", "planner_version", "selected_capabilities", "task_count"],
+  "additionalProperties": true
+}

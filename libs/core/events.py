@@ -6,7 +6,14 @@ CRITIC_STREAM = "critic.events"
 POLICY_STREAM = "policy.events"
 
 JOB_EVENTS = ["job.created", "job.canceled"]
-PLAN_EVENTS = ["plan.created", "plan.approved", "plan.rejected", "plan.failed"]
+PLAN_EVENTS = [
+    "plan.created",
+    "plan.approved",
+    "plan.rejected",
+    "plan.failed",
+    "plan.capability_search",
+    "plan.capability_selection",
+]
 TASK_EVENTS = [
     "task.ready",
     "task.policy_check",

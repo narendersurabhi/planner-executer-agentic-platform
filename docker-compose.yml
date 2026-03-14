@@ -136,10 +136,11 @@ services:
       context: .
       dockerfile: services/ui/Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
         NEXT_PUBLIC_DEV_TOOLS: ${NEXT_PUBLIC_DEV_TOOLS:-false}
     environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:18000}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
+      API_PROXY_TARGET: ${API_PROXY_TARGET:-http://api:8000}
       NEXT_PUBLIC_DEV_TOOLS: ${NEXT_PUBLIC_DEV_TOOLS:-false}
     ports:
       - "3002:3000"

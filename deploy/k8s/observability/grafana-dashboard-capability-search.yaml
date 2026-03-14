@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-capability-search
+  namespace: awe
+data:
+  capability-search.json: |
+    {
+      "uid": "capability-search",
+      "title": "Capability Search",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "Capability Search Requests (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (request_source, result) (rate(capability_search_requests_total[5m]))",
+              "legendFormat": "{{request_source}} / {{result}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "Capability Search Results Returned (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (request_source, intent) (rate(capability_search_results_total[5m]))",
+              "legendFormat": "{{request_source}} / {{intent}}"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "Planner Capability Selections (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, sum by (capability) (rate(planner_capability_selection_total[5m])))",
+              "legendFormat": "{{capability}}"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Capability Execution Outcomes (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, sum by (capability, status) (rate(capability_execution_outcomes_total[5m])))",
+              "legendFormat": "{{capability}} / {{status}}"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "Search Empty Result Ratio",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 0, "y": 16, "w": 8, "h": 6 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(capability_search_requests_total{result=\"empty\"}[5m])) / clamp_min(sum(rate(capability_search_requests_total[5m])), 0.0001)"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "Selected Capability Success Ratio",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 8, "y": 16, "w": 8, "h": 6 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(capability_execution_outcomes_total{status=\"completed\"}[5m])) / clamp_min(sum(rate(capability_execution_outcomes_total[5m])), 0.0001)"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 7,
+          "type": "stat",
+          "title": "Selection to Search Ratio",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 16, "y": 16, "w": 8, "h": 6 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(planner_capability_selection_total[5m])) / clamp_min(sum(rate(capability_search_requests_total[5m])), 0.0001)"
+            }
+          ]
+        }
+      ]
+    }

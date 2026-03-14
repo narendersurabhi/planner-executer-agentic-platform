@@ -3,8 +3,10 @@ name = "agentic-planner"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+  "typing-extensions>=4.12.2",
   "redis>=5.0",
   "pydantic>=2.6",
+  "prometheus-client>=0.19",
   "structlog>=24.1.0",
 ]
 

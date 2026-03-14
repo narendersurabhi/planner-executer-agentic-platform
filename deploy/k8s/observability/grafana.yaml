@@ -51,8 +51,22 @@ spec:
           configMap:
             name: grafana-dashboard-provider
         - name: dashboards
-          configMap:
-            name: grafana-dashboard-agent-logs
+          projected:
+            sources:
+              - configMap:
+                  name: grafana-dashboard-agent-logs
+              - configMap:
+                  name: grafana-dashboard-capability-search
+              - configMap:
+                  name: grafana-dashboard-job-metrics
+              - configMap:
+                  name: grafana-dashboard-task-metrics
+              - configMap:
+                  name: grafana-dashboard-capability-metrics
+              - configMap:
+                  name: grafana-dashboard-service-uptime
+              - configMap:
+                  name: grafana-dashboard-orchestrator-errors
 ---
 apiVersion: v1
 kind: Service

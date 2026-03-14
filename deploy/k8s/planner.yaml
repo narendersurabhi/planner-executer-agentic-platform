@@ -27,6 +27,11 @@ spec:
                   name: awe-secrets
                   key: OPENAI_API_KEY
                   optional: true
+            - name: PLANNER_METRICS_PORT
+              value: "9101"
+          ports:
+            - containerPort: 9101
+              name: metrics
           resources:
             requests:
               cpu: 100m
@@ -43,3 +48,16 @@ spec:
         - name: capability-registry-config
           configMap:
             name: capability-registry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: planner
+  namespace: awe
+spec:
+  selector:
+    app: planner
+  ports:
+    - name: metrics
+      port: 9101
+      targetPort: 9101

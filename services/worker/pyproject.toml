@@ -6,6 +6,7 @@ dependencies = [
   "redis>=5.0",
   "pydantic>=2.6",
   "jsonschema>=4.21",
+  "prometheus-client>=0.19",
   "structlog>=24.1.0",
   "docxtpl>=0.16",
 ]

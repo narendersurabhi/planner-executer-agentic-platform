@@ -20,6 +20,12 @@ spec:
           envFrom:
             - configMapRef:
                 name: awe-config
+          env:
+            - name: POLICY_METRICS_PORT
+              value: "9103"
+          ports:
+            - containerPort: 9103
+              name: metrics
           resources:
             requests:
               cpu: 100m
@@ -27,3 +33,16 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: policy
+  namespace: awe
+spec:
+  selector:
+    app: policy
+  ports:
+    - name: metrics
+      port: 9103
+      targetPort: 9103

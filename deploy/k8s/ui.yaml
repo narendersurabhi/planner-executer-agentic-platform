@@ -21,7 +21,9 @@ spec:
             - containerPort: 3000
           env:
             - name: NEXT_PUBLIC_API_URL
-              value: http://api:8000
+              value: /api
+            - name: API_PROXY_TARGET
+              value: http://api.awe.svc.cluster.local:8000
           resources:
             requests:
               cpu: 100m

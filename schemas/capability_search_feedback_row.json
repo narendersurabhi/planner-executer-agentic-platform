@@ -1,0 +1,63 @@
+{
+  "$id": "capability_search_feedback_row",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string", "minLength": 1 },
+    "correlation_id": { "type": "string", "minLength": 1 },
+    "search_queries": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "retrieved_capabilities": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "selected_capabilities": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "executed_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "required": ["id", "status"],
+        "additionalProperties": false
+      }
+    },
+    "execution_succeeded": { "type": "boolean" },
+    "planner_override": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "retrieved_selected": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "retrieved_executed": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "hard_negative_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": [
+    "job_id",
+    "correlation_id",
+    "search_queries",
+    "retrieved_capabilities",
+    "selected_capabilities",
+    "executed_capabilities",
+    "execution_succeeded",
+    "planner_override",
+    "retrieved_selected",
+    "retrieved_executed",
+    "hard_negative_ids"
+  ],
+  "additionalProperties": false
+}

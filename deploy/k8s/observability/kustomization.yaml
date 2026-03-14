@@ -11,4 +11,10 @@ resources:
   - grafana-datasources.yaml
   - grafana-dashboard-provider.yaml
   - grafana-dashboard-agent-logs.yaml
+  - grafana-dashboard-capability-search.yaml
+  - grafana-dashboard-job-metrics.yaml
+  - grafana-dashboard-task-metrics.yaml
+  - grafana-dashboard-capability-metrics.yaml
+  - grafana-dashboard-service-uptime.yaml
+  - grafana-dashboard-orchestrator-errors.yaml
   - grafana.yaml

@@ -11,9 +11,11 @@ from time import perf_counter
 from typing import Any, List, Mapping, Sequence
 
 import redis
+from prometheus_client import start_http_server
 from pydantic import BaseModel
 
 from libs.core import (
+    capability_search,
     capability_registry,
     events,
     intent_contract,
@@ -39,8 +41,10 @@ PLANNER_MAX_DEPTH = os.getenv("PLANNER_MAX_DEPTH")
 OPENAI_TIMEOUT_S = os.getenv("OPENAI_TIMEOUT_S")
 OPENAI_MAX_RETRIES = os.getenv("OPENAI_MAX_RETRIES")
 SCHEMA_REGISTRY_PATH = os.getenv("SCHEMA_REGISTRY_PATH", "/app/schemas")
+METRICS_PORT = int(os.getenv("PLANNER_METRICS_PORT", "9101"))
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+_METRICS_SERVER_STARTED = False
 
 DEFAULT_ALLOWED_BLOCK_TYPES = [
     "text",
@@ -324,6 +328,7 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
     tool_catalog_json = json.dumps(
         combined_catalog, ensure_ascii=False, indent=2, default=_json_fallback
     )
+    semantic_capability_hints = _planner_semantic_capability_hints(job, capabilities, limit=10)
     job_json = json.dumps(
         job.model_dump(mode="json"), ensure_ascii=False, indent=2, default=_json_fallback
     )
@@ -343,6 +348,13 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
             "Prefer preserving this segment order in tasks/dependencies.\n"
         )
     intent_repair_block = _job_intent_mismatch_recovery_block(job)
+    semantic_capability_block = ""
+    if semantic_capability_hints:
+        semantic_capability_block = (
+            "Most relevant capabilities for this goal from local semantic search:\n"
+            f"{json.dumps(semantic_capability_hints, ensure_ascii=False, indent=2, default=_json_fallback)}\n"
+            "Prefer these capabilities when they fit the goal and required inputs.\n"
+        )
     return (
         "You are a planner. Return ONLY valid JSON for a PlanCreate object (no prose).\n"
         "Required top-level fields: planner_version, tasks_summary, dag_edges, tasks.\n"
@@ -388,7 +400,8 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
         "6) Prefer the generic validation + rendering pipeline:\n"
         "   - Generate a DocumentSpec JSON.\n"
         "   - Validate with document_spec_validate.\n"
-        "   - Render with docx_generate_from_spec.\n"
+        "   - Render with docx_generate_from_spec or pdf_generate_from_spec.\n"
+        "   - Do not add a separate output-path derivation task unless the path itself is needed downstream.\n"
         "   Use specialized tools only if explicitly requested.\n"
         "7) If unsure, use llm_generate.\n"
         "8) Keep output compact. Do NOT copy or embed large raw text from Job JSON "
@@ -404,6 +417,7 @@ def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
         f"{intent_graph_block}"
         f"{intent_repair_block}"
         f"Allowed tool names: {tool_names}\n"
+        f"{semantic_capability_block}"
         f"Tool catalog (JSON): {tool_catalog_json}\n"
         f"Goal: {job.goal}\n"
         f"Job (JSON): {job_json}\n"
@@ -1036,12 +1050,19 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
         "document.docx.generate",
         "document.pdf.generate",
     }
+    document_spec_consumer_requests = {
+        "document_spec_validate",
+        "document.spec.validate",
+    }
     document_spec_producers = {
         "document.spec.generate",
         "document_spec_generate",
+        "llm_generate_document_spec",
+        "llm_repair_document_spec",
+        "llm_improve_document_spec",
+        "llm_iterative_improve_document_spec",
+        "document.spec.repair",
     }
-    derive_requests = {"derive_output_filename", "derive_output_path", "document.output.derive"}
-
     def _ref_task_exists(value: Any) -> bool:
         if not isinstance(value, dict):
             return False
@@ -1080,7 +1101,12 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
 
     for index, task in enumerate(tasks):
         request_id = next(
-            (req for req in (task.tool_requests or []) if str(req) in renderer_requests),
+            (
+                req
+                for req in (task.tool_requests or [])
+                if str(req) in renderer_requests
+                or str(req) in document_spec_consumer_requests
+            ),
             None,
         )
         if request_id is None:
@@ -1106,31 +1132,14 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
                 }
                 changed = True
 
-        has_valid_path_ref = _ref_task_exists(payload.get("path"))
-        has_valid_output_path_ref = _ref_task_exists(payload.get("output_path"))
-        if (
-            ("path" not in payload and "output_path" not in payload)
-            or (
-                isinstance(payload.get("path"), dict)
-                and not has_valid_path_ref
-                and ("output_path" not in payload or not has_valid_output_path_ref)
-            )
-            or (
-                isinstance(payload.get("output_path"), dict)
-                and not has_valid_output_path_ref
-                and ("path" not in payload or not has_valid_path_ref)
-            )
-        ):
-            source_task_name, source_request_id = _find_source_task_name(
-                task, index, derive_requests
-            )
-            if source_task_name and source_request_id:
-                payload["path"] = {
-                    "$from": (
-                        f"dependencies_by_name.{source_task_name}."
-                        f"{source_request_id}.path"
-                    )
-                }
+        if request_id in renderer_requests:
+            has_valid_path_ref = _ref_task_exists(payload.get("path"))
+            has_valid_output_path_ref = _ref_task_exists(payload.get("output_path"))
+            if isinstance(payload.get("path"), dict) and not has_valid_path_ref:
+                payload.pop("path", None)
+                changed = True
+            if isinstance(payload.get("output_path"), dict) and not has_valid_output_path_ref:
+                payload.pop("output_path", None)
                 changed = True
 
         tool_inputs[request_id] = payload
@@ -1335,6 +1344,7 @@ def _build_validation_payload(
         dict(raw_tool_inputs),
         dependency_defaults=_dependency_fill_defaults(),
     )
+    payload.setdefault("tool_inputs", dict(raw_tool_inputs))
     schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
     if _schema_requires_key(schema, "job"):
         payload.setdefault("job", job.model_dump(mode="json"))
@@ -1372,6 +1382,9 @@ def _build_validation_payload(
             continue
         if isinstance(value, (int, float, bool)):
             payload[key] = value
+    # Planner-time validation should account for deterministic runtime date defaults.
+    if "today" not in payload and "date" not in payload:
+        payload["today"] = datetime.utcnow().date().isoformat()
     return payload
 
 
@@ -1405,6 +1418,90 @@ def _planner_capabilities() -> dict[str, capability_registry.CapabilitySpec]:
     return dict(sorted(registry.enabled_capabilities().items()))
 
 
+def _emit_plan_event(
+    event_type: str,
+    *,
+    job_id: str | None,
+    correlation_id: str | None,
+    payload: dict[str, Any],
+) -> None:
+    event = models.EventEnvelope(
+        type=event_type,
+        version="1",
+        occurred_at=datetime.utcnow(),
+        correlation_id=correlation_id or str(uuid.uuid4()),
+        job_id=job_id,
+        payload=payload,
+    )
+    try:
+        redis_client.xadd(events.PLAN_STREAM, {"data": event.model_dump_json()})
+    except Exception as exc:  # noqa: BLE001
+        core_logging.get_logger("planner").warning(
+            "plan_event_emit_failed",
+            event_type=event_type,
+            job_id=job_id,
+            error=str(exc),
+        )
+
+
+def _planner_semantic_capability_hints(
+    job: models.Job,
+    capabilities: Mapping[str, capability_registry.CapabilitySpec],
+    *,
+    correlation_id: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    entries = capability_search.build_capability_search_entries(capabilities)
+    started = perf_counter()
+    matches = capability_search.search_capabilities(
+        query=job.goal,
+        capability_entries=entries,
+        limit=limit,
+    )
+    latency_ms = round((perf_counter() - started) * 1000.0, 3)
+    _emit_plan_event(
+        "plan.capability_search",
+        job_id=job.id,
+        correlation_id=correlation_id,
+        payload={
+            "job_id": job.id,
+            "goal": job.goal,
+            "request_source": "planner_prompt",
+            "limit": limit,
+            "latency_ms": latency_ms,
+            "results": matches,
+            "result_count": len(matches),
+        },
+    )
+    return matches
+
+
+def _emit_planner_capability_selection_event(
+    job: models.Job,
+    plan: models.PlanCreate,
+    *,
+    correlation_id: str | None = None,
+) -> None:
+    selected_capabilities: list[str] = []
+    for task in plan.tasks:
+        for tool_name in task.tool_requests or []:
+            normalized = str(tool_name or "").strip()
+            if normalized and normalized not in selected_capabilities:
+                selected_capabilities.append(normalized)
+    _emit_plan_event(
+        "plan.capability_selection",
+        job_id=job.id,
+        correlation_id=correlation_id,
+        payload={
+            "job_id": job.id,
+            "goal": job.goal,
+            "planner_version": plan.planner_version,
+            "selected_capabilities": selected_capabilities,
+            "task_count": len(plan.tasks),
+        },
+    )
+
+
 def _validate_capability_inputs(
     capability: capability_registry.CapabilitySpec,
     task: models.TaskCreate,
@@ -1417,6 +1514,17 @@ def _validate_capability_inputs(
     if schema is None:
         return f"capability_schema_not_found:{capability.input_schema_ref}"
     payload = _build_capability_validation_payload(task, raw_tool_inputs, job)
+    if capability.capability_id == "github.repo.list" and "query" not in payload:
+        job_context = job.context_json if isinstance(job.context_json, dict) else {}
+        github_query: Any = raw_tool_inputs.get("github_query")
+        if not github_query:
+            github_query = payload.get("github_query")
+        if not github_query:
+            github_query = job_context.get("query")
+        if not github_query:
+            github_query = job_context.get("github_query")
+        if isinstance(github_query, str) and github_query.strip():
+            payload["query"] = github_query
     errors = payload_resolver.validate_tool_inputs(
         {capability.capability_id: payload},
         {capability.capability_id: schema},
@@ -1448,6 +1556,7 @@ def _build_capability_validation_payload(
         dict(raw_tool_inputs),
         dependency_defaults=_dependency_fill_defaults(),
     )
+    payload.setdefault("tool_inputs", dict(raw_tool_inputs))
     if task.deps:
         for key, default_value in _dependency_fill_defaults().items():
             payload.setdefault(key, default_value)
@@ -1480,6 +1589,9 @@ def _build_capability_validation_payload(
             continue
         if isinstance(value, (int, float, bool)):
             payload[key] = value
+    # Keep capability schema validation aligned with deterministic runtime date defaults.
+    if "today" not in payload and "date" not in payload:
+        payload["today"] = datetime.utcnow().date().isoformat()
     return payload
 
 
@@ -1575,6 +1687,10 @@ def _task_depths(tasks: List[models.TaskCreate], limit: int) -> dict[str, int]:
 
 
 def run() -> None:
+    global _METRICS_SERVER_STARTED
+    if not _METRICS_SERVER_STARTED:
+        start_http_server(METRICS_PORT)
+        _METRICS_SERVER_STARTED = True
     group = "planner"
     consumer = str(uuid.uuid4())
     try:
@@ -1594,25 +1710,25 @@ def run() -> None:
                     continue
                 try:
                     plan = plan_job(job)
-                    event = models.EventEnvelope(
-                        type="plan.created",
-                        version="1",
-                        occurred_at=datetime.utcnow(),
-                        correlation_id=payload.get("correlation_id", str(uuid.uuid4())),
+                    correlation_id = str(payload.get("correlation_id", str(uuid.uuid4())))
+                    _emit_plan_event(
+                        "plan.created",
                         job_id=job.id,
+                        correlation_id=correlation_id,
                         payload=plan.model_dump(),
                     )
-                    redis_client.xadd(events.PLAN_STREAM, {"data": event.model_dump_json()})
+                    _emit_planner_capability_selection_event(
+                        job,
+                        plan,
+                        correlation_id=correlation_id,
+                    )
                 except Exception as exc:  # noqa: BLE001
-                    fail_event = models.EventEnvelope(
-                        type="plan.failed",
-                        version="1",
-                        occurred_at=datetime.utcnow(),
-                        correlation_id=payload.get("correlation_id", str(uuid.uuid4())),
+                    _emit_plan_event(
+                        "plan.failed",
                         job_id=job.id,
+                        correlation_id=str(payload.get("correlation_id", str(uuid.uuid4()))),
                         payload={"job_id": job.id, "error": str(exc)},
                     )
-                    redis_client.xadd(events.PLAN_STREAM, {"data": fail_event.model_dump_json()})
                 redis_client.xack(events.JOB_STREAM, group, message_id)
 
 

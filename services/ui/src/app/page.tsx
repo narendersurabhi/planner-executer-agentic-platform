@@ -5,7 +5,7 @@ import ComposerDagCanvas from "./components/composer/ComposerDagCanvas";
 import ComposerStepInspector from "./components/composer/ComposerStepInspector";
 import ComposerValidationPanel from "./components/composer/ComposerValidationPanel";
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const apiUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
 const jaegerUiUrl = (process.env.NEXT_PUBLIC_JAEGER_URL || "http://localhost:16686").replace(
   /\/+$/,
   ""
@@ -980,6 +980,65 @@ type IntentDecomposeResponse = {
   intent_graph: GoalIntentGraph;
 };
 
+type CapabilitySearchItem = {
+  id: string;
+  score: number;
+  reason: string;
+  source: string;
+  description?: string;
+  group?: string;
+  subgroup?: string;
+  tags?: string[];
+};
+
+type CapabilitySearchResponse = {
+  mode: string;
+  query: string;
+  intent?: string | null;
+  limit: number;
+  items: CapabilitySearchItem[];
+};
+
+type CapabilityRecommendation = {
+  id: string;
+  reason: string;
+  score: number;
+  confidence?: number;
+  source?: string;
+};
+
+const capabilitySourceBadgeClass = (source?: string) => {
+  switch (source) {
+    case "semantic_search":
+      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    case "llm":
+      return "border-sky-200 bg-sky-50 text-sky-700";
+    case "heuristic":
+    case "llm_fallback":
+    case "fallback_segment":
+      return "border-amber-200 bg-amber-50 text-amber-700";
+    default:
+      return "border-slate-200 bg-slate-50 text-slate-600";
+  }
+};
+
+const capabilitySourceLabel = (source?: string) => source || "unknown";
+
+const capabilityHoverCardText = (item: {
+  reason?: string;
+  score?: number;
+  source?: string;
+  description?: string;
+}) => {
+  const parts = [
+    item.reason ? `Reason: ${item.reason}` : "",
+    typeof item.score === "number" ? `Score: ${item.score.toFixed(2)}` : "",
+    item.source ? `Source: ${item.source}` : "",
+    item.description ? `Description: ${item.description}` : "",
+  ].filter(Boolean);
+  return parts.join("\n");
+};
+
 type ComposerValidationIssue = {
   severity: "error" | "warning";
   source: "local" | "compile" | "preflight";
@@ -1180,48 +1239,6 @@ type Template = {
   variables?: TemplateVariable[];
 };
 
-const LEGACY_RESUME_TEMPLATE_NAME_TOKENS = [
-  "resume tailor",
-  "resume render",
-  "cover letter",
-  "coverletter",
-];
-
-const LEGACY_RESUME_TEMPLATE_GOAL_TOKENS = [
-  "llm_tailor_resume_text",
-  "llm_improve_tailored_resume_text",
-  "llm_iterative_improve_tailored_resume_text",
-  "llm_generate_resume_doc_spec",
-  "llm_generate_resume_doc_spec_from_text",
-  "llm_generate_coverletter_doc_spec_from_text",
-  "llm_generate_cover_letter_from_resume",
-  "resume_doc_spec_validate",
-  "resume_doc_spec_to_document_spec",
-  "coverletter_doc_spec_to_document_spec",
-  "resume_generate_ats_docx",
-  "cover_letter_generate_ats_docx",
-  "tailored_resume",
-  "tailored_text",
-];
-
-const isLegacyResumeTemplate = (template: Partial<Template> | null | undefined) => {
-  if (!template) {
-    return false;
-  }
-  const name = String(template.name || "").toLowerCase();
-  const description = String(template.description || "").toLowerCase();
-  const goal = String(template.goal || "").toLowerCase();
-  const contextJson = String(template.contextJson || "").toLowerCase();
-  return (
-    LEGACY_RESUME_TEMPLATE_NAME_TOKENS.some(
-      (token) => name.includes(token) || description.includes(token)
-    ) ||
-    LEGACY_RESUME_TEMPLATE_GOAL_TOKENS.some(
-      (token) => goal.includes(token) || contextJson.includes(token)
-    )
-  );
-};
-
 const CHAINABLE_REQUIRED_FIELDS = new Set([
   "document_spec",
   "validation_report",
@@ -1331,7 +1348,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Do NOT prefix paths with repos/, repositories/, or the repo name. " +
       "Do not create GitHub repositories or push to Git.",
     contextJson:
-      '{\n  "code_goal": "{{code_goal}}",\n  "workspace_path": "{{workspace_path}}",\n  "constraints": "{{constraints}}",\n  "max_steps": "{{max_steps}}"\n}',
+      '{\n  "code_goal": "{{code_goal}}",\n  "workspace_path": "{{workspace_path}}",\n  "constraints": "{{constraints}}",\n  "goal": "{{code_goal}}",\n  "max_steps": "{{max_steps}}"\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -1370,27 +1387,21 @@ const BUILT_IN_TEMPLATES: Template[] = [
     id: "tpl-github-push-workspace",
     name: "GitHub: Generate Code & Open PR",
     description:
-      "Generate code into the workspace, create the GitHub repo if missing, then open a PR.",
+      "Generate code into the workspace and open a PR. Repository must already exist and be accessible to GitHub token.",
     goal:
-      "Ensure the GitHub repository '{{repo_owner}}/{{repo_name}}' exists (create if missing). " +
-      "Use repo_name exactly as provided (it must be a GitHub-safe slug). " +
-      "Do NOT call github_repo_update. If listing repositories, call github_repo_list WITHOUT an org field (personal account). " +
-      "When calling github_repo_create, set auto_init=true and use the provided default_branch so the branch is created. " +
-      "Then clone or pull the repository into '{{workspace_path}}' using github_repo_clone_or_pull " +
-      "(owner '{{repo_owner}}', repo '{{repo_name}}', path '{{workspace_path}}', branch '{{default_branch}}'). " +
-      "If clone/pull fails, stop and do not proceed. " +
-      "Then use coding_agent_autonomous to create {{workspace_path}}/IMPLEMENTATION_PLAN.md and implement each step " +
-      "for this goal: {{code_goal}}. Keep the implementation compact. If constraints are provided, follow them. " +
+      "Use github.repo.list with github_query: 'repo:{{repo_name}} owner:{{repo_owner}}' only to verify that repository '{{repo_owner}}/{{repo_name}}' exists. " +
+      "If the repository is missing, stop and do not proceed. " +
+      "Then use codegen.autonomous with explicit tool_inputs for implementation in the existing workspace path 'repos/{{repo_name}}': " +
+      "{goal: '{{code_goal}}', workspace_path: 'repos/{{repo_name}}', constraints: '{{constraints}}', max_steps: {{max_steps}}}. " +
+      "The coding task must create repos/{{repo_name}}/IMPLEMENTATION_PLAN.md and implement each step for this goal. " +
+      "Keep the implementation compact. If constraints are provided, follow them. " +
       "All file paths must be workspace-relative (repo-relative), e.g., docker-compose.yml or .github/workflows/ci.yml. " +
-      "Do NOT prefix paths with repos/, repositories/, or the repo name. " +
-      "Then create a branch and open a pull request from the workspace using github_repo_push_pr with owner '{{repo_owner}}' " +
-      "and repo '{{repo_name}}'. Do not invent alternate repo names. " +
-      "In the plan, do NOT generate a slug. Set tool_inputs explicitly for github_repo_create " +
-      "(name, description, private, default_branch), github_repo_clone_or_pull (owner, repo, path, branch), " +
-      "and github_repo_push_pr (owner, repo, path, base, branch, title, body, message) " +
-      "using the provided variables.",
+      "Use existing workspace path 'repos/{{repo_name}}' consistently. " +
+      "Then open the pull request using codegen.publish_pr with tool_inputs: " +
+      "{owner: '{{repo_owner}}', repo: '{{repo_name}}', branch: '{{pr_branch}}', base: '{{default_branch}}', " +
+      "workspace_path: 'repos/{{repo_name}}'}.",
     contextJson:
-      '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "max_steps": "{{max_steps}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "repo_private": "{{repo_private}}",\n  "auto_init": "true",\n  "default_branch": "{{default_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "commit_message": "{{commit_message}}",\n  "pr_branch": "{{pr_branch}}",\n  "pr_title": "{{pr_title}}",\n  "pr_body": "{{pr_body}}"\n}',
+  '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "goal": "{{code_goal}}",\n  "github_query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "max_steps": "{{max_steps}}",\n  "owner": "{{repo_owner}}",\n  "repo": "{{repo_name}}",\n  "branch": "{{pr_branch}}",\n  "base": "{{default_branch}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "default_branch": "{{default_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "pr_branch": "{{pr_branch}}",\n  "tool_inputs": {\n    "github.repo.list": {\n      "query": "repo:{{repo_name}} owner:{{repo_owner}}"\n    },\n    "codegen.autonomous": {\n      "goal": "{{code_goal}}",\n      "workspace_path": "repos/{{repo_name}}",\n      "constraints": "{{constraints}}",\n      "max_steps": "{{max_steps}}"\n    },\n    "codegen.publish_pr": {\n      "owner": "{{repo_owner}}",\n      "repo": "{{repo_name}}",\n      "branch": "{{pr_branch}}",\n      "base": "{{default_branch}}",\n      "workspace_path": "repos/{{repo_name}}"\n    }\n  }\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -1431,25 +1442,11 @@ const BUILT_IN_TEMPLATES: Template[] = [
         placeholder: "e.g., narendersurabhi"
       },
       {
-        key: "repo_private",
-        label: "Private Repo",
-        scope: "default",
-        required: false,
-        placeholder: "true or false"
-      },
-      {
         key: "default_branch",
         label: "Default Branch",
         scope: "default",
-        required: false,
-        placeholder: "dev"
-      },
-      {
-        key: "commit_message",
-        label: "Commit Message",
-        scope: "default",
-        required: false,
-        placeholder: "Initial commit"
+        required: true,
+        placeholder: "main"
       },
       {
         key: "pr_branch",
@@ -1458,42 +1455,25 @@ const BUILT_IN_TEMPLATES: Template[] = [
         required: true,
         placeholder: "e.g., feature/user-signup"
       },
-      {
-        key: "pr_title",
-        label: "PR Title",
-        scope: "per_run",
-        required: true,
-        placeholder: "e.g., Add user signup/signin"
-      },
-      {
-        key: "pr_body",
-        label: "PR Body",
-        scope: "default",
-        required: false,
-        placeholder: "Optional PR description"
-      }
     ]
   },
   {
     id: "tpl-github-improve-repo",
     name: "GitHub: Improve Existing Repo & Open PR",
     description:
-      "Clone an existing repo into the workspace, implement the goal, then open a PR.",
+      "Implement a goal in an already prepared workspace and open a PR.",
     goal:
-      "Use github_repo_clone_or_pull to fetch '{{repo_owner}}/{{repo_name}}' into '{{workspace_path}}' " +
-      "from base branch '{{base_branch}}'. " +
-      "Do NOT call github_repo_list. If clone/pull fails, stop the plan and do not proceed. " +
-      "Then use coding_agent_autonomous to create {{workspace_path}}/IMPLEMENTATION_PLAN.md and implement each step " +
-      "for this goal: {{code_goal}}. Keep the implementation compact. If constraints are provided, follow them. " +
+      "Use codegen.autonomous to implement repos/{{repo_name}}/IMPLEMENTATION_PLAN.md and each step for this goal: {{code_goal}}. " +
+      "Keep the implementation compact. If constraints are provided, follow them. " +
       "All file paths must be workspace-relative (repo-relative), e.g., docker-compose.yml or .github/workflows/ci.yml. " +
-      "Do NOT prefix paths with repos/, repositories/, or the repo name. " +
-      "Then create a branch and open a pull request from the workspace using github_repo_push_pr with owner '{{repo_owner}}' " +
+      "Use existing workspace path 'repos/{{repo_name}}' consistently. " +
+      "Then open a pull request from the workspace using codegen.publish_pr with owner '{{repo_owner}}' " +
       "and repo '{{repo_name}}'. Do not create or update the repository. " +
       "Use repo_name exactly as provided (it must be a GitHub-safe slug). " +
-      "Set tool_inputs explicitly for github_repo_clone_or_pull (owner, repo, path, branch) and github_repo_push_pr " +
-      "(owner, repo, path, base, branch, title, body, message) using the provided variables.",
+      "Set tool_inputs explicitly for codegen.autonomous(goal: '{{code_goal}}', workspace_path: 'repos/{{repo_name}}', constraints: '{{constraints}}', max_steps: {{max_steps}}) and codegen.publish_pr " +
+      "with required fields: {owner: '{{repo_owner}}', repo: '{{repo_name}}', branch: '{{pr_branch}}', base: '{{base_branch}}', workspace_path: 'repos/{{repo_name}}'}.",
     contextJson:
-      '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "max_steps": "{{max_steps}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "base_branch": "{{base_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "commit_message": "{{commit_message}}",\n  "pr_branch": "{{pr_branch}}",\n  "pr_title": "{{pr_title}}",\n  "pr_body": "{{pr_body}}"\n}',
+  '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "goal": "{{code_goal}}",\n  "github_query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "max_steps": "{{max_steps}}",\n  "owner": "{{repo_owner}}",\n  "repo": "{{repo_name}}",\n  "branch": "{{pr_branch}}",\n  "base": "{{base_branch}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "base_branch": "{{base_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "pr_branch": "{{pr_branch}}",\n  "tool_inputs": {\n    "github.repo.list": {\n      "query": "repo:{{repo_name}} owner:{{repo_owner}}"\n    },\n    "codegen.autonomous": {\n      "goal": "{{code_goal}}",\n      "workspace_path": "repos/{{repo_name}}",\n      "constraints": "{{constraints}}",\n      "max_steps": "{{max_steps}}"\n    },\n    "codegen.publish_pr": {\n      "owner": "{{repo_owner}}",\n      "repo": "{{repo_name}}",\n      "branch": "{{pr_branch}}",\n      "base": "{{base_branch}}",\n      "workspace_path": "repos/{{repo_name}}"\n    }\n  }\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -1536,15 +1516,8 @@ const BUILT_IN_TEMPLATES: Template[] = [
         key: "base_branch",
         label: "Base Branch",
         scope: "default",
-        required: false,
+        required: true,
         placeholder: "main"
-      },
-      {
-        key: "commit_message",
-        label: "Commit Message",
-        scope: "default",
-        required: false,
-        placeholder: "Improve repo per goal"
       },
       {
         key: "pr_branch",
@@ -1553,19 +1526,35 @@ const BUILT_IN_TEMPLATES: Template[] = [
         required: true,
         placeholder: "e.g., feature/improvements"
       },
+    ]
+  },
+  {
+    id: "tpl-github-check-repo-env",
+    name: "GitHub: Check Repo Exists (token from env)",
+    description:
+      "Check repository existence using authenticated GitHub search; token is read from GITHUB_TOKEN.",
+    goal:
+      "Use github.repo.list with github_query: 'repo:{{repo_name}} owner:{{repo_owner}}' to verify that repository '{{repo_owner}}/{{repo_name}}' exists. " +
+      "If the repository is not found, stop and report this failure. " +
+      "Do not include github_token in plan context; authentication should come from environment variable GITHUB_TOKEN.",
+    contextJson:
+      '{\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "github_query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "query": "repo:{{repo_name}} owner:{{repo_owner}}"\n}',
+    priority: 2,
+    builtIn: true,
+    variables: [
       {
-        key: "pr_title",
-        label: "PR Title",
+        key: "repo_owner",
+        label: "Repo Owner",
         scope: "per_run",
         required: true,
-        placeholder: "e.g., Improve signup reliability"
+        placeholder: "e.g., narendersurabhi"
       },
       {
-        key: "pr_body",
-        label: "PR Body",
-        scope: "default",
-        required: false,
-        placeholder: "Optional PR description"
+        key: "repo_name",
+        label: "Repo Name (slug)",
+        scope: "per_run",
+        required: true,
+        placeholder: "e.g., awesome-repo"
       }
     ]
   },
@@ -1611,6 +1600,63 @@ const BUILT_IN_TEMPLATES: Template[] = [
         scope: "per_run",
         required: true,
         placeholder: "2026-02-10"
+      },
+      {
+        key: "output_dir",
+        label: "Output Folder",
+        scope: "default",
+        required: false,
+        placeholder: "documents"
+      }
+    ]
+  },
+  {
+    id: "tpl-doc-from-markdown-style",
+    name: "Document from Markdown (Style Mapping)",
+    description:
+      "Convert markdown into a professional DOCX while preserving style intent through block mapping.",
+    goal:
+      "Use llm_generate_document_spec to transform {{markdown_text}} into a DocumentSpec. " +
+      "Use this mapping: '#'->heading level 1, '##'->heading 2, '###'->heading 3, plain paragraphs->paragraph, blank line->spacer, " +
+      "'- or *' list->bullets, '[text](url)' in paragraph text stays as plain paragraph text, " +
+      "'**bold**' and '_italic_' preserved with markdown-style emphasis converted into the corresponding tokenized inline style markers. " +
+      "Do not invent sections beyond the markdown structure. " +
+      "Set allowed_block_types to [\"text\",\"paragraph\",\"heading\",\"bullets\",\"spacer\",\"optional_paragraph\",\"repeat\"], strict=true, and document_type=\"document\". " +
+      "Validate the result with document_spec_validate strict=true. " +
+      "Then call document.output.derive (derive_output_path) with topic '{{topic}}', output_dir '{{output_dir}}', date '{{today}}'. " +
+      "Finally, call document.docx.generate with document_spec from llm_generate_document_spec and path from derive_output_path.",
+    contextJson:
+      '{\n  "markdown_text": "{{markdown_text}}",\n  "topic": "{{topic}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
+    priority: 2,
+    builtIn: true,
+    variables: [
+      {
+        key: "markdown_text",
+        label: "Markdown Source",
+        scope: "per_run",
+        required: true,
+        placeholder: "# Heading\\n\\nParagraph text..."
+      },
+      {
+        key: "topic",
+        label: "Output Topic",
+        scope: "per_run",
+        required: true,
+        placeholder: "Q2 Service Stability Report"
+      },
+      {
+        key: "tone",
+        label: "Tone",
+        scope: "default",
+        required: false,
+        placeholder: "Professional, concise"
+      },
+      {
+        key: "today",
+        label: "Today (YYYY-MM-DD)",
+        scope: "per_run",
+        required: true,
+        placeholder: "2026-03-12"
       },
       {
         key: "output_dir",
@@ -1911,6 +1957,7 @@ export default function Home() {
   const [intentAssessment, setIntentAssessment] = useState<GoalIntentAssessment | null>(null);
   const [intentClarificationAnswers, setIntentClarificationAnswers] = useState<string[]>([]);
   const [intentClarificationLoading, setIntentClarificationLoading] = useState(false);
+  const [jobSubmitLoading, setJobSubmitLoading] = useState(false);
   const [intentGraph, setIntentGraph] = useState<GoalIntentGraph | null>(null);
   const [intentGraphGoal, setIntentGraphGoal] = useState("");
   const [intentGraphLoading, setIntentGraphLoading] = useState(false);
@@ -1989,8 +2036,18 @@ export default function Home() {
   const [chainTargetInputField, setChainTargetInputField] = useState("document_spec");
   const [chainDefaultValue, setChainDefaultValue] = useState("");
   const [chainCapabilityQuery, setChainCapabilityQuery] = useState("");
+  const [semanticCapabilitySearchResults, setSemanticCapabilitySearchResults] = useState<
+    CapabilitySearchItem[]
+  >([]);
+  const [semanticCapabilitySearchLoading, setSemanticCapabilitySearchLoading] = useState(false);
+  const [semanticCapabilitySearchError, setSemanticCapabilitySearchError] = useState<string | null>(
+    null
+  );
+  const [semanticGoalCapabilityRecommendations, setSemanticGoalCapabilityRecommendations] =
+    useState<CapabilitySearchItem[]>([]);
+  const [semanticGoalCapabilityLoading, setSemanticGoalCapabilityLoading] = useState(false);
   const [llmCapabilityRecommendations, setLlmCapabilityRecommendations] = useState<
-    Array<{ id: string; reason: string; score: number; confidence?: number }>
+    CapabilityRecommendation[]
   >([]);
   const [llmCapabilityRecommendationSource, setLlmCapabilityRecommendationSource] = useState<
     "llm" | "heuristic" | "llm_fallback" | null
@@ -2299,6 +2356,28 @@ export default function Home() {
     }
   };
 
+  const searchCapabilities = async (
+    query: string,
+    options?: { intent?: string; limit?: number }
+  ) => {
+    const response = await fetch(`${apiUrl}/capabilities/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query,
+        intent: options?.intent,
+        limit: options?.limit ?? 8,
+      }),
+    });
+    const body = (await response.json()) as CapabilitySearchResponse | { detail?: unknown };
+    if (!response.ok) {
+      const detail =
+        body && typeof body === "object" && "detail" in body ? String(body.detail || "") : "";
+      throw new Error(detail || `Capability search failed (${response.status}).`);
+    }
+    return body as CapabilitySearchResponse;
+  };
+
   const availableCapabilities = useMemo(() => {
     const items = capabilityCatalog?.items || [];
     return [...items].sort((a, b) => a.id.localeCompare(b.id));
@@ -2337,18 +2416,98 @@ export default function Home() {
     }));
   }, [availableCapabilities, visualChainNodes]);
 
+  useEffect(() => {
+    const query = chainCapabilityQuery.trim();
+    if (!query || chainCapabilityOptions.length === 0) {
+      setSemanticCapabilitySearchResults([]);
+      setSemanticCapabilitySearchError(null);
+      setSemanticCapabilitySearchLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const handle = window.setTimeout(async () => {
+      setSemanticCapabilitySearchLoading(true);
+      setSemanticCapabilitySearchError(null);
+      try {
+        const result = await searchCapabilities(query, { limit: 12 });
+        if (cancelled) {
+          return;
+        }
+        setSemanticCapabilitySearchResults(result.items || []);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setSemanticCapabilitySearchResults([]);
+        setSemanticCapabilitySearchError(
+          error instanceof Error ? error.message : "Capability search failed."
+        );
+      } finally {
+        if (!cancelled) {
+          setSemanticCapabilitySearchLoading(false);
+        }
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [chainCapabilityOptions.length, chainCapabilityQuery]);
+
+  useEffect(() => {
+    const query = goal.trim();
+    if (!query || chainCapabilityOptions.length === 0) {
+      setSemanticGoalCapabilityRecommendations([]);
+      setSemanticGoalCapabilityLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const handle = window.setTimeout(async () => {
+      setSemanticGoalCapabilityLoading(true);
+      try {
+        const result = await searchCapabilities(query, { limit: 6 });
+        if (cancelled) {
+          return;
+        }
+        setSemanticGoalCapabilityRecommendations(result.items || []);
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        setSemanticGoalCapabilityRecommendations([]);
+      } finally {
+        if (!cancelled) {
+          setSemanticGoalCapabilityLoading(false);
+        }
+      }
+    }, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [chainCapabilityOptions.length, goal]);
+
   const filteredChainCapabilityOptions = useMemo(() => {
     const query = chainCapabilityQuery.trim().toLowerCase();
     if (!query) {
       return chainCapabilityOptions;
     }
-    return chainCapabilityOptions.filter((item) =>
+    const lexical = chainCapabilityOptions.filter((item) =>
       [item.id, item.label, item.description, item.group, item.subgroup]
         .join(" ")
         .toLowerCase()
         .includes(query)
     );
-  }, [chainCapabilityOptions, chainCapabilityQuery]);
+    if (semanticCapabilitySearchResults.length === 0) {
+      return lexical;
+    }
+    const byId = new Map(chainCapabilityOptions.map((item) => [item.id, item]));
+    const semanticOrdered = semanticCapabilitySearchResults
+      .map((item) => byId.get(item.id))
+      .filter((item): item is (typeof chainCapabilityOptions)[number] => Boolean(item));
+    const seen = new Set(semanticOrdered.map((item) => item.id));
+    return [...semanticOrdered, ...lexical.filter((item) => !seen.has(item.id))];
+  }, [chainCapabilityOptions, chainCapabilityQuery, semanticCapabilitySearchResults]);
 
   const chainCapabilityRecommendations = useMemo(() => {
     if (chainCapabilityOptions.length === 0) {
@@ -2405,7 +2564,8 @@ export default function Home() {
       return {
         id: item.id,
         score,
-        reason: reasons.join(" • ")
+        reason: reasons.join(" • "),
+        source: "heuristic",
       };
     });
 
@@ -2414,14 +2574,27 @@ export default function Home() {
       .slice(0, 6);
   }, [chainCapabilityOptions, goal, visualChainNodes, contextJson]);
 
-  const displayedCapabilityRecommendations = useMemo(() => {
+  const displayedCapabilityRecommendations = useMemo<CapabilityRecommendation[]>(() => {
     if (llmCapabilityRecommendations.length === 0) {
+      if (semanticGoalCapabilityRecommendations.length > 0) {
+        return semanticGoalCapabilityRecommendations.map((item) => ({
+          id: item.id,
+          reason: item.reason,
+          score: item.score,
+          source: item.source || "semantic_search",
+        }));
+      }
       return chainCapabilityRecommendations;
     }
     const validIds = new Set(chainCapabilityOptions.map((item) => item.id));
     const filtered = llmCapabilityRecommendations.filter((item) => validIds.has(item.id));
     return filtered.length > 0 ? filtered : chainCapabilityRecommendations;
-  }, [chainCapabilityOptions, chainCapabilityRecommendations, llmCapabilityRecommendations]);
+  }, [
+    chainCapabilityOptions,
+    chainCapabilityRecommendations,
+    llmCapabilityRecommendations,
+    semanticGoalCapabilityRecommendations,
+  ]);
 
   useEffect(() => {
     if (!visualChainDraftCapability && chainCapabilityOptions.length > 0) {
@@ -2938,7 +3111,8 @@ export default function Home() {
           score: Number.isFinite(Number(entry.score)) ? Number(entry.score) : 0,
           confidence: Number.isFinite(Number(entry.confidence))
             ? Number(entry.confidence)
-            : undefined
+            : undefined,
+          source: body.source || "heuristic",
         }))
         .filter((entry) => Boolean(entry.id));
       setLlmCapabilityRecommendations(normalized);
@@ -3114,6 +3288,35 @@ export default function Home() {
       return;
     }
     addCapabilityNodeToVisualChain(normalizedId);
+  };
+
+  const addTopSuggestedCapabilitiesToVisualChain = (
+    capabilityIds: string[],
+    options?: { limit?: number; segmentId?: string }
+  ) => {
+    const limit = Math.max(1, Math.min(10, options?.limit ?? 3));
+    const selected = capabilityIds
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .slice(0, limit);
+    if (selected.length === 0) {
+      return;
+    }
+    const valid = selected.filter((capabilityId) => capabilityById.has(capabilityId));
+    const missing = selected.filter((capabilityId) => !capabilityById.has(capabilityId));
+    if (valid.length === 0) {
+      setChainComposerNotice(
+        `Intent suggestions${options?.segmentId ? ` for ${options.segmentId}` : ""} are not in the current capability catalog.`
+      );
+      return;
+    }
+    setVisualChainDraftCapability(valid[0]);
+    valid.forEach((capabilityId) => addCapabilityNodeToVisualChain(capabilityId));
+    setChainComposerNotice(
+      `Added ${valid.length} suggested capability step(s)${
+        options?.segmentId ? ` from ${options.segmentId}` : ""
+      }.${missing.length > 0 ? ` Skipped ${missing.length} missing catalog item(s).` : ""}`
+    );
   };
 
   const buildDeriveOutputBindings = (
@@ -4937,6 +5140,9 @@ export default function Home() {
     if (intentClarificationLoading) {
       return "Intent clarification check is running.";
     }
+    if (jobSubmitLoading) {
+      return "Submitting job...";
+    }
     if (intentAssessment?.needs_clarification && unresolvedIntentQuestions > 0) {
       return `Answer ${unresolvedIntentQuestions} intent clarification question(s).`;
     }
@@ -4948,6 +5154,7 @@ export default function Home() {
     goal,
     intentAssessment,
     intentClarificationLoading,
+    jobSubmitLoading,
     missingCapabilityInputs.length,
     parsedContextForCapabilities,
     unresolvedIntentQuestions
@@ -5047,7 +5254,7 @@ export default function Home() {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         const custom = parsed
-          .filter((entry) => entry && entry.id && entry.name && !isLegacyResumeTemplate(entry))
+          .filter((entry) => entry && entry.id && entry.name)
           .map((entry) => {
             return {
               ...entry,
@@ -5192,11 +5399,9 @@ export default function Home() {
     if (templates.length === 0) {
       return;
     }
-    const custom = templates.filter((template) => !template.builtIn && !isLegacyResumeTemplate(template));
+    const custom = templates.filter((template) => !template.builtIn);
     window.localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(custom));
-    const order = templates
-      .filter((template) => !isLegacyResumeTemplate(template))
-      .map((template) => template.id);
+    const order = templates.map((template) => template.id);
     window.localStorage.setItem(TEMPLATE_ORDER_KEY, JSON.stringify(order));
   }, [templates]);
 
@@ -5292,10 +5497,18 @@ export default function Home() {
     try {
       setIntentClarificationLoading(true);
       let assessmentForSubmit = intentAssessment;
+      const clarifyController = new AbortController();
+      const clarifyTimeoutMs = 8000;
+      const clarifyTimeoutId = window.setTimeout(() => {
+        clarifyController.abort();
+      }, clarifyTimeoutMs);
       const clarifyResponse = await fetch(`${apiUrl}/intent/clarify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ goal: goal.trim() })
+        body: JSON.stringify({ goal: goal.trim() }),
+        signal: clarifyController.signal
+      }).finally(() => {
+        window.clearTimeout(clarifyTimeoutId);
       });
       if (clarifyResponse.ok) {
         const clarifyBody = (await clarifyResponse.json()) as IntentClarifyResponse;
@@ -5312,6 +5525,8 @@ export default function Home() {
         );
         return;
       }
+      setIntentClarificationLoading(false);
+      setJobSubmitLoading(true);
 
       let submissionGoal = goal.trim();
       const submissionContext = { ...(parsedContext as Record<string, unknown>) };
@@ -5382,9 +5597,14 @@ export default function Home() {
       setIntentClarificationAnswers([]);
       loadJobs();
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setSubmitError("Intent clarification timed out after 8s. Retry and check API reachability.");
+        return;
+      }
       setSubmitError(error instanceof Error ? error.message : "Network error while submitting job.");
     } finally {
       setIntentClarificationLoading(false);
+      setJobSubmitLoading(false);
     }
   };
 
@@ -6824,28 +7044,88 @@ const openTemplateModal = (template: Template) => {
               {displayedCapabilityRecommendations.length > 0 ? (
                 <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
                   <span className="text-slate-500">
-                    Recommended{llmCapabilityRecommendationSource ? ` (${llmCapabilityRecommendationSource})` : ""}:
+                    Recommended
+                    {llmCapabilityRecommendationSource
+                      ? ` (${llmCapabilityRecommendationSource})`
+                      : semanticGoalCapabilityRecommendations.length > 0
+                        ? " (semantic_search)"
+                        : ""}:
                   </span>
+                  {semanticGoalCapabilityRecommendations.length > 0 &&
+                  llmCapabilityRecommendations.length === 0 ? (
+                    <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-emerald-700">
+                      semantic_search
+                    </span>
+                  ) : null}
+                  <div className="flex flex-wrap items-center gap-1 text-[10px] text-slate-500">
+                    <span>Legend:</span>
+                    {["semantic_search", "llm", "heuristic"].map((source) => (
+                      <span
+                        key={`cap-legend-${source}`}
+                        className={`rounded-full border px-2 py-0.5 uppercase tracking-[0.12em] ${capabilitySourceBadgeClass(source)}`}
+                      >
+                        {capabilitySourceLabel(source)}
+                      </span>
+                    ))}
+                  </div>
+                  <button
+                    className="rounded-full border border-slate-300 bg-white px-2 py-0.5 text-[10px] font-semibold text-slate-700 hover:border-slate-400 disabled:opacity-50"
+                    onClick={() =>
+                      addTopSuggestedCapabilitiesToVisualChain(
+                        displayedCapabilityRecommendations.map((item) => item.id),
+                        {
+                          limit: 3,
+                          segmentId: llmCapabilityRecommendationSource || "recommended",
+                        }
+                      )
+                    }
+                    disabled={displayedCapabilityRecommendations.length === 0}
+                    title="Add the top 3 currently recommended capabilities to the visual chain"
+                  >
+                    Add recommended top 3
+                  </button>
                   {displayedCapabilityRecommendations.map((item) => (
-                    <button
-                      key={`cap-rec-${item.id}`}
-                      className={`rounded-full border px-2 py-0.5 ${
-                        visualChainDraftCapability === item.id
-                          ? "border-sky-300 bg-sky-50 text-sky-700"
-                          : "border-slate-300 bg-white text-slate-700"
-                      }`}
-                      onClick={() => setVisualChainDraftCapability(item.id)}
-                      title={item.reason}
-                    >
-                      {item.id}
-                    </button>
+                    <div key={`cap-rec-${item.id}`} className="group relative inline-flex">
+                      <button
+                        className={`rounded-full border px-2 py-0.5 ${
+                          visualChainDraftCapability === item.id
+                            ? "border-sky-300 bg-sky-50 text-sky-700"
+                            : "border-slate-300 bg-white text-slate-700"
+                        }`}
+                        onClick={() => setVisualChainDraftCapability(item.id)}
+                      >
+                        {item.id}
+                        <span
+                          className={`ml-1 rounded-full border px-1 py-[1px] text-[9px] uppercase tracking-[0.12em] ${capabilitySourceBadgeClass(item.source)}`}
+                        >
+                          {capabilitySourceLabel(item.source)}
+                        </span>
+                        <span className="ml-1 rounded-full bg-slate-100 px-1 py-[1px] text-[9px] text-slate-600">
+                          {item.score.toFixed(1)}
+                        </span>
+                      </button>
+                      <div className="pointer-events-none absolute left-0 top-full z-20 mt-1 hidden min-w-[240px] whitespace-pre-line rounded-lg border border-slate-200 bg-slate-950 px-3 py-2 text-[10px] leading-4 text-white shadow-xl group-hover:block">
+                        {capabilityHoverCardText(item)}
+                      </div>
+                    </div>
                   ))}
                 </div>
+              ) : null}
+              {semanticGoalCapabilityLoading && llmCapabilityRecommendations.length === 0 ? (
+                <div className="text-[11px] text-slate-500">Finding capabilities related to the goal...</div>
               ) : null}
               {llmCapabilityRecommendationWarning ? (
                 <div className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
                   Recommendation note: {llmCapabilityRecommendationWarning}
                 </div>
+              ) : null}
+              {semanticCapabilitySearchError ? (
+                <div className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                  Search note: {semanticCapabilitySearchError}
+                </div>
+              ) : null}
+              {semanticCapabilitySearchLoading ? (
+                <div className="text-[11px] text-slate-500">Searching capability catalog...</div>
               ) : null}
               {filteredChainCapabilityOptions.length === 0 ? (
                 <div className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
@@ -7711,6 +7991,9 @@ const openTemplateModal = (template: Template) => {
                 {intentClarificationLoading ? (
                   <div className="mt-3 text-xs text-slate-500">Checking goal intent clarity...</div>
                 ) : null}
+                {jobSubmitLoading ? (
+                  <div className="mt-3 text-xs text-slate-500">Submitting job...</div>
+                ) : null}
                 <div className="mt-4 grid gap-4">
                   <div>
                     <label className="text-sm font-medium text-slate-700">Goal</label>
@@ -7787,6 +8070,17 @@ const openTemplateModal = (template: Template) => {
                                   cap autofilled: {intentGraph.summary.capability_suggestions_autofilled}
                                 </span>
                               ) : null}
+                              <div className="flex flex-wrap items-center gap-1 text-[10px] text-slate-500">
+                                <span>Sources:</span>
+                                {["semantic_search", "llm", "heuristic", "fallback_segment"].map((source) => (
+                                  <span
+                                    key={`intent-source-legend-${source}`}
+                                    className={`rounded-full border px-2 py-0.5 uppercase tracking-[0.12em] ${capabilitySourceBadgeClass(source)}`}
+                                  >
+                                    {capabilitySourceLabel(source)}
+                                  </span>
+                                ))}
+                              </div>
                             </div>
                             <div className="space-y-2">
                               {intentGraph.segments.map((segment) => (
@@ -7798,9 +8092,25 @@ const openTemplateModal = (template: Template) => {
                                     <div className="text-xs font-semibold text-slate-800">
                                       {segment.id}: {segment.intent}
                                     </div>
-                                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
-                                      confidence {segment.confidence.toFixed(2)}
-                                    </span>
+                                    <div className="flex items-center gap-2">
+                                      {segment.suggested_capabilities.length > 1 ? (
+                                        <button
+                                          className="rounded-full border border-slate-300 bg-white px-2 py-0.5 text-[10px] font-semibold text-slate-700 hover:border-slate-400"
+                                          onClick={() =>
+                                            addTopSuggestedCapabilitiesToVisualChain(
+                                              segment.suggested_capabilities,
+                                              { limit: 3, segmentId: segment.id }
+                                            )
+                                          }
+                                          title="Add the top 3 suggested capabilities from this segment to the visual chain"
+                                        >
+                                          Add top 3
+                                        </button>
+                                      ) : null}
+                                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
+                                        confidence {segment.confidence.toFixed(2)}
+                                      </span>
+                                    </div>
                                   </div>
                                   {segment.objective ? (
                                     <div className="mt-1 text-[11px] text-slate-600">{segment.objective}</div>
@@ -7828,20 +8138,42 @@ const openTemplateModal = (template: Template) => {
                                         const ranking = segment.suggested_capability_rankings?.find(
                                           (entry) => entry.id === capabilityId
                                         );
-                                        const title = ranking?.reason
-                                          ? `${ranking.reason} (source: ${ranking.source || "n/a"}, score: ${ranking.score.toFixed(3)})`
-                                          : "Add to chain and auto-connect to previous step";
                                         return (
-                                        <button
+                                        <div
                                           key={`intent-capability-${segment.id}-${capabilityId}`}
-                                          className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] text-sky-700 hover:bg-sky-100"
-                                          onClick={() =>
-                                            addIntentSuggestedCapabilityToVisualChain(capabilityId)
-                                          }
-                                          title={title}
+                                          className="group relative inline-flex"
                                         >
-                                          {capabilityId}
-                                        </button>
+                                          <button
+                                            className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] text-sky-700 hover:bg-sky-100"
+                                            onClick={() =>
+                                              addIntentSuggestedCapabilityToVisualChain(capabilityId)
+                                            }
+                                          >
+                                            {capabilityId}
+                                            {ranking?.source ? (
+                                              <span
+                                                className={`ml-1 rounded-full border px-1 py-[1px] text-[9px] uppercase tracking-[0.12em] ${capabilitySourceBadgeClass(ranking.source)}`}
+                                              >
+                                                {capabilitySourceLabel(ranking.source)}
+                                              </span>
+                                            ) : null}
+                                            {typeof ranking?.score === "number" ? (
+                                              <span className="ml-1 rounded-full bg-slate-100 px-1 py-[1px] text-[9px] text-slate-600">
+                                                {ranking.score.toFixed(1)}
+                                              </span>
+                                            ) : null}
+                                          </button>
+                                          <div className="pointer-events-none absolute left-0 top-full z-20 mt-1 hidden min-w-[240px] whitespace-pre-line rounded-lg border border-slate-200 bg-slate-950 px-3 py-2 text-[10px] leading-4 text-white shadow-xl group-hover:block">
+                                            {capabilityHoverCardText({
+                                              reason:
+                                                ranking?.reason ||
+                                                "Add to chain and auto-connect to previous step.",
+                                              score: ranking?.score,
+                                              source: ranking?.source,
+                                              description: capabilityById.get(capabilityId)?.description,
+                                            })}
+                                          </div>
+                                        </div>
                                         );
                                       })}
                                     </div>
@@ -8304,10 +8636,10 @@ const openTemplateModal = (template: Template) => {
                   <button
                     className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-md transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={submitJob}
-                    disabled={isSubmitDisabled || intentClarificationLoading}
+                    disabled={isSubmitDisabled}
                     title={submitDisabledReason || ""}
                   >
-                    Submit Job
+                    {jobSubmitLoading ? "Submitting..." : "Submit Job"}
                   </button>
                   {submitDisabledReason ? (
                     <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">

@@ -1,0 +1,38 @@
+{
+  "$id": "capability_search_event",
+  "type": "object",
+  "properties": {
+    "correlation_id": { "type": "string", "minLength": 1 },
+    "job_id": { "type": ["string", "null"] },
+    "query": { "type": "string", "minLength": 1 },
+    "intent": { "type": ["string", "null"] },
+    "limit": { "type": "integer", "minimum": 1 },
+    "request_source": { "type": "string", "minLength": 1 },
+    "latency_ms": { "type": "number", "minimum": 0 },
+    "result_count": { "type": "integer", "minimum": 0 },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "score": { "type": "number" },
+          "reason": { "type": "string" },
+          "source": { "type": "string" }
+        },
+        "required": ["id", "score", "reason", "source"],
+        "additionalProperties": true
+      }
+    }
+  },
+  "required": [
+    "correlation_id",
+    "query",
+    "limit",
+    "request_source",
+    "latency_ms",
+    "result_count",
+    "results"
+  ],
+  "additionalProperties": true
+}

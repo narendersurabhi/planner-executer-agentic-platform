@@ -15,3 +15,38 @@ data:
         static_configs:
           - targets:
               - api.awe.svc.cluster.local:8000
+      - job_name: awe-planner
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - planner.awe.svc.cluster.local:9101
+      - job_name: awe-worker
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - worker.awe.svc.cluster.local:9102
+      - job_name: awe-policy
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - policy.awe.svc.cluster.local:9103
+      - job_name: awe-coder
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - coder.awe.svc.cluster.local:8000
+      - job_name: awe-prometheus
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - prometheus.awe.svc.cluster.local:9090
+      - job_name: awe-loki
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - loki.awe.svc.cluster.local:3100
+      - job_name: awe-grafana
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - grafana.awe.svc.cluster.local:3000

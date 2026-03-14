@@ -13,6 +13,7 @@ from pathlib import Path
 
 import redis
 from jsonschema import Draft202012Validator
+from prometheus_client import start_http_server
 
 from libs.core import (
     capability_registry,
@@ -142,8 +143,10 @@ WORKER_DEFAULT_MAX_ATTEMPTS = (
     _parse_optional_int(os.getenv("WORKER_DEFAULT_MAX_ATTEMPTS", "3")) or 3
 )
 WORKER_DLQ_ENABLED = os.getenv("WORKER_DLQ_ENABLED", "true").lower() == "true"
+METRICS_PORT = _parse_optional_int(os.getenv("WORKER_METRICS_PORT", "9102")) or 9102
 _SEMANTIC_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s+|\n+")
 _SEMANTIC_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
+_METRICS_SERVER_STARTED = False
 
 
 LLM_PROVIDER_INSTANCE = None
@@ -2291,6 +2294,10 @@ def _process_task_ready_message(message_id: str, envelope: Mapping[str, Any]) ->
 
 
 def run() -> None:
+    global _METRICS_SERVER_STARTED
+    if not _METRICS_SERVER_STARTED:
+        start_http_server(METRICS_PORT)
+        _METRICS_SERVER_STARTED = True
     group = WORKER_GROUP
     consumer = WORKER_CONSUMER
     try:

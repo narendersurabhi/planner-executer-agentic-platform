@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-job-metrics
+  namespace: awe
+data:
+  job-metrics.json: |
+    {
+      "uid": "job-metrics",
+      "title": "Job Metrics",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "Jobs Created (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "rate(jobs_created_total[5m])",
+              "legendFormat": "jobs"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "Intent Clarification Required (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "rate(intent_clarification_required_total[5m])",
+              "legendFormat": "clarification required"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "Intent Decompose Requests (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (mode, result) (rate(intent_decompose_requests_total[5m]))",
+              "legendFormat": "{{mode}} / {{result}}"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Intent Decompose Failures (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (mode, error_type) (rate(intent_decompose_failures_total[5m]))",
+              "legendFormat": "{{mode}} / {{error_type}}"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Orchestrator Recovered Events (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (stream) (rate(orchestrator_recovered_events_total[5m]))",
+              "legendFormat": "{{stream}}"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Orchestrator Errors (rate)",
+          "datasource": "Prometheus",
+          "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "rate(orchestrator_loop_errors_total[5m])",
+              "legendFormat": "loop"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (stream) (rate(orchestrator_handle_errors_total[5m]))",
+              "legendFormat": "handle / {{stream}}"
+            }
+          ]
+        }
+      ]
+    }

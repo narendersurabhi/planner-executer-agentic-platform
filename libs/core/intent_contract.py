@@ -354,7 +354,9 @@ def _coerce_payload_mapping(payload: Any) -> Mapping[str, Any]:
 
 def _value_present(value: Any, *, key: str) -> bool:
     if key == "document_spec":
-        return isinstance(value, Mapping) and bool(value)
+        # Planner-time validation may normalize dependency references to {} placeholders.
+        # Treat any mapping as present so intent checks don't reject valid dependency wiring.
+        return isinstance(value, Mapping)
     if isinstance(value, str):
         return bool(value.strip())
     return value is not None
@@ -373,11 +375,34 @@ def _job_context_value(payload_map: Mapping[str, Any], key: str) -> Any:
 
 
 def _payload_has_required_input(payload_map: Mapping[str, Any], key: str) -> bool:
+    if key == "length":
+        for candidate in ("length", "target_pages", "page_count", "max_words", "word_count"):
+            if candidate in payload_map and _value_present(payload_map.get(candidate), key=candidate):
+                return True
+            value = _job_context_value(payload_map, candidate)
+            if _value_present(value, key=candidate):
+                return True
+        # For document generation, a concrete instruction is often sufficient to infer length.
+        if _value_present(payload_map.get("instruction"), key="instruction"):
+            return True
     if key in payload_map and _value_present(payload_map.get(key), key=key):
         return True
     aliases: dict[str, tuple[str, ...]] = {
         "path": ("output_path",),
         "output_path": ("path",),
+        "date": ("today",),
+        "filename": ("file_name", "output_filename", "path", "output_path"),
+        "github_query": ("query",),
+        "target_repo": ("query", "github_query", "repo", "repo_name"),
+        "title": (
+            "document_title",
+            "topic",
+            "subject",
+            "target_role_name",
+            "role_name",
+            "job_title",
+            "role",
+        ),
         "job_posting_text": ("job_description",),
         "company_logo_image": ("company_logo", "company_logo_url", "logo_url"),
     }
@@ -442,6 +467,14 @@ def validate_intent_segment_contract(
     for key in slots.get("must_have_inputs", []):
         if not isinstance(key, str) or not key:
             continue
+        if (
+            key in {"path", "output_path"}
+            and _capability_auto_derives_output_path(capability_id or tool_name)
+        ):
+            continue
+        if key == "document_spec" and _capability_derives_output_path(capability_id or tool_name):
+            # Output-path derivation capabilities don't need the full document spec payload.
+            continue
         if "_or_" in key:
             continue
         if _payload_has_required_input(payload_map, key):
@@ -481,6 +514,25 @@ def validate_intent_segment_contract(
         actual = _normalize_risk_level(capability_risk_tier) or str(capability_risk_tier or "")
         return f"risk_level_mismatch:{tool_name}:expected<={expected}:actual={actual}"
     return None
+
+
+def _capability_auto_derives_output_path(capability_id_or_tool_name: str) -> bool:
+    normalized = str(capability_id_or_tool_name or "").strip().lower()
+    return normalized in {
+        "document.docx.generate",
+        "document.pdf.generate",
+        "docx_generate_from_spec",
+        "pdf_generate_from_spec",
+    }
+
+
+def _capability_derives_output_path(capability_id_or_tool_name: str) -> bool:
+    normalized = str(capability_id_or_tool_name or "").strip().lower()
+    return normalized in {
+        "document.output.derive",
+        "derive_output_path",
+        "derive_output_filename",
+    }
 
 
 def _infer_intent_from_text_with_source(
@@ -610,7 +662,7 @@ def _required_inputs_for_clause(intent: str, clause: str) -> tuple[str, ...]:
         elif "docx" in lowered:
             base.append("output_format=docx")
     if intent == "io" and any(token in lowered for token in ("github", "repo", "repository")):
-        base.append("github_query")
+        base.append("query")
     deduped: list[str] = []
     for item in base:
         if item not in deduped:
@@ -623,9 +675,9 @@ def _suggested_capabilities_for_clause(intent: str, clause: str) -> tuple[str, .
     lowered = clause.lower()
     if intent == "render":
         if "pdf" in lowered:
-            suggestions = ["document.pdf.generate", "document.output.derive"]
+            suggestions = ["document.pdf.generate"]
         elif "docx" in lowered:
-            suggestions = ["document.docx.generate", "document.output.derive"]
+            suggestions = ["document.docx.generate"]
     if intent == "io" and any(token in lowered for token in ("github", "repo", "repository")):
         suggestions.insert(0, "github.repo.list")
     deduped: list[str] = []

@@ -12,7 +12,7 @@ Required env:
 Optional env:
   IMAGE_REGISTRY      Container registry (default: ghcr.io)
   IMAGE_TAG           Image tag (default: latest)
-  NEXT_PUBLIC_API_URL UI build arg (default: http://localhost:18000)
+  NEXT_PUBLIC_API_URL UI build arg (default: /api)
   NEXT_PUBLIC_DEV_TOOLS UI build arg (default: false)
 EOF
 }
@@ -49,7 +49,7 @@ for service in "${services[@]}"; do
     build)
       if [[ "$service" == "ui" ]]; then
         docker build \
-          --build-arg "NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:18000}" \
+          --build-arg "NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-/api}" \
           --build-arg "NEXT_PUBLIC_DEV_TOOLS=${NEXT_PUBLIC_DEV_TOOLS:-false}" \
           -f "services/${service}/Dockerfile" \
           -t "${image}" \

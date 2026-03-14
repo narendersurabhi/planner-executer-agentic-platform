@@ -66,6 +66,65 @@ def test_intent_decompose_endpoint_returns_graph():
     assert "must_have_inputs" in graph["segments"][0]["slots"]
 
 
+def test_capabilities_search_returns_ranked_matches() -> None:
+    response = client.post(
+        "/capabilities/search",
+        json={"query": "render a pdf report from a document spec", "intent": "render", "limit": 5},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["query"] == "render a pdf report from a document spec"
+    assert body["intent"] == "render"
+    assert len(body["items"]) >= 1
+    ids = [item["id"] for item in body["items"]]
+    assert "document.pdf.generate" in ids
+    first = body["items"][0]
+    assert isinstance(first["score"], float)
+    assert isinstance(first["reason"], str) and first["reason"]
+
+
+def test_capabilities_search_emits_capability_search_event(monkeypatch) -> None:
+    events_seen = []
+    monkeypatch.setattr(
+        main,
+        "_emit_event",
+        lambda event_type, payload: events_seen.append((event_type, payload)),
+    )
+
+    response = client.post(
+        "/capabilities/search",
+        json={
+            "query": "render a pdf report from a document spec",
+            "intent": "render",
+            "limit": 5,
+            "request_source": "composer",
+            "correlation_id": "corr-search-1",
+            "job_id": "job-search-1",
+        },
+    )
+    assert response.status_code == 200
+    assert events_seen
+    event_type, payload = events_seen[-1]
+    assert event_type == "plan.capability_search"
+    assert payload["request_source"] == "composer"
+    assert payload["correlation_id"] == "corr-search-1"
+    assert payload["job_id"] == "job-search-1"
+    assert payload["result_count"] >= 1
+    assert any(item["id"] == "document.pdf.generate" for item in payload["results"])
+
+
+def test_capabilities_search_requires_query() -> None:
+    response = client.post("/capabilities/search", json={"query": ""})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "query_required"
+
+
+def test_capabilities_search_validates_limit() -> None:
+    response = client.post("/capabilities/search", json={"query": "pdf", "limit": 0})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit_out_of_range"
+
+
 def test_intent_decompose_endpoint_uses_llm_when_enabled(monkeypatch):
     class _Provider:
         def generate(self, prompt: str):  # noqa: ARG002
@@ -493,6 +552,55 @@ def test_intent_decompose_uses_semantic_workflow_hints_in_llm_prompt(monkeypatch
     assert graph["summary"]["memory_hints_used"] >= 1
     assert prompts
     assert "Similar successful workflow hints from semantic memory" in prompts[0]
+
+
+def test_intent_decompose_uses_semantic_capability_hints_in_llm_prompt(monkeypatch):
+    prompts: list[str] = []
+
+    class _Provider:
+        def generate(self, prompt: str):  # noqa: ARG002
+            prompts.append(prompt)
+            return LLMResponse(
+                content=(
+                    '{"segments":[{"id":"s1","intent":"render","objective":"Render pdf report",'
+                    '"confidence":0.9,"depends_on":[],"required_inputs":["document_spec","path"],'
+                    '"suggested_capabilities":["document.pdf.generate"]}]}'
+                )
+            )
+
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_MODE", "llm")
+    monkeypatch.setattr(main, "_intent_decompose_provider", _Provider())
+
+    response = client.post(
+        "/intent/decompose",
+        json={"goal": "Render a PDF report from a document spec"},
+    )
+    assert response.status_code == 200
+    graph = response.json()["intent_graph"]
+    assert graph["summary"]["semantic_capability_hints_used"] >= 1
+    assert prompts
+    assert "Most relevant capabilities for this goal from local semantic search" in prompts[0]
+    assert "document.pdf.generate" in prompts[0]
+
+
+def test_intent_decompose_emits_capability_search_event_for_semantic_hints(monkeypatch):
+    events_seen = []
+    monkeypatch.setattr(
+        main,
+        "_emit_event",
+        lambda event_type, payload: events_seen.append((event_type, payload)),
+    )
+
+    graph = main._decompose_goal_intent("Search semantic memory for user preferences")
+
+    assert graph["summary"]["semantic_capability_hints_used"] >= 1
+    assert events_seen
+    event_type, payload = events_seen[-1]
+    assert event_type == "plan.capability_search"
+    assert payload["request_source"] == "intent_decompose"
+    assert payload["query"] == "Search semantic memory for user preferences"
+    assert payload["result_count"] >= 1
 
 
 def test_refresh_job_status_persists_intent_outcome_memory_and_calibration():
@@ -1671,6 +1779,54 @@ def test_preflight_plan_endpoint_returns_intent_segment_slot_diagnostics() -> No
     assert isinstance(diagnostics, list) and diagnostics
     assert diagnostics[0]["code"] == "intent_segment.must_have_inputs_missing"
     assert diagnostics[0]["field"] == "GenerateText"
+
+
+def test_preflight_plan_endpoint_accepts_intent_segment_tool_inputs_requirement() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "segment contract",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "ImplementRepository",
+                    "description": "Implement repository changes",
+                    "instruction": "Use codegen.autonomous to implement the goal.",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "generate",
+                    "deps": [],
+                    "tool_requests": ["llm_generate"],
+                    "tool_inputs": {"llm_generate": {"text": "implement it"}},
+                    "critic_required": False,
+                }
+            ],
+        },
+        "goal_intent_graph": {
+            "segments": [
+                {
+                    "id": "s1",
+                    "intent": "generate",
+                    "objective": "Implement repository",
+                    "required_inputs": ["instruction"],
+                    "suggested_capabilities": ["llm.text.generate"],
+                    "slots": {
+                        "entity": "repository",
+                        "artifact_type": "code",
+                        "output_format": "txt",
+                        "risk_level": "read_only",
+                        "must_have_inputs": ["tool_inputs"],
+                    },
+                }
+            ]
+        },
+        "job_context": {},
+    }
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
 
 
 def test_preflight_task_intent_uses_goal_text_when_task_text_generic() -> None:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from . import capability_registry
+from . import capability_registry, capability_reranker
 
 
 _STOPWORDS = {
@@ -34,6 +36,10 @@ _INTENT_TOKENS: dict[str, tuple[str, ...]] = {
     "render": ("render", "docx", "pdf", "format"),
     "io": ("read", "write", "search", "list", "fetch", "memory", "file", "github"),
 }
+
+_DEFAULT_RERANK_FEEDBACK_PATH = Path(
+    os.getenv("CAPABILITY_SEARCH_FEEDBACK_PATH", "artifacts/evals/capability_search_feedback.jsonl")
+)
 
 
 def _tokenize(value: str) -> list[str]:
@@ -119,6 +125,7 @@ def search_capabilities(
     capability_entries: Iterable[Mapping[str, Any]],
     limit: int = 8,
     intent_hint: str | None = None,
+    rerank_feedback_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     query_tokens = sorted(set(_tokenize(query)))
     if not query_tokens:
@@ -170,4 +177,12 @@ def search_capabilities(
             }
         )
     results.sort(key=lambda item: (-float(item["score"]), str(item["id"])))
-    return results[: max(1, limit)]
+    if rerank_feedback_rows is None and os.getenv("CAPABILITY_SEARCH_RERANK_ENABLED", "true").lower() == "true":
+        rerank_feedback_rows = capability_reranker.load_feedback_rows(_DEFAULT_RERANK_FEEDBACK_PATH)
+    return capability_reranker.rerank_capability_results(
+        query=query,
+        intent_hint=intent_hint,
+        results=results,
+        feedback_rows=rerank_feedback_rows,
+        limit=max(1, limit),
+    )

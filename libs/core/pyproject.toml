@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Shared core models and utilities"
 requires-python = ">=3.11"
 dependencies = [
+  "typing-extensions>=4.12.2",
   "pydantic>=2.6",
   "pydantic-settings>=2.2",
   "jsonschema>=4.21",

@@ -1,0 +1,35 @@
+{
+  "$id": "capability_reranker_training_example",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string" },
+    "correlation_id": { "type": "string" },
+    "query": { "type": "string", "minLength": 1 },
+    "positive_capability_id": { "type": "string", "minLength": 1 },
+    "negative_capability_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "selected_capabilities": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "retrieved_capabilities": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "execution_succeeded": { "type": "boolean" },
+    "source": { "type": "string", "minLength": 1 }
+  },
+  "required": [
+    "query",
+    "positive_capability_id",
+    "negative_capability_ids",
+    "selected_capabilities",
+    "retrieved_capabilities",
+    "execution_succeeded",
+    "source"
+  ],
+  "additionalProperties": false
+}

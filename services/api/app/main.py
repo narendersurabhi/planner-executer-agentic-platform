@@ -366,6 +366,26 @@ interaction_summary_memory_persist_total = Counter(
     "Interaction summary memory writes",
     ["status"],
 )
+capability_search_requests_total = Counter(
+    "capability_search_requests_total",
+    "Capability search requests",
+    ["request_source", "intent", "result"],
+)
+capability_search_results_total = Counter(
+    "capability_search_results_total",
+    "Capability search results returned",
+    ["request_source", "intent"],
+)
+planner_capability_selection_total = Counter(
+    "planner_capability_selection_total",
+    "Capabilities selected by planner-created plans",
+    ["capability"],
+)
+capability_execution_outcomes_total = Counter(
+    "capability_execution_outcomes_total",
+    "Capability execution outcomes observed from task results",
+    ["capability", "status"],
+)
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -1535,12 +1555,6 @@ def _heuristic_capability_recommendations(
             if last_output and last_output in required_inputs:
                 score += 32
                 reasons.append(f"uses previous output '{last_output}'")
-            if capability_id == "document.output.derive" and (
-                last_capability_id.startswith("document.spec.")
-                or last_capability_id.startswith("document.runbook.")
-            ):
-                score += 30
-                reasons.append("common next step after document spec generation")
             if capability_id in {"document.docx.generate", "document.pdf.generate"} and (
                 last_capability_id == "document.output.derive"
             ):
@@ -1902,11 +1916,71 @@ def _semantic_goal_capability_hints(
     limit: int = 8,
     intent_hint: str | None = None,
 ) -> list[dict[str, Any]]:
-    return capability_search.search_capabilities(
+    started = time.perf_counter()
+    matches = capability_search.search_capabilities(
         query=goal,
         capability_entries=allowed_capability_catalog,
         limit=limit,
         intent_hint=intent_hint,
+    )
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 3)
+    _emit_capability_search_event(
+        query=goal,
+        intent_hint=intent_hint,
+        limit=limit,
+        matches=matches,
+        request_source="intent_decompose",
+        latency_ms=latency_ms,
+    )
+    return matches
+
+
+def _emit_capability_search_event(
+    *,
+    query: str,
+    intent_hint: str | None,
+    limit: int,
+    matches: list[dict[str, Any]],
+    request_source: str,
+    latency_ms: float,
+    correlation_id: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    normalized_source = str(request_source or "unknown").strip() or "unknown"
+    normalized_intent = str(intent_hint or "none").strip().lower() or "none"
+    capability_search_requests_total.labels(
+        request_source=normalized_source,
+        intent=normalized_intent,
+        result="ok" if matches else "empty",
+    ).inc()
+    if matches:
+        capability_search_results_total.labels(
+            request_source=normalized_source,
+            intent=normalized_intent,
+        ).inc(len(matches))
+    _emit_event(
+        "plan.capability_search",
+        {
+            "correlation_id": correlation_id or str(uuid.uuid4()),
+            "job_id": job_id,
+            "query": query,
+            "intent": intent_hint,
+            "limit": limit,
+            "request_source": normalized_source,
+            "latency_ms": latency_ms,
+            "results": [
+                {
+                    "id": str(entry.get("id") or "").strip(),
+                    "score": float(entry.get("score") or 0.0),
+                    "reason": str(entry.get("reason") or "").strip(),
+                    "source": str(entry.get("source") or "semantic_search").strip()
+                    or "semantic_search",
+                }
+                for entry in matches
+                if str(entry.get("id") or "").strip()
+            ],
+            "result_count": len(matches),
+        },
     )
 
 
@@ -3289,6 +3363,7 @@ def _handle_plan_created(envelope: dict) -> None:
         db.add(record)
         db.flush()
         plan_record_id = record.id
+        selected_capabilities: set[str] = set()
         task_intent_profiles: dict[str, dict[str, Any]] = {}
         goal_intent_segments = _goal_intent_segments_from_metadata(
             job.metadata_json if job and isinstance(job.metadata_json, dict) else {}
@@ -3321,6 +3396,10 @@ def _handle_plan_created(envelope: dict) -> None:
                 critic_required=1 if task.critic_required else 0,
             )
             db.add(task_record)
+            for capability_id in task.tool_requests or []:
+                normalized_capability = str(capability_id or "").strip()
+                if normalized_capability:
+                    selected_capabilities.add(normalized_capability)
             task_intent_value = (
                 task.intent.value if isinstance(task.intent, models.ToolIntent) else str(task.intent or "")
             )
@@ -3344,6 +3423,8 @@ def _handle_plan_created(envelope: dict) -> None:
             _set_job_status(job, models.JobStatus.planning)
             job.updated_at = now
         db.commit()
+    for capability_id in selected_capabilities:
+        planner_capability_selection_total.labels(capability=capability_id).inc()
     _enqueue_ready_tasks(job_id, plan_record_id, envelope.get("correlation_id"))
     _refresh_job_status(job_id)
 
@@ -3380,6 +3461,13 @@ def _handle_task_completed(envelope: dict) -> None:
         task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
         if not task:
             return
+        for capability_id in task.tool_requests or []:
+            normalized_capability = str(capability_id or "").strip()
+            if normalized_capability:
+                capability_execution_outcomes_total.labels(
+                    capability=normalized_capability,
+                    status="completed",
+                ).inc()
         task.status = models.TaskStatus.completed.value
         task.updated_at = now
         db.commit()
@@ -3401,6 +3489,13 @@ def _handle_task_failed(envelope: dict) -> None:
         task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
         if not task:
             return
+        for capability_id in task.tool_requests or []:
+            normalized_capability = str(capability_id or "").strip()
+            if normalized_capability:
+                capability_execution_outcomes_total.labels(
+                    capability=normalized_capability,
+                    status="failed",
+                ).inc()
         if isinstance(error, str) and (
             "tool_intent_mismatch" in error or "contract.intent_mismatch" in error
         ):
@@ -4206,12 +4301,14 @@ def _compile_plan_preflight(
                 if isinstance(resolved_payload_raw, Mapping)
                 else {}
             )
+            segment_payload = dict(resolved_payload)
+            segment_payload.setdefault("tool_inputs", task_payload.get("tool_inputs", {}))
             capability_spec = capabilities.get(request_id)
             segment_contract_error = intent_contract.validate_intent_segment_contract(
                 segment=goal_intent_segment,
                 task_intent=task_intent,
                 tool_name=request_id,
-                payload=resolved_payload,
+                payload=segment_payload,
                 capability_id=request_id if capability_spec is not None else None,
                 capability_risk_tier=capability_spec.risk_tier
                 if capability_spec is not None
@@ -5039,6 +5136,74 @@ def list_capabilities(
             }
         )
     return {"mode": mode, "items": items}
+
+
+@app.post("/capabilities/search")
+def search_capabilities(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query_required")
+    try:
+        limit = int(payload.get("limit", 8))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit_invalid")
+    if limit < 1 or limit > 50:
+        raise HTTPException(status_code=400, detail="limit_out_of_range")
+    intent_hint = str(payload.get("intent") or "").strip().lower() or None
+    request_source = str(payload.get("request_source") or "api").strip().lower() or "api"
+    correlation_id = str(payload.get("correlation_id") or "").strip() or None
+    job_id = str(payload.get("job_id") or "").strip() or None
+    mode = capability_registry.resolve_capability_mode()
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"capability_registry_load_failed:{exc}") from exc
+
+    entries = capability_search.build_capability_search_entries(registry.enabled_capabilities())
+    started = time.perf_counter()
+    matches = capability_search.search_capabilities(
+        query=query,
+        capability_entries=entries,
+        limit=limit,
+        intent_hint=intent_hint,
+    )
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 3)
+    _emit_capability_search_event(
+        query=query,
+        intent_hint=intent_hint,
+        limit=limit,
+        matches=matches,
+        request_source=request_source,
+        latency_ms=latency_ms,
+        correlation_id=correlation_id,
+        job_id=job_id,
+    )
+    details_by_id = {str(entry.get("id") or ""): entry for entry in entries}
+    items: list[dict[str, Any]] = []
+    for match in matches:
+        capability_id = str(match.get("id") or "").strip()
+        if not capability_id:
+            continue
+        entry = details_by_id.get(capability_id, {})
+        items.append(
+            {
+                "id": capability_id,
+                "score": float(match.get("score") or 0.0),
+                "reason": str(match.get("reason") or "").strip() or "semantic match",
+                "source": str(match.get("source") or "semantic_search"),
+                "description": str(entry.get("description") or "").strip(),
+                "group": str(entry.get("group") or "").strip(),
+                "subgroup": str(entry.get("subgroup") or "").strip(),
+                "tags": [tag for tag in entry.get("tags", []) if isinstance(tag, str)],
+            }
+        )
+    return {
+        "mode": mode,
+        "query": query,
+        "intent": intent_hint,
+        "limit": limit,
+        "items": items,
+    }
 
 
 @app.get("/jobs/{job_id}", response_model=models.Job)

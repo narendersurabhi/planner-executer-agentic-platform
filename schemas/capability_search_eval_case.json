@@ -1,0 +1,27 @@
+{
+  "$id": "capability_search_eval_case",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "query": { "type": "string", "minLength": 1 },
+    "intent": { "type": "string" },
+    "segment_text": { "type": "string" },
+    "expected_capability_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "acceptable_alternates": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "must_have": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "risk_tier": { "type": "string" },
+    "notes": { "type": "string" }
+  },
+  "required": ["id", "query", "expected_capability_ids"],
+  "additionalProperties": false
+}
