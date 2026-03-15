@@ -1477,13 +1477,72 @@ def _tool_payload(
     task_payload: dict,
     tool_inputs: dict,
 ) -> dict:
-    return payload_resolver.resolve_tool_payload(
+    payload = payload_resolver.resolve_tool_payload(
         tool_name,
         instruction,
         context if isinstance(context, dict) else {},
         task_payload if isinstance(task_payload, dict) else {},
         tool_inputs if isinstance(tool_inputs, dict) else {},
     )
+    if tool_name == "github.repo.list":
+        payload = _normalize_github_repo_list_payload(
+            payload,
+            task_payload if isinstance(task_payload, dict) else {},
+            tool_inputs if isinstance(tool_inputs, dict) else {},
+            context if isinstance(context, dict) else {},
+        )
+    return payload
+
+
+def _normalize_github_repo_list_payload(
+    payload: dict[str, Any],
+    task_payload: dict[str, Any],
+    tool_inputs: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(payload) if isinstance(payload, dict) else {}
+
+    def _read_str(source: Mapping[str, Any] | None, *keys: str) -> str | None:
+        if not isinstance(source, Mapping):
+            return None
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    raw_tool_inputs = tool_inputs.get("github.repo.list")
+    if not isinstance(raw_tool_inputs, Mapping):
+        raw_tool_inputs = {}
+    job_context = context.get("job_context")
+    if not isinstance(job_context, Mapping):
+        job_context = context
+
+    owner = (
+        _read_str(raw_tool_inputs, "owner", "repo_owner")
+        or _read_str(normalized, "owner", "repo_owner")
+        or _read_str(task_payload, "owner", "repo_owner")
+        or _read_str(job_context, "owner", "repo_owner")
+    )
+    repo = (
+        _read_str(raw_tool_inputs, "repo", "repo_name")
+        or _read_str(normalized, "repo", "repo_name")
+        or _read_str(task_payload, "repo", "repo_name")
+        or _read_str(job_context, "repo", "repo_name")
+    )
+    if owner and repo:
+        normalized["query"] = f"repo:{repo} owner:{owner}"
+        return normalized
+
+    fallback_query = (
+        _read_str(raw_tool_inputs, "query", "github_query")
+        or _read_str(normalized, "query", "github_query")
+        or _read_str(task_payload, "query", "github_query")
+        or _read_str(job_context, "query", "github_query")
+    )
+    if fallback_query:
+        normalized["query"] = fallback_query
+    return normalized
 
 
 def _merge_payload_from_task(payload: dict, task_payload: dict, instruction: str) -> dict:

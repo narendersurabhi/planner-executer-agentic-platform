@@ -4,7 +4,16 @@ import io
 import json
 from urllib.error import HTTPError
 
-from libs.core.llm_provider import OpenAIProvider
+from urllib.error import URLError
+
+from libs.core.llm_provider import (
+    LLMProvider,
+    LLMProviderError,
+    LLMRequest,
+    LLMResponse,
+    OpenAIProvider,
+    parse_json_object,
+)
 from libs.core import llm_provider as llm_provider_module
 
 
@@ -88,3 +97,91 @@ def test_openai_provider_retries_without_temperature_on_unsupported_error(monkey
     assert len(captured_payloads) == 2
     assert captured_payloads[0]["temperature"] == 0.2
     assert "temperature" not in captured_payloads[1]
+
+
+def test_openai_provider_builds_request_payload_from_llm_request() -> None:
+    provider = OpenAIProvider(
+        api_key="test-key",
+        model="gpt-4.1-mini",
+        temperature=0.4,
+        max_output_tokens=256,
+    )
+
+    payload = provider._build_payload(  # type: ignore[attr-defined]
+        LLMRequest(
+            prompt="hello",
+            system_prompt="system message",
+            temperature=0.1,
+            max_output_tokens=42,
+            metadata={"component": "coder", "goal_len": 9},
+        )
+    )
+
+    assert payload == {
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "instructions": "system message",
+        "temperature": 0.1,
+        "max_output_tokens": 42,
+        "metadata": {"component": "coder", "goal_len": "9"},
+    }
+
+
+def test_openai_provider_retries_retryable_connection_error(monkeypatch) -> None:
+    state = {"count": 0}
+    sleeps: list[int] = []
+
+    def _fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+        del request, timeout
+        if state["count"] == 0:
+            state["count"] += 1
+            raise URLError("temporary network failure")
+        return _FakeHTTPResponse(_success_payload())
+
+    monkeypatch.setattr(llm_provider_module, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(llm_provider_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    provider = OpenAIProvider(
+        api_key="test-key",
+        model="gpt-4.1-mini",
+        max_retries=1,
+    )
+
+    response = provider.generate("hello")
+
+    assert response.content == '{"ok":true}'
+    assert sleeps == [1]
+
+
+def test_openai_provider_raises_for_empty_output(monkeypatch) -> None:
+    def _fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+        del request, timeout
+        return _FakeHTTPResponse({"output": []})
+
+    monkeypatch.setattr(llm_provider_module, "urlopen", _fake_urlopen)
+
+    provider = OpenAIProvider(api_key="test-key", model="gpt-4.1-mini")
+
+    try:
+        provider.generate("hello")
+    except LLMProviderError as exc:
+        assert str(exc) == "OpenAI API returned empty output"
+    else:  # pragma: no cover
+        raise AssertionError("Expected LLMProviderError")
+
+
+def test_parse_json_object_extracts_fenced_json_object() -> None:
+    payload = parse_json_object('```json\n{"ok": true, "count": 2}\n```')
+
+    assert payload == {"ok": True, "count": 2}
+
+
+def test_generate_json_object_uses_generate_compatibility_path() -> None:
+    class _LegacyProvider(LLMProvider):
+        def generate(self, prompt: str) -> LLMResponse:
+            assert prompt == "hello"
+            return LLMResponse(content='{"ok": true}')
+
+    payload = _LegacyProvider().generate_json_object("hello")
+
+    assert payload == {"ok": True}

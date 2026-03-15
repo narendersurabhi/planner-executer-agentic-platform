@@ -97,3 +97,19 @@ def test_intent_segment_contract_detects_missing_required_payload_input() -> Non
         capability_risk_tier="bounded_write",
     )
     assert mismatch == "must_have_inputs_missing:path"
+
+
+def test_tool_payload_builds_github_repo_query_from_context_fields() -> None:
+    payload = main._tool_payload(
+        "github.repo.list",
+        "Verify repository exists",
+        {
+            "job_context": {
+                "repo_owner": "narendersurabhi",
+                "repo_name": "scientific-agent-lab",
+            }
+        },
+        {"tool_inputs": {"github.repo.list": {}}},
+        {"github.repo.list": {}},
+    )
+    assert payload["query"] == "repo:scientific-agent-lab owner:narendersurabhi"

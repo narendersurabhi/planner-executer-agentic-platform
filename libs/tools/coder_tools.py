@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -305,6 +306,13 @@ def _collect_workspace_files_for_push(
     return files, skipped
 
 
+def _default_pr_branch_name(repo: str) -> str:
+    repo_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", repo.strip()).strip(".-")
+    if not repo_slug:
+        repo_slug = "workspace"
+    return f"codex/{repo_slug}"
+
+
 def coding_agent_publish_pr(
     payload: dict[str, Any],
     *,
@@ -326,6 +334,10 @@ def coding_agent_publish_pr(
         raise ToolExecutionError("Missing base")
     if not isinstance(workspace_path, str) or not workspace_path.strip():
         raise ToolExecutionError("Missing workspace_path")
+    branch = branch.strip()
+    base = base.strip()
+    if branch == base:
+        branch = _default_pr_branch_name(repo)
 
     include_globs = _as_str_list(payload.get("include_globs"), ["**/*"])
     exclude_globs = _as_str_list(

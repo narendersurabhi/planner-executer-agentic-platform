@@ -4,7 +4,7 @@ import json
 from typing import Any, Callable
 
 from libs.core import prompts
-from libs.core.llm_provider import LLMProvider
+from libs.core.llm_provider import LLMProvider, LLMProviderError
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
 from libs.framework.tool_runtime import Tool, ToolExecutionError
 
@@ -178,16 +178,10 @@ def llm_repair_document_spec(
         f"Original DocumentSpec: {original_json}\n"
         "Return ONLY the repaired JSON object."
     )
-    response = provider.generate(prompt)
-    json_text = _extract_json(response.content)
-    if not json_text:
-        raise ToolExecutionError("Failed to extract JSON from LLM response")
     try:
-        document_spec = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
-    if not isinstance(document_spec, dict):
-        raise ToolExecutionError("Repaired JSON must be an object")
+        document_spec = provider.generate_json_object(prompt)
+    except LLMProviderError as exc:
+        raise ToolExecutionError(str(exc)) from exc
     return {"document_spec": sanitize_document_spec(document_spec)}
 
 
@@ -212,16 +206,10 @@ def llm_generate_document_spec(
             "Provide either job object or explicit fields: instruction, topic, audience, tone, today, output_dir"
         )
     prompt = prompts.document_spec_prompt(_compact_document_spec_job(job, payload), allowed)
-    response = provider.generate(prompt)
-    json_text = _extract_json(response.content)
-    if not json_text:
-        raise ToolExecutionError("Failed to extract JSON from LLM response")
     try:
-        document_spec = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
-    if not isinstance(document_spec, dict):
-        raise ToolExecutionError("DocumentSpec must be an object")
+        document_spec = provider.generate_json_object(prompt)
+    except LLMProviderError as exc:
+        raise ToolExecutionError(str(exc)) from exc
     return {"document_spec": sanitize_document_spec(document_spec)}
 
 
@@ -279,41 +267,11 @@ def llm_improve_document_spec(
     if not isinstance(validation_report, dict):
         raise ToolExecutionError("validation_report must be an object")
     prompt = prompts.document_spec_improve_prompt(document_spec, validation_report, allowed)
-    response = provider.generate(prompt)
-    json_text = _extract_json(response.content)
-    if not json_text:
-        raise ToolExecutionError("Failed to extract JSON from LLM response")
     try:
-        improved_spec = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
-    if not isinstance(improved_spec, dict):
-        raise ToolExecutionError("Improved DocumentSpec must be an object")
+        improved_spec = provider.generate_json_object(prompt)
+    except LLMProviderError as exc:
+        raise ToolExecutionError(str(exc)) from exc
     return {"document_spec": sanitize_document_spec(improved_spec)}
-
-
-def _extract_json(text: str) -> str:
-    content = text.strip()
-    if content.startswith("```"):
-        parts = content.split("```")
-        if len(parts) > 1:
-            content = parts[1]
-        content = content.lstrip()
-        if content.startswith("json"):
-            content = content[4:].lstrip()
-    first_obj = content.find("{")
-    first_arr = content.find("[")
-    if first_obj == -1 and first_arr == -1:
-        return ""
-    if first_arr == -1 or (first_obj != -1 and first_obj < first_arr):
-        start = first_obj
-        end = content.rfind("}")
-    else:
-        start = first_arr
-        end = content.rfind("]")
-    if start == -1 or end == -1 or end <= start:
-        return ""
-    return content[start : end + 1]
 
 
 def _resolve_allowed_block_types(raw: Any) -> list[str]:

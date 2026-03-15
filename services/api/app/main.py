@@ -4098,6 +4098,106 @@ def _collect_reference_paths(value: Any) -> list[list[str]]:
     return refs
 
 
+def _normalize_preflight_reference_payload(
+    value: Any,
+    *,
+    dependency_names: set[str],
+    tasks_by_name: Mapping[str, models.TaskCreate],
+) -> Any:
+    if isinstance(value, dict):
+        normalized = dict(value)
+        from_path = normalized.get("$from")
+        if isinstance(from_path, str) and from_path.strip():
+            raw = from_path.strip()
+            body = raw[2:] if raw.startswith("$.") else raw
+            if body.startswith("/"):
+                parts = [part.replace("~1", "/").replace("~0", "~") for part in body.split("/")[1:]]
+            else:
+                parts = [segment for segment in body.split(".") if segment]
+            canonical = _canonicalize_preflight_reference_path(
+                parts,
+                dependency_names=dependency_names,
+                tasks_by_name=tasks_by_name,
+            )
+            if canonical:
+                escaped = [segment.replace("~", "~0").replace("/", "~1") for segment in canonical]
+                normalized["$from"] = "/" + "/".join(escaped)
+        for key, child in list(normalized.items()):
+            if key == "$from":
+                continue
+            normalized[key] = _normalize_preflight_reference_payload(
+                child,
+                dependency_names=dependency_names,
+                tasks_by_name=tasks_by_name,
+            )
+        return normalized
+    if isinstance(value, list):
+        return [
+            _normalize_preflight_reference_payload(
+                child,
+                dependency_names=dependency_names,
+                tasks_by_name=tasks_by_name,
+            )
+            for child in value
+        ]
+    return value
+
+
+def _canonicalize_preflight_reference_path(
+    path: list[str],
+    *,
+    dependency_names: set[str],
+    tasks_by_name: Mapping[str, models.TaskCreate],
+) -> list[str]:
+    if len(path) < 3:
+        return path
+
+    if path[0] in {"dependencies_by_name", "dependencies"}:
+        root = path[0]
+        remaining = path[1:]
+    else:
+        root = ""
+        remaining = path
+
+    dep_name: str | None = None
+    dep_consumed = 0
+    for end in range(len(remaining), 0, -1):
+        candidate = ".".join(remaining[:end]).strip()
+        if candidate in dependency_names:
+            dep_name = candidate
+            dep_consumed = end
+            break
+    if not dep_name:
+        return path
+
+    dep_task = tasks_by_name.get(dep_name)
+    if dep_task is None:
+        return path
+
+    tail = remaining[dep_consumed:]
+    if not tail:
+        normalized = [dep_name]
+        return [root, *normalized] if root else normalized
+
+    tool_requests = [str(item).strip() for item in (dep_task.tool_requests or []) if str(item).strip()]
+    tool_name: str | None = None
+    tool_consumed = 0
+    for end in range(len(tail), 0, -1):
+        candidate = ".".join(tail[:end]).strip()
+        if candidate in tool_requests:
+            tool_name = candidate
+            tool_consumed = end
+            break
+
+    normalized = [dep_name]
+    if tool_name:
+        normalized.append(tool_name)
+        normalized.extend(tail[tool_consumed:])
+    else:
+        normalized.extend(tail)
+    return [root, *normalized] if root else normalized
+
+
 def _build_preflight_dependency_output(task: models.TaskCreate) -> dict[str, Any]:
     output: dict[str, Any] = {
         "document_spec": {},
@@ -4210,20 +4310,30 @@ def _compile_plan_preflight(
         if isinstance(job_context, dict) and job_context:
             context["job_context"] = job_context
 
+        normalized_tool_inputs = _normalize_preflight_reference_payload(
+            task.tool_inputs or {},
+            dependency_names=dependency_names,
+            tasks_by_name=tasks_by_name,
+        )
         task_payload = {
             "name": task.name,
             "instruction": task.instruction,
             "tool_requests": list(task.tool_requests or []),
-            "tool_inputs": task.tool_inputs or {},
+            "tool_inputs": normalized_tool_inputs,
         }
 
         # Seed exact $from paths with typed placeholders to reduce false negatives
         # when dependency outputs are not available yet.
-        references = _collect_reference_paths(task.tool_inputs or {})
+        references = _collect_reference_paths(normalized_tool_inputs)
         reference_error: str | None = None
         for path in references:
             if not path:
                 continue
+            path = _canonicalize_preflight_reference_path(
+                path,
+                dependency_names=dependency_names,
+                tasks_by_name=tasks_by_name,
+            )
             if path[0] in {"dependencies_by_name", "dependencies", "job_context"}:
                 root_key = path[0]
                 if root_key == "job_context":
@@ -4303,6 +4413,20 @@ def _compile_plan_preflight(
             )
             segment_payload = dict(resolved_payload)
             segment_payload.setdefault("tool_inputs", task_payload.get("tool_inputs", {}))
+            if (
+                "instruction" not in segment_payload
+                and isinstance(task.instruction, str)
+                and task.instruction.strip()
+            ):
+                segment_payload["instruction"] = task.instruction.strip()
+            if request_id == "github.repo.list":
+                github_query = _synthesize_preflight_github_repo_query(
+                    task_payload=task_payload,
+                    segment_payload=segment_payload,
+                    job_context=context.get("job_context"),
+                )
+                if github_query:
+                    segment_payload["query"] = github_query
             capability_spec = capabilities.get(request_id)
             segment_contract_error = intent_contract.validate_intent_segment_contract(
                 segment=goal_intent_segment,
@@ -4556,6 +4680,47 @@ def _preflight_capability_intent_mismatch(
     if task_intent in allowed:
         return None
     return f"task_intent_mismatch:{capability_id}:{task_intent}:allowed={','.join(sorted(allowed))}"
+
+
+def _synthesize_preflight_github_repo_query(
+    *,
+    task_payload: Mapping[str, Any] | None,
+    segment_payload: Mapping[str, Any] | None,
+    job_context: Mapping[str, Any] | None,
+) -> str | None:
+    def _read_str(source: Mapping[str, Any] | None, *keys: str) -> str | None:
+        if not isinstance(source, Mapping):
+            return None
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    raw_tool_inputs = None
+    if isinstance(task_payload, Mapping):
+        tool_inputs = task_payload.get("tool_inputs")
+        if isinstance(tool_inputs, Mapping):
+            entry = tool_inputs.get("github.repo.list")
+            if isinstance(entry, Mapping):
+                raw_tool_inputs = entry
+    owner = (
+        _read_str(raw_tool_inputs, "owner", "repo_owner")
+        or _read_str(segment_payload, "owner", "repo_owner")
+        or _read_str(job_context, "owner", "repo_owner")
+    )
+    repo = (
+        _read_str(raw_tool_inputs, "repo", "repo_name")
+        or _read_str(segment_payload, "repo", "repo_name")
+        or _read_str(job_context, "repo", "repo_name")
+    )
+    if owner and repo:
+        return f"repo:{repo} owner:{owner}"
+    return (
+        _read_str(raw_tool_inputs, "query", "github_query")
+        or _read_str(segment_payload, "query", "github_query")
+        or _read_str(job_context, "query", "github_query")
+    )
 
 
 def _store_task_output(task_id: str, outputs: dict[str, Any]) -> None:

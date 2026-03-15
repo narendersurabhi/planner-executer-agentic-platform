@@ -295,8 +295,7 @@ def _add_paragraph(
         _add_term_definition_runs(paragraph, text)
         return paragraph
     if style_hint == "role_title":
-        run = paragraph.add_run(text)
-        run.bold = True
+        _append_inline_runs(paragraph, text, base_bold=True)
         paragraph.paragraph_format.space_before = Pt(10)
         paragraph.paragraph_format.space_after = Pt(1)
         paragraph.paragraph_format.keep_with_next = True
@@ -308,9 +307,7 @@ def _add_paragraph(
         _add_role_meta_runs(paragraph, text)
         return paragraph
     if style_hint == "role_group_heading":
-        run = paragraph.add_run(text)
-        run.bold = True
-        run.italic = True
+        _append_inline_runs(paragraph, text, base_bold=True, base_italic=True)
         paragraph.paragraph_format.space_before = Pt(6)
         paragraph.paragraph_format.space_after = Pt(2)
         paragraph.paragraph_format.keep_with_next = True
@@ -325,17 +322,17 @@ def _add_paragraph(
             paragraph.add_run("\t")
             paragraph.add_run(right.strip())
         else:
-            run = paragraph.add_run(text)
-            run.bold = True
+            _append_inline_runs(paragraph, text, base_bold=True)
         paragraph.paragraph_format.space_before = Pt(4)
         paragraph.paragraph_format.space_after = Pt(2)
         return paragraph
 
-    run = paragraph.add_run(text)
+    runs = _append_inline_runs(paragraph, text)
     if style_hint == "cover_letter_name":
-        run.bold = True
-        run.font.size = Pt(20)
-        run.font.name = "Calibri"
+        for run in runs:
+            run.bold = True
+            run.font.size = Pt(20)
+            run.font.name = "Calibri"
         paragraph.paragraph_format.space_before = Pt(0)
         paragraph.paragraph_format.space_after = Pt(3)
         return paragraph
@@ -364,31 +361,36 @@ def _add_paragraph(
         paragraph.paragraph_format.space_after = Pt(0)
         return paragraph
     if style_hint == "title":
-        run.bold = True
-        run.font.size = Pt(22)
-        run.font.name = "Calibri"
+        for run in runs:
+            run.bold = True
+            run.font.size = Pt(22)
+            run.font.name = "Calibri"
         paragraph.paragraph_format.space_before = Pt(0)
         paragraph.paragraph_format.space_after = Pt(3)
     if style_hint == "subtitle":
-        run.bold = False
-        run.font.size = Pt(13)
-        run.font.name = "Calibri"
+        for run in runs:
+            run.bold = False
+            run.font.size = Pt(13)
+            run.font.name = "Calibri"
         paragraph.paragraph_format.space_before = Pt(0)
         paragraph.paragraph_format.space_after = Pt(6)
     if style_hint in {"body_bold"}:
-        run.bold = True
+        for run in runs:
+            run.bold = True
     if style_hint == "contact":
         paragraph.paragraph_format.space_after = Pt(0)
         paragraph.paragraph_format.space_before = Pt(0)
-        run.font.name = "Calibri"
-        run.font.size = Pt(10.5)
+        for run in runs:
+            run.font.name = "Calibri"
+            run.font.size = Pt(10.5)
     if style_hint == "dates_right":
         paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     if style_hint == "divider":
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         paragraph.paragraph_format.space_before = Pt(2)
         paragraph.paragraph_format.space_after = Pt(2)
-        run.font.size = Pt(8)
+        for run in runs:
+            run.font.size = Pt(8)
     if bullet:
         paragraph.paragraph_format.space_after = Pt(2)
         paragraph.paragraph_format.left_indent = Pt(18)
@@ -449,6 +451,45 @@ def _add_role_meta_runs(paragraph, text: str) -> None:
         right_run.italic = True
         return
     paragraph.add_run(text)
+
+
+def _append_inline_runs(
+    paragraph: Paragraph,
+    text: str,
+    *,
+    base_bold: bool = False,
+    base_italic: bool = False,
+) -> list:
+    runs = []
+    active_bold = False
+    active_italic = False
+    parts = re.split(r"(<\/?b>|<\/?i>|\*\*|_)", text)
+    for part in parts:
+        if not part:
+            continue
+        token = part.lower()
+        if token in {"<b>", "**"}:
+            active_bold = not active_bold
+            continue
+        if token == "</b>":
+            active_bold = False
+            continue
+        if token in {"<i>", "_"}:
+            active_italic = not active_italic
+            continue
+        if token == "</i>":
+            active_italic = False
+            continue
+        run = paragraph.add_run(part)
+        run.bold = base_bold or active_bold
+        run.italic = base_italic or active_italic
+        runs.append(run)
+    if not runs:
+        run = paragraph.add_run("")
+        run.bold = base_bold
+        run.italic = base_italic
+        runs.append(run)
+    return runs
 
 
 def _resolve_items(value: Any, context: Dict[str, Any], strict: bool) -> List[Any]:

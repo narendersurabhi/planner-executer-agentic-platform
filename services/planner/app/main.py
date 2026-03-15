@@ -1345,6 +1345,8 @@ def _build_validation_payload(
         dependency_defaults=_dependency_fill_defaults(),
     )
     payload.setdefault("tool_inputs", dict(raw_tool_inputs))
+    if "instruction" not in payload and isinstance(task.instruction, str) and task.instruction.strip():
+        payload["instruction"] = task.instruction.strip()
     schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
     if _schema_requires_key(schema, "job"):
         payload.setdefault("job", job.model_dump(mode="json"))
@@ -1514,22 +1516,54 @@ def _validate_capability_inputs(
     if schema is None:
         return f"capability_schema_not_found:{capability.input_schema_ref}"
     payload = _build_capability_validation_payload(task, raw_tool_inputs, job)
-    if capability.capability_id == "github.repo.list" and "query" not in payload:
+    if capability.capability_id == "github.repo.list":
         job_context = job.context_json if isinstance(job.context_json, dict) else {}
-        github_query: Any = raw_tool_inputs.get("github_query")
-        if not github_query:
-            github_query = payload.get("github_query")
-        if not github_query:
-            github_query = job_context.get("query")
-        if not github_query:
-            github_query = job_context.get("github_query")
-        if isinstance(github_query, str) and github_query.strip():
+        github_query = _synthesize_github_repo_query(
+            raw_tool_inputs=raw_tool_inputs,
+            payload=payload,
+            job_context=job_context,
+        )
+        if github_query:
             payload["query"] = github_query
     errors = payload_resolver.validate_tool_inputs(
         {capability.capability_id: payload},
         {capability.capability_id: schema},
     )
     return errors.get(capability.capability_id)
+
+
+def _synthesize_github_repo_query(
+    *,
+    raw_tool_inputs: Mapping[str, Any] | None,
+    payload: Mapping[str, Any] | None,
+    job_context: Mapping[str, Any] | None,
+) -> str | None:
+    def _read_str(source: Mapping[str, Any] | None, *keys: str) -> str | None:
+        if not isinstance(source, Mapping):
+            return None
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    owner = (
+        _read_str(raw_tool_inputs, "owner", "repo_owner")
+        or _read_str(payload, "owner", "repo_owner")
+        or _read_str(job_context, "owner", "repo_owner")
+    )
+    repo = (
+        _read_str(raw_tool_inputs, "repo", "repo_name")
+        or _read_str(payload, "repo", "repo_name")
+        or _read_str(job_context, "repo", "repo_name")
+    )
+    if owner and repo:
+        return f"repo:{repo} owner:{owner}"
+    return (
+        _read_str(raw_tool_inputs, "query", "github_query")
+        or _read_str(payload, "query", "github_query")
+        or _read_str(job_context, "query", "github_query")
+    )
 
 
 def _load_schema_from_ref(schema_ref: str) -> dict[str, Any] | None:
@@ -1589,6 +1623,14 @@ def _build_capability_validation_payload(
             continue
         if isinstance(value, (int, float, bool)):
             payload[key] = value
+    if task.tool_requests and "github.repo.list" in task.tool_requests:
+        github_query = _synthesize_github_repo_query(
+            raw_tool_inputs=raw_tool_inputs,
+            payload=payload,
+            job_context=job_context,
+        )
+        if github_query:
+            payload["query"] = github_query
     # Keep capability schema validation aligned with deterministic runtime date defaults.
     if "today" not in payload and "date" not in payload:
         payload["today"] = datetime.utcnow().date().isoformat()

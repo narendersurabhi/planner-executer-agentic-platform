@@ -2203,6 +2203,48 @@ def test_plan_preflight_compiler_flags_broken_reference_path() -> None:
     assert "input reference resolution failed" in errors["ReuseJson"]
 
 
+def test_plan_preflight_accepts_reference_path_with_dotted_tool_name() -> None:
+    plan = models.PlanCreate(
+        planner_version="test",
+        tasks_summary="github repo ref",
+        dag_edges=[["Verify repository exists", "Decide whether to proceed"]],
+        tasks=[
+            models.TaskCreate(
+                name="Verify repository exists",
+                description="Verify repository exists",
+                instruction="Check repo",
+                acceptance_criteria=["done"],
+                expected_output_schema_ref="schemas/github_repo_list_result",
+                intent=models.ToolIntent.validate,
+                deps=[],
+                tool_requests=["github.repo.list"],
+                tool_inputs={"github.repo.list": {"query": "repo:demo owner:octocat"}},
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="Decide whether to proceed",
+                description="Decide whether to proceed",
+                instruction="Use repository check output",
+                acceptance_criteria=["done"],
+                expected_output_schema_ref="schemas/validation_report",
+                intent=models.ToolIntent.validate,
+                deps=["Verify repository exists"],
+                tool_requests=["json_transform"],
+                tool_inputs={
+                    "json_transform": {
+                        "input": {
+                            "$from": "dependencies_by_name.Verify repository exists.github.repo.list"
+                        }
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+    errors = main._compile_plan_preflight(plan, job_context={})
+    assert errors == {}
+
+
 def test_plan_preflight_ignores_non_matching_intent_segments_when_suggested_capabilities_present() -> None:
     plan = models.PlanCreate(
         planner_version="test",
@@ -2247,6 +2289,122 @@ def test_plan_preflight_ignores_non_matching_intent_segments_when_suggested_capa
     errors = main._compile_plan_preflight(
         plan,
         job_context={},
+        goal_intent_graph=goal_intent_graph,
+    )
+    assert errors == {}
+
+
+def test_plan_preflight_uses_task_instruction_for_intent_segment_contract() -> None:
+    plan = models.PlanCreate(
+        planner_version="test",
+        tasks_summary="abort if missing",
+        dag_edges=[["VerifyRepoExists", "AbortIfRepoMissing"]],
+        tasks=[
+            models.TaskCreate(
+                name="VerifyRepoExists",
+                description="Verify repository exists",
+                instruction="Call github.repo.list to verify the repository exists.",
+                acceptance_criteria=["done"],
+                expected_output_schema_ref="schemas/github_repo_list_result",
+                intent=models.ToolIntent.validate,
+                deps=[],
+                tool_requests=["github.repo.list"],
+                tool_inputs={
+                    "github.repo.list": {
+                        "query": "repo:scientific-agent-lab owner:narendersurabhhi"
+                    }
+                },
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="AbortIfRepoMissing",
+                description="Stop if repository missing",
+                instruction=(
+                    "Inspect the VerifyRepoExists output; if the repository is not found, "
+                    "mark the plan aborted and stop execution."
+                ),
+                acceptance_criteria=["done"],
+                expected_output_schema_ref="schemas/validation_report",
+                intent=models.ToolIntent.generate,
+                deps=["VerifyRepoExists"],
+                tool_requests=["llm_generate"],
+                tool_inputs={},
+                critic_required=True,
+            ),
+        ],
+    )
+    goal_intent_graph = {
+        "segments": [
+            {
+                "id": "s1",
+                "intent": "generate",
+                "objective": "Stop if repository missing",
+                "required_inputs": ["instruction"],
+                "suggested_capabilities": ["llm.text.generate"],
+                "slots": {
+                    "entity": "repository",
+                    "artifact_type": "validation_report",
+                    "output_format": "txt",
+                    "risk_level": "read_only",
+                    "must_have_inputs": ["instruction"],
+                },
+            }
+        ]
+    }
+
+    errors = main._compile_plan_preflight(
+        plan,
+        job_context={},
+        goal_intent_graph=goal_intent_graph,
+    )
+    assert errors == {}
+
+
+def test_plan_preflight_uses_synthesized_github_query_for_intent_segment_contract() -> None:
+    plan = models.PlanCreate(
+        planner_version="test",
+        tasks_summary="repo check",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="CheckRepoExists",
+                description="Verify repository exists",
+                instruction="Call github.repo.list to verify the repository exists.",
+                acceptance_criteria=["done"],
+                expected_output_schema_ref="schemas/github_repo_list_result",
+                intent=models.ToolIntent.validate,
+                deps=[],
+                tool_requests=["github.repo.list"],
+                tool_inputs={"github.repo.list": {}},
+                critic_required=False,
+            )
+        ],
+    )
+    goal_intent_graph = {
+        "segments": [
+            {
+                "id": "s1",
+                "intent": "validate",
+                "objective": "Verify repository exists",
+                "required_inputs": ["query"],
+                "suggested_capabilities": ["github.repo.list"],
+                "slots": {
+                    "entity": "repository",
+                    "artifact_type": "validation_report",
+                    "output_format": None,
+                    "risk_level": "read_only",
+                    "must_have_inputs": ["query"],
+                },
+            }
+        ]
+    }
+
+    errors = main._compile_plan_preflight(
+        plan,
+        job_context={
+            "repo_owner": "narendersurabhi",
+            "repo_name": "scientific-agent-lab",
+        },
         goal_intent_graph=goal_intent_graph,
     )
     assert errors == {}

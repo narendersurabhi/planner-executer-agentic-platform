@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from libs.core import prompts
-from libs.core.llm_provider import LLMProvider
+from libs.core.llm_provider import LLMProvider, LLMProviderError
 from libs.core.models import RiskLevel, ToolIntent, ToolSpec
 from libs.framework.tool_runtime import Tool, ToolExecutionError
 
@@ -234,16 +234,10 @@ def _llm_generate_openapi_spec(payload: dict[str, Any], provider: LLMProvider) -
     if not isinstance(job, dict):
         raise ToolExecutionError("job must be an object")
     prompt = prompts.openapi_spec_prompt(job)
-    response = provider.generate(prompt)
-    json_text = _extract_json(response.content)
-    if not json_text:
-        raise ToolExecutionError("Failed to extract JSON from LLM response")
     try:
-        openapi_spec = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
-    if not isinstance(openapi_spec, dict):
-        raise ToolExecutionError("openapi_spec must be an object")
+        openapi_spec = provider.generate_json_object(prompt)
+    except LLMProviderError as exc:
+        raise ToolExecutionError(str(exc)) from exc
     return {"openapi_spec": openapi_spec}
 
 
@@ -258,38 +252,8 @@ def _llm_improve_openapi_spec(payload: dict[str, Any], provider: LLMProvider) ->
     if not isinstance(job, dict):
         job = None
     prompt = prompts.openapi_spec_improve_prompt(openapi_spec, validation_report, job=job)
-    response = provider.generate(prompt)
-    json_text = _extract_json(response.content)
-    if not json_text:
-        raise ToolExecutionError("Failed to extract JSON from LLM response")
     try:
-        improved = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        raise ToolExecutionError(f"Invalid JSON returned: {exc}") from exc
-    if not isinstance(improved, dict):
-        raise ToolExecutionError("Improved OpenAPI spec must be an object")
+        improved = provider.generate_json_object(prompt)
+    except LLMProviderError as exc:
+        raise ToolExecutionError(str(exc)) from exc
     return {"openapi_spec": improved}
-
-
-def _extract_json(text: str) -> str:
-    content = text.strip()
-    if content.startswith("```"):
-        parts = content.split("```")
-        if len(parts) > 1:
-            content = parts[1]
-        content = content.lstrip()
-        if content.startswith("json"):
-            content = content[4:].lstrip()
-    first_obj = content.find("{")
-    first_arr = content.find("[")
-    if first_obj == -1 and first_arr == -1:
-        return ""
-    if first_arr == -1 or (first_obj != -1 and first_obj < first_arr):
-        start = first_obj
-        end = content.rfind("}")
-    else:
-        start = first_arr
-        end = content.rfind("]")
-    if start == -1 or end == -1 or end <= start:
-        return ""
-    return content[start : end + 1]

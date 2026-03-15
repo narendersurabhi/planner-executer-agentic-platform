@@ -1389,7 +1389,8 @@ const BUILT_IN_TEMPLATES: Template[] = [
     description:
       "Generate code into the workspace and open a PR. Repository must already exist and be accessible to GitHub token.",
     goal:
-      "Use github.repo.list with github_query: 'repo:{{repo_name}} owner:{{repo_owner}}' only to verify that repository '{{repo_owner}}/{{repo_name}}' exists. " +
+      "Use github.repo.list only to verify that repository '{{repo_owner}}/{{repo_name}}' exists. " +
+      "Build the repository search from explicit repo_owner and repo_name context fields; do not invent or rewrite the GitHub search query. " +
       "If the repository is missing, stop and do not proceed. " +
       "Then use codegen.autonomous with explicit tool_inputs for implementation in the existing workspace path 'repos/{{repo_name}}': " +
       "{goal: '{{code_goal}}', workspace_path: 'repos/{{repo_name}}', constraints: '{{constraints}}', max_steps: {{max_steps}}}. " +
@@ -1401,7 +1402,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "{owner: '{{repo_owner}}', repo: '{{repo_name}}', branch: '{{pr_branch}}', base: '{{default_branch}}', " +
       "workspace_path: 'repos/{{repo_name}}'}.",
     contextJson:
-  '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "goal": "{{code_goal}}",\n  "github_query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "max_steps": "{{max_steps}}",\n  "owner": "{{repo_owner}}",\n  "repo": "{{repo_name}}",\n  "branch": "{{pr_branch}}",\n  "base": "{{default_branch}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "default_branch": "{{default_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "pr_branch": "{{pr_branch}}",\n  "tool_inputs": {\n    "github.repo.list": {\n      "query": "repo:{{repo_name}} owner:{{repo_owner}}"\n    },\n    "codegen.autonomous": {\n      "goal": "{{code_goal}}",\n      "workspace_path": "repos/{{repo_name}}",\n      "constraints": "{{constraints}}",\n      "max_steps": "{{max_steps}}"\n    },\n    "codegen.publish_pr": {\n      "owner": "{{repo_owner}}",\n      "repo": "{{repo_name}}",\n      "branch": "{{pr_branch}}",\n      "base": "{{default_branch}}",\n      "workspace_path": "repos/{{repo_name}}"\n    }\n  }\n}',
+  '{\n  "code_goal": "{{code_goal}}",\n  "constraints": "{{constraints}}",\n  "goal": "{{code_goal}}",\n  "github_query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "query": "repo:{{repo_name}} owner:{{repo_owner}}",\n  "max_steps": "{{max_steps}}",\n  "owner": "{{repo_owner}}",\n  "repo": "{{repo_name}}",\n  "branch": "{{pr_branch}}",\n  "base": "{{default_branch}}",\n  "repo_name": "{{repo_name}}",\n  "repo_owner": "{{repo_owner}}",\n  "default_branch": "{{default_branch}}",\n  "workspace_path": "repos/{{repo_name}}",\n  "pr_branch": "{{pr_branch}}",\n  "tool_inputs": {\n    "github.repo.list": {},\n    "codegen.autonomous": {\n      "goal": "{{code_goal}}",\n      "workspace_path": "repos/{{repo_name}}",\n      "constraints": "{{constraints}}",\n      "max_steps": "{{max_steps}}"\n    },\n    "codegen.publish_pr": {\n      "owner": "{{repo_owner}}",\n      "repo": "{{repo_name}}",\n      "branch": "{{pr_branch}}",\n      "base": "{{default_branch}}",\n      "workspace_path": "repos/{{repo_name}}"\n    }\n  }\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -1453,7 +1454,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
         label: "PR Branch",
         scope: "per_run",
         required: true,
-        placeholder: "e.g., feature/user-signup"
+        placeholder: "e.g., codex/scientific-agent-lab"
       },
     ]
   },
@@ -1470,6 +1471,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Then open a pull request from the workspace using codegen.publish_pr with owner '{{repo_owner}}' " +
       "and repo '{{repo_name}}'. Do not create or update the repository. " +
       "Use repo_name exactly as provided (it must be a GitHub-safe slug). " +
+      "The PR branch must differ from the base branch. " +
       "Set tool_inputs explicitly for codegen.autonomous(goal: '{{code_goal}}', workspace_path: 'repos/{{repo_name}}', constraints: '{{constraints}}', max_steps: {{max_steps}}) and codegen.publish_pr " +
       "with required fields: {owner: '{{repo_owner}}', repo: '{{repo_name}}', branch: '{{pr_branch}}', base: '{{base_branch}}', workspace_path: 'repos/{{repo_name}}'}.",
     contextJson:
@@ -1524,7 +1526,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
         label: "PR Branch",
         scope: "per_run",
         required: true,
-        placeholder: "e.g., feature/improvements"
+        placeholder: "e.g., codex/your-change"
       },
     ]
   },
@@ -1534,7 +1536,8 @@ const BUILT_IN_TEMPLATES: Template[] = [
     description:
       "Check repository existence using authenticated GitHub search; token is read from GITHUB_TOKEN.",
     goal:
-      "Use github.repo.list with github_query: 'repo:{{repo_name}} owner:{{repo_owner}}' to verify that repository '{{repo_owner}}/{{repo_name}}' exists. " +
+      "Use github.repo.list to verify that repository '{{repo_owner}}/{{repo_name}}' exists. " +
+      "Build the repository search from explicit repo_owner and repo_name context fields; do not invent or rewrite the GitHub search query. " +
       "If the repository is not found, stop and report this failure. " +
       "Do not include github_token in plan context; authentication should come from environment variable GITHUB_TOKEN.",
     contextJson:
