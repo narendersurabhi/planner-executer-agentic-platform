@@ -8,6 +8,7 @@ __all__ = [
     "policy_engine",
     "orchestrator",
     "llm_provider",
+    "chat_contracts",
     "execution_contracts",
     "planner_contracts",
     "workflow_contracts",

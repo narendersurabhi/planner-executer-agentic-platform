@@ -24,6 +24,36 @@ class JobRecord(Base):
     plan: Mapped["PlanRecord"] = relationship("PlanRecord", back_populates="job", uselist=False)
 
 
+class ChatSessionRecord(Base):
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    title: Mapped[str] = mapped_column(String)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+
+    messages: Mapped[List["ChatMessageRecord"]] = relationship(
+        "ChatMessageRecord",
+        back_populates="session",
+    )
+
+
+class ChatMessageRecord(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    role: Mapped[str] = mapped_column(String, index=True)
+    content: Mapped[str] = mapped_column(String)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    action_json: Mapped[Dict[str, Any] | None] = mapped_column("action", JSON, nullable=True)
+    job_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+    session: Mapped[ChatSessionRecord] = relationship("ChatSessionRecord", back_populates="messages")
+
+
 class PlanRecord(Base):
     __tablename__ = "plans"
 

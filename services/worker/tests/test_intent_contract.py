@@ -201,3 +201,54 @@ def test_tool_payload_builds_github_repo_query_from_context_fields() -> None:
         {"github.repo.list": {}},
     )
     assert payload["query"] == "repo:scientific-agent-lab owner:narendersurabhi"
+
+
+def test_validate_expected_output_rejects_invalid_render_validation_report() -> None:
+    error = main._validate_expected_output(
+        {
+            "tool_requests": ["docx_generate_from_spec"],
+            "tool_inputs": {
+                "docx_generate_from_spec": {
+                    "validation_report": {
+                        "valid": False,
+                        "errors": [
+                            {
+                                "path": "/blocks/0/text",
+                                "message": "text/paragraph requires text: string",
+                            }
+                        ],
+                    }
+                }
+            },
+        },
+        {},
+    )
+
+    assert (
+        error
+        == "render_validation_failed:docx_generate_from_spec:/blocks/0/text: text/paragraph requires text: string"
+    )
+
+
+def test_validate_expected_output_rejects_render_errors_without_validation_report() -> None:
+    error = main._validate_expected_output(
+        {
+            "tool_requests": ["document.pdf.generate"],
+            "tool_inputs": {
+                "document.pdf.generate": {
+                    "errors": [
+                        {
+                            "path": "/blocks/1/items",
+                            "message": "items must be an array",
+                        }
+                    ]
+                }
+            },
+        },
+        {},
+    )
+
+    assert (
+        error
+        == "render_validation_failed:document.pdf.generate:/blocks/1/items: items must be an array"
+    )

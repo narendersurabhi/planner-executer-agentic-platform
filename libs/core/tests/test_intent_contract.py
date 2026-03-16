@@ -364,6 +364,52 @@ def test_validate_intent_segment_contract_accepts_target_repo_alias_from_query()
     assert mismatch is None
 
 
+def test_validate_intent_segment_contract_accepts_repo_full_name_from_owner_and_repo() -> None:
+    segment = {
+        "intent": "io",
+        "objective": "Verify repository accessibility",
+        "slots": {
+            "entity": "repository",
+            "artifact_type": "validation_report",
+            "output_format": None,
+            "risk_level": "read_only",
+            "must_have_inputs": ["repo_full_name"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="io",
+        tool_name="github.repo.list",
+        payload={"owner": "narendersurabhi", "repo": "scientific-agent-lab"},
+        capability_id="github.repo.list",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
+def test_validate_intent_segment_contract_accepts_repo_full_name_from_query() -> None:
+    segment = {
+        "intent": "io",
+        "objective": "Verify repository accessibility",
+        "slots": {
+            "entity": "repository",
+            "artifact_type": "validation_report",
+            "output_format": None,
+            "risk_level": "read_only",
+            "must_have_inputs": ["repo_full_name"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="io",
+        tool_name="github.repo.list",
+        payload={"query": "repo:scientific-agent-lab owner:narendersurabhi"},
+        capability_id="github.repo.list",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
 def test_validate_intent_segment_contract_accepts_title_alias_from_topic() -> None:
     segment = {
         "intent": "generate",

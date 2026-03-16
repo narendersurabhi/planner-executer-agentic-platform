@@ -375,6 +375,21 @@ def _job_context_value(payload_map: Mapping[str, Any], key: str) -> Any:
 
 
 def _payload_has_required_input(payload_map: Mapping[str, Any], key: str) -> bool:
+    if key == "repo_full_name":
+        owner = (
+            payload_map.get("owner")
+            or payload_map.get("repo_owner")
+            or _job_context_value(payload_map, "owner")
+            or _job_context_value(payload_map, "repo_owner")
+        )
+        repo = (
+            payload_map.get("repo")
+            or payload_map.get("repo_name")
+            or _job_context_value(payload_map, "repo")
+            or _job_context_value(payload_map, "repo_name")
+        )
+        if _value_present(owner, key="owner") and _value_present(repo, key="repo"):
+            return True
     if key == "length":
         for candidate in ("length", "target_pages", "page_count", "max_words", "word_count"):
             if candidate in payload_map and _value_present(payload_map.get(candidate), key=candidate):
@@ -402,6 +417,7 @@ def _payload_has_required_input(payload_map: Mapping[str, Any], key: str) -> boo
         "filename": ("file_name", "output_filename", "path", "output_path"),
         "github_query": ("query",),
         "target_repo": ("query", "github_query", "repo", "repo_name"),
+        "repo_full_name": ("query", "github_query", "target_repo"),
         "title": (
             "document_title",
             "topic",

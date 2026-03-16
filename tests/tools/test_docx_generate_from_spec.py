@@ -49,12 +49,45 @@ def test_path_traversal_blocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         )
 
 
-def test_missing_path_fails_schema_validation() -> None:
+def test_invalid_validation_report_blocks_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ARTIFACTS_DIR", str(_artifact_dir(tmp_path)))
     registry = _make_registry()
     spec = _load_fixture("resume_ats_single_column_spec.json")
-    call = registry.execute("docx_generate_from_spec", {"document_spec": spec}, "id", "trace")
-    assert call.status == "failed"
-    assert "path must be a non-empty string" in call.output_or_error["error"]
+    with pytest.raises(ToolExecutionError, match="document_spec validation failed"):
+        registry.get("docx_generate_from_spec").handler(
+            {
+                "document_spec": spec,
+                "path": "tests/blocked.docx",
+                "validation_report": {
+                    "valid": False,
+                    "errors": [
+                        {
+                            "path": "/blocks/0/text",
+                            "message": "text/paragraph requires text: string",
+                        }
+                    ],
+                },
+            }
+        )
+
+
+def test_missing_path_auto_derives_output_path() -> None:
+    import tempfile
+
+    from pytest import MonkeyPatch
+
+    monkeypatch = MonkeyPatch()
+    monkeypatch.setenv("ARTIFACTS_DIR", str(_artifact_dir(Path(tempfile.mkdtemp()))))
+    registry = _make_registry()
+    spec = _load_fixture("resume_ats_single_column_spec.json")
+    try:
+        call = registry.execute("docx_generate_from_spec", {"document_spec": spec}, "id", "trace")
+        assert call.status == "completed"
+        assert call.output_or_error["path"].endswith(".docx")
+    finally:
+        monkeypatch.undo()
 
 
 def test_strict_unresolved_placeholder_raises(

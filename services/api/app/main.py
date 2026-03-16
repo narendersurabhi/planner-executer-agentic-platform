@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from libs.core import (
     capability_search,
     capability_registry,
+    chat_contracts,
     document_store,
     execution_contracts,
     events,
@@ -43,8 +44,13 @@ from libs.core.llm_provider import (
     resolve_provider,
 )
 from .database import Base, SessionLocal, engine
-from .models import EventOutboxRecord, JobRecord, PlanRecord, TaskRecord
-from . import dispatch_service, intent_service, memory_store
+from .models import (
+    EventOutboxRecord,
+    JobRecord,
+    PlanRecord,
+    TaskRecord,
+)
+from . import chat_execution_service, chat_service, dispatch_service, intent_service, memory_store
 
 core_logging.configure_logging("api")
 logger = logging.getLogger("api.orchestrator")
@@ -176,6 +182,17 @@ INTENT_MEMORY_RETRIEVAL_ENABLED = (
 INTENT_MEMORY_RETRIEVAL_LIMIT = max(
     1, min(10, int(os.getenv("INTENT_MEMORY_RETRIEVAL_LIMIT", "3")))
 )
+CHAT_DIRECT_EXECUTION_ENABLED = (
+    os.getenv("CHAT_DIRECT_EXECUTION_ENABLED", "true").lower() == "true"
+)
+CHAT_DIRECT_CAPABILITIES = {
+    entry.strip()
+    for entry in os.getenv(
+        "CHAT_DIRECT_CAPABILITIES",
+        ",".join(sorted(chat_execution_service.DEFAULT_CHAT_DIRECT_CAPABILITIES)),
+    ).split(",")
+    if entry.strip()
+}
 INTENT_MEMORY_PERSIST_ENABLED = (
     os.getenv("INTENT_MEMORY_PERSIST_ENABLED", "true").lower() == "true"
 )
@@ -278,6 +295,51 @@ def _build_intent_decompose_provider() -> LLMProvider | None:
 
 
 _intent_decompose_provider = _build_intent_decompose_provider()
+
+
+def _build_chat_router_provider() -> LLMProvider | None:
+    provider_name = (LLM_PROVIDER_NAME or "").strip().lower()
+    if not provider_name or provider_name == "mock":
+        return None
+    model_name = (LLM_MODEL_NAME or "").strip()
+    if not model_name:
+        return None
+    try:
+        return resolve_provider(
+            provider_name,
+            api_key=OPENAI_API_KEY or None,
+            model=model_name,
+            base_url=OPENAI_BASE_URL or None,
+            timeout_s=max(1.0, OPENAI_TIMEOUT_S),
+            max_retries=max(0, OPENAI_MAX_RETRIES),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "chat_router_provider_init_failed",
+            extra={"provider": provider_name, "model": model_name},
+        )
+        return None
+
+
+_chat_router_provider = _build_chat_router_provider()
+
+
+def _build_chat_direct_executor() -> chat_execution_service.ChatDirectExecutor | None:
+    if not CHAT_DIRECT_EXECUTION_ENABLED:
+        return None
+    try:
+        return chat_execution_service.build_chat_direct_executor(
+            service_name="api",
+            allowed_capabilities=CHAT_DIRECT_CAPABILITIES,
+            llm_enabled=False,
+            llm_provider_instance=None,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_direct_executor_init_failed")
+        return None
+
+
+_chat_direct_executor = _build_chat_direct_executor()
 
 
 def _init_db() -> None:
@@ -800,6 +862,65 @@ def _slot_question(slot: str, goal: str) -> str:
     return f"Provide clarification for slot '{slot}' for goal: '{goal[:120]}'."
 
 
+def _looks_like_conversational_turn(content: str) -> bool:
+    lowered = str(content or "").strip().lower()
+    if not lowered:
+        return True
+    casual_phrases = (
+        "hi",
+        "hello",
+        "hey",
+        "help",
+        "thanks",
+        "thank you",
+        "how are you",
+        "what can you do",
+        "can you help me understand",
+        "why ",
+        "what is ",
+        "what are ",
+        "how does ",
+        "how do ",
+        "can you explain",
+        "explain ",
+    )
+    workflow_tokens = (
+        "create ",
+        "build ",
+        "generate ",
+        "render ",
+        "deploy ",
+        "port forward",
+        "open pull request",
+        "open pr",
+        "check repo",
+        "list repos",
+        "write file",
+        "update file",
+        "make a workflow",
+        "create a workflow",
+        "submit a job",
+        "run ",
+    )
+    if any(token in lowered for token in workflow_tokens):
+        return False
+    if lowered.endswith("?"):
+        return True
+    return any(lowered.startswith(phrase) or lowered == phrase for phrase in casual_phrases)
+
+
+def _fallback_chat_response(content: str) -> str:
+    lowered = str(content or "").strip().lower()
+    if lowered in {"hi", "hello", "hey"}:
+        return "I can chat, answer questions, and create workflows when execution is needed."
+    if lowered in {"thanks", "thank you"}:
+        return "You can keep chatting here, or ask me to create a workflow when you want work executed."
+    return (
+        "I can answer questions directly here, and when you want work executed I can turn that into "
+        "a workflow and submit a job."
+    )
+
+
 def _goal_intent_segments_from_metadata(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     graph = (
         workflow_contracts.parse_intent_graph(metadata.get("goal_intent_graph"))
@@ -868,6 +989,272 @@ def _assess_goal_intent(goal: str) -> dict[str, Any]:
     }
 
 
+def _route_chat_turn(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> dict[str, Any]:
+    fallback = _fallback_chat_turn_route(
+        content=content,
+        candidate_goal=candidate_goal,
+        session_metadata=session_metadata,
+    )
+    if _chat_router_provider is None:
+        return fallback
+    pending_clarification = bool(
+        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
+    )
+    try:
+        prompt = _build_chat_router_prompt(
+            content=content,
+            candidate_goal=candidate_goal,
+            pending_clarification=pending_clarification,
+            merged_context=merged_context,
+            messages=messages,
+        )
+        parsed = _chat_router_provider.generate_request_json_object(
+            LLMRequest(
+                prompt=prompt,
+                system_prompt=(
+                    "You route chat turns for an agent platform. "
+                    "Return JSON only. "
+                    "Use route='respond' for normal conversation or explanation when no tools/workflow are needed. "
+                    "Use route='tool_call' only for a single safe read-only capability from the allowed catalog. "
+                    "Use route='submit_job' only when the user wants the system to perform work, create artifacts, inspect systems, or run automation. "
+                    "Use route='ask_clarification' only when workflow execution is needed but essential details are missing. "
+                    "Never choose tool_call for writes, multi-step work, or anything outside the allowed direct catalog."
+                ),
+                metadata={
+                    "component": "chat_router",
+                    "pending_clarification": str(pending_clarification).lower(),
+                },
+            )
+        )
+        return _normalize_chat_route(
+            parsed,
+            content=content,
+            candidate_goal=candidate_goal,
+            fallback=fallback,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_router_failed")
+        return fallback
+
+
+def _fallback_chat_turn_route(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    pending_clarification = bool(
+        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
+    )
+    assessment = _assess_goal_intent(candidate_goal)
+    if pending_clarification or not _looks_like_conversational_turn(content):
+        if bool(assessment.get("requires_blocking_clarification")):
+            questions = [
+                str(question).strip()
+                for question in assessment.get("questions", [])
+                if isinstance(question, str) and question.strip()
+            ]
+            return {
+                "type": "ask_clarification",
+                "assistant_content": "\n".join(questions) if questions else "What should I do next?",
+                "clarification_questions": questions,
+                "goal_intent_profile": assessment,
+            }
+        return {
+            "type": "submit_job",
+            "assistant_content": "",
+            "clarification_questions": [],
+            "goal_intent_profile": assessment,
+        }
+    return {
+        "type": "respond",
+        "assistant_content": _fallback_chat_response(content),
+        "clarification_questions": [],
+        "goal_intent_profile": assessment,
+    }
+
+
+def _build_chat_router_prompt(
+    *,
+    content: str,
+    candidate_goal: str,
+    pending_clarification: bool,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> str:
+    recent_messages: list[dict[str, str]] = []
+    for message in list(messages or [])[-6:]:
+        recent_messages.append(
+            {
+                "role": str(message.role),
+                "content": str(message.content or "")[:500],
+            }
+        )
+    direct_capabilities = [
+        {
+            "id": capability_id,
+            "description": _chat_direct_capability_description(capability_id),
+        }
+        for capability_id in sorted(CHAT_DIRECT_CAPABILITIES)
+    ]
+    payload = {
+        "current_user_message": content,
+        "candidate_goal": candidate_goal,
+        "pending_clarification": pending_clarification,
+        "context_json": dict(merged_context or {}),
+        "recent_messages": recent_messages,
+        "direct_capabilities": direct_capabilities,
+        "response_schema": {
+            "route": "respond | tool_call | ask_clarification | submit_job",
+            "assistant_response": "string",
+            "intent": "generate | transform | validate | render | io | other",
+            "risk_level": "read_only | bounded_write | high_risk_write",
+            "confidence": "0..1",
+            "output_format": "string",
+            "target_system": "string",
+            "safety_constraints": "string",
+            "capability_id": "string",
+            "arguments": {"any": "json object"},
+            "clarification_questions": ["string"],
+        },
+    }
+    return (
+        "Decide whether this turn should stay conversational or become a workflow request.\n"
+        "Rules:\n"
+        "- respond: answer normally, no workflow/job needed.\n"
+        "- tool_call: perform exactly one safe read-only capability from direct_capabilities.\n"
+        "- ask_clarification: workflow is needed, but essential details are missing.\n"
+        "- submit_job: workflow/job should be created now.\n"
+        "- If pending_clarification is true, treat the user message as an attempt to complete an existing workflow request.\n"
+        "- Ask for safety constraints only when a high-risk write workflow is actually being requested.\n"
+        "- Use tool_call only when one direct capability is sufficient and no durable workflow is needed.\n"
+        "- Return JSON only.\n\n"
+        f"{json.dumps(payload, ensure_ascii=True)}"
+    )
+
+
+def _normalize_chat_route(
+    parsed: Mapping[str, Any],
+    *,
+    content: str,
+    candidate_goal: str,
+    fallback: Mapping[str, Any],
+) -> dict[str, Any]:
+    heuristic = _assess_goal_intent(candidate_goal)
+    route = str(parsed.get("route") or parsed.get("type") or "").strip().lower()
+    if route not in {"respond", "tool_call", "ask_clarification", "submit_job"}:
+        route = str(fallback.get("type") or "respond")
+    if route == "respond" and not _looks_like_conversational_turn(content):
+        route = str(fallback.get("type") or "respond")
+    capability_id = str(parsed.get("capability_id") or "").strip()
+    if route == "tool_call" and capability_id not in CHAT_DIRECT_CAPABILITIES:
+        route = str(fallback.get("type") or "respond")
+        capability_id = ""
+    arguments = dict(parsed.get("arguments")) if isinstance(parsed.get("arguments"), Mapping) else {}
+
+    intent = str(parsed.get("intent") or heuristic.get("intent") or "").strip().lower()
+    if intent not in {"generate", "transform", "validate", "render", "io"}:
+        intent = str(heuristic.get("intent") or "")
+    risk_level = str(parsed.get("risk_level") or heuristic.get("risk_level") or "").strip().lower()
+    if risk_level not in {"read_only", "bounded_write", "high_risk_write"}:
+        risk_level = str(heuristic.get("risk_level") or "read_only")
+    confidence_raw = parsed.get("confidence")
+    confidence = float(heuristic.get("confidence") or 0.0)
+    if isinstance(confidence_raw, (int, float)):
+        confidence = max(0.0, min(1.0, float(confidence_raw)))
+    threshold = _resolve_intent_confidence_threshold(intent, risk_level)
+
+    slot_values = dict(heuristic.get("slot_values") or {})
+    for key in ("output_format", "target_system", "safety_constraints"):
+        value = parsed.get(key)
+        if isinstance(value, str) and value.strip():
+            slot_values[key] = value.strip()
+    slot_values["intent_action"] = intent
+    slot_values["risk_level"] = risk_level
+
+    blocking_slots = _blocking_clarification_slots(intent, risk_level)
+    missing_slots = [
+        slot_name
+        for slot_name in blocking_slots
+        if not str(slot_values.get(slot_name) or "").strip()
+    ]
+    parsed_missing_slots = parsed.get("missing_slots")
+    if isinstance(parsed_missing_slots, list):
+        for slot_name in parsed_missing_slots:
+            normalized = str(slot_name).strip()
+            if normalized and normalized in blocking_slots and normalized not in missing_slots:
+                missing_slots.append(normalized)
+    low_confidence = confidence < threshold
+    if route != "respond" and low_confidence and "intent_action" in blocking_slots and "intent_action" not in missing_slots:
+        missing_slots.append("intent_action")
+    if route == "tool_call" and (missing_slots or risk_level != "read_only"):
+        route = str(fallback.get("type") or "respond")
+    if route == "submit_job" and missing_slots:
+        route = "ask_clarification"
+    clarification_questions = [
+        str(question).strip()
+        for question in parsed.get("clarification_questions", [])
+        if isinstance(question, str) and question.strip()
+    ]
+    if route == "ask_clarification" and not clarification_questions:
+        clarification_questions = [_slot_question(slot_name, candidate_goal) for slot_name in missing_slots]
+    assistant_response = str(parsed.get("assistant_response") or "").strip()
+    if route == "respond" and not assistant_response:
+        assistant_response = _fallback_chat_response(content)
+    if route in {"respond", "tool_call"}:
+        blocking_slots = []
+        missing_slots = []
+        clarification_questions = []
+    assessment = {
+        "intent": intent,
+        "source": "llm_chat_router",
+        "confidence": round(confidence, 3),
+        "risk_level": risk_level,
+        "threshold": threshold,
+        "low_confidence": low_confidence,
+        "needs_clarification": bool(missing_slots),
+        "requires_blocking_clarification": bool(missing_slots),
+        "questions": clarification_questions,
+        "blocking_slots": blocking_slots,
+        "missing_slots": missing_slots,
+        "slot_values": slot_values,
+        "clarification_mode": "llm_targeted_slot_filling",
+    }
+    return {
+        "type": route,
+        "assistant_content": assistant_response,
+        "capability_id": capability_id,
+        "arguments": arguments,
+        "clarification_questions": clarification_questions,
+        "goal_intent_profile": assessment,
+    }
+
+
+def _chat_direct_capability_description(capability_id: str) -> str:
+    descriptions = {
+        "github.repo.list": "List repositories for a user/org or search repositories.",
+        "github.user.me": "Return the authenticated GitHub user profile.",
+        "github.issue.search": "Search GitHub issues or pull requests.",
+        "github.user.search": "Search GitHub users.",
+        "github.branch.list": "List branches for a GitHub repository.",
+        "filesystem.artifacts.list": "List files under the shared artifacts directory.",
+        "filesystem.artifacts.read_text": "Read a text file from the shared artifacts directory.",
+        "filesystem.artifacts.search_text": "Search text within files in the shared artifacts directory.",
+        "filesystem.workspace.list": "List files under the shared workspace directory.",
+        "filesystem.workspace.read_text": "Read a text file from the shared workspace directory.",
+        "memory.read": "Read structured memory entries by name/key/job/user/project.",
+        "memory.semantic.search": "Search semantic memory for related facts.",
+    }
+    return descriptions.get(capability_id, capability_id)
+
+
 def _dispatch_runtime() -> dispatch_service.ApiDispatchRuntime:
     return dispatch_service.ApiDispatchRuntime(
         redis_client=redis_client,
@@ -884,6 +1271,37 @@ def _dispatch_runtime() -> dispatch_service.ApiDispatchRuntime:
             tool_input_schemas=TOOL_INPUT_SCHEMAS,
         ),
     )
+
+
+def _chat_runtime() -> chat_service.ChatServiceRuntime:
+    return chat_service.ChatServiceRuntime(
+        route_turn=_route_chat_turn,
+        execute_direct_capability=_execute_chat_direct_capability,
+        create_job=_create_job_internal,
+        utcnow=_utcnow,
+        make_id=lambda: str(uuid.uuid4()),
+    )
+
+
+def _execute_chat_direct_capability(
+    *,
+    capability_id: str,
+    arguments: dict[str, Any],
+    trace_id: str,
+) -> dict[str, Any]:
+    if _chat_direct_executor is None:
+        raise RuntimeError("chat_direct_execution_disabled")
+    result = _chat_direct_executor.execute_capability(
+        capability_id=capability_id,
+        arguments=arguments,
+        trace_id=trace_id,
+    )
+    return {
+        "capability_id": result.capability_id,
+        "tool_name": result.tool_name,
+        "output": result.output,
+        "assistant_response": result.assistant_response,
+    }
 
 
 def _dispatch_callbacks() -> dispatch_service.ApiDispatchCallbacks:
@@ -4959,11 +5377,52 @@ def _read_task_events_for_job(job_id: str, limit: int) -> list[dict[str, Any]]:
     return entries
 
 
-@app.post("/jobs", response_model=models.Job)
-def create_job(
-    job: models.JobCreate,
-    require_clarification: bool = Query(False),
+@app.post("/chat/sessions", response_model=chat_contracts.ChatSession)
+def create_chat_session(
+    request: chat_contracts.ChatSessionCreate,
     db: Session = Depends(get_db),
+) -> chat_contracts.ChatSession:
+    return chat_service.create_session(db, request, runtime=_chat_runtime())
+
+
+@app.get("/chat/sessions/{session_id}", response_model=chat_contracts.ChatSession)
+def get_chat_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+) -> chat_contracts.ChatSession:
+    session = chat_service.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="chat_session_not_found")
+    return session
+
+
+@app.post(
+    "/chat/sessions/{session_id}/messages",
+    response_model=chat_contracts.ChatTurnResponse,
+)
+def create_chat_message(
+    session_id: str,
+    request: chat_contracts.ChatTurnRequest,
+    db: Session = Depends(get_db),
+) -> chat_contracts.ChatTurnResponse:
+    try:
+        return chat_service.handle_turn(
+            db,
+            session_id,
+            request,
+            runtime=_chat_runtime(),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="chat_session_not_found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _create_job_internal(
+    job: models.JobCreate,
+    db: Session,
+    *,
+    require_clarification: bool = False,
 ) -> models.Job:
     job_id = str(uuid.uuid4())
     now = _utcnow()
@@ -5067,6 +5526,15 @@ def create_job(
         _seed_task_output_memory(db, job_id, context_json_for_job)
     _emit_event("job.created", _job_from_record(record).model_dump())
     return _job_from_record(record)
+
+
+@app.post("/jobs", response_model=models.Job)
+def create_job(
+    job: models.JobCreate,
+    require_clarification: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> models.Job:
+    return _create_job_internal(job, db, require_clarification=require_clarification)
 
 
 def _seed_task_output_memory(db: Session, job_id: str, context_json: Dict[str, Any]) -> None:

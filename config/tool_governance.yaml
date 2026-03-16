@@ -111,6 +111,10 @@ tool_governance:
         - file_read_text
         - list_files
         - search_text
+        - workspace_list_files
+        - workspace_read_text
+        - memory_read
+        - memory_semantic_search
       deny:
         - run_tests
         - sleep

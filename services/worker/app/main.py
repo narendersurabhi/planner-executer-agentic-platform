@@ -1252,6 +1252,9 @@ def _enforce_capability_input_contract(
 
 
 def _validate_expected_output(task_payload: dict, outputs: dict) -> str | None:
+    render_validation_error = _validate_render_inputs(task_payload)
+    if render_validation_error:
+        return render_validation_error
     schema_ref = task_payload.get("expected_output_schema_ref")
     tool_requests = task_payload.get("tool_requests", [])
     if "llm_generate" not in tool_requests:
@@ -1287,6 +1290,62 @@ def _validate_expected_output(task_payload: dict, outputs: dict) -> str | None:
         )
         return f"schema_validation_failed:{messages}"
     return None
+
+
+def _validate_render_inputs(task_payload: dict) -> str | None:
+    tool_requests = task_payload.get("tool_requests", [])
+    if not isinstance(tool_requests, list) or not any(
+        _is_render_request(tool_request) for tool_request in tool_requests
+    ):
+        return None
+    tool_inputs = task_payload.get("tool_inputs")
+    if not isinstance(tool_inputs, Mapping):
+        return None
+    for request_id in tool_requests:
+        if not _is_render_request(request_id):
+            continue
+        payload = tool_inputs.get(request_id)
+        if not isinstance(payload, Mapping):
+            continue
+        validation_report = payload.get("validation_report")
+        if isinstance(validation_report, Mapping):
+            valid = validation_report.get("valid")
+            if valid is False:
+                return _format_render_validation_error(
+                    request_id,
+                    validation_report.get("errors"),
+                )
+        errors = payload.get("errors")
+        if isinstance(errors, list) and errors:
+            return _format_render_validation_error(request_id, errors)
+    return None
+
+
+def _is_render_request(request_id: Any) -> bool:
+    if not isinstance(request_id, str):
+        return False
+    normalized = request_id.strip().lower()
+    return normalized in {
+        "docx_generate_from_spec",
+        "pdf_generate_from_spec",
+        "document.docx.generate",
+        "document.pdf.generate",
+    }
+
+
+def _format_render_validation_error(request_id: str, errors: Any) -> str:
+    if not isinstance(errors, list) or not errors:
+        return f"render_validation_failed:{request_id}:document_spec_invalid"
+    messages: list[str] = []
+    for error in errors[:5]:
+        if isinstance(error, Mapping):
+            path = str(error.get("path") or "<root>")
+            message = str(error.get("message") or "invalid")
+            messages.append(f"{path}: {message}")
+        else:
+            messages.append(str(error))
+    joined = "; ".join(messages)
+    return f"render_validation_failed:{request_id}:{joined}"
 
 
 def _resolve_schema_path(schema_ref: str) -> Path | None:

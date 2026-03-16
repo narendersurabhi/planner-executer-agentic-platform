@@ -23,6 +23,12 @@ spec:
             - configMapRef:
                 name: awe-config
           env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:

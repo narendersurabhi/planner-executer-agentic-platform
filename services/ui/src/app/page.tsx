@@ -632,6 +632,45 @@ type Job = {
   context_json?: Record<string, unknown>;
 };
 
+type ChatAssistantAction = {
+  type: "respond" | "tool_call" | "ask_clarification" | "submit_job" | "attach_to_job" | "summarize_job";
+  goal?: string | null;
+  job_id?: string | null;
+  capability_id?: string | null;
+  tool_name?: string | null;
+  clarification_questions?: string[];
+  goal_intent_profile?: Record<string, unknown>;
+  context_json?: Record<string, unknown>;
+};
+
+type ChatMessage = {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+  metadata?: Record<string, unknown>;
+  action?: ChatAssistantAction | null;
+  job_id?: string | null;
+};
+
+type ChatSession = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  metadata?: Record<string, unknown>;
+  active_job_id?: string | null;
+  messages: ChatMessage[];
+};
+
+type ChatTurnResponse = {
+  session: ChatSession;
+  user_message: ChatMessage;
+  assistant_message: ChatMessage;
+  job?: Job | null;
+};
+
 type Plan = {
   id: string;
   job_id: string;
@@ -1987,6 +2026,11 @@ export default function Home() {
   const [isReorderMode, setIsReorderMode] = useState(false);
   const [draggingTemplateId, setDraggingTemplateId] = useState<string | null>(null);
   const [dragOverTemplateId, setDragOverTemplateId] = useState<string | null>(null);
+  const [chatSession, setChatSession] = useState<ChatSession | null>(null);
+  const [chatInput, setChatInput] = useState("");
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatUseComposeContext, setChatUseComposeContext] = useState(true);
   const [showTaskInputs, setShowTaskInputs] = useState(false);
   const [showRecentEvents, setShowRecentEvents] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
@@ -2113,6 +2157,7 @@ export default function Home() {
   const [composerCompileLoading, setComposerCompileLoading] = useState(false);
   const [isDesktop, setIsDesktop] = useState(false);
   const [hasSetInitialSidebar, setHasSetInitialSidebar] = useState(false);
+  const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
   const intentGraphRequestSeqRef = useRef(0);
   const devToolsEnabled = process.env.NEXT_PUBLIC_DEV_TOOLS === "true";
 
@@ -2291,6 +2336,7 @@ export default function Home() {
   const selectedJob = selectedJobId
     ? jobs.find((job) => job.id === selectedJobId) || null
     : null;
+  const chatMessages = chatSession?.messages || [];
   const sidebarLayout = useMemo(() => {
     if (!isDesktop) {
       return { left: 0, right: 0 };
@@ -2320,6 +2366,14 @@ export default function Home() {
   useEffect(() => {
     selectedJobIdRef.current = selectedJobId;
   }, [selectedJobId]);
+
+  useEffect(() => {
+    const node = chatTranscriptRef.current;
+    if (!node) {
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
+  }, [chatMessages.length]);
 
   const loadJobs = async () => {
     const response = await fetch(`${apiUrl}/jobs`);
@@ -5936,6 +5990,79 @@ const openTemplateModal = (template: Template) => {
     }
   };
 
+  const createChatSession = async () => {
+    const response = await fetch(`${apiUrl}/chat/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: chatInput.trim() ? chatInput.trim().slice(0, 80) : "New chat"
+      })
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        text
+          ? `Failed to create chat session (${response.status}): ${text}`
+          : `Failed to create chat session (${response.status}).`
+      );
+    }
+    return (await response.json()) as ChatSession;
+  };
+
+  const resetChatSession = () => {
+    setChatSession(null);
+    setChatInput("");
+    setChatError(null);
+  };
+
+  const submitChatTurn = async () => {
+    const content = chatInput.trim();
+    if (!content) {
+      setChatError("Message is required.");
+      return;
+    }
+    if (chatUseComposeContext && !parsedContextForCapabilities) {
+      setChatError("Context JSON must be a valid object before sending it with chat.");
+      return;
+    }
+
+    try {
+      setChatLoading(true);
+      setChatError(null);
+      let session = chatSession;
+      if (!session) {
+        session = await createChatSession();
+      }
+      const response = await fetch(`${apiUrl}/chat/sessions/${encodeURIComponent(session.id)}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content,
+          context_json: chatUseComposeContext ? parsedContextForCapabilities || {} : {},
+          priority
+        })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(
+          text
+            ? `Failed to send chat message (${response.status}): ${text}`
+            : `Failed to send chat message (${response.status}).`
+        );
+      }
+      const body = (await response.json()) as ChatTurnResponse;
+      setChatSession(body.session);
+      setChatInput("");
+      if (body.job?.id) {
+        await loadJobs();
+        await loadJobDetails(body.job.id);
+      }
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : "Network error while sending chat.");
+    } finally {
+      setChatLoading(false);
+    }
+  };
 
   const loadJobDetails = async (jobId: string) => {
     setSelectedJobId(jobId);
@@ -7980,7 +8107,7 @@ const openTemplateModal = (template: Template) => {
                 Compose
               </div>
             </div>
-            <div className="mt-6">
+            <div className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
               <div className="rounded-2xl bg-white/95 p-6 text-slate-900 shadow-lg ring-1 ring-white/30">
                 <div className="flex items-center justify-between">
                   <h2 className="font-display text-xl">Compose Job</h2>
@@ -8650,6 +8777,127 @@ const openTemplateModal = (template: Template) => {
                       {submitDisabledReason}
                     </div>
                   ) : null}
+                </div>
+              </div>
+              <div className="rounded-2xl bg-slate-950/90 p-6 text-white shadow-lg ring-1 ring-white/10">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h2 className="font-display text-xl">Chat Operator</h2>
+                    <p className="mt-1 text-xs text-slate-300">
+                      Chat submits normal jobs through the existing planner and worker pipeline.
+                    </p>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/20 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-200 transition hover:border-white/40 disabled:opacity-40"
+                    onClick={resetChatSession}
+                    disabled={chatLoading}
+                  >
+                    New chat
+                  </button>
+                </div>
+                <div className="mt-4 flex flex-wrap items-center gap-2 text-[11px] text-slate-300">
+                  <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">
+                    {chatSession ? `Session ${chatSession.id.slice(0, 8)}` : "No session yet"}
+                  </span>
+                  <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2 py-1 text-emerald-200">
+                    {chatSession?.active_job_id ? `Active job ${chatSession.active_job_id.slice(0, 8)}` : "Ready"}
+                  </span>
+                </div>
+                <div
+                  ref={chatTranscriptRef}
+                  className="mt-4 max-h-[26rem] min-h-[18rem] space-y-3 overflow-y-auto rounded-2xl border border-white/10 bg-black/20 p-4"
+                >
+                  {chatMessages.length === 0 ? (
+                    <div className="flex h-full min-h-[15rem] items-center justify-center rounded-xl border border-dashed border-white/10 bg-white/5 px-4 text-center text-sm text-slate-300">
+                      Start with a plain request like “Create a DOCX from this markdown” or
+                      “Open a PR for the generated repository”.
+                    </div>
+                  ) : (
+                    chatMessages.map((message) => (
+                      <div
+                        key={message.id}
+                        className={`max-w-[92%] rounded-2xl px-4 py-3 text-sm shadow-sm ${
+                          message.role === "user"
+                            ? "ml-auto bg-white text-slate-900"
+                            : "border border-white/10 bg-white/10 text-slate-100"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.18em]">
+                          <span className={message.role === "user" ? "text-slate-500" : "text-slate-300"}>
+                            {message.role}
+                          </span>
+                          <span className={message.role === "user" ? "text-slate-400" : "text-slate-400"}>
+                            {formatTimestamp(message.created_at)}
+                          </span>
+                        </div>
+                        <div className="mt-2 whitespace-pre-wrap break-words">{message.content}</div>
+                        {message.action?.clarification_questions &&
+                        message.action.clarification_questions.length > 0 ? (
+                          <div className="mt-3 space-y-1 rounded-xl border border-amber-300/20 bg-amber-300/10 px-3 py-2 text-[12px] text-amber-100">
+                            {message.action.clarification_questions.map((question, index) => (
+                              <div key={`${message.id}-question-${index}`}>{question}</div>
+                            ))}
+                          </div>
+                        ) : null}
+                        {message.job_id ? (
+                          <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-emerald-300/20 bg-emerald-300/10 px-3 py-2 text-[12px] text-emerald-100">
+                            <span>Job {message.job_id}</span>
+                            <button
+                              className="rounded-full border border-emerald-200/30 px-2 py-1 text-[11px] font-semibold text-emerald-50 transition hover:border-emerald-100/60"
+                              onClick={() => loadJobDetails(message.job_id || "")}
+                            >
+                              Open
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="mt-4 flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-300">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-white/20 bg-transparent"
+                      checked={chatUseComposeContext}
+                      onChange={(event) => setChatUseComposeContext(event.target.checked)}
+                    />
+                    Send current Context JSON with chat turns
+                  </label>
+                  <span>{chatUseComposeContext ? "Context attached" : "Message only"}</span>
+                </div>
+                {chatError ? (
+                  <div className="mt-3 rounded-xl border border-rose-300/20 bg-rose-300/10 px-3 py-2 text-sm text-rose-100">
+                    {chatError}
+                  </div>
+                ) : null}
+                <div className="mt-4 space-y-3">
+                  <textarea
+                    className="min-h-[8rem] w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder:text-slate-400 focus:border-sky-300/40 focus:outline-none focus:ring-2 focus:ring-sky-300/20"
+                    value={chatInput}
+                    onChange={(event) => setChatInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                        event.preventDefault();
+                        void submitChatTurn();
+                      }
+                    }}
+                    placeholder="Ask for work in natural language. Cmd/Ctrl+Enter sends."
+                  />
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-[11px] text-slate-400">
+                      {chatSession?.metadata?.pending_clarification
+                        ? "Pending clarification is remembered in this session."
+                        : "Chat stays thin: it creates jobs, it does not bypass workflow controls."}
+                    </div>
+                    <button
+                      className="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-slate-950 shadow-md transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={submitChatTurn}
+                      disabled={chatLoading || !chatInput.trim()}
+                    >
+                      {chatLoading ? "Sending..." : "Send"}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

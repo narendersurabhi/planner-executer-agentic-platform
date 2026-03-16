@@ -75,6 +75,7 @@ def _docx_generate_from_spec(payload: Dict[str, Any]) -> Dict[str, Any]:
         _tool_error(
             "document_spec missing (not found in memory). Provide document_spec explicitly."
         )
+    _ensure_validation_passed(payload)
 
     try:
         path = resolve_or_derive_output_path(payload, extension="docx")
@@ -120,6 +121,29 @@ def _docx_generate_from_spec(payload: Dict[str, Any]) -> Dict[str, Any]:
     document.save(output_path)
     bytes_written = output_path.stat().st_size
     return {"path": str(output_path), "bytes_written": int(bytes_written)}
+
+
+def _ensure_validation_passed(payload: Dict[str, Any]) -> None:
+    validation_report = payload.get("validation_report")
+    if isinstance(validation_report, dict) and validation_report.get("valid") is False:
+        _tool_error(_format_validation_errors(validation_report.get("errors")))
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        _tool_error(_format_validation_errors(errors))
+
+
+def _format_validation_errors(errors: Any) -> str:
+    if not isinstance(errors, list) or not errors:
+        return "document_spec validation failed"
+    messages: list[str] = []
+    for error in errors[:5]:
+        if isinstance(error, dict):
+            path = str(error.get("path") or "<root>")
+            message = str(error.get("message") or "invalid")
+            messages.append(f"{path}: {message}")
+        else:
+            messages.append(str(error))
+    return "document_spec validation failed: " + "; ".join(messages)
 
 
 def _safe_join_artifacts_path(path: str) -> Path:
