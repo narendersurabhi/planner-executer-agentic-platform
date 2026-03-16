@@ -73,9 +73,9 @@ def test_resolve_execution_context_uses_llm_provider_when_enabled(monkeypatch) -
 
     monkeypatch.setattr(runtime_service.llm_provider, "resolve_provider", lambda *args, **kwargs: provider)
     monkeypatch.setattr(
-        runtime_service.tool_registry,
-        "default_registry",
-        lambda *args, **kwargs: _FakeRegistry([tool]),
+        runtime_service.tool_bootstrap,
+        "build_default_registry",
+        lambda **kwargs: _FakeRegistry([tool]),
     )
 
     context = runtime_service.resolve_execution_context(

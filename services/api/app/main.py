@@ -32,7 +32,7 @@ from libs.core import (
     orchestrator,
     payload_resolver,
     state_machine,
-    tool_registry,
+    tool_bootstrap,
     workflow_contracts,
 )
 from libs.core.llm_provider import (
@@ -210,7 +210,7 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 TASK_OUTPUT_KEY_PREFIX = "task_output:"
 TASK_RESULT_KEY_PREFIX = "task_result:"
 
-_tool_spec_registry = tool_registry.default_registry(
+_tool_spec_registry = tool_bootstrap.build_default_registry(
     http_fetch_enabled=False,
     llm_enabled=True,
     llm_provider=MockLLMProvider(),

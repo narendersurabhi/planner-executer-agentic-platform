@@ -6,21 +6,17 @@ import math
 import os
 import re
 import shutil
-import inspect
 import time
 from datetime import UTC, datetime
 from subprocess import CompletedProcess, run
-from importlib import import_module
-from importlib import metadata as importlib_metadata
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from .llm_provider import LLMProvider, LLMRequest
-from . import prompts, tracing as core_tracing
+from . import prompts, tool_bootstrap, tool_catalog, tool_governance, tool_plugins, tracing as core_tracing
 from libs.core import mcp_gateway
-from .models import RiskLevel, ToolIntent, ToolSpec
+from .models import ToolSpec
 from libs.framework.tool_runtime import (
     Tool,
     ToolExecutionError,
@@ -29,63 +25,21 @@ from libs.framework.tool_runtime import (
     validate_schema as _validate_schema,
 )
 from libs.core.memory_client import MemoryClient, MemoryClientError
-from libs.tools.docx_generate_from_spec import register_docx_tools
-from libs.tools.pdf_generate_from_spec import register_pdf_tools
-from libs.tools.document_spec_validate import register_document_spec_tools
-from libs.tools.document_spec_iterative import register_document_spec_iterative_tools
 from libs.tools.document_spec_llm import (
     llm_generate_document_spec as _llm_generate_document_spec_external,
     llm_improve_document_spec as _llm_improve_document_spec_external,
-    register_document_spec_llm_tools,
 )
-from libs.tools.core_ops import CoreOpsHandlers, register_core_ops_tools
-from libs.tools.llm_tool_groups import (
-    register_coding_agent_tools,
-    register_llm_text_tool,
-)
+from libs.tools.core_ops import CoreOpsHandlers
 from libs.tools import mcp_client
 from libs.tools import coder_tools
-from libs.tools.github_tools import register_github_tools
-from libs.tools.openapi_iterative import register_openapi_iterative_tools
-
-try:  # Optional at import-time; policy service already depends on PyYAML.
-    import yaml
-except Exception:  # noqa: BLE001
-    yaml = None
 
 LOGGER = logging.getLogger(__name__)
 
 
-class ToolPluginLoadError(ToolExecutionError):
-    pass
+ToolPluginLoadError = tool_plugins.ToolPluginLoadError
 
 
-@dataclass
-class ToolAllowDecision:
-    allowed: bool
-    reason: str
-    mode: str = "enforce"
-    violated: bool = False
-
-
-@dataclass
-class _Ruleset:
-    allow: set[str]
-    deny: set[str]
-
-
-@dataclass
-class _GovernanceConfig:
-    mode: str
-    global_rules: _Ruleset
-    service_rules: dict[str, _Ruleset]
-    tenant_rules: dict[str, _Ruleset]
-    job_type_rules: dict[str, _Ruleset]
-    blocked_risk_by_service: dict[str, set[str]]
-
-
-_GOVERNANCE_CACHE_KEY: tuple[str, float] | None = None
-_GOVERNANCE_CACHE_VALUE: _GovernanceConfig | None = None
+ToolAllowDecision = tool_governance.ToolAllowDecision
 
 
 def _extract_mcp_error_phase(error_text: str) -> str | None:
@@ -251,210 +205,6 @@ def _host_allowed(host: str, allowlist: List[str]) -> bool:
     return False
 
 
-def _parse_csv_values(raw: str | None) -> set[str]:
-    if not raw:
-        return set()
-    return {part.strip() for part in raw.split(",") if part.strip()}
-
-
-def _tool_governance_enabled() -> bool:
-    return os.getenv("TOOL_GOVERNANCE_ENABLED", "true").lower() == "true"
-
-
-def _tool_governance_mode_env() -> str | None:
-    raw = os.getenv("TOOL_GOVERNANCE_MODE", "").strip().lower()
-    if raw in {"enforce", "dry_run"}:
-        return raw
-    return None
-
-
-def _normalize_rule_key(value: str | None) -> str:
-    if not value:
-        return ""
-    return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).lower().strip("_")
-
-
-def _resolve_tool_governance_config_path() -> Path:
-    raw = os.getenv("TOOL_GOVERNANCE_CONFIG_PATH", "config/tool_governance.yaml").strip()
-    return Path(raw).expanduser()
-
-
-def _ruleset_from_raw(raw: Any) -> _Ruleset:
-    if not isinstance(raw, dict):
-        return _Ruleset(allow=set(), deny=set())
-    allow = (
-        {str(item).strip() for item in raw.get("allow", []) if str(item).strip()}
-        if isinstance(raw.get("allow"), list)
-        else set()
-    )
-    deny = (
-        {str(item).strip() for item in raw.get("deny", []) if str(item).strip()}
-        if isinstance(raw.get("deny"), list)
-        else set()
-    )
-    return _Ruleset(allow=allow, deny=deny)
-
-
-def _rules_map_from_raw(raw: Any) -> dict[str, _Ruleset]:
-    if not isinstance(raw, dict):
-        return {}
-    mapped: dict[str, _Ruleset] = {}
-    for key, value in raw.items():
-        norm_key = _normalize_rule_key(str(key))
-        if not norm_key:
-            continue
-        mapped[norm_key] = _ruleset_from_raw(value)
-    return mapped
-
-
-def _blocked_risk_by_service_from_raw(raw: Any) -> dict[str, set[str]]:
-    if not isinstance(raw, dict):
-        return {}
-    mapped: dict[str, set[str]] = {}
-    for key, value in raw.items():
-        norm_key = _normalize_rule_key(str(key))
-        if not norm_key:
-            continue
-        if isinstance(value, list):
-            mapped[norm_key] = {
-                str(entry).strip().lower() for entry in value if str(entry).strip()
-            }
-    return mapped
-
-
-def _default_governance_config() -> _GovernanceConfig:
-    mode = _tool_governance_mode_env() or "enforce"
-    return _GovernanceConfig(
-        mode=mode,
-        global_rules=_Ruleset(allow=set(), deny=set()),
-        service_rules={},
-        tenant_rules={},
-        job_type_rules={},
-        blocked_risk_by_service={},
-    )
-
-
-def _load_governance_config() -> _GovernanceConfig:
-    global _GOVERNANCE_CACHE_KEY, _GOVERNANCE_CACHE_VALUE
-    config = _default_governance_config()
-    if not _tool_governance_enabled():
-        config.mode = "enforce"
-        return config
-    config_path = _resolve_tool_governance_config_path()
-    try:
-        mtime = config_path.stat().st_mtime
-    except OSError:
-        mtime = -1.0
-    cache_key = (str(config_path), mtime)
-    if _GOVERNANCE_CACHE_KEY == cache_key and _GOVERNANCE_CACHE_VALUE is not None:
-        return _GOVERNANCE_CACHE_VALUE
-    loaded = config
-    if mtime >= 0 and yaml is not None:
-        try:
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("tool_governance_config_load_failed path=%s error=%s", config_path, exc)
-            data = {}
-        gov = data.get("tool_governance", {}) if isinstance(data, dict) else {}
-        if isinstance(gov, dict):
-            mode = _tool_governance_mode_env() or str(gov.get("mode", "")).strip().lower() or "enforce"
-            if mode not in {"enforce", "dry_run"}:
-                mode = "enforce"
-            loaded = _GovernanceConfig(
-                mode=mode,
-                global_rules=_ruleset_from_raw(gov.get("global", {})),
-                service_rules=_rules_map_from_raw(gov.get("services", {})),
-                tenant_rules=_rules_map_from_raw(gov.get("tenants", {})),
-                job_type_rules=_rules_map_from_raw(gov.get("job_types", {})),
-                blocked_risk_by_service=_blocked_risk_by_service_from_raw(
-                    (gov.get("risk", {}) or {}).get("blocked_levels_by_service", {})
-                    if isinstance(gov.get("risk", {}), dict)
-                    else {}
-                ),
-            )
-    _GOVERNANCE_CACHE_KEY = cache_key
-    _GOVERNANCE_CACHE_VALUE = loaded
-    return loaded
-
-
-def _plugin_fail_fast() -> bool:
-    return os.getenv("TOOL_PLUGIN_FAIL_FAST", "true").lower() == "true"
-
-
-def _normalize_service_name(service_name: str | None) -> str:
-    if not service_name:
-        return ""
-    normalized = re.sub(r"[^A-Za-z0-9]+", "_", service_name.strip())
-    return normalized.upper().strip("_")
-
-
-def _service_env_name(service_name: str, suffix: str) -> str:
-    return f"{service_name}_{suffix}"
-
-
-def _context_lookup(context: dict[str, Any], *keys: str) -> str:
-    for key in keys:
-        value = context.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    nested = context.get("job_context")
-    if isinstance(nested, dict):
-        for key in keys:
-            value = nested.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return ""
-
-
-def _resolve_allowlist_sets(
-    service_name: str | None, context: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    gov = _load_governance_config()
-    normalized_service_key = _normalize_rule_key(service_name)
-    service_rules = gov.service_rules.get(normalized_service_key, _Ruleset(set(), set()))
-    context = context if isinstance(context, dict) else {}
-    tenant_key = _normalize_rule_key(
-        _context_lookup(context, "tenant_id", "org_id", "organization_id")
-    )
-    job_type_key = _normalize_rule_key(_context_lookup(context, "job_type", "workflow_type"))
-    tenant_rules = gov.tenant_rules.get(tenant_key, _Ruleset(set(), set()))
-    job_type_rules = gov.job_type_rules.get(job_type_key, _Ruleset(set(), set()))
-    normalized_service = _normalize_service_name(service_name)
-    global_enabled = _parse_csv_values(os.getenv("ENABLED_TOOLS"))
-    global_disabled = _parse_csv_values(os.getenv("DISABLED_TOOLS"))
-    service_enabled = set()
-    service_disabled = set()
-    if normalized_service:
-        service_enabled = _parse_csv_values(
-            os.getenv(_service_env_name(normalized_service, "ENABLED_TOOLS"))
-        )
-        service_disabled = _parse_csv_values(
-            os.getenv(_service_env_name(normalized_service, "DISABLED_TOOLS"))
-        )
-    return {
-        "mode": gov.mode,
-        "global_enabled": global_enabled,
-        "global_disabled": global_disabled,
-        "service_enabled": service_enabled,
-        "service_disabled": service_disabled,
-        "config_global_allow": gov.global_rules.allow,
-        "config_global_deny": gov.global_rules.deny,
-        "config_service_allow": service_rules.allow,
-        "config_service_deny": service_rules.deny,
-        "config_tenant_allow": tenant_rules.allow,
-        "config_tenant_deny": tenant_rules.deny,
-        "config_job_type_allow": job_type_rules.allow,
-        "config_job_type_deny": job_type_rules.deny,
-        "blocked_risk_levels": gov.blocked_risk_by_service.get(normalized_service_key, set()),
-    }
-
-
-def _deny_decision(mode: str, reason: str) -> ToolAllowDecision:
-    if mode == "dry_run":
-        return ToolAllowDecision(True, f"dry_run:{reason}", mode=mode, violated=True)
-    return ToolAllowDecision(False, reason, mode=mode, violated=True)
-
-
 def evaluate_tool_allowlist(
     tool_name: str,
     service_name: str | None = None,
@@ -462,99 +212,24 @@ def evaluate_tool_allowlist(
     context: dict[str, Any] | None = None,
     tool_spec: ToolSpec | None = None,
 ) -> ToolAllowDecision:
-    sets = _resolve_allowlist_sets(service_name, context=context)
-    mode = str(sets.get("mode") or "enforce")
-
-    deny_checks = (
-        ("global_disabled", sets["global_disabled"]),
-        ("service_disabled", sets["service_disabled"]),
-        ("config_global_deny", sets["config_global_deny"]),
-        ("config_service_deny", sets["config_service_deny"]),
-        ("config_tenant_deny", sets["config_tenant_deny"]),
-        ("config_job_type_deny", sets["config_job_type_deny"]),
+    return tool_governance.evaluate_tool_allowlist(
+        tool_name,
+        service_name,
+        context=context,
+        tool_spec=tool_spec,
     )
-    for reason, denied_set in deny_checks:
-        if denied_set and tool_name in denied_set:
-            return _deny_decision(mode, reason)
-
-    blocked_risk_levels = sets.get("blocked_risk_levels", set())
-    if blocked_risk_levels and tool_spec is not None:
-        risk_level = (
-            tool_spec.risk_level.value
-            if isinstance(tool_spec.risk_level, RiskLevel)
-            else str(tool_spec.risk_level).lower()
-        )
-        if risk_level in blocked_risk_levels:
-            return _deny_decision(mode, f"risk_blocked:{risk_level}")
-
-    allow_checks = (
-        ("not_in_global_enabled", sets["global_enabled"]),
-        ("not_in_service_enabled", sets["service_enabled"]),
-        ("not_in_config_global_allow", sets["config_global_allow"]),
-        ("not_in_config_service_allow", sets["config_service_allow"]),
-        ("not_in_config_tenant_allow", sets["config_tenant_allow"]),
-        ("not_in_config_job_type_allow", sets["config_job_type_allow"]),
-    )
-    for reason, allowed_set in allow_checks:
-        if allowed_set and tool_name not in allowed_set:
-            return _deny_decision(mode, reason)
-    return ToolAllowDecision(True, "allowed", mode=mode, violated=False)
-
-
-def _tool_enabled(
-    name: str, service_name: str | None = None, tool_spec: ToolSpec | None = None
-) -> bool:
-    return evaluate_tool_allowlist(name, service_name, tool_spec=tool_spec).allowed
 
 
 def _filter_registry_tools(registry: ToolRegistry, service_name: str | None = None) -> None:
-    sets = _resolve_allowlist_sets(service_name)
-    effective_lists = [
-        sets.get("global_enabled", set()),
-        sets.get("global_disabled", set()),
-        sets.get("service_enabled", set()),
-        sets.get("service_disabled", set()),
-        sets.get("config_global_allow", set()),
-        sets.get("config_global_deny", set()),
-        sets.get("config_service_allow", set()),
-        sets.get("config_service_deny", set()),
-        sets.get("blocked_risk_levels", set()),
-    ]
-    if not any(effective_lists):
-        return
-    kept: dict[str, Tool] = {}
-    for tool_name in list(registry._tools.keys()):
-        tool = registry._tools[tool_name]
-        if _tool_enabled(tool_name, service_name, tool.spec):
-            kept[tool_name] = registry._tools[tool_name]
-    registry._tools = kept
+    tool_governance.filter_registry_tools(registry, service_name)
 
 
 def _parse_plugin_spec(spec: str) -> tuple[str, str]:
-    value = spec.strip()
-    if not value:
-        raise ToolPluginLoadError("Empty plugin spec in TOOL_PLUGIN_MODULES")
-    if ":" not in value:
-        return value, "register_tools"
-    module_path, attr_name = value.split(":", 1)
-    module_path = module_path.strip()
-    attr_name = attr_name.strip() or "register_tools"
-    if not module_path:
-        raise ToolPluginLoadError(f"Invalid plugin spec: {spec}")
-    return module_path, attr_name
+    return tool_plugins.parse_plugin_spec(spec)
 
 
 def _resolve_module_register_fn(module: Any, attr_name: str) -> Callable[..., None]:
-    candidates = [attr_name]
-    if attr_name == "register_tools":
-        candidates.append("register")
-    for candidate in candidates:
-        register_fn = getattr(module, candidate, None)
-        if callable(register_fn):
-            return register_fn
-    raise ToolPluginLoadError(
-        f"Tool plugin module '{module.__name__}' missing callable '{attr_name}'"
-    )
+    return tool_plugins.resolve_module_register_fn(module, attr_name)
 
 
 def _call_register_fn(
@@ -565,26 +240,13 @@ def _call_register_fn(
     llm_provider: Optional[LLMProvider],
     http_fetch_enabled: bool,
 ) -> None:
-    signature = inspect.signature(register_fn)
-    kwargs: dict[str, Any] = {}
-    if "context" in signature.parameters:
-        kwargs["context"] = {
-            "llm_enabled": llm_enabled,
-            "llm_provider": llm_provider,
-            "http_fetch_enabled": http_fetch_enabled,
-        }
-    if "llm_enabled" in signature.parameters:
-        kwargs["llm_enabled"] = llm_enabled
-    if "llm_provider" in signature.parameters:
-        kwargs["llm_provider"] = llm_provider
-    if "http_fetch_enabled" in signature.parameters:
-        kwargs["http_fetch_enabled"] = http_fetch_enabled
-    if "provider" in signature.parameters and "llm_provider" not in signature.parameters:
-        kwargs["provider"] = llm_provider
-    try:
-        register_fn(registry, **kwargs)
-    except TypeError as exc:
-        raise ToolPluginLoadError(f"Invalid tool plugin signature for {register_fn}: {exc}") from exc
+    tool_plugins.call_register_fn(
+        register_fn,
+        registry,
+        llm_enabled=llm_enabled,
+        llm_provider=llm_provider,
+        http_fetch_enabled=http_fetch_enabled,
+    )
 
 
 def _load_module_plugins(
@@ -594,35 +256,16 @@ def _load_module_plugins(
     llm_provider: Optional[LLMProvider],
     http_fetch_enabled: bool,
 ) -> None:
-    plugin_specs = _parse_csv_values(os.getenv("TOOL_PLUGIN_MODULES"))
-    for plugin_spec in sorted(plugin_specs):
-        try:
-            module_path, attr_name = _parse_plugin_spec(plugin_spec)
-            module = import_module(module_path)
-            register_fn = _resolve_module_register_fn(module, attr_name)
-            _call_register_fn(
-                register_fn,
-                registry,
-                llm_enabled=llm_enabled,
-                llm_provider=llm_provider,
-                http_fetch_enabled=http_fetch_enabled,
-            )
-            LOGGER.info("tool_plugin_loaded source=module plugin=%s", plugin_spec)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error(
-                "tool_plugin_load_failed source=module plugin=%s error=%s",
-                plugin_spec,
-                exc,
-            )
-            if _plugin_fail_fast():
-                raise
+    tool_plugins.load_module_plugins(
+        registry,
+        llm_enabled=llm_enabled,
+        llm_provider=llm_provider,
+        http_fetch_enabled=http_fetch_enabled,
+    )
 
 
 def _iter_entry_points(group: str) -> list[Any]:
-    eps = importlib_metadata.entry_points()
-    if hasattr(eps, "select"):
-        return list(eps.select(group=group))
-    return list(eps.get(group, []))
+    return tool_plugins._iter_entry_points(group)
 
 
 def _load_entrypoint_plugins(
@@ -632,32 +275,66 @@ def _load_entrypoint_plugins(
     llm_provider: Optional[LLMProvider],
     http_fetch_enabled: bool,
 ) -> None:
-    if os.getenv("TOOL_PLUGIN_DISCOVERY_ENABLED", "false").lower() != "true":
-        return
-    group = os.getenv("TOOL_PLUGIN_ENTRYPOINT_GROUP", "awe.tools")
-    for entry_point in _iter_entry_points(group):
-        try:
-            loaded = entry_point.load()
-            if callable(loaded):
-                register_fn = loaded
-            else:
-                register_fn = _resolve_module_register_fn(loaded, "register_tools")
-            _call_register_fn(
-                register_fn,
-                registry,
-                llm_enabled=llm_enabled,
-                llm_provider=llm_provider,
-                http_fetch_enabled=http_fetch_enabled,
-            )
-            LOGGER.info("tool_plugin_loaded source=entry_point plugin=%s", entry_point.name)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error(
-                "tool_plugin_load_failed source=entry_point plugin=%s error=%s",
-                entry_point.name,
-                exc,
-            )
-            if _plugin_fail_fast():
-                raise
+    tool_plugins.load_entrypoint_plugins(
+        registry,
+        llm_enabled=llm_enabled,
+        llm_provider=llm_provider,
+        http_fetch_enabled=http_fetch_enabled,
+    )
+
+
+def _build_core_ops_handlers() -> CoreOpsHandlers:
+    return CoreOpsHandlers(
+        math_eval=_math_eval,
+        text_summarize=_text_summarize,
+        file_write_artifact=lambda payload: _write_text_file(payload, default_filename="artifact.txt"),
+        file_write_text=lambda payload: _write_text_file(payload, default_filename="output.txt"),
+        file_write_code=_file_write_code,
+        file_read_text=_file_read_text,
+        list_files=_list_files,
+        workspace_write_text=lambda payload: _write_workspace_text_file(
+            payload, default_filename="output.txt"
+        ),
+        workspace_write_code=_workspace_write_code,
+        workspace_read_text=_workspace_read_text,
+        workspace_list_files=_list_workspace_files,
+        artifact_mkdir=_artifact_mkdir,
+        workspace_mkdir=_workspace_mkdir,
+        artifact_delete=_artifact_delete,
+        workspace_delete=_workspace_delete,
+        artifact_rename=_artifact_rename,
+        workspace_rename=_workspace_rename,
+        artifact_copy=_artifact_copy,
+        workspace_copy=_workspace_copy,
+        artifact_move=_artifact_move_to_workspace,
+        derive_output_path=_derive_output_path,
+        derive_output_filename=_derive_output_filename,
+        run_tests=_run_tests,
+        search_text=_search_text,
+        memory_read=_memory_read,
+        memory_write=_memory_write,
+        memory_semantic_write=_memory_semantic_write,
+        memory_semantic_search=_memory_semantic_search,
+        docx_render=_docx_render,
+        sleep=_sleep,
+        http_fetch=_http_fetch,
+    )
+
+
+def _default_catalog_handlers() -> tool_catalog.ToolCatalogHandlers:
+    return tool_catalog.ToolCatalogHandlers(
+        core_ops_handlers=_build_core_ops_handlers(),
+        resolve_llm_timeout_s=_resolve_llm_timeout_s,
+        resolve_coding_agent_timeout_s=_resolve_coding_agent_timeout_s,
+        resolve_llm_iterative_timeout_s=_resolve_llm_iterative_tool_timeout_s,
+        llm_generate=_llm_generate,
+        coding_agent_generate=_coding_agent_generate,
+        coding_agent_autonomous=_coding_agent_autonomous,
+        coding_agent_publish_pr=_coding_agent_publish_pr,
+        llm_generate_document_spec=_llm_generate_document_spec,
+        llm_improve_document_spec=_llm_improve_document_spec,
+        sanitize_document_spec=_sanitize_document_spec,
+    )
 
 
 def default_registry(
@@ -666,137 +343,13 @@ def default_registry(
     llm_provider: Optional[LLMProvider] = None,
     service_name: Optional[str] = None,
 ) -> ToolRegistry:
-    registry = ToolRegistry()
-
-    registry.register(
-        Tool(
-            spec=ToolSpec(
-                name="json_transform",
-                description="Wrap or reshape already-available JSON input",
-                usage_guidance=(
-                    "Use only when you already have structured JSON and need to pass it forward. "
-                    "Provide the JSON as the 'input' field. This tool does NOT generate new content."
-                ),
-                input_schema={
-                    "type": "object",
-                    "properties": {"input": {}},
-                    "required": ["input"],
-                },
-                output_schema={
-                    "type": "object",
-                    "properties": {"result": {}},
-                    "required": ["result"],
-                },
-                timeout_s=5,
-                risk_level=RiskLevel.low,
-                tool_intent=ToolIntent.transform,
-            ),
-            handler=lambda payload: {"result": payload.get("input")},
-        )
-    )
-
-    register_core_ops_tools(
-        registry,
-        handlers=CoreOpsHandlers(
-            math_eval=_math_eval,
-            text_summarize=_text_summarize,
-            file_write_artifact=lambda payload: _write_text_file(payload, default_filename="artifact.txt"),
-            file_write_text=lambda payload: _write_text_file(payload, default_filename="output.txt"),
-            file_write_code=_file_write_code,
-            file_read_text=_file_read_text,
-            list_files=_list_files,
-            workspace_write_text=lambda payload: _write_workspace_text_file(
-                payload, default_filename="output.txt"
-            ),
-            workspace_write_code=_workspace_write_code,
-            workspace_read_text=_workspace_read_text,
-            workspace_list_files=_list_workspace_files,
-            artifact_mkdir=_artifact_mkdir,
-            workspace_mkdir=_workspace_mkdir,
-            artifact_delete=_artifact_delete,
-            workspace_delete=_workspace_delete,
-            artifact_rename=_artifact_rename,
-            workspace_rename=_workspace_rename,
-            artifact_copy=_artifact_copy,
-            workspace_copy=_workspace_copy,
-            artifact_move=_artifact_move_to_workspace,
-            derive_output_path=_derive_output_path,
-            derive_output_filename=_derive_output_filename,
-            run_tests=_run_tests,
-            search_text=_search_text,
-            memory_read=_memory_read,
-            memory_write=_memory_write,
-            memory_semantic_write=_memory_semantic_write,
-            memory_semantic_search=_memory_semantic_search,
-            docx_render=_docx_render,
-            sleep=_sleep,
-            http_fetch=_http_fetch,
-        ),
+    return tool_bootstrap.build_tool_registry(
+        handlers=_default_catalog_handlers(),
         http_fetch_enabled=http_fetch_enabled,
-    )
-
-    register_docx_tools(registry)
-    register_pdf_tools(registry)
-    register_document_spec_tools(registry)
-    register_github_tools(registry)
-
-    if llm_enabled:
-        if llm_provider is None:
-            raise ValueError("llm_enabled requires a llm_provider instance")
-        llm_timeout_s = _resolve_llm_timeout_s(llm_provider)
-        coding_agent_timeout_s = _resolve_coding_agent_timeout_s()
-        mcp_timeout_s = _resolve_mcp_tool_timeout_s()
-        llm_iterative_timeout_s = _resolve_llm_iterative_tool_timeout_s(llm_provider)
-
-        register_llm_text_tool(
-            registry,
-            timeout_s=llm_timeout_s,
-            handler=lambda payload, provider=llm_provider: _llm_generate(payload, provider),
-        )
-        register_coding_agent_tools(
-            registry,
-            timeout_s=coding_agent_timeout_s,
-            handler_generate=_coding_agent_generate,
-            handler_autonomous=lambda payload, provider=llm_provider: _coding_agent_autonomous(
-                payload, provider
-            ),
-            handler_publish_pr=_coding_agent_publish_pr,
-        )
-        register_document_spec_llm_tools(
-            registry,
-            llm_provider,
-            timeout_s=llm_timeout_s,
-            sanitize_document_spec=_sanitize_document_spec,
-        )
-        register_document_spec_iterative_tools(
-            registry,
-            llm_provider,
-            timeout_s=llm_iterative_timeout_s,
-            generate_document_spec=_llm_generate_document_spec,
-            improve_document_spec=_llm_improve_document_spec,
-            sanitize_document_spec=_sanitize_document_spec,
-        )
-        register_openapi_iterative_tools(
-            registry,
-            llm_provider,
-            timeout_s=llm_iterative_timeout_s,
-        )
-
-    _load_module_plugins(
-        registry,
         llm_enabled=llm_enabled,
         llm_provider=llm_provider,
-        http_fetch_enabled=http_fetch_enabled,
+        service_name=service_name,
     )
-    _load_entrypoint_plugins(
-        registry,
-        llm_enabled=llm_enabled,
-        llm_provider=llm_provider,
-        http_fetch_enabled=http_fetch_enabled,
-    )
-    _filter_registry_tools(registry, service_name)
-
-    return registry
 
 
 def _math_eval(payload: Dict[str, Any]) -> Dict[str, Any]:

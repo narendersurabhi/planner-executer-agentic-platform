@@ -4,13 +4,13 @@ from libs.core import models
 from services.worker.app import tool_runtime_adapter
 
 
-def test_build_worker_tool_runtime_uses_default_registry(monkeypatch) -> None:
+def test_build_worker_tool_runtime_uses_tool_bootstrap(monkeypatch) -> None:
     registry = object()
     seen: list[tuple[bool, bool, object | None, str]] = []
 
-    def fake_default_registry(
-        http_fetch_enabled: bool = False,
+    def fake_build_default_registry(
         *,
+        http_fetch_enabled: bool = False,
         llm_enabled: bool = False,
         llm_provider=None,
         service_name: str | None = None,
@@ -19,9 +19,9 @@ def test_build_worker_tool_runtime_uses_default_registry(monkeypatch) -> None:
         return registry
 
     monkeypatch.setattr(
-        tool_runtime_adapter.tool_registry,
-        "default_registry",
-        fake_default_registry,
+        tool_runtime_adapter.tool_bootstrap,
+        "build_default_registry",
+        fake_build_default_registry,
     )
 
     runtime = tool_runtime_adapter.build_worker_tool_runtime(

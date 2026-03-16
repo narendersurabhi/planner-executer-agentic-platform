@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 import redis
 
-from libs.core import events, llm_provider, logging as core_logging, models, tool_registry
+from libs.core import events, llm_provider, logging as core_logging, models, tool_bootstrap
 
 
 @dataclass(frozen=True)
@@ -56,14 +56,17 @@ def resolve_execution_context(config: PlannerRuntimeConfig) -> PlannerExecutionC
             timeout_s=config.openai_timeout_s,
             max_retries=config.openai_max_retries,
         )
-        registry = tool_registry.default_registry(
-            False,
+        registry = tool_bootstrap.build_default_registry(
+            http_fetch_enabled=False,
             llm_enabled=True,
             llm_provider=provider,
             service_name="planner",
         )
     else:
-        registry = tool_registry.default_registry(False, service_name="planner")
+        registry = tool_bootstrap.build_default_registry(
+            http_fetch_enabled=False,
+            service_name="planner",
+        )
     return PlannerExecutionContext(
         provider=provider,
         tool_specs=registry.list_specs(),

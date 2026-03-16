@@ -4,7 +4,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 from jsonschema import Draft202012Validator
@@ -191,4 +191,4 @@ def validate_schema(schema: dict[str, Any] | None, payload: dict[str, Any], labe
 
 
 def _to_datetime(timestamp: float) -> datetime:
-    return datetime.utcfromtimestamp(timestamp)
+    return datetime.fromtimestamp(timestamp, UTC)
