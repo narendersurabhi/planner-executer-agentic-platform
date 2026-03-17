@@ -1,6 +1,11 @@
 "use client";
 
-import type { WorkflowDefinition, WorkflowVersion } from "./types";
+import type {
+  WorkflowDefinition,
+  WorkflowRun,
+  WorkflowTrigger,
+  WorkflowVersion,
+} from "./types";
 import { formatTimestamp } from "./utils";
 
 type StudioWorkflowLibraryProps = {
@@ -10,11 +15,19 @@ type StudioWorkflowLibraryProps = {
   workflowVersions: WorkflowVersion[];
   workflowVersionsLoading: boolean;
   workflowVersionsError: string | null;
+  workflowTriggers: WorkflowTrigger[];
+  workflowTriggersLoading: boolean;
+  workflowTriggersError: string | null;
+  workflowRuns: WorkflowRun[];
+  workflowRunsLoading: boolean;
+  workflowRunsError: string | null;
   activeWorkflowDefinitionId: string | null;
   activeWorkflowVersionId: string | null;
   onRefresh: () => void;
   onOpenDefinition: (definition: WorkflowDefinition) => void;
   onOpenVersion: (version: WorkflowVersion) => void;
+  onCreateManualTrigger: () => void;
+  onInvokeTrigger: (trigger: WorkflowTrigger) => void;
 };
 
 export default function StudioWorkflowLibrary({
@@ -24,11 +37,19 @@ export default function StudioWorkflowLibrary({
   workflowVersions,
   workflowVersionsLoading,
   workflowVersionsError,
+  workflowTriggers,
+  workflowTriggersLoading,
+  workflowTriggersError,
+  workflowRuns,
+  workflowRunsLoading,
+  workflowRunsError,
   activeWorkflowDefinitionId,
   activeWorkflowVersionId,
   onRefresh,
   onOpenDefinition,
   onOpenVersion,
+  onCreateManualTrigger,
+  onInvokeTrigger,
 }: StudioWorkflowLibraryProps) {
   return (
     <section className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm">
@@ -122,6 +143,76 @@ export default function StudioWorkflowLibrary({
       </div>
 
       <div className="mt-6">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+            Triggers
+          </div>
+          <button
+            className="rounded-full border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-900 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={onCreateManualTrigger}
+            disabled={!activeWorkflowDefinitionId}
+          >
+            Create Manual Trigger
+          </button>
+        </div>
+        {!activeWorkflowDefinitionId ? (
+          <div className="mt-3 rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-500">
+            Open a saved workflow definition before configuring triggers.
+          </div>
+        ) : workflowTriggersLoading ? (
+          <div className="mt-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+            Loading triggers...
+          </div>
+        ) : workflowTriggersError ? (
+          <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            {workflowTriggersError}
+          </div>
+        ) : workflowTriggers.length === 0 ? (
+          <div className="mt-3 rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-500">
+            No triggers yet. Create a manual trigger to invoke the latest published version.
+          </div>
+        ) : (
+          <div className="mt-3 space-y-3">
+            {workflowTriggers.map((trigger) => (
+              <article
+                key={trigger.id}
+                className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-4"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-slate-900">
+                      {trigger.title}
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-500">
+                      <span className="rounded-full bg-white px-2.5 py-1">
+                        {trigger.trigger_type}
+                      </span>
+                      <span
+                        className={`rounded-full px-2.5 py-1 ${
+                          trigger.enabled
+                            ? "bg-emerald-100 text-emerald-700"
+                            : "bg-slate-200 text-slate-600"
+                        }`}
+                      >
+                        {trigger.enabled ? "enabled" : "disabled"}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    className="rounded-full border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-900 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => onInvokeTrigger(trigger)}
+                    disabled={!trigger.enabled}
+                  >
+                    Invoke
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="mt-6">
         <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
           Version History
         </div>
@@ -183,6 +274,76 @@ export default function StudioWorkflowLibrary({
                 </article>
               );
             })}
+          </div>
+        )}
+      </div>
+
+      <div className="mt-6">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+          Run History
+        </div>
+        {!activeWorkflowDefinitionId ? (
+          <div className="mt-3 rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-500">
+            Open a saved workflow definition to browse its run history.
+          </div>
+        ) : workflowRunsLoading ? (
+          <div className="mt-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+            Loading workflow runs...
+          </div>
+        ) : workflowRunsError ? (
+          <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            {workflowRunsError}
+          </div>
+        ) : workflowRuns.length === 0 ? (
+          <div className="mt-3 rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-500">
+            No runs yet. Publish and run a workflow, or invoke a trigger, to populate history.
+          </div>
+        ) : (
+          <div className="mt-3 space-y-3">
+            {workflowRuns.map((run) => (
+              <article
+                key={run.id}
+                className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-4"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-slate-900">{run.title}</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {formatTimestamp(run.updated_at || run.created_at)}
+                    </div>
+                  </div>
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] ${
+                      run.job_status === "succeeded"
+                        ? "bg-emerald-100 text-emerald-700"
+                        : run.job_status === "failed"
+                          ? "bg-rose-100 text-rose-700"
+                          : run.job_status === "running"
+                            ? "bg-sky-100 text-sky-700"
+                            : "bg-slate-200 text-slate-600"
+                    }`}
+                  >
+                    {run.job_status || "queued"}
+                  </span>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-500">
+                  <span className="rounded-full bg-white px-2.5 py-1">
+                    job {run.job_id.slice(0, 8)}
+                  </span>
+                  <span className="rounded-full bg-white px-2.5 py-1">
+                    plan {run.plan_id.slice(0, 8)}
+                  </span>
+                  <span className="rounded-full bg-white px-2.5 py-1">
+                    version {run.version_id.slice(0, 8)}
+                  </span>
+                  {run.trigger_id ? (
+                    <span className="rounded-full bg-white px-2.5 py-1">
+                      trigger {run.trigger_id.slice(0, 8)}
+                    </span>
+                  ) : null}
+                </div>
+              </article>
+            ))}
           </div>
         )}
       </div>

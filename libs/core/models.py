@@ -56,6 +56,13 @@ class MemoryScope(str, Enum):
     global_ = "global"
 
 
+class WorkflowTriggerType(str, Enum):
+    manual = "manual"
+    api = "api"
+    webhook = "webhook"
+    schedule = "schedule"
+
+
 class ToolSpec(BaseModel):
     name: str
     description: str
@@ -312,9 +319,57 @@ class WorkflowVersion(BaseModel):
     created_at: datetime
 
 
+class WorkflowTriggerCreate(BaseModel):
+    title: str
+    trigger_type: WorkflowTriggerType = WorkflowTriggerType.manual
+    enabled: bool = True
+    config: Dict[str, Any] = Field(default_factory=dict)
+    user_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowTriggerUpdate(BaseModel):
+    title: Optional[str] = None
+    enabled: Optional[bool] = None
+    config: Optional[Dict[str, Any]] = None
+    user_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class WorkflowTrigger(BaseModel):
+    id: str
+    definition_id: str
+    title: str
+    trigger_type: WorkflowTriggerType
+    enabled: bool = True
+    config: Dict[str, Any] = Field(default_factory=dict)
+    user_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkflowRun(BaseModel):
+    id: str
+    definition_id: str
+    version_id: str
+    trigger_id: Optional[str] = None
+    title: str
+    goal: str = ""
+    requested_context_json: Dict[str, Any] = Field(default_factory=dict)
+    job_id: str
+    plan_id: str
+    job_status: Optional[JobStatus] = None
+    user_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
 class WorkflowRunResult(BaseModel):
     workflow_definition: WorkflowDefinition
     workflow_version: WorkflowVersion
+    workflow_run: WorkflowRun
     job: Job
     plan: Plan
 

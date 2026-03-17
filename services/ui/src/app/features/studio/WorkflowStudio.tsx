@@ -10,6 +10,7 @@ import ScreenHeader, {
 } from "../../components/ScreenHeader";
 import StudioCapabilityPalette from "./StudioCapabilityPalette";
 import StudioCompilePanel from "./StudioCompilePanel";
+import StudioWorkflowInterfacePanel from "./StudioWorkflowInterfacePanel";
 import StudioNodeInspector from "./StudioNodeInspector";
 import StudioWorkflowLibrary from "./StudioWorkflowLibrary";
 import type {
@@ -26,8 +27,15 @@ import type {
   StudioControlCase,
   StudioControlConfig,
   StudioControlKind,
+  WorkflowBinding,
   WorkflowDefinition,
+  WorkflowInputDefinition,
+  WorkflowInterface,
+  WorkflowOutputDefinition,
+  WorkflowRun,
   WorkflowRunResult,
+  WorkflowTrigger,
+  WorkflowVariableDefinition,
   WorkflowVersion,
 } from "./types";
 import {
@@ -68,6 +76,12 @@ const initialStudioDraft = (): ComposerDraft => ({
   edges: [],
 });
 
+const initialWorkflowInterface = (): WorkflowInterface => ({
+  inputs: [],
+  variables: [],
+  outputs: [],
+});
+
 const createStudioOutput = () => ({
   id: `output-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
   name: "",
@@ -86,6 +100,32 @@ const createStudioControlCase = (): StudioControlCase => ({
   id: `case-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
   label: "",
   match: "",
+});
+
+const createWorkflowInputDefinition = (): WorkflowInputDefinition => ({
+  id: `workflow-input-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  key: "",
+  label: "",
+  valueType: "string",
+  required: false,
+  description: "",
+  defaultValue: "",
+  binding: null,
+});
+
+const createWorkflowVariableDefinition = (): WorkflowVariableDefinition => ({
+  id: `workflow-variable-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  key: "",
+  description: "",
+  binding: { kind: "literal", value: "" },
+});
+
+const createWorkflowOutputDefinition = (): WorkflowOutputDefinition => ({
+  id: `workflow-output-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  key: "",
+  label: "",
+  description: "",
+  binding: null,
 });
 
 const defaultControlConfig = (kind: StudioControlKind): StudioControlConfig => {
@@ -170,6 +210,20 @@ const normalizeInputBinding = (value: unknown): ComposerInputBinding | null => {
       ...(typeof value.defaultValue === "string" ? { defaultValue: value.defaultValue } : {}),
     };
   }
+  if (value.kind === "workflow_input") {
+    return {
+      kind: "workflow_input",
+      inputKey: typeof value.inputKey === "string" ? value.inputKey : "",
+      ...(typeof value.defaultValue === "string" ? { defaultValue: value.defaultValue } : {}),
+    };
+  }
+  if (value.kind === "workflow_variable") {
+    return {
+      kind: "workflow_variable",
+      variableKey: typeof value.variableKey === "string" ? value.variableKey : "",
+      ...(typeof value.defaultValue === "string" ? { defaultValue: value.defaultValue } : {}),
+    };
+  }
   if (value.kind === "literal") {
     return {
       kind: "literal",
@@ -188,6 +242,52 @@ const normalizeInputBinding = (value: unknown): ComposerInputBinding | null => {
       scope: value.scope === "user" || value.scope === "global" ? value.scope : "job",
       name: typeof value.name === "string" ? value.name : "",
       ...(typeof value.key === "string" ? { key: value.key } : {}),
+    };
+  }
+  return null;
+};
+
+const normalizeWorkflowBinding = (value: unknown): WorkflowBinding | null => {
+  if (!isRecord(value) || typeof value.kind !== "string") {
+    return null;
+  }
+  if (value.kind === "literal") {
+    return { kind: "literal", value: typeof value.value === "string" ? value.value : "" };
+  }
+  if (value.kind === "context") {
+    return { kind: "context", path: typeof value.path === "string" ? value.path : "" };
+  }
+  if (value.kind === "memory") {
+    return {
+      kind: "memory",
+      scope: value.scope === "user" || value.scope === "global" ? value.scope : "job",
+      name: typeof value.name === "string" ? value.name : "",
+      ...(typeof value.key === "string" ? { key: value.key } : {}),
+    };
+  }
+  if (value.kind === "secret") {
+    return {
+      kind: "secret",
+      secretName: typeof value.secretName === "string" ? value.secretName : "",
+    };
+  }
+  if (value.kind === "workflow_input") {
+    return {
+      kind: "workflow_input",
+      inputKey: typeof value.inputKey === "string" ? value.inputKey : "",
+    };
+  }
+  if (value.kind === "workflow_variable") {
+    return {
+      kind: "workflow_variable",
+      variableKey: typeof value.variableKey === "string" ? value.variableKey : "",
+    };
+  }
+  if (value.kind === "step_output") {
+    return {
+      kind: "step_output",
+      sourceNodeId: typeof value.sourceNodeId === "string" ? value.sourceNodeId : "",
+      sourcePath: typeof value.sourcePath === "string" ? value.sourcePath : "",
     };
   }
   return null;
@@ -356,6 +456,77 @@ const normalizePersistedEdges = (value: unknown): ComposerDraftEdge[] => {
   }, []);
 };
 
+const normalizeWorkflowInterface = (value: unknown): WorkflowInterface => {
+  if (!isRecord(value)) {
+    return initialWorkflowInterface();
+  }
+  const inputs = Array.isArray(value.inputs)
+    ? value.inputs.reduce<WorkflowInputDefinition[]>((items, rawInput, index) => {
+        if (!isRecord(rawInput)) {
+          return items;
+        }
+        items.push({
+          id:
+            typeof rawInput.id === "string" && rawInput.id.trim()
+              ? rawInput.id
+              : `restored-workflow-input-${index + 1}`,
+          key: typeof rawInput.key === "string" ? rawInput.key : "",
+          label: typeof rawInput.label === "string" ? rawInput.label : "",
+          valueType:
+            rawInput.valueType === "number" ||
+            rawInput.valueType === "boolean" ||
+            rawInput.valueType === "object" ||
+            rawInput.valueType === "array"
+              ? rawInput.valueType
+              : "string",
+          required: Boolean(rawInput.required),
+          description: typeof rawInput.description === "string" ? rawInput.description : "",
+          defaultValue:
+            typeof rawInput.defaultValue === "string" ? rawInput.defaultValue : "",
+          binding: normalizeWorkflowBinding(rawInput.binding),
+        });
+        return items;
+      }, [])
+    : [];
+  const variables = Array.isArray(value.variables)
+    ? value.variables.reduce<WorkflowVariableDefinition[]>((items, rawVariable, index) => {
+        if (!isRecord(rawVariable)) {
+          return items;
+        }
+        items.push({
+          id:
+            typeof rawVariable.id === "string" && rawVariable.id.trim()
+              ? rawVariable.id
+              : `restored-workflow-variable-${index + 1}`,
+          key: typeof rawVariable.key === "string" ? rawVariable.key : "",
+          description:
+            typeof rawVariable.description === "string" ? rawVariable.description : "",
+          binding: normalizeWorkflowBinding(rawVariable.binding),
+        });
+        return items;
+      }, [])
+    : [];
+  const outputs = Array.isArray(value.outputs)
+    ? value.outputs.reduce<WorkflowOutputDefinition[]>((items, rawOutput, index) => {
+        if (!isRecord(rawOutput)) {
+          return items;
+        }
+        items.push({
+          id:
+            typeof rawOutput.id === "string" && rawOutput.id.trim()
+              ? rawOutput.id
+              : `restored-workflow-output-${index + 1}`,
+          key: typeof rawOutput.key === "string" ? rawOutput.key : "",
+          label: typeof rawOutput.label === "string" ? rawOutput.label : "",
+          description: typeof rawOutput.description === "string" ? rawOutput.description : "",
+          binding: normalizeWorkflowBinding(rawOutput.binding),
+        });
+        return items;
+      }, [])
+    : [];
+  return { inputs, variables, outputs };
+};
+
 const restorePersistedWorkflowDraft = (
   draft: StudioPersistedWorkflowDraft | null | undefined,
   fallbackGoal: string,
@@ -369,6 +540,10 @@ const restorePersistedWorkflowDraft = (
         ? draft.contextJsonText
         : JSON.stringify(fallbackContext, null, 2),
     nodePositions: normalizeCanvasPointMap(draft?.nodePositions),
+    workflowInterface: normalizeWorkflowInterface(
+      draft?.workflowInterface ||
+        (isRecord(draft) && "workflow_interface" in draft ? draft.workflow_interface : null)
+    ),
     composerDraft: {
       summary:
         typeof draft?.summary === "string" && draft.summary.trim()
@@ -385,6 +560,9 @@ export default function WorkflowStudio() {
   const [contextJson, setContextJson] = useState(initialContextJson);
   const [workspaceUserId, setWorkspaceUserId] = useState(DEFAULT_WORKSPACE_USER_ID);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>(initialStudioDraft);
+  const [workflowInterface, setWorkflowInterface] = useState<WorkflowInterface>(
+    initialWorkflowInterface
+  );
   const [capabilityCatalog, setCapabilityCatalog] = useState<CapabilityCatalog | null>(null);
   const [capabilityLoading, setCapabilityLoading] = useState(true);
   const [capabilityError, setCapabilityError] = useState<string | null>(null);
@@ -405,6 +583,12 @@ export default function WorkflowStudio() {
   const [workflowVersions, setWorkflowVersions] = useState<WorkflowVersion[]>([]);
   const [workflowVersionsLoading, setWorkflowVersionsLoading] = useState(false);
   const [workflowVersionsError, setWorkflowVersionsError] = useState<string | null>(null);
+  const [workflowTriggers, setWorkflowTriggers] = useState<WorkflowTrigger[]>([]);
+  const [workflowTriggersLoading, setWorkflowTriggersLoading] = useState(false);
+  const [workflowTriggersError, setWorkflowTriggersError] = useState<string | null>(null);
+  const [workflowRuns, setWorkflowRuns] = useState<WorkflowRun[]>([]);
+  const [workflowRunsLoading, setWorkflowRunsLoading] = useState(false);
+  const [workflowRunsError, setWorkflowRunsError] = useState<string | null>(null);
   const [workflowActionLoading, setWorkflowActionLoading] = useState<
     "save" | "publish" | "run" | null
   >(null);
@@ -568,6 +752,72 @@ export default function WorkflowStudio() {
     }
   };
 
+  const refreshWorkflowTriggers = async (definitionId: string) => {
+    if (!definitionId.trim()) {
+      setWorkflowTriggers([]);
+      setWorkflowTriggersError(null);
+      setWorkflowTriggersLoading(false);
+      return;
+    }
+    setWorkflowTriggersLoading(true);
+    setWorkflowTriggersError(null);
+    try {
+      const response = await fetch(
+        `${apiUrl}/workflows/definitions/${encodeURIComponent(definitionId)}/triggers`
+      );
+      const body = (await response.json()) as WorkflowTrigger[] | { detail?: unknown };
+      if (!response.ok) {
+        const detail = (body as { detail?: unknown }).detail;
+        throw new Error(
+          typeof detail === "string"
+            ? detail
+            : `Workflow trigger request failed (${response.status}).`
+        );
+      }
+      setWorkflowTriggers(Array.isArray(body) ? body : []);
+    } catch (error) {
+      setWorkflowTriggersError(
+        error instanceof Error ? error.message : "Failed to load workflow triggers."
+      );
+      setWorkflowTriggers([]);
+    } finally {
+      setWorkflowTriggersLoading(false);
+    }
+  };
+
+  const refreshWorkflowRuns = async (definitionId: string) => {
+    if (!definitionId.trim()) {
+      setWorkflowRuns([]);
+      setWorkflowRunsError(null);
+      setWorkflowRunsLoading(false);
+      return;
+    }
+    setWorkflowRunsLoading(true);
+    setWorkflowRunsError(null);
+    try {
+      const response = await fetch(
+        `${apiUrl}/workflows/definitions/${encodeURIComponent(definitionId)}/runs?limit=12`
+      );
+      const body = (await response.json()) as WorkflowRun[] | { detail?: unknown };
+      if (!response.ok) {
+        const detail = (body as { detail?: unknown }).detail;
+        throw new Error(
+          typeof detail === "string"
+            ? detail
+            : `Workflow run history request failed (${response.status}).`
+        );
+      }
+      setWorkflowRuns(Array.isArray(body) ? body : []);
+    } catch (error) {
+      setWorkflowRunsError(
+        error instanceof Error ? error.message : "Failed to load workflow run history."
+      );
+      setWorkflowRuns([]);
+    } finally {
+      setWorkflowRunsLoading(false);
+    }
+  };
+
   useEffect(() => {
     void refreshWorkflowDefinitions();
   }, [workspaceUserId]);
@@ -577,9 +827,17 @@ export default function WorkflowStudio() {
       setWorkflowVersions([]);
       setWorkflowVersionsError(null);
       setWorkflowVersionsLoading(false);
+      setWorkflowTriggers([]);
+      setWorkflowTriggersError(null);
+      setWorkflowTriggersLoading(false);
+      setWorkflowRuns([]);
+      setWorkflowRunsError(null);
+      setWorkflowRunsLoading(false);
       return;
     }
     void refreshWorkflowVersions(activeWorkflowDefinitionId);
+    void refreshWorkflowTriggers(activeWorkflowDefinitionId);
+    void refreshWorkflowRuns(activeWorkflowDefinitionId);
   }, [activeWorkflowDefinitionId]);
 
   const availableCapabilities = useMemo(() => {
@@ -679,7 +937,7 @@ export default function WorkflowStudio() {
     setChainPreflightResult(null);
     setComposerCompileResult(null);
     setActiveComposerIssueFocus(null);
-  }, [goal, contextJson, visualChainNodes, composerDraftEdges]);
+  }, [goal, contextJson, visualChainNodes, composerDraftEdges, workflowInterface]);
 
   useEffect(() => {
     if (!dagCanvasDraggingNodeId && !dagConnectorDrag) {
@@ -886,7 +1144,13 @@ export default function WorkflowStudio() {
   const setVisualBindingMode = (
     nodeId: string,
     field: string,
-    mode: "context" | "from" | "literal" | "memory"
+    mode:
+      | "context"
+      | "from"
+      | "literal"
+      | "memory"
+      | "workflow_input"
+      | "workflow_variable"
   ) => {
     if (mode === "context") {
       setVisualBindingContext(nodeId, field);
@@ -898,6 +1162,14 @@ export default function WorkflowStudio() {
     }
     if (mode === "memory") {
       setVisualBindingMemory(nodeId, field, "job");
+      return;
+    }
+    if (mode === "workflow_input") {
+      setVisualBindingWorkflowInput(nodeId, field);
+      return;
+    }
+    if (mode === "workflow_variable") {
+      setVisualBindingWorkflowVariable(nodeId, field);
       return;
     }
     const sourceNodes = visualChainNodes.filter((node) => node.id !== nodeId);
@@ -1017,6 +1289,96 @@ export default function WorkflowStudio() {
     );
   };
 
+  const setVisualBindingWorkflowInput = (nodeId: string, field: string) => {
+    const fallbackKey = workflowInterface.inputs[0]?.key || "";
+    setVisualChainNodes((prev) =>
+      prev.map((node) =>
+        node.id === nodeId
+          ? {
+              ...node,
+              inputBindings: {
+                ...node.inputBindings,
+                [field]: { kind: "workflow_input", inputKey: fallbackKey },
+              },
+            }
+          : node
+      )
+    );
+  };
+
+  const updateVisualBindingWorkflowInput = (
+    nodeId: string,
+    field: string,
+    inputKey: string
+  ) => {
+    setVisualChainNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId) {
+          return node;
+        }
+        const currentBinding = node.inputBindings[field];
+        if (!currentBinding || currentBinding.kind !== "workflow_input") {
+          return node;
+        }
+        return {
+          ...node,
+          inputBindings: {
+            ...node.inputBindings,
+            [field]: {
+              ...currentBinding,
+              inputKey,
+            },
+          },
+        };
+      })
+    );
+  };
+
+  const setVisualBindingWorkflowVariable = (nodeId: string, field: string) => {
+    const fallbackKey = workflowInterface.variables[0]?.key || "";
+    setVisualChainNodes((prev) =>
+      prev.map((node) =>
+        node.id === nodeId
+          ? {
+              ...node,
+              inputBindings: {
+                ...node.inputBindings,
+                [field]: { kind: "workflow_variable", variableKey: fallbackKey },
+              },
+            }
+          : node
+      )
+    );
+  };
+
+  const updateVisualBindingWorkflowVariable = (
+    nodeId: string,
+    field: string,
+    variableKey: string
+  ) => {
+    setVisualChainNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId) {
+          return node;
+        }
+        const currentBinding = node.inputBindings[field];
+        if (!currentBinding || currentBinding.kind !== "workflow_variable") {
+          return node;
+        }
+        return {
+          ...node,
+          inputBindings: {
+            ...node.inputBindings,
+            [field]: {
+              ...currentBinding,
+              variableKey,
+            },
+          },
+        };
+      })
+    );
+  };
+
   const addCustomInputField = (nodeId: string, field: string) => {
     const trimmed = field.trim();
     if (!trimmed) {
@@ -1123,6 +1485,80 @@ export default function WorkflowStudio() {
           : node
       )
     );
+  };
+
+  const addWorkflowInputDefinition = () => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      inputs: [...prev.inputs, createWorkflowInputDefinition()],
+    }));
+  };
+
+  const updateWorkflowInputDefinition = (
+    inputId: string,
+    patch: Partial<WorkflowInputDefinition>
+  ) => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      inputs: prev.inputs.map((item) => (item.id === inputId ? { ...item, ...patch } : item)),
+    }));
+  };
+
+  const removeWorkflowInputDefinition = (inputId: string) => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      inputs: prev.inputs.filter((item) => item.id !== inputId),
+    }));
+  };
+
+  const addWorkflowVariableDefinition = () => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      variables: [...prev.variables, createWorkflowVariableDefinition()],
+    }));
+  };
+
+  const updateWorkflowVariableDefinition = (
+    variableId: string,
+    patch: Partial<WorkflowVariableDefinition>
+  ) => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      variables: prev.variables.map((item) =>
+        item.id === variableId ? { ...item, ...patch } : item
+      ),
+    }));
+  };
+
+  const removeWorkflowVariableDefinition = (variableId: string) => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      variables: prev.variables.filter((item) => item.id !== variableId),
+    }));
+  };
+
+  const addWorkflowOutputDefinition = () => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      outputs: [...prev.outputs, createWorkflowOutputDefinition()],
+    }));
+  };
+
+  const updateWorkflowOutputDefinition = (
+    outputId: string,
+    patch: Partial<WorkflowOutputDefinition>
+  ) => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      outputs: prev.outputs.map((item) => (item.id === outputId ? { ...item, ...patch } : item)),
+    }));
+  };
+
+  const removeWorkflowOutputDefinition = (outputId: string) => {
+    setWorkflowInterface((prev) => ({
+      ...prev,
+      outputs: prev.outputs.filter((item) => item.id !== outputId),
+    }));
   };
 
   const addCapabilityNodeToStudio = (capabilityId: string) => {
@@ -1601,6 +2037,24 @@ export default function WorkflowStudio() {
             schemaDescription,
           };
         }
+        if (binding?.kind === "workflow_input" && binding.inputKey.trim()) {
+          return {
+            field,
+            status: "provided" as const,
+            detail: `workflow.input.${binding.inputKey}`,
+            schemaType,
+            schemaDescription,
+          };
+        }
+        if (binding?.kind === "workflow_variable" && binding.variableKey.trim()) {
+          return {
+            field,
+            status: "provided" as const,
+            detail: `workflow.variable.${binding.variableKey}`,
+            schemaType,
+            schemaDescription,
+          };
+        }
         if (binding?.kind === "context" && binding.path.trim()) {
           return {
             field,
@@ -1729,6 +2183,30 @@ export default function WorkflowStudio() {
           detail: binding.name.trim()
             ? `memory:${binding.scope}/${binding.name}${binding.key ? `/${binding.key}` : ""}`
             : "memory name missing",
+          schemaType,
+          schemaDescription,
+        };
+      }
+      if (binding?.kind === "workflow_input") {
+        return {
+          field,
+          required: false,
+          status: binding.inputKey.trim() ? ("provided" as const) : ("missing" as const),
+          detail: binding.inputKey.trim()
+            ? `workflow.input.${binding.inputKey}`
+            : "workflow input key missing",
+          schemaType,
+          schemaDescription,
+        };
+      }
+      if (binding?.kind === "workflow_variable") {
+        return {
+          field,
+          required: false,
+          status: binding.variableKey.trim() ? ("provided" as const) : ("missing" as const),
+          detail: binding.variableKey.trim()
+            ? `workflow.variable.${binding.variableKey}`
+            : "workflow variable key missing",
           schemaType,
           schemaDescription,
         };
@@ -2048,11 +2526,21 @@ export default function WorkflowStudio() {
           bindings: node.inputBindings,
         })),
         edges: composerDraftEdges,
+        workflowInterface,
       },
       job_context: parsedContext,
       goal: goal.trim() || undefined,
     };
-  }, [composerDraft.summary, composerDraftEdges, contextState.context, contextState.invalid, goal, visualChainNodes, workspaceUserId]);
+  }, [
+    composerDraft.summary,
+    composerDraftEdges,
+    contextState.context,
+    contextState.invalid,
+    goal,
+    visualChainNodes,
+    workflowInterface,
+    workspaceUserId,
+  ]);
 
   const draftPayloadPreview = useMemo(() => {
     const parsedContext = contextState.invalid
@@ -2074,11 +2562,21 @@ export default function WorkflowStudio() {
           variables: node.variables,
         })),
         edges: composerDraftEdges,
+        workflowInterface,
       },
       job_context: parsedContext,
       goal: goal.trim() || undefined,
     };
-  }, [composerDraft.summary, composerDraftEdges, contextState.context, contextState.invalid, goal, visualChainNodes, workspaceUserId]);
+  }, [
+    composerDraft.summary,
+    composerDraftEdges,
+    contextState.context,
+    contextState.invalid,
+    goal,
+    visualChainNodes,
+    workflowInterface,
+    workspaceUserId,
+  ]);
 
   const persistedWorkflowDraft = useMemo(
     () => ({
@@ -2099,8 +2597,17 @@ export default function WorkflowStudio() {
         variables: node.variables,
       })),
       edges: composerDraftEdges,
+      workflowInterface,
     }),
-    [composerDraft.summary, composerDraftEdges, composerNodePositions, contextJson, goal, visualChainNodes]
+    [
+      composerDraft.summary,
+      composerDraftEdges,
+      composerNodePositions,
+      contextJson,
+      goal,
+      visualChainNodes,
+      workflowInterface,
+    ]
   );
 
   const resetStudioTransientState = () => {
@@ -2119,11 +2626,14 @@ export default function WorkflowStudio() {
     setGoal("");
     setContextJson(initialContextJson());
     setComposerDraft(initialStudioDraft());
+    setWorkflowInterface(initialWorkflowInterface());
     setComposerNodePositions({});
     setSavedWorkflowDefinition(null);
     setPublishedWorkflowVersion(null);
     setLoadedWorkflowVersionId(null);
     setWorkflowVersions([]);
+    setWorkflowTriggers([]);
+    setWorkflowRuns([]);
     resetStudioTransientState();
     setStudioNotice("Started a fresh studio draft.");
   };
@@ -2137,6 +2647,7 @@ export default function WorkflowStudio() {
     setGoal(restored.goal);
     setContextJson(restored.contextJsonText);
     setComposerDraft(restored.composerDraft);
+    setWorkflowInterface(restored.workflowInterface);
     setComposerNodePositions(restored.nodePositions);
     setSavedWorkflowDefinition(definition);
     setPublishedWorkflowVersion(null);
@@ -2181,6 +2692,7 @@ export default function WorkflowStudio() {
     setGoal(restored.goal);
     setContextJson(restored.contextJsonText);
     setComposerDraft(restored.composerDraft);
+    setWorkflowInterface(restored.workflowInterface);
     setComposerNodePositions(restored.nodePositions);
     setSavedWorkflowDefinition(definition);
     setPublishedWorkflowVersion(version);
@@ -2224,6 +2736,8 @@ export default function WorkflowStudio() {
       const definition = body as WorkflowDefinition;
       setSavedWorkflowDefinition(definition);
       void refreshWorkflowDefinitions();
+      void refreshWorkflowTriggers(definition.id);
+      void refreshWorkflowRuns(definition.id);
       setStudioNotice(`Saved draft ${definition.title}.`);
       return definition;
     } catch (error) {
@@ -2261,6 +2775,7 @@ export default function WorkflowStudio() {
       setLoadedWorkflowVersionId(version.id);
       void refreshWorkflowDefinitions();
       void refreshWorkflowVersions(definition.id);
+      void refreshWorkflowRuns(definition.id);
       setStudioNotice(`Published workflow version v${version.version_number}.`);
       return version;
     } catch (error) {
@@ -2294,11 +2809,86 @@ export default function WorkflowStudio() {
         );
       }
       const result = body as WorkflowRunResult;
+      setPublishedWorkflowVersion(result.workflow_version);
+      setLoadedWorkflowVersionId(result.workflow_version.id);
+      void refreshWorkflowRuns(result.workflow_definition.id);
       setStudioNotice(
         `Started job ${result.job.id} from workflow version v${result.workflow_version.version_number}.`
       );
     } catch (error) {
       setStudioNotice(error instanceof Error ? error.message : "Failed to run workflow version.");
+    } finally {
+      setWorkflowActionLoading(null);
+    }
+  };
+
+  const createManualWorkflowTrigger = async () => {
+    if (!activeWorkflowDefinitionId || !savedWorkflowDefinition) {
+      setStudioNotice("Save or open a workflow definition before creating a trigger.");
+      return;
+    }
+    setWorkflowActionLoading("save");
+    try {
+      const response = await fetch(
+        `${apiUrl}/workflows/definitions/${encodeURIComponent(activeWorkflowDefinitionId)}/triggers`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: `${savedWorkflowDefinition.title} manual trigger`,
+            trigger_type: "manual",
+            enabled: true,
+            config: { version_mode: "latest_published" },
+            user_id: workspaceUserId.trim() || undefined,
+            metadata: { source: "workflow_studio" },
+          }),
+        }
+      );
+      const body = (await response.json()) as WorkflowTrigger | { detail?: unknown };
+      if (!response.ok) {
+        const detail = (body as { detail?: unknown }).detail;
+        throw new Error(
+          typeof detail === "string"
+            ? detail
+            : `Create trigger failed (${response.status}).`
+        );
+      }
+      void refreshWorkflowTriggers(activeWorkflowDefinitionId);
+      setStudioNotice(`Created manual trigger ${(body as WorkflowTrigger).title}.`);
+    } catch (error) {
+      setStudioNotice(error instanceof Error ? error.message : "Failed to create workflow trigger.");
+    } finally {
+      setWorkflowActionLoading(null);
+    }
+  };
+
+  const invokeWorkflowTrigger = async (trigger: WorkflowTrigger) => {
+    setWorkflowActionLoading("run");
+    try {
+      const response = await fetch(
+        `${apiUrl}/workflows/triggers/${encodeURIComponent(trigger.id)}/invoke`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ priority: 0 }),
+        }
+      );
+      const body = (await response.json()) as WorkflowRunResult | { detail?: unknown };
+      if (!response.ok) {
+        const detail = (body as { detail?: unknown }).detail;
+        throw new Error(
+          typeof detail === "string"
+            ? detail
+            : `Trigger invoke failed (${response.status}).`
+        );
+      }
+      const result = body as WorkflowRunResult;
+      setPublishedWorkflowVersion(result.workflow_version);
+      setLoadedWorkflowVersionId(result.workflow_version.id);
+      void refreshWorkflowRuns(result.workflow_definition.id);
+      setStudioNotice(`Triggered job ${result.job.id} via ${trigger.title}.`);
+    } catch (error) {
+      setStudioNotice(error instanceof Error ? error.message : "Failed to invoke workflow trigger.");
     } finally {
       setWorkflowActionLoading(null);
     }
@@ -2453,6 +3043,85 @@ export default function WorkflowStudio() {
       });
     });
 
+    const seenWorkflowInputKeys = new Set<string>();
+    workflowInterface.inputs.forEach((input, index) => {
+      const key = input.key.trim();
+      if (!key) {
+        localErrors.push(`Workflow input ${index + 1}: key is required.`);
+      } else if (seenWorkflowInputKeys.has(key)) {
+        localErrors.push(`Duplicate workflow input key '${key}'.`);
+      } else {
+        seenWorkflowInputKeys.add(key);
+      }
+      if (input.binding?.kind === "context" && !input.binding.path.trim()) {
+        localErrors.push(`Workflow input '${key || index + 1}': context path is required.`);
+      }
+      if (input.binding?.kind === "memory" && !input.binding.name.trim()) {
+        localErrors.push(`Workflow input '${key || index + 1}': memory name is required.`);
+      }
+      if (input.binding?.kind === "secret" && !input.binding.secretName.trim()) {
+        localErrors.push(`Workflow input '${key || index + 1}': secret name is required.`);
+      }
+    });
+
+    const seenWorkflowVariableKeys = new Set<string>();
+    workflowInterface.variables.forEach((variable, index) => {
+      const key = variable.key.trim();
+      if (!key) {
+        localErrors.push(`Workflow variable ${index + 1}: key is required.`);
+      } else if (seenWorkflowVariableKeys.has(key)) {
+        localErrors.push(`Duplicate workflow variable key '${key}'.`);
+      } else {
+        seenWorkflowVariableKeys.add(key);
+      }
+      if (variable.binding?.kind === "context" && !variable.binding.path.trim()) {
+        localErrors.push(`Workflow variable '${key || index + 1}': context path is required.`);
+      }
+      if (variable.binding?.kind === "memory" && !variable.binding.name.trim()) {
+        localErrors.push(`Workflow variable '${key || index + 1}': memory name is required.`);
+      }
+      if (variable.binding?.kind === "secret" && !variable.binding.secretName.trim()) {
+        localErrors.push(`Workflow variable '${key || index + 1}': secret name is required.`);
+      }
+      if (variable.binding?.kind === "workflow_input" && !variable.binding.inputKey.trim()) {
+        localErrors.push(`Workflow variable '${key || index + 1}': workflow input key is required.`);
+      }
+    });
+
+    const seenWorkflowOutputKeys = new Set<string>();
+    workflowInterface.outputs.forEach((output, index) => {
+      const key = output.key.trim();
+      if (!key) {
+        localErrors.push(`Workflow output ${index + 1}: key is required.`);
+      } else if (seenWorkflowOutputKeys.has(key)) {
+        localErrors.push(`Duplicate workflow output key '${key}'.`);
+      } else {
+        seenWorkflowOutputKeys.add(key);
+      }
+      if (output.binding?.kind === "context" && !output.binding.path.trim()) {
+        localErrors.push(`Workflow output '${key || index + 1}': context path is required.`);
+      }
+      if (output.binding?.kind === "workflow_input" && !output.binding.inputKey.trim()) {
+        localErrors.push(`Workflow output '${key || index + 1}': workflow input key is required.`);
+      }
+      if (
+        output.binding?.kind === "workflow_variable" &&
+        !output.binding.variableKey.trim()
+      ) {
+        localErrors.push(
+          `Workflow output '${key || index + 1}': workflow variable key is required.`
+        );
+      }
+      if (output.binding?.kind === "step_output") {
+        if (!output.binding.sourceNodeId.trim()) {
+          localErrors.push(`Workflow output '${key || index + 1}': source step is required.`);
+        }
+        if (!output.binding.sourcePath.trim()) {
+          localErrors.push(`Workflow output '${key || index + 1}': source path is required.`);
+        }
+      }
+    });
+
     visualChainNodesWithStatus.forEach(({ node, requiredStatus }) => {
       if (node.nodeKind === "control") {
         return;
@@ -2471,6 +3140,12 @@ export default function WorkflowStudio() {
           }
           if (binding.kind === "memory" && !binding.name.trim()) {
             localErrors.push(`Step ${node.taskName}: memory name for '${field}' is required.`);
+          }
+          if (binding.kind === "workflow_input" && !binding.inputKey.trim()) {
+            localErrors.push(`Step ${node.taskName}: workflow input for '${field}' is required.`);
+          }
+          if (binding.kind === "workflow_variable" && !binding.variableKey.trim()) {
+            localErrors.push(`Step ${node.taskName}: workflow variable for '${field}' is required.`);
           }
           return;
         }
@@ -2783,6 +3458,22 @@ export default function WorkflowStudio() {
             />
           </section>
 
+          <StudioWorkflowInterfacePanel
+            workflowInterface={workflowInterface}
+            contextPathSuggestions={contextPathSuggestions}
+            visualChainNodes={visualChainNodes}
+            outputPathSuggestionsForNode={outputPathSuggestionsForNode}
+            onAddInput={addWorkflowInputDefinition}
+            onUpdateInput={updateWorkflowInputDefinition}
+            onRemoveInput={removeWorkflowInputDefinition}
+            onAddVariable={addWorkflowVariableDefinition}
+            onUpdateVariable={updateWorkflowVariableDefinition}
+            onRemoveVariable={removeWorkflowVariableDefinition}
+            onAddOutput={addWorkflowOutputDefinition}
+            onUpdateOutput={updateWorkflowOutputDefinition}
+            onRemoveOutput={removeWorkflowOutputDefinition}
+          />
+
           <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
@@ -2879,17 +3570,29 @@ export default function WorkflowStudio() {
             workflowVersions={workflowVersions}
             workflowVersionsLoading={workflowVersionsLoading}
             workflowVersionsError={workflowVersionsError}
+            workflowTriggers={workflowTriggers}
+            workflowTriggersLoading={workflowTriggersLoading}
+            workflowTriggersError={workflowTriggersError}
+            workflowRuns={workflowRuns}
+            workflowRunsLoading={workflowRunsLoading}
+            workflowRunsError={workflowRunsError}
             activeWorkflowDefinitionId={activeWorkflowDefinitionId}
             activeWorkflowVersionId={activeWorkflowVersionId}
             onRefresh={() => {
               void refreshWorkflowDefinitions();
               if (activeWorkflowDefinitionId) {
                 void refreshWorkflowVersions(activeWorkflowDefinitionId);
+                void refreshWorkflowTriggers(activeWorkflowDefinitionId);
+                void refreshWorkflowRuns(activeWorkflowDefinitionId);
               }
             }}
             onOpenDefinition={restoreWorkflowDefinition}
             onOpenVersion={(version) => {
               void restoreWorkflowVersion(version);
+            }}
+            onCreateManualTrigger={createManualWorkflowTrigger}
+            onInvokeTrigger={(trigger) => {
+              void invokeWorkflowTrigger(trigger);
             }}
           />
 
@@ -2902,6 +3605,7 @@ export default function WorkflowStudio() {
             visualChainNodes={visualChainNodes}
             outputPathSuggestionsForNode={outputPathSuggestionsForNode}
             contextPathSuggestions={contextPathSuggestions}
+            workflowInterface={workflowInterface}
             autoWireNodeBindings={autoWireNodeBindings}
             quickFixNodeBindings={quickFixNodeBindings}
             setSelectedDagNodeId={setSelectedDagNodeId}
@@ -2917,6 +3621,8 @@ export default function WorkflowStudio() {
             updateVisualBindingLiteral={updateVisualBindingLiteral}
             updateVisualBindingContextPath={updateVisualBindingContextPath}
             updateVisualBindingMemory={updateVisualBindingMemory}
+            updateVisualBindingWorkflowInput={updateVisualBindingWorkflowInput}
+            updateVisualBindingWorkflowVariable={updateVisualBindingWorkflowVariable}
             setVisualBindingFromPrevious={setVisualBindingFromPrevious}
             canInsertDeriveOutputPath={canInsertDeriveForSelectedNode}
             onInsertDeriveOutputPath={insertDeriveOutputPathStepForNode}
