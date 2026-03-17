@@ -247,6 +247,13 @@ kubectl port-forward -n awe svc/grafana 3000:3000
 kubectl port-forward -n awe svc/jaeger 16686:16686
 ```
 
+## Guides
+
+- [User Guide](docs/user-guide.md)
+- [API Guide](docs/api.md)
+- [Architecture](docs/architecture.md)
+- [Semantic Memory](docs/semantic-memory.md)
+
 ## Worker Reliability and Scaling
 
 Workers consume `task.ready` from Redis Streams consumer group `workers`.
