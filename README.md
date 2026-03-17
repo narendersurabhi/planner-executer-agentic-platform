@@ -1,6 +1,6 @@
-# Goal-Driven Agentic Workflow Engine (AWE)
+# Agentic Workflow Studio
 
-AWE is a multi-service agentic platform for turning a user goal into an executable plan, running tool-backed tasks, and streaming progress/results to a UI.
+Agentic Workflow Studio is a full-stack planner-executor workflow platform for authoring and executing AI-powered workflows through chat, structured job composition, and a visual DAG editor. It uses typed planner-worker contracts, reusable capabilities, memory, triggers, and Kubernetes runtime orchestration.
 
 ## Agentic Pattern
 

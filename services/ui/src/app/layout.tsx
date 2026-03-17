@@ -14,8 +14,9 @@ const bodyFont = Manrope({
 });
 
 export const metadata = {
-  title: "Agentic Planner Executor",
-  description: "Planner executor agentic platform"
+  title: "Agentic Workflow Studio",
+  description:
+    "A planner-executor workflow platform for authoring and executing AI-powered workflows through chat, compose, and a visual DAG editor."
 };
 
 export default function RootLayout({

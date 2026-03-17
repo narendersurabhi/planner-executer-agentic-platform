@@ -6589,9 +6589,9 @@ const openTemplateModal = (template: Template) => {
         <div className="pointer-events-none absolute top-48 -left-16 h-80 w-80 rounded-full bg-amber-200/50 blur-3xl animate-float-soft" />
         <div className="mx-auto max-w-7xl px-4 py-12 sm:px-6 lg:px-8">
           <ScreenHeader
-            eyebrow="Agentic Planner Executor"
+            eyebrow="Agentic Workflow Studio"
             title="Welcome"
-            description="Choose the surface you want to work in. Compose, Chat, and Workflow Studio now open as dedicated screens."
+            description="Choose the surface you want to work in. Compose, Chat, Workflow Studio, and Memory each open as dedicated screens in the same planner-executor workflow platform."
             activeScreen="home"
           >
             <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
@@ -8218,11 +8218,11 @@ const openTemplateModal = (template: Template) => {
         }}
       >
         <ScreenHeader
-          eyebrow="Agentic Planner Executor"
+          eyebrow="Agentic Workflow Studio"
           title={showComposeScreen ? "Compose Workflow Jobs" : "Chat Operator"}
           description={
             showComposeScreen
-              ? "Craft a goal, attach context, validate the chain, and submit a workflow without leaving the screen."
+              ? "Craft a goal, attach context, validate the chain, and submit a workflow from a structured planner-executor workspace."
               : "Stay conversational until the operator needs a tool call or workflow, then track the resulting jobs in the same workspace."
           }
           activeScreen={showComposeScreen ? "compose" : "chat"}

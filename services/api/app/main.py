@@ -70,7 +70,7 @@ async def _app_lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Agentic Planner Executor API", lifespan=_app_lifespan)
+app = FastAPI(title="Agentic Workflow Studio API", lifespan=_app_lifespan)
 
 cors_origins = [
     origin.strip()

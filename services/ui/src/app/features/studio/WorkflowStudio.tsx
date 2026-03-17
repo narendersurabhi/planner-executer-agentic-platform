@@ -3300,7 +3300,7 @@ export default function WorkflowStudio() {
   return (
     <div className="space-y-6">
       <ScreenHeader
-        eyebrow="Workflow Studio"
+        eyebrow="Agentic Workflow Studio"
         title="Design DAGs before you run them."
         description="Build visual workflows with a capability palette on the left, graph canvas in the middle, and node inspector plus compile preview on the right."
         activeScreen="studio"
