@@ -115,3 +115,66 @@ def test_execute_capability_rejects_non_read_only(monkeypatch) -> None:
         assert "chat_direct_capability_not_read_only" in str(exc)
     else:
         raise AssertionError("expected direct execution to reject non-read-only capability")
+
+
+def test_execute_capability_allows_rag_retrieve_mcp(monkeypatch) -> None:
+    spec = capability_registry.CapabilitySpec(
+        capability_id="rag.retrieve",
+        description="Retrieve ranked chunks from a vector-backed RAG index",
+        risk_tier="read_only",
+        idempotency="read",
+        adapters=(
+            capability_registry.CapabilityAdapterSpec(
+                type="mcp",
+                server_id="rag_retriever_qdrant",
+                tool_name="retrieve",
+            ),
+        ),
+        enabled=True,
+    )
+    monkeypatch.setattr(
+        chat_execution_service.capability_registry,
+        "load_capability_registry",
+        lambda: capability_registry.CapabilityRegistry({"rag.retrieve": spec}),
+    )
+    monkeypatch.setattr(
+        chat_execution_service.capability_registry,
+        "evaluate_capability_allowlist",
+        lambda capability_id, service_name=None: capability_registry.CapabilityAllowDecision(
+            allowed=True, reason="allowed"
+        ),
+    )
+    monkeypatch.setattr(
+        chat_execution_service.mcp_gateway,
+        "invoke_capability",
+        lambda capability_id, arguments, capability_registry=None, execute_tool=None: {
+            "matches": [
+                {
+                    "chunk_id": "chunk-1",
+                    "document_id": "doc-1",
+                    "text": "Kubernetes local deployment syncs config and restarts workloads.",
+                    "score": 0.913,
+                    "metadata": {"path": "README.md", "section": "Kubernetes"},
+                    "source_uri": "README.md#kubernetes",
+                }
+            ]
+        },
+    )
+
+    executor = chat_execution_service.ChatDirectExecutor(
+        registry=_FakeRegistry(),
+        config=chat_execution_service.ChatDirectExecutionConfig(
+            allowed_capabilities={"rag.retrieve"}
+        ),
+    )
+
+    result = executor.execute_capability(
+        capability_id="rag.retrieve",
+        arguments={"query": "How does Kubernetes local deployment work?", "top_k": 3},
+        trace_id="trace-rag-1",
+    )
+
+    assert result.capability_id == "rag.retrieve"
+    assert result.tool_name == "retrieve"
+    assert "Retrieved matches:" in result.assistant_response
+    assert "README.md#kubernetes" in result.assistant_response

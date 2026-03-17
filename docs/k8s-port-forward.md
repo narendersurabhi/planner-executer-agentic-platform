@@ -41,6 +41,9 @@ kubectl port-forward -n awe svc/ui 8510:80
 # Coder
 kubectl port-forward -n awe svc/coder 18001:8000
 
+# Qdrant HTTP API
+kubectl port-forward -n awe svc/qdrant 16333:6333
+
 ```
 
 ## Observability services

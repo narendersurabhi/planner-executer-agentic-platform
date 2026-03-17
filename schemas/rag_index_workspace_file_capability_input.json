@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RagIndexWorkspaceFileCapabilityInput",
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path relative to WORKSPACE_DIR."
+    },
+    "collection_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ensure_collection": {
+      "type": "boolean"
+    },
+    "document_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_uri": {
+      "type": "string"
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    },
+    "chunk_size_chars": {
+      "type": "integer",
+      "minimum": 200,
+      "maximum": 20000
+    },
+    "chunk_overlap_chars": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 5000
+    },
+    "max_chunks": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}

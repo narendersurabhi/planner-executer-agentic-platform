@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RagEnsureCollectionCapabilityOutput",
+  "type": "object",
+  "properties": {
+    "collection_name": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["created", "exists"]
+    },
+    "vector_size": {
+      "type": "integer"
+    },
+    "distance": {
+      "type": "string"
+    },
+    "vector_name": {
+      "type": ["string", "null"]
+    },
+    "payload_keyword_fields": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "collection_name",
+    "status",
+    "vector_size",
+    "distance",
+    "payload_keyword_fields"
+  ],
+  "additionalProperties": false
+}

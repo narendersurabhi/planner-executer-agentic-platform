@@ -32,7 +32,7 @@ if [[ -z "$owner" ]]; then
   exit 1
 fi
 
-services=(api planner worker coder ui policy)
+services=(api planner worker coder ui policy rag-retriever-mcp)
 
 image_for() {
   local service="$1"
@@ -52,6 +52,11 @@ for service in "${services[@]}"; do
           --build-arg "NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-/api}" \
           --build-arg "NEXT_PUBLIC_DEV_TOOLS=${NEXT_PUBLIC_DEV_TOOLS:-false}" \
           -f "services/${service}/Dockerfile" \
+          -t "${image}" \
+          .
+      elif [[ "$service" == "rag-retriever-mcp" ]]; then
+        docker build \
+          -f "services/rag_retriever/Dockerfile" \
           -t "${image}" \
           .
       else

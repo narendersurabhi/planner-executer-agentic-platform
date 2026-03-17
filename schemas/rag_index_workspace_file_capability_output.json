@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RagIndexWorkspaceFileCapabilityOutput",
+  "type": "object",
+  "properties": {
+    "collection_name": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "document_id": {
+      "type": "string"
+    },
+    "chunk_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "upserted_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "chunk_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "collection_name",
+    "path",
+    "document_id",
+    "chunk_count",
+    "upserted_count",
+    "chunk_ids"
+  ],
+  "additionalProperties": false
+}

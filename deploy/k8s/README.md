@@ -66,7 +66,7 @@ IMAGE_OWNER=narendersurabhi IMAGE_TAG=local make images-build
 make k8s-apply-local
 ```
 
-This profile reduces replicas, mounts worker `/shared` from host path via `hostPath`, and uses `ClusterIP` for `ui`.
+This profile reduces replicas, mounts `/shared` from a node `hostPath`, pins local `/shared` consumers to one labeled node for consistent workspace visibility, and uses `ClusterIP` for `ui`.
 
 To copy generated files from worker `/shared` to your local checkout:
 

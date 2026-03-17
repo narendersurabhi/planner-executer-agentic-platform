@@ -1,5 +1,8 @@
 # Tools
 
+For a full engineering guide on exposing an AI agent through the capability system, see [agent-capabilities.md](agent-capabilities.md).
+For the Qdrant-backed retrieval and indexing workflow, see [rag-playbook.md](rag-playbook.md).
+
 Tools are registered in libs/core/tool_registry.py with explicit schemas, usage guidance, and enforced timeouts.
 The http_fetch tool is optional and guarded by TOOL_HTTP_FETCH_ENABLED and TOOL_HTTP_FETCH_ALLOWLIST.
 File read/write tools only allow paths under /shared/artifacts unless using workspace_* tools.

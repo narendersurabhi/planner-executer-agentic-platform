@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RagRetrieveCapabilityOutput",
+  "type": "object",
+  "properties": {
+    "matches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "chunk_id": {"type": "string"},
+          "document_id": {"type": "string"},
+          "text": {"type": "string"},
+          "score": {"type": "number"},
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "source_uri": {"type": "string"}
+        },
+        "required": [
+          "chunk_id",
+          "document_id",
+          "text",
+          "score",
+          "metadata",
+          "source_uri"
+        ],
+        "additionalProperties": true
+      }
+    }
+  },
+  "required": ["matches"],
+  "additionalProperties": true
+}

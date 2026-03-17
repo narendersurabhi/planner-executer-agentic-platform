@@ -22,7 +22,7 @@ data:
           "targets": [
             {
               "refId": "A",
-              "expr": "max by (job) (up{job=~\"awe-api|awe-planner|awe-worker|awe-policy|awe-coder|awe-prometheus|awe-loki|awe-grafana\"})"
+              "expr": "max by (job) (up{job=~\"awe-api|awe-planner|awe-worker|awe-policy|awe-coder|awe-qdrant|awe-rag-retriever-mcp|awe-prometheus|awe-loki|awe-grafana\"})"
             }
           ],
           "options": {
@@ -68,7 +68,7 @@ data:
           "targets": [
             {
               "refId": "A",
-              "expr": "max by (job) (up{job=~\"awe-api|awe-planner|awe-worker|awe-policy|awe-coder|awe-prometheus|awe-loki|awe-grafana\"})",
+              "expr": "max by (job) (up{job=~\"awe-api|awe-planner|awe-worker|awe-policy|awe-coder|awe-qdrant|awe-rag-retriever-mcp|awe-prometheus|awe-loki|awe-grafana\"})",
               "legendFormat": "{{job}}"
             }
           ],
@@ -89,7 +89,7 @@ data:
           "targets": [
             {
               "refId": "A",
-              "expr": "avg by (job) (avg_over_time(up{job=~\"awe-api|awe-planner|awe-worker|awe-policy|awe-coder|awe-prometheus|awe-loki|awe-grafana\"}[1h]))"
+              "expr": "avg by (job) (avg_over_time(up{job=~\"awe-api|awe-planner|awe-worker|awe-policy|awe-coder|awe-qdrant|awe-rag-retriever-mcp|awe-prometheus|awe-loki|awe-grafana\"}[1h]))"
             }
           ],
           "options": {

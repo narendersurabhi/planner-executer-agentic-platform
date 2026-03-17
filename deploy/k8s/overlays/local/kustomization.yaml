@@ -6,11 +6,14 @@ resources:
   - ../../configmap.yaml
   - ../../pvc-postgres.yaml
   - ../../pvc-redis.yaml
+  - ../../pvc-qdrant.yaml
   - ../../postgres.yaml
   - ../../redis.yaml
+  - ../../qdrant.yaml
   - ../../jaeger.yaml
   - ../../github-mcp.yaml
   - ../../coder.yaml
+  - ../../rag-retriever-mcp.yaml
   - ../../planner.yaml
   - ../../policy.yaml
   - ../../worker.yaml
@@ -20,6 +23,7 @@ resources:
   - ../../hpa-coder.yaml
   - pv-postgres-hostpath.yaml
   - pv-redis-hostpath.yaml
+  - pv-qdrant-hostpath.yaml
 configMapGenerator:
   - name: capability-registry
     files:
@@ -41,6 +45,9 @@ images:
     newTag: latest
   - name: ghcr.io/your-org/awe-coder
     newName: localhost:5001/localhost/awe-coder
+    newTag: latest
+  - name: ghcr.io/your-org/awe-rag-retriever-mcp
+    newName: localhost:5001/localhost/awe-rag-retriever-mcp
     newTag: latest
   - name: ghcr.io/your-org/awe-ui
     newName: localhost:5001/localhost/awe-ui
@@ -95,6 +102,12 @@ patches:
     target:
       kind: Deployment
       name: api
+  - path: patch-rag-retriever-shared.json
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: rag-retriever-mcp
   - path: patch-pvc-postgres-hostpath.yaml
     target:
       kind: PersistentVolumeClaim
@@ -103,3 +116,7 @@ patches:
     target:
       kind: PersistentVolumeClaim
       name: redis-data
+  - path: patch-pvc-qdrant-hostpath.yaml
+    target:
+      kind: PersistentVolumeClaim
+      name: qdrant-data

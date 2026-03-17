@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-retriever-mcp
+  namespace: awe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-retriever-mcp
+  template:
+    metadata:
+      labels:
+        app: rag-retriever-mcp
+    spec:
+      containers:
+        - name: rag-retriever-mcp
+          image: ghcr.io/your-org/awe-rag-retriever-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8086
+              name: http
+          envFrom:
+            - configMapRef:
+                name: awe-config
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: QDRANT_API_KEY
+                  optional: true
+            - name: RAG_RETRIEVER_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: RAG_RETRIEVER_MCP_TOKEN
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: shared-data
+              mountPath: /shared
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8086
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8086
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: shared-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-retriever-mcp
+  namespace: awe
+spec:
+  selector:
+    app: rag-retriever-mcp
+  ports:
+    - name: http
+      port: 8086
+      targetPort: 8086

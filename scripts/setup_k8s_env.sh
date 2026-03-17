@@ -32,6 +32,84 @@ fi
 if ! grep -q '^REDIS_URL=' "$tmp_env"; then
   echo "REDIS_URL=redis://redis:6379/0" >>"$tmp_env"
 fi
+if ! grep -q '^QDRANT_URL=' "$tmp_env"; then
+  echo "QDRANT_URL=http://qdrant:6333" >>"$tmp_env"
+fi
+if ! grep -q '^QDRANT_COLLECTION=' "$tmp_env"; then
+  echo "QDRANT_COLLECTION=rag_default" >>"$tmp_env"
+fi
+if ! grep -q '^QDRANT_TIMEOUT_S=' "$tmp_env"; then
+  echo "QDRANT_TIMEOUT_S=10" >>"$tmp_env"
+fi
+if ! grep -q '^QDRANT_VECTOR_SIZE=' "$tmp_env"; then
+  echo "QDRANT_VECTOR_SIZE=1536" >>"$tmp_env"
+fi
+if ! grep -q '^QDRANT_DISTANCE=' "$tmp_env"; then
+  echo "QDRANT_DISTANCE=Cosine" >>"$tmp_env"
+fi
+if ! grep -q '^QDRANT_ON_DISK_PAYLOAD=' "$tmp_env"; then
+  echo "QDRANT_ON_DISK_PAYLOAD=true" >>"$tmp_env"
+fi
+if ! grep -q '^QDRANT_CREATE_PAYLOAD_INDEXES=' "$tmp_env"; then
+  echo "QDRANT_CREATE_PAYLOAD_INDEXES=true" >>"$tmp_env"
+fi
+if ! grep -q '^QDRANT_PAYLOAD_INDEX_FIELDS=' "$tmp_env"; then
+  echo "QDRANT_PAYLOAD_INDEX_FIELDS=document_id,namespace,tenant_id,user_id,workspace_id,source_uri" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_EMBEDDING_PROVIDER=' "$tmp_env"; then
+  echo "RAG_EMBEDDING_PROVIDER=openai" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_EMBEDDING_MODEL=' "$tmp_env"; then
+  echo "RAG_EMBEDDING_MODEL=text-embedding-3-small" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_EMBEDDING_TIMEOUT_S=' "$tmp_env"; then
+  echo "RAG_EMBEDDING_TIMEOUT_S=15" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_REQUIRE_SCOPE=' "$tmp_env"; then
+  echo "RAG_REQUIRE_SCOPE=true" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_TOP_K_DEFAULT=' "$tmp_env"; then
+  echo "RAG_TOP_K_DEFAULT=5" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_TOP_K_MAX=' "$tmp_env"; then
+  echo "RAG_TOP_K_MAX=20" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_ALLOWED_EXTENSIONS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_ALLOWED_EXTENSIONS=.md,.txt,.rst,.json,.yaml,.yml,.toml,.py,.ts,.tsx,.js,.jsx,.css,.html,.sql,.sh" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_MAX_FILE_BYTES=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_MAX_FILE_BYTES=2000000" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_CHUNK_SIZE_CHARS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_CHUNK_SIZE_CHARS=1200" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_CHUNK_OVERLAP_CHARS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_CHUNK_OVERLAP_CHARS=200" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_MAX_CHUNKS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_MAX_CHUNKS=200" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_PAYLOAD_TEXT_KEY=' "$tmp_env"; then
+  echo "RAG_PAYLOAD_TEXT_KEY=text" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_PAYLOAD_DOCUMENT_ID_KEY=' "$tmp_env"; then
+  echo "RAG_PAYLOAD_DOCUMENT_ID_KEY=document_id" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_PAYLOAD_SOURCE_URI_KEY=' "$tmp_env"; then
+  echo "RAG_PAYLOAD_SOURCE_URI_KEY=source_uri" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_PAYLOAD_NAMESPACE_KEY=' "$tmp_env"; then
+  echo "RAG_PAYLOAD_NAMESPACE_KEY=namespace" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_PAYLOAD_TENANT_ID_KEY=' "$tmp_env"; then
+  echo "RAG_PAYLOAD_TENANT_ID_KEY=tenant_id" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_PAYLOAD_USER_ID_KEY=' "$tmp_env"; then
+  echo "RAG_PAYLOAD_USER_ID_KEY=user_id" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_PAYLOAD_WORKSPACE_ID_KEY=' "$tmp_env"; then
+  echo "RAG_PAYLOAD_WORKSPACE_ID_KEY=workspace_id" >>"$tmp_env"
+fi
 
 kubectl create configmap awe-config --from-env-file="$tmp_env" --dry-run=client -o yaml | kubectl apply -n awe -f -
 

@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RagEnsureCollectionCapabilityInput",
+  "type": "object",
+  "properties": {
+    "collection_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional collection name. Defaults to QDRANT_COLLECTION."
+    },
+    "vector_size": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Embedding vector size for the collection."
+    },
+    "distance": {
+      "type": "string",
+      "description": "Vector similarity distance, such as Cosine or Dot."
+    },
+    "vector_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional named-vector key."
+    },
+    "create_payload_indexes": {
+      "type": "boolean",
+      "description": "Whether to create keyword payload indexes for common filter fields."
+    },
+    "payload_keyword_fields": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Optional payload fields to index as keywords."
+    },
+    "on_disk_payload": {
+      "type": "boolean",
+      "description": "Whether payload values should be stored on disk."
+    }
+  },
+  "additionalProperties": false
+}

@@ -311,6 +311,21 @@ Recommended path:
 3. Bind inputs from `memory` in Studio or let chat/workflows inherit `user_id`
 4. Run the workflow
 
+### 6. Build a Qdrant-Backed RAG Workflow
+
+Use when you want grounded retrieval over your own indexed chunks.
+
+Recommended path:
+
+1. `rag.collection.ensure`
+2. `rag.index.upsert_texts` or `rag.index.workspace_file`
+3. `rag.retrieve`
+4. optional answer-generation step
+
+Use `tenant_id`, `workspace_id`, `user_id`, and `namespace` consistently at both index time and retrieval time.
+
+For the full engineering flow, see [rag-playbook.md](rag-playbook.md).
+
 ## Troubleshooting
 
 ### Compile Preview fails

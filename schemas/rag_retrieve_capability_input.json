@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RagRetrieveCapabilityInput",
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "minLength": 1},
+    "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
+    "namespace": {"type": "string"},
+    "tenant_id": {"type": "string"},
+    "user_id": {"type": "string"},
+    "workspace_id": {"type": "string"},
+    "filters": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "min_score": {"type": "number"},
+    "include_text": {"type": "boolean"},
+    "include_metadata": {"type": "boolean"}
+  },
+  "required": ["query"],
+  "additionalProperties": true
+}

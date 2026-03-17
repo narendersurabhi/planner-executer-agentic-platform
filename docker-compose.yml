@@ -131,6 +131,40 @@ services:
       OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES}
     ports:
       - "18010:8000"
+  rag-retriever-mcp:
+    build:
+      context: .
+      dockerfile: services/rag_retriever/Dockerfile
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      WORKSPACE_DIR: /shared/workspace
+      QDRANT_URL: ${QDRANT_URL:-}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-}
+      QDRANT_VECTOR_NAME: ${QDRANT_VECTOR_NAME:-}
+      QDRANT_TIMEOUT_S: ${QDRANT_TIMEOUT_S:-10}
+      QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1536}
+      QDRANT_DISTANCE: ${QDRANT_DISTANCE:-Cosine}
+      QDRANT_ON_DISK_PAYLOAD: ${QDRANT_ON_DISK_PAYLOAD:-true}
+      QDRANT_CREATE_PAYLOAD_INDEXES: ${QDRANT_CREATE_PAYLOAD_INDEXES:-true}
+      QDRANT_PAYLOAD_INDEX_FIELDS: ${QDRANT_PAYLOAD_INDEX_FIELDS:-document_id,namespace,tenant_id,user_id,workspace_id,source_uri}
+      RAG_EMBEDDING_PROVIDER: ${RAG_EMBEDDING_PROVIDER:-openai}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-text-embedding-3-small}
+      RAG_EMBEDDING_TIMEOUT_S: ${RAG_EMBEDDING_TIMEOUT_S:-15}
+      RAG_REQUIRE_SCOPE: ${RAG_REQUIRE_SCOPE:-true}
+      RAG_TOP_K_DEFAULT: ${RAG_TOP_K_DEFAULT:-5}
+      RAG_TOP_K_MAX: ${RAG_TOP_K_MAX:-20}
+      RAG_WORKSPACE_ALLOWED_EXTENSIONS: ${RAG_WORKSPACE_ALLOWED_EXTENSIONS:-.md,.txt,.rst,.json,.yaml,.yml,.toml,.py,.ts,.tsx,.js,.jsx,.css,.html,.sql,.sh}
+      RAG_WORKSPACE_MAX_FILE_BYTES: ${RAG_WORKSPACE_MAX_FILE_BYTES:-2000000}
+      RAG_WORKSPACE_CHUNK_SIZE_CHARS: ${RAG_WORKSPACE_CHUNK_SIZE_CHARS:-1200}
+      RAG_WORKSPACE_CHUNK_OVERLAP_CHARS: ${RAG_WORKSPACE_CHUNK_OVERLAP_CHARS:-200}
+      RAG_WORKSPACE_MAX_CHUNKS: ${RAG_WORKSPACE_MAX_CHUNKS:-200}
+      RAG_RETRIEVER_MCP_TOKEN: ${RAG_RETRIEVER_MCP_TOKEN:-}
+    ports:
+      - "18086:8086"
+    volumes:
+      - ./workspace:/shared/workspace:ro
   ui:
     build:
       context: .

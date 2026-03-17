@@ -659,6 +659,118 @@ capabilities:
         tool_name: memory_semantic_search
         arg_map: {}
         enabled: true
+  - id: rag.retrieve
+    description: Retrieve ranked chunks from a vector-backed RAG index for grounding and citations.
+    risk_tier: read_only
+    idempotency: read
+    group: rag
+    subgroup: retrieval
+    input_schema_ref: rag_retrieve_capability_input
+    output_schema_ref: rag_retrieve_capability_output
+    tags:
+      - rag
+      - retrieval
+      - vector-db
+      - qdrant
+      - grounding
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: retrieve
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 20
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: rag.collection.ensure
+    description: Ensure a Qdrant collection exists with the configured vector shape and payload indexes.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: admin
+    input_schema_ref: rag_ensure_collection_capability_input
+    output_schema_ref: rag_ensure_collection_capability_output
+    tags:
+      - rag
+      - qdrant
+      - collection
+      - admin
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: ensure_collection
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 30
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: rag.index.upsert_texts
+    description: Embed and upsert text chunks with metadata into the configured Qdrant collection.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_upsert_texts_capability_input
+    output_schema_ref: rag_index_upsert_texts_capability_output
+    tags:
+      - rag
+      - qdrant
+      - indexing
+      - embeddings
+      - vector-db
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: upsert_texts
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 60
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: rag.index.workspace_file
+    description: Read a text-like file from the shared workspace, chunk it, embed it, and upsert it into Qdrant.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_workspace_file_capability_input
+    output_schema_ref: rag_index_workspace_file_capability_output
+    tags:
+      - rag
+      - qdrant
+      - indexing
+      - workspace
+      - file
+      - embeddings
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: index_workspace_file
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 90
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
   - id: document.output.derive
     description: Derive a generic safe relative output path for generated document artifacts (set output_extension for pdf/md/etc.).
     risk_tier: read_only

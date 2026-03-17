@@ -79,6 +79,7 @@ configmap-from-env:
 	kubectl create configmap awe-config --from-env-file=.env --dry-run=client -o yaml | kubectl apply -f -
 
 k8s-apply-local:
+	./scripts/ensure_local_shared_node.sh
 	kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/local | kubectl apply -f -
 	./scripts/setup_k8s_env.sh
 
@@ -88,12 +89,13 @@ k8s-pin-local-images:
 	kubectl set image deployment/policy -n awe policy=localhost:5001/localhost/awe-policy:$(IMAGE_TAG)
 	kubectl set image deployment/worker -n awe worker=localhost:5001/localhost/awe-worker:$(IMAGE_TAG)
 	kubectl set image deployment/coder -n awe coder=localhost:5001/localhost/awe-coder:$(IMAGE_TAG)
+	kubectl set image deployment/rag-retriever-mcp -n awe rag-retriever-mcp=localhost:5001/localhost/awe-rag-retriever-mcp:$(IMAGE_TAG)
 	kubectl set image deployment/ui -n awe ui=localhost:5001/localhost/awe-ui:$(IMAGE_TAG)
 
 k8s-delete-local:
 	# Safe local teardown: keep PV/PVC objects and their data.
-	kubectl delete deployment -n awe api planner policy worker coder ui postgres redis --ignore-not-found
-	kubectl delete service -n awe api coder postgres redis ui --ignore-not-found
+	kubectl delete deployment -n awe api planner policy worker coder rag-retriever-mcp ui postgres redis qdrant --ignore-not-found
+	kubectl delete service -n awe api coder rag-retriever-mcp postgres redis qdrant ui --ignore-not-found
 	kubectl delete hpa -n awe api coder --ignore-not-found
 	kubectl delete configmap -n awe awe-config --ignore-not-found
 	kubectl delete secret -n awe awe-secrets --ignore-not-found
@@ -110,18 +112,22 @@ k8s-up-local:
 	kubectl rollout status deployment/policy -n awe --timeout=180s
 	kubectl rollout status deployment/worker -n awe --timeout=180s
 	kubectl rollout status deployment/coder -n awe --timeout=180s
+	kubectl rollout status deployment/qdrant -n awe --timeout=180s
+	kubectl rollout status deployment/rag-retriever-mcp -n awe --timeout=180s
 	kubectl rollout status deployment/ui -n awe --timeout=180s
 
 k8s-down-local:
 	$(MAKE) k8s-delete-local
 
 k8s-restart-local:
-	kubectl rollout restart deployment -n awe api planner policy worker coder ui
+	kubectl rollout restart deployment -n awe api planner policy worker coder qdrant rag-retriever-mcp ui
 	kubectl rollout status deployment/api -n awe --timeout=180s
 	kubectl rollout status deployment/planner -n awe --timeout=180s
 	kubectl rollout status deployment/policy -n awe --timeout=180s
 	kubectl rollout status deployment/worker -n awe --timeout=180s
 	kubectl rollout status deployment/coder -n awe --timeout=180s
+	kubectl rollout status deployment/qdrant -n awe --timeout=180s
+	kubectl rollout status deployment/rag-retriever-mcp -n awe --timeout=180s
 	kubectl rollout status deployment/ui -n awe --timeout=180s
 
 k8s-sync-shared:

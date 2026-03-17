@@ -309,6 +309,8 @@ kubectl port-forward -n awe svc/prometheus 9090:9090
 - [User Guide](docs/user-guide.md)
 - [API Guide](docs/api.md)
 - [Architecture](docs/architecture.md)
+- [AI Agents as Capabilities](docs/agent-capabilities.md)
+- [RAG Playbook](docs/rag-playbook.md)
 - [Semantic Memory](docs/semantic-memory.md)
 
 ## Worker Reliability and Scaling

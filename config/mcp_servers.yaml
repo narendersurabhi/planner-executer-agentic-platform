@@ -10,3 +10,14 @@ mcp_servers:
     max_retries: 1
     retry_sleep_s: 0.25
     bearer_env: GITHUB_TOKEN
+  rag_retriever_qdrant:
+    enabled: true
+    base_url: http://rag-retriever-mcp:8086
+    route_paths:
+      - /mcp
+      - /mcp/rpc
+      - /mcp/rpc/mcp
+    timeout_s: 20
+    max_retries: 1
+    retry_sleep_s: 0.25
+    bearer_env: RAG_RETRIEVER_MCP_TOKEN

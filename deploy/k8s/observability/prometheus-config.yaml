@@ -35,6 +35,16 @@ data:
         static_configs:
           - targets:
               - coder.awe.svc.cluster.local:8000
+      - job_name: awe-rag-retriever-mcp
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - rag-retriever-mcp.awe.svc.cluster.local:8086
+      - job_name: awe-qdrant
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - qdrant.awe.svc.cluster.local:6333
       - job_name: awe-prometheus
         metrics_path: /metrics
         static_configs:

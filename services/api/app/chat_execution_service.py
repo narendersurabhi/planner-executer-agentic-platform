@@ -22,6 +22,7 @@ DEFAULT_CHAT_DIRECT_CAPABILITIES = {
     "filesystem.workspace.read_text",
     "memory.read",
     "memory.semantic.search",
+    "rag.retrieve",
 }
 
 
@@ -216,6 +217,31 @@ def _format_chat_direct_result(
         if isinstance(entries, list) and entries:
             preview = json.dumps(entries[:5], ensure_ascii=True, indent=2)
             return preview[:max_preview_chars]
+    if capability_id == "rag.retrieve":
+        matches = output.get("matches")
+        if isinstance(matches, list) and matches:
+            lines: list[str] = []
+            for match in matches[:5]:
+                if not isinstance(match, dict):
+                    continue
+                source_uri = str(match.get("source_uri") or "").strip()
+                document_id = str(match.get("document_id") or "").strip()
+                score = match.get("score")
+                text = str(match.get("text") or "").strip()
+                label = source_uri or document_id or "match"
+                if isinstance(score, (int, float)):
+                    prefix = f"- {label} (score {score:.3f})"
+                else:
+                    prefix = f"- {label}"
+                if text:
+                    excerpt = text[:180]
+                    suffix = "..." if len(text) > 180 else ""
+                    lines.append(f"{prefix}: {excerpt}{suffix}")
+                else:
+                    lines.append(prefix)
+            if lines:
+                return "Retrieved matches:\n" + "\n".join(lines)
+            return "No matches found."
 
     rendered = json.dumps(output, ensure_ascii=True, indent=2, default=str)
     if len(rendered) > max_preview_chars:

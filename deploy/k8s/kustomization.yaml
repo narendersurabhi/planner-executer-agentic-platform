@@ -6,12 +6,15 @@ resources:
   - configmap.yaml
   - pvc-postgres.yaml
   - pvc-redis.yaml
+  - pvc-qdrant.yaml
   - pvc-shared.yaml
   - postgres.yaml
   - redis.yaml
+  - qdrant.yaml
   - jaeger.yaml
   - github-mcp.yaml
   - coder.yaml
+  - rag-retriever-mcp.yaml
   - planner.yaml
   - policy.yaml
   - worker.yaml
@@ -40,6 +43,9 @@ images:
     newTag: latest
   - name: ghcr.io/your-org/awe-coder
     newName: localhost:5001/awe-coder
+    newTag: latest
+  - name: ghcr.io/your-org/awe-rag-retriever-mcp
+    newName: localhost:5001/awe-rag-retriever-mcp
     newTag: latest
   - name: ghcr.io/your-org/awe-ui
     newName: localhost:5001/awe-ui
