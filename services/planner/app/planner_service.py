@@ -511,6 +511,7 @@ def _fill_payload_context_defaults(
 ) -> None:
     for key in (
         "instruction",
+        "markdown_text",
         "topic",
         "audience",
         "tone",
@@ -549,6 +550,15 @@ def build_validation_payload(
         dict(raw_tool_inputs),
         dependency_defaults=dependency_fill_defaults(),
     )
+    projected_inputs = job_projection.project_explicit_inputs_for_tool(
+        tool.name,
+        request.job_payload,
+        default_goal=request.goal,
+    )
+    if projected_inputs:
+        payload.pop("job", None)
+        for key, value in projected_inputs.items():
+            payload.setdefault(key, value)
     payload.setdefault("tool_inputs", dict(raw_tool_inputs))
     if "instruction" not in payload and isinstance(task.instruction, str) and task.instruction.strip():
         payload["instruction"] = task.instruction.strip()
@@ -585,6 +595,20 @@ def build_capability_validation_payload(
         dict(raw_tool_inputs),
         dependency_defaults=dependency_fill_defaults(),
     )
+    projected_inputs = {}
+    if task.tool_requests:
+        for request_id in task.tool_requests:
+            projected_inputs = job_projection.project_explicit_inputs_for_tool(
+                request_id,
+                request.job_payload,
+                default_goal=request.goal,
+            )
+            if projected_inputs:
+                break
+    if projected_inputs:
+        payload.pop("job", None)
+        for key, value in projected_inputs.items():
+            payload.setdefault(key, value)
     payload.setdefault("tool_inputs", dict(raw_tool_inputs))
     if task.deps:
         for key, default_value in dependency_fill_defaults().items():

@@ -374,19 +374,27 @@ def _job_context_value(payload_map: Mapping[str, Any], key: str) -> Any:
     return None
 
 
-def _payload_has_required_input(payload_map: Mapping[str, Any], key: str) -> bool:
+def _payload_has_required_input(
+    payload_map: Mapping[str, Any], key: str, *, tool_name: str | None = None
+) -> bool:
+    allow_job_context = tool_name not in {
+        "llm_generate_document_spec",
+        "document.spec.generate",
+        "llm_generate_document_spec_from_markdown",
+        "document.spec.generate_from_markdown",
+    }
     if key == "repo_full_name":
         owner = (
             payload_map.get("owner")
             or payload_map.get("repo_owner")
-            or _job_context_value(payload_map, "owner")
-            or _job_context_value(payload_map, "repo_owner")
+            or (allow_job_context and _job_context_value(payload_map, "owner"))
+            or (allow_job_context and _job_context_value(payload_map, "repo_owner"))
         )
         repo = (
             payload_map.get("repo")
             or payload_map.get("repo_name")
-            or _job_context_value(payload_map, "repo")
-            or _job_context_value(payload_map, "repo_name")
+            or (allow_job_context and _job_context_value(payload_map, "repo"))
+            or (allow_job_context and _job_context_value(payload_map, "repo_name"))
         )
         if _value_present(owner, key="owner") and _value_present(repo, key="repo"):
             return True
@@ -394,7 +402,7 @@ def _payload_has_required_input(payload_map: Mapping[str, Any], key: str) -> boo
         for candidate in ("length", "target_pages", "page_count", "max_words", "word_count"):
             if candidate in payload_map and _value_present(payload_map.get(candidate), key=candidate):
                 return True
-            value = _job_context_value(payload_map, candidate)
+            value = _job_context_value(payload_map, candidate) if allow_job_context else None
             if _value_present(value, key=candidate):
                 return True
         # For document generation, a concrete instruction is often sufficient to infer length.
@@ -433,7 +441,7 @@ def _payload_has_required_input(payload_map: Mapping[str, Any], key: str) -> boo
     for candidate in (key,) + aliases.get(key, ()):
         if candidate in payload_map and _value_present(payload_map.get(candidate), key=candidate):
             return True
-        value = _job_context_value(payload_map, candidate)
+        value = _job_context_value(payload_map, candidate) if allow_job_context else None
         if _value_present(value, key=key):
             return True
     return False
@@ -503,7 +511,7 @@ def validate_intent_segment_contract(
             continue
         if "_or_" in key:
             continue
-        if _payload_has_required_input(payload_map, key):
+        if _payload_has_required_input(payload_map, key, tool_name=tool_name):
             continue
         missing_inputs.append(key)
     if missing_inputs:

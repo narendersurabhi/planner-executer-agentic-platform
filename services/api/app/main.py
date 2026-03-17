@@ -728,138 +728,78 @@ def _threshold_bucket(value: float) -> str:
 
 
 def _infer_goal_risk_level(goal: str, intent: str) -> str:
-    lowered = str(goal or "").lower()
-    high_risk_tokens = (
-        "delete",
-        "destroy",
-        "remove",
-        "drop",
-        "shutdown",
-        "infra",
-        "prod",
-        "production",
-        "payment",
-        "billing",
-        "credential",
-        "secret",
+    return intent_service.assess_goal_intent(
+        goal,
+        config=_goal_intent_assess_config(),
+        runtime=intent_service.GoalIntentRuntime(
+            infer_task_intent=lambda _goal: type(
+                "_GoalIntentInference",
+                (),
+                {"intent": intent, "source": "main_wrapper", "confidence": 1.0},
+            )(),
+        ),
+    ).risk_level or "read_only"
+
+
+def _goal_intent_assess_config() -> intent_service.GoalIntentConfig:
+    return intent_service.GoalIntentConfig(
+        min_confidence=INTENT_MIN_CONFIDENCE,
+        min_confidence_by_intent=dict(INTENT_MIN_CONFIDENCE_BY_INTENT),
+        min_confidence_by_risk=dict(INTENT_MIN_CONFIDENCE_BY_RISK),
+        clarification_blocking_slots=set(INTENT_CLARIFICATION_BLOCKING_SLOTS),
     )
-    if any(token in lowered for token in high_risk_tokens):
-        return "high_risk_write"
-    bounded_tokens = (
-        "create",
-        "update",
-        "write",
-        "publish",
-        "push",
-        "commit",
-        "open pr",
-        "pull request",
-        "render",
-        "generate",
-    )
-    if intent in {"render", "transform", "generate"} and any(
-        token in lowered for token in bounded_tokens
-    ):
-        return "bounded_write"
-    if intent == "io" and any(token in lowered for token in ("write", "upload", "save", "push")):
-        return "bounded_write"
-    return "read_only"
+
+
+def _record_goal_intent_assessment_metrics(
+    profile: workflow_contracts.GoalIntentProfile,
+) -> None:
+    needs_clarification = bool(profile.needs_clarification)
+    intent_assessments_total.labels(
+        needs_clarification=str(needs_clarification).lower()
+    ).inc()
+    intent_threshold_evaluations_total.labels(
+        intent=profile.intent or "generate",
+        risk_level=profile.risk_level or "read_only",
+        needs_clarification=str(needs_clarification).lower(),
+        threshold_bucket=_threshold_bucket(float(profile.threshold or 0.0)),
+    ).inc()
+    if profile.requires_blocking_clarification:
+        intent_clarification_required_total.inc()
 
 
 def _resolve_intent_confidence_threshold(intent: str, risk_level: str) -> float:
-    base = max(0.0, min(1.0, float(INTENT_MIN_CONFIDENCE)))
-    intent_override = INTENT_MIN_CONFIDENCE_BY_INTENT.get(intent)
-    risk_override = INTENT_MIN_CONFIDENCE_BY_RISK.get(risk_level)
-    candidates = [base]
-    if isinstance(intent_override, float):
-        candidates.append(intent_override)
-    if isinstance(risk_override, float):
-        candidates.append(risk_override)
-    return round(max(candidates), 3)
+    return intent_service.resolve_intent_confidence_threshold(
+        intent,
+        risk_level,
+        config=_goal_intent_assess_config(),
+    )
 
 
 def _extract_goal_slot_signals(goal: str, intent: str, risk_level: str) -> dict[str, Any]:
-    lowered = str(goal or "").lower()
-    output_format = ""
-    for token, normalized in (
-        ("pdf", "pdf"),
-        ("docx", "docx"),
-        ("markdown", "md"),
-        (".md", "md"),
-        ("json", "json"),
-        ("csv", "csv"),
-        ("xlsx", "xlsx"),
-        ("excel", "xlsx"),
-        ("html", "html"),
-        ("text", "txt"),
-        ("txt", "txt"),
-    ):
-        if token in lowered:
-            output_format = normalized
-            break
-    target_system = ""
-    target_candidates = (
-        "github",
-        "gitlab",
-        "jira",
-        "slack",
-        "notion",
-        "confluence",
-        "filesystem",
-        "workspace",
-        "artifacts",
-        "gmail",
+    profile = intent_service.assess_goal_intent(
+        goal,
+        config=_goal_intent_assess_config(),
+        runtime=intent_service.GoalIntentRuntime(
+            infer_task_intent=lambda _goal: type(
+                "_GoalIntentInference",
+                (),
+                {"intent": intent, "source": "main_wrapper", "confidence": 1.0},
+            )(),
+        ),
     )
-    for token in target_candidates:
-        if token in lowered:
-            target_system = token
-            break
-    safety_constraints = ""
-    if any(
-        token in lowered
-        for token in (
-            "read only",
-            "read-only",
-            "no write",
-            "without write",
-            "do not delete",
-            "safe mode",
-            "dry run",
-        )
-    ):
-        safety_constraints = "present"
-    return {
-        "intent_action": intent or "",
-        "output_format": output_format,
-        "target_system": target_system,
-        "safety_constraints": safety_constraints,
-        "risk_level": risk_level,
-    }
+    return dict(profile.slot_values)
 
 
 def _blocking_clarification_slots(intent: str, risk_level: str) -> list[str]:
-    slots: list[str] = []
-    if "intent_action" in INTENT_CLARIFICATION_BLOCKING_SLOTS:
-        slots.append("intent_action")
-    if intent in {"render", "generate"} and "output_format" in INTENT_CLARIFICATION_BLOCKING_SLOTS:
-        slots.append("output_format")
-    if intent == "io" and "target_system" in INTENT_CLARIFICATION_BLOCKING_SLOTS:
-        slots.append("target_system")
-    if risk_level == "high_risk_write" and "safety_constraints" in INTENT_CLARIFICATION_BLOCKING_SLOTS:
-        slots.append("safety_constraints")
-    return slots
+    return intent_service.blocking_clarification_slots(
+        intent,
+        risk_level,
+        config=_goal_intent_assess_config(),
+    )
 
 
 def _slot_question(slot: str, goal: str) -> str:
-    if slot == "intent_action":
-        return "What should the system do first (generate, transform, validate, render, or io)?"
-    if slot == "output_format":
-        return "What output format do you need (for example PDF, DOCX, JSON, or Markdown)?"
-    if slot == "target_system":
-        return "Which target system should this use (for example GitHub, Jira, Slack, filesystem)?"
-    if slot == "safety_constraints":
-        return "What safety constraints must be enforced (for example read-only, no deletes, dry-run)?"
-    return f"Provide clarification for slot '{slot}' for goal: '{goal[:120]}'."
+    return intent_service.slot_question(slot, goal)
 
 
 def _looks_like_conversational_turn(content: str) -> bool:
@@ -939,54 +879,15 @@ def _goal_intent_segments_from_metadata(metadata: Mapping[str, Any] | None) -> l
     return segments
 
 
-def _assess_goal_intent(goal: str) -> dict[str, Any]:
-    inference = intent_contract.infer_task_intent_from_goal_with_metadata(goal)
-    intent = inference.intent
-    risk_level = _infer_goal_risk_level(goal, intent)
-    threshold = _resolve_intent_confidence_threshold(intent, risk_level)
-    confidence = round(float(inference.confidence), 3)
-    slot_values = _extract_goal_slot_signals(goal, intent, risk_level)
-    blocking_slots = _blocking_clarification_slots(intent, risk_level)
-    missing_slots = [
-        slot_name
-        for slot_name in blocking_slots
-        if not str(slot_values.get(slot_name) or "").strip()
-    ]
-    low_confidence = confidence < threshold
-    # Low-confidence intent inference is treated as missing intent_action for slot-filling.
-    if low_confidence and "intent_action" in blocking_slots and "intent_action" not in missing_slots:
-        missing_slots.append("intent_action")
-    requires_blocking_clarification = bool(missing_slots)
-    needs_clarification = bool(missing_slots)
-    intent_assessments_total.labels(
-        needs_clarification=str(bool(needs_clarification)).lower()
-    ).inc()
-    intent_threshold_evaluations_total.labels(
-        intent=intent,
-        risk_level=risk_level,
-        needs_clarification=str(bool(needs_clarification)).lower(),
-        threshold_bucket=_threshold_bucket(threshold),
-    ).inc()
-    if requires_blocking_clarification:
-        intent_clarification_required_total.inc()
-    questions: list[str] = []
-    for slot_name in missing_slots:
-        questions.append(_slot_question(slot_name, goal))
-    return {
-        "intent": intent,
-        "source": inference.source,
-        "confidence": confidence,
-        "risk_level": risk_level,
-        "threshold": threshold,
-        "low_confidence": low_confidence,
-        "needs_clarification": needs_clarification,
-        "requires_blocking_clarification": requires_blocking_clarification,
-        "questions": questions,
-        "blocking_slots": blocking_slots,
-        "missing_slots": missing_slots,
-        "slot_values": slot_values,
-        "clarification_mode": "targeted_slot_filling",
-    }
+def _assess_goal_intent(goal: str) -> workflow_contracts.GoalIntentProfile:
+    return intent_service.assess_goal_intent(
+        goal,
+        config=_goal_intent_assess_config(),
+        runtime=intent_service.GoalIntentRuntime(
+            infer_task_intent=intent_contract.infer_task_intent_from_goal_with_metadata,
+            record_metrics=_record_goal_intent_assessment_metrics,
+        ),
+    )
 
 
 def _route_chat_turn(
@@ -1054,30 +955,31 @@ def _fallback_chat_turn_route(
         isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
     )
     assessment = _assess_goal_intent(candidate_goal)
+    assessment_json = workflow_contracts.dump_goal_intent_profile(assessment) or {}
     if pending_clarification or not _looks_like_conversational_turn(content):
-        if bool(assessment.get("requires_blocking_clarification")):
+        if bool(assessment.requires_blocking_clarification):
             questions = [
                 str(question).strip()
-                for question in assessment.get("questions", [])
+                for question in assessment.questions
                 if isinstance(question, str) and question.strip()
             ]
             return {
                 "type": "ask_clarification",
                 "assistant_content": "\n".join(questions) if questions else "What should I do next?",
                 "clarification_questions": questions,
-                "goal_intent_profile": assessment,
+                "goal_intent_profile": assessment_json,
             }
         return {
             "type": "submit_job",
             "assistant_content": "",
             "clarification_questions": [],
-            "goal_intent_profile": assessment,
+            "goal_intent_profile": assessment_json,
         }
     return {
         "type": "respond",
         "assistant_content": _fallback_chat_response(content),
         "clarification_questions": [],
-        "goal_intent_profile": assessment,
+        "goal_intent_profile": assessment_json,
     }
 
 
@@ -1159,19 +1061,19 @@ def _normalize_chat_route(
         capability_id = ""
     arguments = dict(parsed.get("arguments")) if isinstance(parsed.get("arguments"), Mapping) else {}
 
-    intent = str(parsed.get("intent") or heuristic.get("intent") or "").strip().lower()
+    intent = str(parsed.get("intent") or heuristic.intent or "").strip().lower()
     if intent not in {"generate", "transform", "validate", "render", "io"}:
-        intent = str(heuristic.get("intent") or "")
-    risk_level = str(parsed.get("risk_level") or heuristic.get("risk_level") or "").strip().lower()
+        intent = str(heuristic.intent or "")
+    risk_level = str(parsed.get("risk_level") or heuristic.risk_level or "").strip().lower()
     if risk_level not in {"read_only", "bounded_write", "high_risk_write"}:
-        risk_level = str(heuristic.get("risk_level") or "read_only")
+        risk_level = str(heuristic.risk_level or "read_only")
     confidence_raw = parsed.get("confidence")
-    confidence = float(heuristic.get("confidence") or 0.0)
+    confidence = float(heuristic.confidence or 0.0)
     if isinstance(confidence_raw, (int, float)):
         confidence = max(0.0, min(1.0, float(confidence_raw)))
     threshold = _resolve_intent_confidence_threshold(intent, risk_level)
 
-    slot_values = dict(heuristic.get("slot_values") or {})
+    slot_values = dict(heuristic.slot_values or {})
     for key in ("output_format", "target_system", "safety_constraints"):
         value = parsed.get(key)
         if isinstance(value, str) and value.strip():
@@ -1233,7 +1135,7 @@ def _normalize_chat_route(
         "capability_id": capability_id,
         "arguments": arguments,
         "clarification_questions": clarification_questions,
-        "goal_intent_profile": assessment,
+        "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(assessment) or {},
     }
 
 
@@ -5427,13 +5329,14 @@ def _create_job_internal(
     job_id = str(uuid.uuid4())
     now = _utcnow()
     goal_assessment = _assess_goal_intent(job.goal)
+    goal_assessment_json = workflow_contracts.dump_goal_intent_profile(goal_assessment) or {}
     gate_on_create = bool(require_clarification or INTENT_CLARIFICATION_ON_CREATE)
-    if gate_on_create and bool(goal_assessment.get("requires_blocking_clarification")):
+    if gate_on_create and bool(goal_assessment.requires_blocking_clarification):
         raise HTTPException(
             status_code=422,
             detail={
                 "error": "intent_clarification_required",
-                "goal_intent_profile": goal_assessment,
+                "goal_intent_profile": goal_assessment_json,
             },
         )
     context_json_for_job = (
@@ -5474,7 +5377,7 @@ def _create_job_internal(
         context_json_for_job if isinstance(context_json_for_job, Mapping) else None
     )
     metadata["semantic_user_id"] = semantic_user_id
-    metadata["goal_intent_profile"] = goal_assessment
+    metadata["goal_intent_profile"] = goal_assessment_json
     if INTENT_DECOMPOSE_ENABLED:
         goal_intent_graph = _decompose_goal_intent(
             job.goal,
@@ -6394,7 +6297,7 @@ def clarify_intent(payload: dict[str, Any]) -> dict[str, Any]:
     assessment = _assess_goal_intent(goal)
     return {
         "goal": goal,
-        "assessment": assessment,
+        "assessment": workflow_contracts.dump_goal_intent_profile(assessment) or {},
     }
 
 

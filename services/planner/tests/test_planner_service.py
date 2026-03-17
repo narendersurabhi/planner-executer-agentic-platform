@@ -152,13 +152,13 @@ def test_validate_plan_request_uses_service_owned_capability_rules() -> None:
     assert reason.startswith("capability_intent_invalid:github.repo.list:CheckRepo:")
 
 
-def test_build_validation_payload_compacts_document_generation_job_payload() -> None:
+def test_build_validation_payload_projects_explicit_document_generation_fields() -> None:
     request = planner_contracts.PlanRequest(
         job_id="job-1",
         goal="Convert markdown to DOCX",
         job_context={
-            "markdown_text": "# Heading\n\nParagraph",
             "topic": "Demo",
+            "audience": "General",
             "tone": "neutral",
             "today": "2026-03-16",
             "output_dir": "documents",
@@ -194,8 +194,15 @@ def test_build_validation_payload_compacts_document_generation_job_payload() -> 
         description="Generate a document spec",
         input_schema={
             "type": "object",
-            "properties": {"job": {"type": "object"}},
-            "required": ["job"],
+            "properties": {
+                "instruction": {"type": "string"},
+                "topic": {"type": "string"},
+                "audience": {"type": "string"},
+                "tone": {"type": "string"},
+                "today": {"type": "string"},
+                "output_dir": {"type": "string"},
+            },
+            "required": ["instruction", "topic", "audience", "tone", "today", "output_dir"],
         },
         output_schema={"type": "object"},
         tool_intent=models.ToolIntent.generate,
@@ -208,16 +215,79 @@ def test_build_validation_payload_compacts_document_generation_job_payload() -> 
         raw_tool_inputs={},
     )
 
-    assert payload["job"] == {
-        "goal": "Convert markdown to DOCX",
-        "context_json": {
+    assert payload["instruction"] == "Convert markdown to DOCX"
+    assert payload["topic"] == "Demo"
+    assert payload["audience"] == "General"
+    assert payload["tone"] == "neutral"
+    assert payload["today"] == "2026-03-16"
+    assert payload["output_dir"] == "documents"
+
+
+def test_build_validation_payload_projects_markdown_document_generation_fields() -> None:
+    request = planner_contracts.PlanRequest(
+        job_id="job-1",
+        goal="Convert markdown to DOCX",
+        job_context={
             "markdown_text": "# Heading\n\nParagraph",
             "topic": "Demo",
             "tone": "neutral",
             "today": "2026-03-16",
             "output_dir": "documents",
         },
-    }
+        job_payload={
+            "goal": "Convert markdown to DOCX",
+            "status": "queued",
+            "context_json": {
+                "markdown_text": "# Heading\n\nParagraph",
+                "topic": "Demo",
+                "tone": "neutral",
+                "today": "2026-03-16",
+                "output_dir": "documents",
+            },
+        },
+    )
+    task = models.TaskCreate(
+        name="Generate DocumentSpec From Markdown",
+        description="Generate document spec from markdown",
+        instruction="Transform markdown into a document spec.",
+        acceptance_criteria=["Spec produced"],
+        expected_output_schema_ref="schemas/document_spec",
+        intent=models.ToolIntent.transform,
+        deps=[],
+        tool_requests=["llm_generate_document_spec_from_markdown"],
+        tool_inputs={"llm_generate_document_spec_from_markdown": {}},
+        critic_required=False,
+    )
+    tool = models.ToolSpec(
+        name="llm_generate_document_spec_from_markdown",
+        description="Generate a document spec from markdown",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "markdown_text": {"type": "string"},
+                "topic": {"type": "string"},
+                "tone": {"type": "string"},
+                "today": {"type": "string"},
+                "output_dir": {"type": "string"},
+            },
+            "required": ["markdown_text"],
+        },
+        output_schema={"type": "object"},
+        tool_intent=models.ToolIntent.transform,
+    )
+
+    payload = planner_service.build_validation_payload(
+        task,
+        tool,
+        request,
+        raw_tool_inputs={},
+    )
+
+    assert payload["markdown_text"] == "# Heading\n\nParagraph"
+    assert payload["topic"] == "Demo"
+    assert payload["tone"] == "neutral"
+    assert payload["today"] == "2026-03-16"
+    assert payload["output_dir"] == "documents"
 
 
 def test_postprocess_llm_plan_synthesizes_execution_bindings() -> None:

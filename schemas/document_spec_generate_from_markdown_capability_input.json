@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "DocumentSpecGenerateCapabilityInput",
+  "title": "DocumentSpecGenerateFromMarkdownCapabilityInput",
   "type": "object",
   "properties": {
-    "instruction": {"type": "string", "minLength": 1},
+    "markdown_text": {"type": "string", "minLength": 1},
     "topic": {"type": "string", "minLength": 1},
     "audience": {"type": "string", "minLength": 1},
     "tone": {"type": "string", "minLength": 1},
@@ -14,14 +14,7 @@
       "items": {"type": "string"}
     }
   },
-  "required": [
-    "instruction",
-    "topic",
-    "audience",
-    "tone",
-    "today",
-    "output_dir"
-  ],
+  "required": ["markdown_text"],
   "additionalProperties": true,
   "not": {"required": ["job"]}
 }

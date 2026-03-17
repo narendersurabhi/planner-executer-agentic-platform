@@ -152,11 +152,10 @@ def test_ensure_task_intents_can_use_goal_intent_sequence() -> None:
     assert updated.tasks[1].intent == models.ToolIntent.render
 
 
-def test_ensure_job_inputs_compacts_document_generation_job_payload() -> None:
+def test_ensure_job_inputs_projects_explicit_document_generation_fields() -> None:
     job = _job()
     job.goal = "Convert markdown to DOCX"
     job.context_json = {
-        "markdown_text": "# Heading\n\nParagraph",
         "topic": "Demo",
         "tone": "neutral",
         "today": "2026-03-16",
@@ -177,22 +176,67 @@ def test_ensure_job_inputs_compacts_document_generation_job_payload() -> None:
                 "llm_generate_document_spec",
                 {
                     "type": "object",
-                    "properties": {"job": {"type": "object"}},
-                    "required": ["job"],
+                    "properties": {
+                        "instruction": {"type": "string"},
+                        "topic": {"type": "string"},
+                        "tone": {"type": "string"},
+                        "today": {"type": "string"},
+                        "output_dir": {"type": "string"},
+                    },
+                    "required": ["instruction", "topic", "tone", "today", "output_dir"],
                 },
             )
         ],
     )
 
-    assert updated.tasks[0].tool_inputs["llm_generate_document_spec"]["job"] == {
-        "goal": "Convert markdown to DOCX",
-        "context_json": {
-            "markdown_text": "# Heading\n\nParagraph",
-            "topic": "Demo",
-            "tone": "neutral",
-            "today": "2026-03-16",
-            "output_dir": "documents",
-        },
+    assert updated.tasks[0].tool_inputs["llm_generate_document_spec"] == {
+        "instruction": "Convert markdown to DOCX",
+        "topic": "Demo",
+        "tone": "neutral",
+        "today": "2026-03-16",
+        "output_dir": "documents",
+    }
+
+
+def test_ensure_job_inputs_projects_markdown_document_generation_fields() -> None:
+    job = _job()
+    job.goal = "Convert markdown to DOCX"
+    job.context_json = {
+        "markdown_text": "# Heading\n\nParagraph",
+        "topic": "Demo",
+        "tone": "neutral",
+        "today": "2026-03-16",
+        "output_dir": "documents",
+    }
+
+    plan = _plan_with_task("llm_generate_document_spec_from_markdown", {})
+    updated = _ensure_job_inputs(
+        plan,
+        job,
+        [
+            _tool(
+                "llm_generate_document_spec_from_markdown",
+                {
+                    "type": "object",
+                    "properties": {
+                        "markdown_text": {"type": "string"},
+                        "topic": {"type": "string"},
+                        "tone": {"type": "string"},
+                        "today": {"type": "string"},
+                        "output_dir": {"type": "string"},
+                    },
+                    "required": ["markdown_text"],
+                },
+            )
+        ],
+    )
+
+    assert updated.tasks[0].tool_inputs["llm_generate_document_spec_from_markdown"] == {
+        "markdown_text": "# Heading\n\nParagraph",
+        "topic": "Demo",
+        "tone": "neutral",
+        "today": "2026-03-16",
+        "output_dir": "documents",
     }
 
 

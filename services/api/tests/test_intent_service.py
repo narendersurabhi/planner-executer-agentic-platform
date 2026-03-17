@@ -2,6 +2,57 @@ from libs.core import workflow_contracts
 from services.api.app import intent_service
 
 
+def test_assess_goal_intent_returns_goal_intent_profile() -> None:
+    recorded: list[workflow_contracts.GoalIntentProfile] = []
+
+    profile = intent_service.assess_goal_intent(
+        "Render a deployment report",
+        config=intent_service.GoalIntentConfig(
+            min_confidence=0.7,
+            min_confidence_by_intent={},
+            min_confidence_by_risk={},
+            clarification_blocking_slots={"intent_action", "output_format", "target_system"},
+        ),
+        runtime=intent_service.GoalIntentRuntime(
+            infer_task_intent=lambda _goal: type(
+                "_Inference",
+                (),
+                {"intent": "render", "source": "test", "confidence": 0.88},
+            )(),
+            record_metrics=recorded.append,
+        ),
+    )
+
+    assert isinstance(profile, workflow_contracts.GoalIntentProfile)
+    assert profile.intent == "render"
+    assert profile.risk_level == "bounded_write"
+    assert profile.missing_slots == ["output_format"]
+    assert profile.questions
+    assert recorded and recorded[0].intent == "render"
+
+
+def test_assess_goal_intent_only_blocks_safety_constraints_for_high_risk_write() -> None:
+    profile = intent_service.assess_goal_intent(
+        "Delete the production repository",
+        config=intent_service.GoalIntentConfig(
+            min_confidence=0.7,
+            min_confidence_by_intent={},
+            min_confidence_by_risk={},
+            clarification_blocking_slots={"intent_action", "output_format", "target_system", "safety_constraints"},
+        ),
+        runtime=intent_service.GoalIntentRuntime(
+            infer_task_intent=lambda _goal: type(
+                "_Inference",
+                (),
+                {"intent": "io", "source": "test", "confidence": 0.91},
+            )(),
+        ),
+    )
+
+    assert profile.risk_level == "high_risk_write"
+    assert "safety_constraints" in profile.missing_slots
+
+
 def test_decompose_goal_intent_returns_llm_graph_with_summary_fields() -> None:
     failures: list[Exception] = []
     recorded: list[tuple[str, bool]] = []

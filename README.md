@@ -158,7 +158,7 @@ make eval-intent
 - Keep secrets in `.env` only.
 - Typical secrets:
   - `OPENAI_API_KEY`
-  - `GITHUB_TOKEN`
+  - `GITHUB_CLASSIC_TOKEN` or `GITHUB_TOKEN`
   - `AWS_ACCESS_KEY_ID`
   - `AWS_SECRET_ACCESS_KEY`
 

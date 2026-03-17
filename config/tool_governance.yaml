@@ -9,6 +9,7 @@ tool_governance:
         - json_transform
         - llm_generate
         - llm_generate_document_spec
+        - llm_generate_document_spec_from_markdown
         - llm_improve_document_spec
         - llm_repair_document_spec
         - llm_iterative_improve_document_spec
@@ -46,6 +47,7 @@ tool_governance:
         - json_transform
         - llm_generate
         - llm_generate_document_spec
+        - llm_generate_document_spec_from_markdown
         - llm_improve_document_spec
         - llm_repair_document_spec
         - llm_iterative_improve_document_spec
@@ -97,6 +99,7 @@ tool_governance:
         - json_transform
         - llm_generate
         - llm_generate_document_spec
+        - llm_generate_document_spec_from_markdown
         - llm_improve_document_spec
         - llm_repair_document_spec
         - llm_iterative_improve_document_spec

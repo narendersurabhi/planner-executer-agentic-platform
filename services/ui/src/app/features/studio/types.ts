@@ -1,0 +1,155 @@
+"use client";
+
+export type CapabilityAdapter = {
+  type: string;
+  server_id: string;
+  tool_name: string;
+};
+
+export type CapabilitySchemaField = {
+  path: string;
+  type: string;
+  required: boolean;
+  description?: string | null;
+};
+
+export type CapabilityItem = {
+  id: string;
+  description: string;
+  enabled: boolean;
+  risk_tier: string;
+  idempotency: string;
+  group?: string | null;
+  subgroup?: string | null;
+  tags: string[];
+  input_schema_ref?: string | null;
+  input_schema?: Record<string, unknown> | null;
+  output_schema_ref?: string | null;
+  output_schema?: Record<string, unknown> | null;
+  input_fields?: CapabilitySchemaField[];
+  output_fields?: CapabilitySchemaField[];
+  required_inputs?: string[];
+  adapters?: CapabilityAdapter[];
+  planner_hints?: Record<string, unknown> | null;
+};
+
+export type CapabilityCatalog = {
+  mode: string;
+  items: CapabilityItem[];
+};
+
+export type ComposerInputBinding =
+  | {
+      kind: "step_output";
+      sourceNodeId: string;
+      sourcePath: string;
+      defaultValue?: string;
+    }
+  | {
+      kind: "literal";
+      value: string;
+    }
+  | {
+      kind: "context";
+      path: string;
+    }
+  | {
+      kind: "memory";
+      scope: "job" | "global";
+      name: string;
+      key?: string;
+    };
+
+export type ComposerDraftNode = {
+  id: string;
+  taskName: string;
+  capabilityId: string;
+  outputPath: string;
+  inputBindings: Record<string, ComposerInputBinding>;
+  outputs: StudioNodeOutput[];
+  variables: StudioNodeVariable[];
+};
+
+export type StudioNodeOutput = {
+  id: string;
+  name: string;
+  path: string;
+  description?: string;
+};
+
+export type StudioNodeVariable = {
+  id: string;
+  key: string;
+  value: string;
+  description?: string;
+};
+
+export type ComposerDraftEdge = {
+  fromNodeId: string;
+  toNodeId: string;
+};
+
+export type ComposerDraft = {
+  summary: string;
+  nodes: ComposerDraftNode[];
+  edges: ComposerDraftEdge[];
+};
+
+export type CanvasPoint = {
+  x: number;
+  y: number;
+};
+
+export type ComposerCompileDiagnostic = {
+  code: string;
+  message: string;
+  field?: string;
+  node_id?: string;
+};
+
+export type ComposerCompileResponse = {
+  valid: boolean;
+  diagnostics: {
+    valid: boolean;
+    errors: ComposerCompileDiagnostic[];
+    warnings: ComposerCompileDiagnostic[];
+  };
+  plan: Record<string, unknown> | null;
+  preflight_errors: Record<string, string>;
+};
+
+export type ChainPreflightResult = {
+  valid: boolean;
+  localErrors: string[];
+  serverErrors: Record<string, string>;
+  serverDiagnostics?: {
+    severity?: "error" | "warning";
+    code: string;
+    field?: string;
+    message: string;
+    slot_fields?: string[];
+  }[];
+  checkedAt: string;
+};
+
+export type ComposerValidationIssue = {
+  severity: "error" | "warning";
+  source: "local" | "compile" | "preflight";
+  code: string;
+  message: string;
+  field?: string;
+  nodeId?: string;
+};
+
+export type ComposerIssueFocus = {
+  nodeId: string;
+  field?: string;
+};
+
+export type NodeRequiredStatus = {
+  field: string;
+  status: "missing" | "from_chain" | "from_context" | "provided";
+  detail: string;
+  schemaType: string;
+  schemaDescription: string;
+};

@@ -65,6 +65,24 @@ class IntentGraph(BaseModel):
     source: str | None = None
 
 
+class GoalIntentProfile(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    intent: str = ""
+    source: str | None = None
+    confidence: float | None = None
+    risk_level: str | None = None
+    threshold: float | None = None
+    low_confidence: bool = False
+    needs_clarification: bool = False
+    requires_blocking_clarification: bool = False
+    questions: list[str] = Field(default_factory=list)
+    blocking_slots: list[str] = Field(default_factory=list)
+    missing_slots: list[str] = Field(default_factory=list)
+    slot_values: dict[str, Any] = Field(default_factory=dict)
+    clarification_mode: str | None = None
+
+
 def parse_intent_graph(value: Any) -> IntentGraph | None:
     if isinstance(value, IntentGraph):
         return value
@@ -81,3 +99,23 @@ def dump_intent_graph(value: IntentGraph | Mapping[str, Any] | None) -> dict[str
     if graph is None:
         return None
     return graph.model_dump(mode="json", exclude_none=True)
+
+
+def parse_goal_intent_profile(value: Any) -> GoalIntentProfile | None:
+    if isinstance(value, GoalIntentProfile):
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return GoalIntentProfile.model_validate(value)
+    except ValidationError:
+        return None
+
+
+def dump_goal_intent_profile(
+    value: GoalIntentProfile | Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    profile = parse_goal_intent_profile(value)
+    if profile is None:
+        return None
+    return profile.model_dump(mode="json", exclude_none=True)

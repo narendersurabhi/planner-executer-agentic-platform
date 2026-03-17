@@ -58,7 +58,7 @@ Notes on coding agent:
 - coding_agent_generate: calls the coder service to generate code files from a goal and writes them to the workspace.
 
 
-Notes on GitHub tools (GITHUB_TOKEN required):
+Notes on GitHub tools (`GITHUB_CLASSIC_TOKEN` preferred, `GITHUB_TOKEN` fallback):
 - github_repo_create: create a repo under user or org.
 - github_repo_update: update description/homepage/visibility/default_branch.
 - github_repo_list: list repos for user or org.

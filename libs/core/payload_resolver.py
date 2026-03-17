@@ -93,7 +93,7 @@ def resolve_tool_payload(
             has_tool_inputs = True
     payload = _merge_payload_from_task(payload, task_payload, instruction)
     payload = _fill_payload_from_context(payload, context)
-    payload = _promote_document_job_fields(payload)
+    payload = _promote_document_job_fields(payload, tool_name=tool_name)
     if tool_name == "llm_generate":
         base_text = payload.get("text") or payload.get("prompt") or instruction
         if context:
@@ -163,6 +163,7 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
         # can succeed before worker-side memory hydration.
         for key in (
             "instruction",
+            "markdown_text",
             "topic",
             "audience",
             "tone",
@@ -217,7 +218,11 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
     return filled
 
 
-def _promote_document_job_fields(payload: dict[str, Any]) -> dict[str, Any]:
+def _promote_document_job_fields(
+    payload: dict[str, Any], *, tool_name: str | None = None
+) -> dict[str, Any]:
+    if tool_name == "llm_generate_document_spec":
+        return dict(payload)
     promoted = dict(payload)
     job = promoted.get("job")
     if not isinstance(job, dict):

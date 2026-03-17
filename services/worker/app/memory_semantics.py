@@ -5,6 +5,7 @@ from typing import Any, Mapping, Sequence
 
 MEMORY_OUTPUT_KEYS = {
     "llm_generate_document_spec": ["document_spec"],
+    "llm_generate_document_spec_from_markdown": ["document_spec"],
     "llm_improve_document_spec": ["document_spec"],
     "llm_iterative_improve_document_spec": [
         "document_spec",

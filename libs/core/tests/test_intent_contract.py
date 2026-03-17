@@ -318,7 +318,30 @@ def test_validate_intent_segment_contract_accepts_filename_aliases_from_payload(
     assert mismatch is None
 
 
-def test_validate_intent_segment_contract_accepts_title_alias_from_job_context() -> None:
+def test_validate_intent_segment_contract_accepts_title_alias_from_explicit_payload() -> None:
+    segment = {
+        "intent": "generate",
+        "objective": "Generate document spec",
+        "slots": {
+            "entity": "document",
+            "artifact_type": "document_spec",
+            "output_format": None,
+            "risk_level": "read_only",
+            "must_have_inputs": ["title"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="generate",
+        tool_name="llm_generate_document_spec",
+        payload={"target_role_name": "Platform Engineer"},
+        capability_id="document.spec.generate",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
+def test_validate_intent_segment_contract_does_not_accept_generate_title_from_job_context() -> None:
     segment = {
         "intent": "generate",
         "objective": "Generate document spec",
@@ -338,7 +361,7 @@ def test_validate_intent_segment_contract_accepts_title_alias_from_job_context()
         capability_id="document.spec.generate",
         capability_risk_tier="read_only",
     )
-    assert mismatch is None
+    assert mismatch == "must_have_inputs_missing:title"
 
 
 def test_validate_intent_segment_contract_accepts_target_repo_alias_from_query() -> None:

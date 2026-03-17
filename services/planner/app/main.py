@@ -525,13 +525,30 @@ def _ensure_job_inputs_for_request(
         changed = False
         for tool_name in task.tool_requests or []:
             tool = tool_map.get(tool_name)
+            payload = tool_inputs.get(tool_name)
+            payload = dict(payload) if isinstance(payload, dict) else {}
+            projected_inputs = job_projection.project_explicit_inputs_for_tool(
+                tool_name,
+                request.job_payload,
+                default_goal=request.goal,
+            )
+            if projected_inputs:
+                if "job" in payload:
+                    payload.pop("job", None)
+                    changed = True
+                for key, value in projected_inputs.items():
+                    if key in payload:
+                        continue
+                    payload[key] = value
+                    changed = True
+                if changed:
+                    tool_inputs[tool_name] = payload
+                continue
             if tool is None:
                 continue
             schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
             if not _schema_requires_key(schema, "job"):
                 continue
-            payload = tool_inputs.get(tool_name)
-            payload = dict(payload) if isinstance(payload, dict) else {}
             existing_job = payload.get("job")
             projected_job_payload = job_projection.project_job_payload_for_tool(
                 tool_name,

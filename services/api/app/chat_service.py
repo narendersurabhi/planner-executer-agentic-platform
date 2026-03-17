@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from libs.core import chat_contracts, models
+from libs.core import chat_contracts, models, workflow_contracts
 
 from .models import ChatMessageRecord, ChatSessionRecord
 
@@ -96,7 +96,9 @@ def handle_turn(
         merged_context=merged_context,
         messages=[_message_from_record(message) for message in messages],
     )
-    assessment = dict(turn_plan.get("goal_intent_profile") or {})
+    assessment = workflow_contracts.dump_goal_intent_profile(
+        turn_plan.get("goal_intent_profile")
+    ) or {}
     route_type = str(turn_plan.get("type") or "").strip().lower() or "respond"
     assistant_content = str(turn_plan.get("assistant_content") or "").strip()
     if not assistant_content:
@@ -299,7 +301,9 @@ def _assistant_metadata(
     assessment: Mapping[str, Any],
     direct_output: Any = None,
 ) -> dict[str, Any]:
-    metadata = {"goal_intent_profile": dict(assessment)}
+    metadata = {
+        "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(assessment) or {}
+    }
     if isinstance(direct_output, Mapping):
         metadata["tool_output"] = dict(direct_output)
     return metadata

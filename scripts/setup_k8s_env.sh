@@ -23,7 +23,7 @@ trap 'rm -f "$tmp_env"' EXIT
 
 # Build ConfigMap input from .env but keep secrets out of ConfigMap.
 grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env \
-  | grep -Ev '^(OPENAI_API_KEY|GITHUB_TOKEN|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)=' >"$tmp_env"
+  | grep -Ev '^(OPENAI_API_KEY|GITHUB_TOKEN|GITHUB_CLASSIC_TOKEN|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)=' >"$tmp_env"
 
 # Ensure K8s service DNS defaults exist when .env is compose-focused.
 if ! grep -q '^DATABASE_URL=' "$tmp_env"; then
@@ -36,12 +36,17 @@ fi
 kubectl create configmap awe-config --from-env-file="$tmp_env" --dry-run=client -o yaml | kubectl apply -n awe -f -
 
 OPENAI_KEY=$(grep -E '^OPENAI_API_KEY=' .env | cut -d= -f2-)
+GITHUB_CLASSIC_TOKEN=$(grep -E '^GITHUB_CLASSIC_TOKEN=' .env | cut -d= -f2-)
 GITHUB_TOKEN=$(grep -E '^GITHUB_TOKEN=' .env | cut -d= -f2-)
 AWS_ACCESS_KEY_ID=$(grep -E '^AWS_ACCESS_KEY_ID=' .env | cut -d= -f2-)
 AWS_SECRET_ACCESS_KEY=$(grep -E '^AWS_SECRET_ACCESS_KEY=' .env | cut -d= -f2-)
 
+if [[ -n "$GITHUB_CLASSIC_TOKEN" ]]; then
+  GITHUB_TOKEN="$GITHUB_CLASSIC_TOKEN"
+fi
+
 if [[ -z "$OPENAI_KEY" || -z "$GITHUB_TOKEN" || -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
-  echo "OPENAI_API_KEY, GITHUB_TOKEN, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY must be set in .env" >&2
+  echo "OPENAI_API_KEY, GITHUB_CLASSIC_TOKEN or GITHUB_TOKEN, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY must be set in .env" >&2
   exit 1
 fi
 

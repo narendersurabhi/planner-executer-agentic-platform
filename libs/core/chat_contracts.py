@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from libs.core import models
+from libs.core import models, workflow_contracts
 
 
 class ChatRole(str, Enum):
@@ -31,7 +31,9 @@ class AssistantAction(BaseModel):
     capability_id: str | None = None
     tool_name: str | None = None
     clarification_questions: list[str] = Field(default_factory=list)
-    goal_intent_profile: dict[str, Any] = Field(default_factory=dict)
+    goal_intent_profile: workflow_contracts.GoalIntentProfile = Field(
+        default_factory=workflow_contracts.GoalIntentProfile
+    )
     context_json: dict[str, Any] = Field(default_factory=dict)
 
 
