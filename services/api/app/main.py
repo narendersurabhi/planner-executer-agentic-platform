@@ -637,12 +637,29 @@ def _task_record_tool_inputs(
     tool_requests: list[str],
     tool_inputs: Mapping[str, Any] | None,
     capability_bindings: Mapping[str, Any] | None = None,
+    execution_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return execution_contracts.embed_capability_bindings(
+    normalized_execution_gate = execution_contracts.normalize_execution_gates(
+        {"tool_inputs": tool_inputs},
+        request_ids=tool_requests,
+    )
+    if isinstance(execution_gate, Mapping):
+        normalized_execution_gate.update(
+            execution_contracts.normalize_execution_gates(
+                {"execution_gates": execution_gate},
+                request_ids=tool_requests,
+            )
+        )
+    embedded = execution_contracts.embed_capability_bindings(
         tool_inputs,
         capability_bindings,
         request_ids=tool_requests,
         capabilities=_api_enabled_capabilities(),
+    )
+    return execution_contracts.embed_execution_gate(
+        embedded,
+        normalized_execution_gate,
+        request_ids=tool_requests,
     )
 
 
@@ -3097,6 +3114,156 @@ def _composer_default_task_name(capability_id: str, index: int) -> str:
     return "".join(segment[:1].upper() + segment[1:] for segment in parts)
 
 
+_COMPOSER_CONTROL_KINDS = {"if", "if_else", "switch", "parallel"}
+
+
+def _composer_control_kind(raw_node: Mapping[str, Any]) -> str:
+    control_kind = str(raw_node.get("controlKind") or raw_node.get("control_kind") or "").strip().lower()
+    if control_kind in _COMPOSER_CONTROL_KINDS:
+        return control_kind
+    capability_id = str(raw_node.get("capabilityId") or raw_node.get("capability_id") or "").strip().lower()
+    if capability_id.startswith("studio.control."):
+        suffix = capability_id.rsplit(".", 1)[-1].strip()
+        if suffix in _COMPOSER_CONTROL_KINDS:
+            return suffix
+    return ""
+
+
+def _composer_is_control_node(raw_node: Mapping[str, Any]) -> bool:
+    node_kind = str(raw_node.get("nodeKind") or raw_node.get("node_kind") or "").strip().lower()
+    return node_kind == "control" or bool(_composer_control_kind(raw_node))
+
+
+def _composer_control_config(raw_node: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = raw_node.get("controlConfig")
+    if not isinstance(value, Mapping):
+        value = raw_node.get("control_config")
+    if isinstance(value, Mapping):
+        return value
+    return {}
+
+
+def _validate_composer_control_node(
+    *,
+    node_id: str,
+    task_name: str,
+    control_kind: str,
+    control_config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    expression = str(control_config.get("expression") or "").strip()
+    parallel_mode = str(control_config.get("parallelMode") or control_config.get("parallel_mode") or "fan_out").strip().lower()
+    if control_kind in {"if", "if_else", "switch"} and not expression:
+        diagnostics.append(
+            {
+                "code": "draft.control_expression_missing",
+                "node_id": node_id,
+                "field": "expression",
+                "message": "Control-flow node requires a non-empty expression.",
+            }
+        )
+    if control_kind in {"if", "if_else"} and expression and not _composer_if_expression_supported(expression):
+        diagnostics.append(
+            {
+                "code": "draft.control_expression_unsupported",
+                "node_id": node_id,
+                "field": "expression",
+                "message": "Conditional control-flow currently supports only context-based expressions.",
+            }
+        )
+    if control_kind == "parallel" and parallel_mode not in {"fan_out", "fan_in"}:
+        diagnostics.append(
+            {
+                "code": "draft.control_parallel_mode_invalid",
+                "node_id": node_id,
+                "field": "parallelMode",
+                "message": "Parallel control-flow node requires parallelMode of fan_out or fan_in.",
+            }
+        )
+    if control_kind == "switch":
+        diagnostics.append(
+            {
+                "code": "draft.control_flow_unsupported",
+                "node_id": node_id,
+                "message": (
+                    f"Control-flow node '{task_name or control_kind}' ({control_kind}) is not compiled into plans yet."
+                ),
+            }
+        )
+    if control_kind == "switch":
+        raw_cases = control_config.get("switchCases")
+        if not isinstance(raw_cases, list):
+            raw_cases = control_config.get("switch_cases")
+        cases = raw_cases if isinstance(raw_cases, list) else []
+        if not cases:
+            diagnostics.append(
+                {
+                    "code": "draft.control_switch_cases_missing",
+                    "node_id": node_id,
+                    "field": "switchCases",
+                    "message": "Switch control-flow node requires at least one case.",
+                }
+            )
+        seen_labels: set[str] = set()
+        for index, raw_case in enumerate(cases):
+            if not isinstance(raw_case, Mapping):
+                diagnostics.append(
+                    {
+                        "code": "draft.control_switch_case_invalid",
+                        "node_id": node_id,
+                        "field": f"switchCases[{index}]",
+                        "message": "Switch case must be an object.",
+                    }
+                )
+                continue
+            label = str(raw_case.get("label") or "").strip()
+            match = str(raw_case.get("match") or "").strip()
+            if not label:
+                diagnostics.append(
+                    {
+                        "code": "draft.control_switch_case_label_missing",
+                        "node_id": node_id,
+                        "field": f"switchCases[{index}].label",
+                        "message": "Switch case label is required.",
+                    }
+                )
+            elif label in seen_labels:
+                diagnostics.append(
+                    {
+                        "code": "draft.control_switch_case_label_duplicate",
+                        "node_id": node_id,
+                        "field": f"switchCases[{index}].label",
+                        "message": f"Duplicate switch case label '{label}'.",
+                    }
+                )
+            else:
+                seen_labels.add(label)
+            if not match:
+                diagnostics.append(
+                    {
+                        "code": "draft.control_switch_case_match_missing",
+                        "node_id": node_id,
+                        "field": f"switchCases[{index}].match",
+                        "message": "Switch case match value is required.",
+                    }
+                )
+    return diagnostics
+
+
+def _composer_if_expression_supported(expression: str) -> bool:
+    normalized = expression.strip()
+    if not normalized:
+        return False
+    if normalized.startswith("context."):
+        return True
+    if "==" in normalized or "!=" in normalized:
+        left, right = normalized.split("==" if "==" in normalized else "!=", 1)
+        left = left.strip()
+        right = right.strip()
+        return left.startswith("context.") and bool(right)
+    return False
+
+
 def _build_plan_from_composer_draft(
     draft: dict[str, Any],
     *,
@@ -3116,6 +3283,7 @@ def _build_plan_from_composer_draft(
     node_by_id: dict[str, dict[str, Any]] = {}
     used_task_names: set[str] = set()
     tool_intent_values = {member.value for member in models.ToolIntent}
+    has_unsupported_control_nodes = False
 
     for index, raw_node in enumerate(raw_nodes):
         if not isinstance(raw_node, dict):
@@ -3131,17 +3299,36 @@ def _build_plan_from_composer_draft(
             raw_node.get("capabilityId") or raw_node.get("capability_id") or ""
         ).strip()
         task_name = str(raw_node.get("taskName") or raw_node.get("task_name") or "").strip()
+        is_control_node = _composer_is_control_node(raw_node)
+        control_kind = _composer_control_kind(raw_node)
+        control_config = _composer_control_config(raw_node)
         if not capability_id:
             diagnostics_errors.append(
                 {
-                    "code": "draft.capability_missing",
+                    "code": "draft.capability_missing" if not is_control_node else "draft.control_kind_missing",
                     "node_id": node_id,
-                    "message": "capabilityId is required.",
+                    "message": "capabilityId is required." if not is_control_node else "Control node is missing control kind/capabilityId.",
                 }
             )
             continue
-        capability_spec = registry.get(capability_id)
-        if capability_spec is None:
+        capability_spec = None
+        if is_control_node:
+            parallel_mode = str(control_config.get("parallelMode") or control_config.get("parallel_mode") or "fan_out").strip().lower()
+            if control_kind not in {"if", "if_else"} and not (
+                control_kind == "parallel" and parallel_mode in {"fan_out", "fan_in"}
+            ):
+                has_unsupported_control_nodes = True
+            diagnostics_errors.extend(
+                _validate_composer_control_node(
+                    node_id=node_id,
+                    task_name=task_name or capability_id,
+                    control_kind=control_kind,
+                    control_config=control_config,
+                )
+            )
+        else:
+            capability_spec = registry.get(capability_id)
+        if not is_control_node and capability_spec is None:
             diagnostics_errors.append(
                 {
                     "code": "draft.capability_unknown",
@@ -3186,6 +3373,9 @@ def _build_plan_from_composer_draft(
             "bindings": dict(bindings),
             "order": index,
             "intent": str(raw_node.get("intent") or "").strip(),
+            "is_control": is_control_node,
+            "control_kind": control_kind,
+            "control_config": dict(control_config),
         }
         canonical_nodes.append(canonical)
         node_by_id[node_id] = canonical
@@ -3235,8 +3425,163 @@ def _build_plan_from_composer_draft(
                 continue
             deps_by_node_id[target_id].add(source_id)
 
+    children_by_node_id: dict[str, set[str]] = {node["node_id"]: set() for node in canonical_nodes}
+    edge_branch_labels: dict[tuple[str, str], str] = {}
+    for target_id, source_ids in deps_by_node_id.items():
+        for source_id in source_ids:
+            if source_id in children_by_node_id:
+                children_by_node_id[source_id].add(target_id)
+    if isinstance(raw_edges, list):
+        for edge in raw_edges:
+            if not isinstance(edge, dict):
+                continue
+            source_id = str(edge.get("fromNodeId") or edge.get("from") or "").strip()
+            target_id = str(edge.get("toNodeId") or edge.get("to") or "").strip()
+            branch_label = str(edge.get("branchLabel") or edge.get("branch_label") or "").strip()
+            if source_id and target_id and branch_label:
+                edge_branch_labels[(source_id, target_id)] = branch_label
+
+    for node in canonical_nodes:
+        if not node.get("is_control") or node.get("control_kind") != "parallel":
+            continue
+        parallel_mode = str(
+            node.get("control_config", {}).get("parallelMode")
+            or node.get("control_config", {}).get("parallel_mode")
+            or "fan_out"
+        ).strip().lower()
+        outgoing_count = len(children_by_node_id.get(node["node_id"], set()))
+        incoming_count = len(deps_by_node_id.get(node["node_id"], set()))
+        if parallel_mode == "fan_out" and outgoing_count < 2:
+            diagnostics_errors.append(
+                {
+                    "code": "draft.control_parallel_fan_out_targets_missing",
+                    "node_id": node["node_id"],
+                    "field": "edges",
+                    "message": "Parallel fan_out control node requires at least two outgoing edges.",
+                }
+            )
+        if parallel_mode == "fan_in" and incoming_count < 2:
+            diagnostics_errors.append(
+                {
+                    "code": "draft.control_parallel_fan_in_sources_missing",
+                    "node_id": node["node_id"],
+                    "field": "edges",
+                    "message": "Parallel fan_in control node requires at least two incoming edges.",
+                }
+            )
+        if parallel_mode == "fan_in" and outgoing_count < 1:
+            diagnostics_errors.append(
+                {
+                    "code": "draft.control_parallel_fan_in_target_missing",
+                    "node_id": node["node_id"],
+                    "field": "edges",
+                    "message": "Parallel fan_in control node requires at least one outgoing edge.",
+                }
+            )
+
+    def _resolve_non_control_deps(node_id: str, seen: set[str] | None = None) -> set[str]:
+        resolved: set[str] = set()
+        for source_id in deps_by_node_id.get(node_id, set()):
+            if source_id == node_id:
+                continue
+            source_node = node_by_id.get(source_id)
+            if source_node is None:
+                continue
+            if not source_node.get("is_control"):
+                resolved.add(source_id)
+                continue
+            next_seen = set(seen or set())
+            if source_id in next_seen:
+                continue
+            next_seen.add(source_id)
+            resolved.update(_resolve_non_control_deps(source_id, next_seen))
+        return resolved
+
+    for node in canonical_nodes:
+        node["execution_gate"] = None
+    for node in canonical_nodes:
+        if not node.get("is_control") or node.get("control_kind") != "if":
+            continue
+        expression = str(node.get("control_config", {}).get("expression") or "").strip()
+        if not expression or not _composer_if_expression_supported(expression):
+            continue
+        queue = list(children_by_node_id.get(node["node_id"], set()))
+        visited: set[str] = set()
+        while queue:
+            candidate_id = queue.pop(0)
+            if candidate_id in visited:
+                continue
+            visited.add(candidate_id)
+            candidate = node_by_id.get(candidate_id)
+            if candidate is None:
+                continue
+            if not candidate.get("is_control"):
+                candidate["execution_gate"] = {"expression": expression}
+            queue.extend(children_by_node_id.get(candidate_id, set()))
+
+    for node in canonical_nodes:
+        if not node.get("is_control") or node.get("control_kind") != "if_else":
+            continue
+        expression = str(node.get("control_config", {}).get("expression") or "").strip()
+        if not expression or not _composer_if_expression_supported(expression):
+            continue
+        config = node.get("control_config", {})
+        true_label = str(config.get("trueLabel") or "true").strip().lower()
+        false_label = str(config.get("falseLabel") or "false").strip().lower()
+        outgoing = sorted(children_by_node_id.get(node["node_id"], set()))
+        true_roots: set[str] = set()
+        false_roots: set[str] = set()
+        for target_id in outgoing:
+            branch_label = edge_branch_labels.get((node["node_id"], target_id), "").strip().lower()
+            if branch_label == true_label:
+                true_roots.add(target_id)
+            elif branch_label == false_label:
+                false_roots.add(target_id)
+        if not true_roots:
+            diagnostics_errors.append(
+                {
+                    "code": "draft.control_if_else_true_branch_missing",
+                    "node_id": node["node_id"],
+                    "field": "edges",
+                    "message": "If / Else control node requires an outgoing edge labeled for the true branch.",
+                }
+            )
+        if not false_roots:
+            diagnostics_errors.append(
+                {
+                    "code": "draft.control_if_else_false_branch_missing",
+                    "node_id": node["node_id"],
+                    "field": "edges",
+                    "message": "If / Else control node requires an outgoing edge labeled for the false branch.",
+                }
+            )
+
+        def _descendants(roots: set[str]) -> set[str]:
+            seen: set[str] = set()
+            queue = list(roots)
+            while queue:
+                candidate_id = queue.pop(0)
+                if candidate_id in seen:
+                    continue
+                seen.add(candidate_id)
+                queue.extend(sorted(children_by_node_id.get(candidate_id, set())))
+            return seen
+
+        true_descendants = _descendants(true_roots)
+        false_descendants = _descendants(false_roots)
+        for candidate_id in sorted(true_descendants - false_descendants):
+            candidate = node_by_id.get(candidate_id)
+            if candidate is not None and not candidate.get("is_control"):
+                candidate["execution_gate"] = {"expression": expression}
+        for candidate_id in sorted(false_descendants - true_descendants):
+            candidate = node_by_id.get(candidate_id)
+            if candidate is not None and not candidate.get("is_control"):
+                candidate["execution_gate"] = {"expression": expression, "negate": True}
+
     tasks_payload: list[dict[str, Any]] = []
     for node in canonical_nodes:
+        if node.get("is_control"):
+            continue
         node_id = node["node_id"]
         capability_id = node["capability_id"]
         capability_spec = node["capability_spec"]
@@ -3357,7 +3702,15 @@ def _build_plan_from_composer_draft(
                 }
             )
 
-        deps = [node_by_id[dep_id]["task_name"] for dep_id in deps_by_node_id.get(node_id, set())]
+        deps = [
+            node_by_id[dep_id]["task_name"]
+            for dep_id in sorted(_resolve_non_control_deps(node_id))
+        ]
+        embedded_tool_inputs = execution_contracts.embed_execution_gate(
+            {capability_id: tool_input_payload},
+            node.get("execution_gate"),
+            request_ids=[capability_id],
+        )
         task_payload: dict[str, Any] = {
             "name": node["task_name"],
             "description": capability_spec.description,
@@ -3366,7 +3719,7 @@ def _build_plan_from_composer_draft(
             "expected_output_schema_ref": capability_spec.output_schema_ref or "",
             "deps": deps,
             "tool_requests": [capability_id],
-            "tool_inputs": {capability_id: tool_input_payload},
+            "tool_inputs": embedded_tool_inputs,
             "critic_required": False,
         }
         intent_value = node.get("intent")
@@ -3404,10 +3757,15 @@ def _build_plan_from_composer_draft(
 
     dag_edges: list[list[str]] = []
     for node in canonical_nodes:
+        if node.get("is_control"):
+            continue
         target_task_name = node["task_name"]
-        for source_node_id in deps_by_node_id.get(node["node_id"], set()):
+        for source_node_id in sorted(_resolve_non_control_deps(node["node_id"])):
             source_task_name = node_by_id[source_node_id]["task_name"]
             dag_edges.append([source_task_name, target_task_name])
+
+    if diagnostics_errors or has_unsupported_control_nodes:
+        return None, diagnostics_errors, diagnostics_warnings
 
     plan_payload = {
         "planner_version": "ui_chaining_composer_v2",

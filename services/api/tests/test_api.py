@@ -1956,6 +1956,365 @@ def test_build_plan_from_composer_draft_derives_intent_from_goal(monkeypatch) ->
     assert plan.tasks[0].intent == models.ToolIntent.render
 
 
+def test_build_plan_from_composer_draft_flags_control_flow_nodes() -> None:
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {
+                    "id": "n1",
+                    "taskName": "ApprovalGate",
+                    "nodeKind": "control",
+                    "controlKind": "if_else",
+                    "capabilityId": "studio.control.if_else",
+                    "controlConfig": {"expression": "context.approved == true"},
+                }
+            ]
+        }
+    )
+
+    assert plan is None
+    codes = {entry["code"] for entry in errors}
+    assert "draft.control_if_else_true_branch_missing" in codes
+    assert "draft.control_if_else_false_branch_missing" in codes
+
+
+def test_build_plan_from_composer_draft_validates_switch_control_cases() -> None:
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {
+                    "id": "n1",
+                    "taskName": "RouteByStatus",
+                    "nodeKind": "control",
+                    "controlKind": "switch",
+                    "capabilityId": "studio.control.switch",
+                    "controlConfig": {
+                        "expression": "context.status",
+                        "switchCases": [{"id": "c1", "label": "", "match": ""}],
+                    },
+                }
+            ]
+        }
+    )
+
+    assert plan is None
+    codes = {entry["code"] for entry in errors}
+    assert "draft.control_switch_case_label_missing" in codes
+    assert "draft.control_switch_case_match_missing" in codes
+
+
+def test_build_plan_from_composer_draft_lowers_if_control_to_execution_gate(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {
+                    "id": "source",
+                    "capabilityId": "json_transform",
+                    "taskName": "LoadData",
+                },
+                {
+                    "id": "gate",
+                    "taskName": "OnlyIfApproved",
+                    "nodeKind": "control",
+                    "controlKind": "if",
+                    "capabilityId": "studio.control.if",
+                    "controlConfig": {"expression": "context.approved == true"},
+                },
+                {
+                    "id": "target",
+                    "capabilityId": "json_transform",
+                    "taskName": "TransformData",
+                },
+            ],
+            "edges": [
+                {"fromNodeId": "source", "toNodeId": "gate"},
+                {"fromNodeId": "gate", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert errors == []
+    assert plan is not None
+    assert [task.name for task in plan.tasks] == ["LoadData", "TransformData"]
+    assert plan.tasks[1].deps == ["LoadData"]
+    assert plan.tasks[1].tool_inputs[main.execution_contracts.EXECUTION_GATE_KEY] == {
+        "json_transform": {"expression": "context.approved == true"}
+    }
+
+
+def test_build_plan_from_composer_draft_lowers_if_else_to_branch_gates(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {"id": "source", "capabilityId": "json_transform", "taskName": "LoadData"},
+                {
+                    "id": "gate",
+                    "taskName": "ApprovalBranch",
+                    "nodeKind": "control",
+                    "controlKind": "if_else",
+                    "capabilityId": "studio.control.if_else",
+                    "controlConfig": {
+                        "expression": "context.approved == true",
+                        "trueLabel": "approved",
+                        "falseLabel": "rejected",
+                    },
+                },
+                {"id": "true-node", "capabilityId": "json_transform", "taskName": "ApprovedPath"},
+                {"id": "false-node", "capabilityId": "json_transform", "taskName": "RejectedPath"},
+                {"id": "join-node", "capabilityId": "json_transform", "taskName": "JoinedPath"},
+            ],
+            "edges": [
+                {"fromNodeId": "source", "toNodeId": "gate"},
+                {"fromNodeId": "gate", "toNodeId": "true-node", "branchLabel": "approved"},
+                {"fromNodeId": "gate", "toNodeId": "false-node", "branchLabel": "rejected"},
+                {"fromNodeId": "true-node", "toNodeId": "join-node"},
+                {"fromNodeId": "false-node", "toNodeId": "join-node"},
+            ],
+        }
+    )
+
+    assert errors == []
+    assert plan is not None
+    task_by_name = {task.name: task for task in plan.tasks}
+    assert task_by_name["ApprovedPath"].tool_inputs[main.execution_contracts.EXECUTION_GATE_KEY] == {
+        "json_transform": {"expression": "context.approved == true"}
+    }
+    assert task_by_name["RejectedPath"].tool_inputs[main.execution_contracts.EXECUTION_GATE_KEY] == {
+        "json_transform": {"expression": "context.approved == true", "negate": True}
+    }
+    assert main.execution_contracts.EXECUTION_GATE_KEY not in task_by_name["JoinedPath"].tool_inputs
+
+
+def test_build_plan_from_composer_draft_requires_if_else_branch_labels(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {
+                    "id": "gate",
+                    "taskName": "ApprovalBranch",
+                    "nodeKind": "control",
+                    "controlKind": "if_else",
+                    "capabilityId": "studio.control.if_else",
+                    "controlConfig": {
+                        "expression": "context.approved == true",
+                    },
+                },
+                {"id": "target", "capabilityId": "json_transform", "taskName": "TargetPath"},
+            ],
+            "edges": [
+                {"fromNodeId": "gate", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert plan is None
+    codes = {entry["code"] for entry in errors}
+    assert "draft.control_if_else_true_branch_missing" in codes
+    assert "draft.control_if_else_false_branch_missing" in codes
+
+
+def test_build_plan_from_composer_draft_lowers_parallel_fan_out(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {"id": "source", "capabilityId": "json_transform", "taskName": "LoadData"},
+                {
+                    "id": "parallel",
+                    "taskName": "FanOut",
+                    "nodeKind": "control",
+                    "controlKind": "parallel",
+                    "capabilityId": "studio.control.parallel",
+                    "controlConfig": {"parallelMode": "fan_out"},
+                },
+                {"id": "left", "capabilityId": "json_transform", "taskName": "LeftBranch"},
+                {"id": "right", "capabilityId": "json_transform", "taskName": "RightBranch"},
+            ],
+            "edges": [
+                {"fromNodeId": "source", "toNodeId": "parallel"},
+                {"fromNodeId": "parallel", "toNodeId": "left"},
+                {"fromNodeId": "parallel", "toNodeId": "right"},
+            ],
+        }
+    )
+
+    assert errors == []
+    assert plan is not None
+    task_by_name = {task.name: task for task in plan.tasks}
+    assert task_by_name["LeftBranch"].deps == ["LoadData"]
+    assert task_by_name["RightBranch"].deps == ["LoadData"]
+
+
+def test_build_plan_from_composer_draft_lowers_parallel_fan_in(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {"id": "left", "capabilityId": "json_transform", "taskName": "LeftBranch"},
+                {"id": "right", "capabilityId": "json_transform", "taskName": "RightBranch"},
+                {
+                    "id": "parallel",
+                    "taskName": "JoinBranches",
+                    "nodeKind": "control",
+                    "controlKind": "parallel",
+                    "capabilityId": "studio.control.parallel",
+                    "controlConfig": {"parallelMode": "fan_in"},
+                },
+                {"id": "target", "capabilityId": "json_transform", "taskName": "AfterJoin"},
+            ],
+            "edges": [
+                {"fromNodeId": "left", "toNodeId": "parallel"},
+                {"fromNodeId": "right", "toNodeId": "parallel"},
+                {"fromNodeId": "parallel", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert errors == []
+    assert plan is not None
+    task_by_name = {task.name: task for task in plan.tasks}
+    assert task_by_name["AfterJoin"].deps == ["LeftBranch", "RightBranch"]
+
+
+def test_build_plan_from_composer_draft_requires_parallel_fan_in_sources(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {"id": "left", "capabilityId": "json_transform", "taskName": "LeftBranch"},
+                {
+                    "id": "parallel",
+                    "taskName": "JoinBranches",
+                    "nodeKind": "control",
+                    "controlKind": "parallel",
+                    "capabilityId": "studio.control.parallel",
+                    "controlConfig": {"parallelMode": "fan_in"},
+                },
+                {"id": "target", "capabilityId": "json_transform", "taskName": "AfterJoin"},
+            ],
+            "edges": [
+                {"fromNodeId": "left", "toNodeId": "parallel"},
+                {"fromNodeId": "parallel", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert plan is None
+    codes = {entry["code"] for entry in errors}
+    assert "draft.control_parallel_fan_in_sources_missing" in codes
+
+
 def test_task_payload_from_record_flags_unresolved_reference_inputs() -> None:
     now = _utcnow()
     record = TaskRecord(

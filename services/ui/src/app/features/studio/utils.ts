@@ -293,6 +293,7 @@ export const normalizeComposerEdges = (
   edges.forEach((edge) => {
     const fromNodeId = String(edge.fromNodeId || "").trim();
     const toNodeId = String(edge.toNodeId || "").trim();
+    const branchLabel = String(edge.branchLabel || "").trim();
     if (!fromNodeId || !toNodeId || fromNodeId === toNodeId) {
       return;
     }
@@ -304,7 +305,7 @@ export const normalizeComposerEdges = (
       return;
     }
     dedupe.add(key);
-    normalized.push({ fromNodeId, toNodeId });
+    normalized.push({ fromNodeId, toNodeId, ...(branchLabel ? { branchLabel } : {}) });
   });
   return normalized;
 };

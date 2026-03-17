@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from libs.core import intent_contract, workflow_contracts
 
 EXECUTION_BINDINGS_KEY = "__capability_bindings__"
+EXECUTION_GATE_KEY = "__execution_gate__"
 
 
 class CapabilityBinding(BaseModel):
@@ -27,6 +28,7 @@ class TaskExecutionStep(BaseModel):
     request_id: str
     resolved_inputs: dict[str, Any] = Field(default_factory=dict)
     capability_binding: CapabilityBinding | None = None
+    execution_gate: dict[str, Any] | None = None
 
 
 class TaskExecutionRequest(BaseModel):
@@ -85,6 +87,7 @@ class TaskDispatchPayload(BaseModel):
     tool_requests: list[str] = Field(default_factory=list)
     tool_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     capability_bindings: dict[str, CapabilityBinding] = Field(default_factory=dict)
+    execution_gates: dict[str, dict[str, Any]] = Field(default_factory=dict)
     critic_required: bool = True
     intent: str | None = None
     intent_source: str | None = None
@@ -121,6 +124,10 @@ def build_task_execution_request(
             request_ids=request_ids,
         )
     )
+    execution_gates = _execution_gates(
+        payload,
+        request_ids=request_ids,
+    )
     attempts = _attempt_count(payload.get("attempts"))
     max_attempts = max(
         attempts,
@@ -153,6 +160,7 @@ def build_task_execution_request(
                 request_id=request_id,
                 resolved_inputs=dict(tool_inputs.get(request_id) or {}),
                 capability_binding=bindings.get(request_id),
+                execution_gate=dict(execution_gates.get(request_id) or {}) or None,
             )
             for request_id in request_ids
         ],
@@ -172,6 +180,10 @@ def build_task_dispatch_payload(
         default_max_attempts=default_max_attempts,
     )
     capability_bindings = normalize_capability_bindings(
+        payload,
+        request_ids=execution_request.tool_requests,
+    )
+    execution_gates = normalize_execution_gates(
         payload,
         request_ids=execution_request.tool_requests,
     )
@@ -201,6 +213,7 @@ def build_task_dispatch_payload(
             "tool_requests": execution_request.tool_requests,
             "tool_inputs": execution_request.tool_inputs,
             "capability_bindings": capability_bindings,
+            "execution_gates": execution_gates,
             "critic_required": _bool_value(payload.get("critic_required"), default=True),
             "intent": execution_request.intent,
             "intent_source": execution_request.intent_source,
@@ -236,6 +249,8 @@ def dump_task_dispatch_payload(
         dumped.pop("tool_inputs_resolved", None)
     if not dumped.get("capability_bindings"):
         dumped.pop("capability_bindings", None)
+    if not dumped.get("execution_gates"):
+        dumped.pop("execution_gates", None)
     return dumped
 
 
@@ -285,13 +300,49 @@ def embed_capability_bindings(
     return merged
 
 
+def normalize_execution_gates(
+    value: Any,
+    *,
+    request_ids: Sequence[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    normalized_request_ids = _request_ids(request_ids or [])
+    gates = _execution_gates(value, request_ids=normalized_request_ids)
+    if normalized_request_ids:
+        return {
+            request_id: gate
+            for request_id in normalized_request_ids
+            if isinstance((gate := gates.get(request_id)), Mapping)
+        }
+    return gates
+
+
+def embed_execution_gate(
+    tool_inputs: Mapping[str, Any] | None,
+    execution_gate: Mapping[str, Any] | None,
+    *,
+    request_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    merged = strip_execution_metadata_from_tool_inputs(tool_inputs)
+    if not isinstance(execution_gate, Mapping):
+        return merged
+    normalized_request_ids = _request_ids(request_ids or [])
+    embedded = {
+        request_id: dict(execution_gate)
+        for request_id in normalized_request_ids
+        if request_id
+    }
+    if embedded:
+        merged[EXECUTION_GATE_KEY] = embedded
+    return merged
+
+
 def strip_execution_metadata_from_tool_inputs(tool_inputs: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(tool_inputs, Mapping):
         return {}
     stripped: dict[str, Any] = {}
     for key, value in tool_inputs.items():
         normalized_key = _string_value(key)
-        if not normalized_key or normalized_key == EXECUTION_BINDINGS_KEY:
+        if not normalized_key or normalized_key in {EXECUTION_BINDINGS_KEY, EXECUTION_GATE_KEY}:
             continue
         stripped[normalized_key] = dict(value) if isinstance(value, Mapping) else value
     return stripped
@@ -324,7 +375,7 @@ def _tool_inputs(value: Any) -> dict[str, dict[str, Any]]:
     normalized: dict[str, dict[str, Any]] = {}
     for request_id, payload in value.items():
         key = _string_value(request_id)
-        if not key or key == EXECUTION_BINDINGS_KEY:
+        if not key or key in {EXECUTION_BINDINGS_KEY, EXECUTION_GATE_KEY}:
             continue
         normalized[key] = dict(payload) if isinstance(payload, Mapping) else {}
     return normalized
@@ -457,6 +508,40 @@ def _raw_capability_bindings(value: Any) -> Any:
         for binding_payload in value.values()
     ):
         return value
+    return None
+
+
+def _execution_gates(
+    value: Any,
+    *,
+    request_ids: Sequence[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    explicit = _raw_execution_gates(value)
+    if not isinstance(explicit, Mapping):
+        return {}
+    normalized_request_ids = _request_ids(request_ids or [])
+    gates: dict[str, dict[str, Any]] = {}
+    for request_id, gate_payload in explicit.items():
+        key = _string_value(request_id)
+        if not key or not isinstance(gate_payload, Mapping):
+            continue
+        gates[key] = dict(gate_payload)
+    if normalized_request_ids:
+        return {request_id: gates[request_id] for request_id in normalized_request_ids if request_id in gates}
+    return gates
+
+
+def _raw_execution_gates(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return None
+    explicit = value.get("execution_gates") or value.get("execution_gate")
+    if explicit is not None:
+        return explicit
+    tool_inputs = value.get("tool_inputs")
+    if isinstance(tool_inputs, Mapping):
+        embedded = tool_inputs.get(EXECUTION_GATE_KEY)
+        if embedded is not None:
+            return embedded
     return None
 
 

@@ -455,3 +455,162 @@ def test_execute_task_request_uses_bound_capability_id(monkeypatch) -> None:
 
     assert result.status == models.TaskStatus.completed
     assert result.outputs["check_repo"]["items"][0]["name"] == "scientific-agent-lab"
+
+
+def test_execute_task_request_skips_when_execution_gate_is_false(monkeypatch) -> None:
+    tool_runtime = _FakeToolRuntime()
+    request = execution_contracts.TaskExecutionRequest(
+        task_id="task-1",
+        job_id="job-1",
+        run_id="run-1",
+        trace_id="trace-1",
+        instruction="Write hello",
+        context={"approved": False},
+        source_payload={"task_id": "task-1", "instruction": "Write hello"},
+        requests=[
+            execution_contracts.TaskExecutionStep(
+                request_id="llm_generate",
+                resolved_inputs={"text": "hello"},
+                execution_gate={"expression": "context.approved == true"},
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        execution_service.core_tracing,
+        "start_span",
+        lambda *args, **kwargs: nullcontext(object()),
+    )
+    monkeypatch.setattr(
+        execution_service.core_tracing,
+        "set_span_attributes",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        execution_service.core_logging,
+        "log_event",
+        lambda *args, **kwargs: None,
+    )
+    result = execution_service.execute_task_request(
+        request,
+        context=execution_service.WorkerExecutionContext(
+            tool_runtime=tool_runtime,
+            capability_runtime=_FakeCapabilityRuntime(),
+            logger=object(),
+            config=execution_service.WorkerExecutionConfig(
+                llm_provider_name="mock",
+                openai_model="",
+                prompt_version="test",
+                policy_version="test",
+                tool_version="test",
+                output_size_cap=1024,
+            ),
+        ),
+        callbacks=execution_service.WorkerExecutionCallbacks(
+            task_intent_inference=lambda _request: intent_contract.TaskIntentInference(
+                intent="generate",
+                source="unit_test",
+                confidence=1.0,
+            ),
+            intent_segment=lambda _request: None,
+            capability_intent_mismatch=lambda _intent, _spec: None,
+            enforce_capability_input_contract=lambda spec, payload: (payload, None, []),
+            build_tool_payload=lambda tool_name, instruction, context, task_payload, tool_inputs: dict(
+                tool_inputs.get(tool_name, {})
+            ),
+            intent_mismatch=lambda _intent, _tool_intent, _tool_name: None,
+            load_memory_inputs=lambda _tool, _task_payload, _trace_id: {},
+            apply_memory_defaults=lambda _tool_name, payload: payload,
+            missing_memory_only_inputs=lambda _tool_name, _payload: [],
+            persist_memory_outputs=lambda _tool, _task_payload, _call, _trace_id: None,
+            sync_output_artifact=lambda _output, _task_id, _tool_name, _trace_id: None,
+            auto_persist_semantic_facts=lambda **kwargs: None,
+            validate_expected_output=lambda _task_payload, _outputs: None,
+            build_task_run_scorecard=lambda **kwargs: {
+                "total_latency_ms": 0,
+                "failure_stage": "",
+            },
+        ),
+    )
+
+    assert result.status == models.TaskStatus.completed
+    assert result.outputs["llm_generate"]["skipped"] is True
+    assert tool_runtime.executed_payloads == []
+
+
+def test_execute_task_request_runs_when_execution_gate_is_negated(monkeypatch) -> None:
+    tool_runtime = _FakeToolRuntime()
+    request = execution_contracts.TaskExecutionRequest(
+        task_id="task-1",
+        job_id="job-1",
+        run_id="run-1",
+        trace_id="trace-1",
+        instruction="Write hello",
+        context={"approved": False},
+        source_payload={"task_id": "task-1", "instruction": "Write hello"},
+        requests=[
+            execution_contracts.TaskExecutionStep(
+                request_id="llm_generate",
+                resolved_inputs={"text": "hello"},
+                execution_gate={"expression": "context.approved == true", "negate": True},
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        execution_service.core_tracing,
+        "start_span",
+        lambda *args, **kwargs: nullcontext(object()),
+    )
+    monkeypatch.setattr(
+        execution_service.core_tracing,
+        "set_span_attributes",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        execution_service.core_logging,
+        "log_event",
+        lambda *args, **kwargs: None,
+    )
+    result = execution_service.execute_task_request(
+        request,
+        context=execution_service.WorkerExecutionContext(
+            tool_runtime=tool_runtime,
+            capability_runtime=_FakeCapabilityRuntime(),
+            logger=object(),
+            config=execution_service.WorkerExecutionConfig(
+                llm_provider_name="mock",
+                openai_model="",
+                prompt_version="test",
+                policy_version="test",
+                tool_version="test",
+                output_size_cap=1024,
+            ),
+        ),
+        callbacks=execution_service.WorkerExecutionCallbacks(
+            task_intent_inference=lambda _request: intent_contract.TaskIntentInference(
+                intent="generate",
+                source="unit_test",
+                confidence=1.0,
+            ),
+            intent_segment=lambda _request: None,
+            capability_intent_mismatch=lambda _intent, _spec: None,
+            enforce_capability_input_contract=lambda spec, payload: (payload, None, []),
+            build_tool_payload=lambda tool_name, instruction, context, task_payload, tool_inputs: dict(
+                tool_inputs.get(tool_name, {})
+            ),
+            intent_mismatch=lambda _intent, _tool_intent, _tool_name: None,
+            load_memory_inputs=lambda _tool, _task_payload, _trace_id: {},
+            apply_memory_defaults=lambda _tool_name, payload: payload,
+            missing_memory_only_inputs=lambda _tool_name, _payload: [],
+            persist_memory_outputs=lambda _tool, _task_payload, _call, _trace_id: None,
+            sync_output_artifact=lambda _output, _task_id, _tool_name, _trace_id: None,
+            auto_persist_semantic_facts=lambda **kwargs: None,
+            validate_expected_output=lambda _task_payload, _outputs: None,
+            build_task_run_scorecard=lambda **kwargs: {
+                "total_latency_ms": 0,
+                "failure_stage": "",
+            },
+        ),
+    )
+
+    assert result.status == models.TaskStatus.completed
+    assert result.outputs["llm_generate"]["text"] == "hello world"

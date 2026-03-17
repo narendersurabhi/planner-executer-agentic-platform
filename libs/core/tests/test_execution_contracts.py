@@ -159,3 +159,26 @@ def test_build_task_dispatch_payload_reads_embedded_capability_bindings() -> Non
         "github.repo.list": {"owner": "narendersurabhi", "repo": "demo"}
     }
     assert payload.capability_bindings["github.repo.list"].server_id == "github_local"
+
+
+def test_embed_execution_gate_roundtrips_through_dispatch_payload() -> None:
+    payload = execution_contracts.build_task_dispatch_payload(
+        {
+            "task_id": "task-1",
+            "tool_requests": ["llm_generate"],
+            "tool_inputs": execution_contracts.embed_execution_gate(
+                {"llm_generate": {"text": "hello"}},
+                {"expression": "context.approved == true"},
+                request_ids=["llm_generate"],
+            ),
+        }
+    )
+
+    assert payload.tool_inputs == {"llm_generate": {"text": "hello"}}
+    assert payload.execution_gates == {
+        "llm_generate": {"expression": "context.approved == true"}
+    }
+    request = execution_contracts.build_task_execution_request(payload.model_dump(mode="json"))
+    assert request.requests[0].execution_gate == {
+        "expression": "context.approved == true"
+    }

@@ -244,6 +244,10 @@ def task_payload_from_record(
         request_ids=record.tool_requests or [],
         capabilities=_enabled_capabilities(),
     )
+    execution_gates = execution_contracts.normalize_execution_gates(
+        {"tool_inputs": raw_tool_inputs},
+        request_ids=record.tool_requests or [],
+    )
     payload: dict[str, Any] = {
         "task_id": record.id,
         "id": record.id,
@@ -266,6 +270,7 @@ def task_payload_from_record(
             raw_tool_inputs
         ),
         "capability_bindings": capability_bindings,
+        "execution_gates": execution_gates,
         "critic_required": bool(record.critic_required),
         "intent": record.intent,
         "created_at": record.created_at,

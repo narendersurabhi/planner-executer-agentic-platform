@@ -127,6 +127,14 @@ def execute_task_request(
     ) as task_span:
         for tool_index, step in enumerate(request.requests):
             request_id = step.request_id
+            gate_decision = _evaluate_execution_gate(step.execution_gate, request.context)
+            if gate_decision is not None and not gate_decision["allowed"]:
+                outputs[request_id] = {
+                    "skipped": True,
+                    "reason": gate_decision["reason"],
+                    "expression": gate_decision["expression"],
+                }
+                continue
             binding = step.capability_binding
             bound_capability_id = (
                 binding.capability_id if binding and binding.capability_id else None
@@ -263,6 +271,82 @@ def execute_task_request(
             finished_at=finished_at,
             error=validation_error or tool_error,
         )
+
+
+def _evaluate_execution_gate(
+    gate: Mapping[str, Any] | None,
+    context: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(gate, Mapping):
+        return None
+    expression = str(gate.get("expression") or "").strip()
+    negate = bool(gate.get("negate"))
+    if not expression:
+        return None
+    try:
+        value = _evaluate_context_expression(expression, context or {})
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "allowed": False,
+            "expression": expression,
+            "reason": f"execution_gate_invalid:{exc}",
+        }
+    allowed = bool(value)
+    if negate:
+        allowed = not allowed
+    return {
+        "allowed": allowed,
+        "expression": expression,
+        "reason": "execution_gate_condition_false" if not negate else "execution_gate_condition_negated_false",
+    }
+
+
+def _evaluate_context_expression(expression: str, context: Mapping[str, Any]) -> Any:
+    for operator in ("==", "!="):
+        if operator in expression:
+            left, right = expression.split(operator, 1)
+            left_value = _resolve_context_operand(left.strip(), context)
+            right_value = _parse_expression_literal(right.strip(), context)
+            return left_value == right_value if operator == "==" else left_value != right_value
+    return _resolve_context_operand(expression.strip(), context)
+
+
+def _resolve_context_operand(token: str, context: Mapping[str, Any]) -> Any:
+    normalized = token.strip()
+    if not normalized:
+        return None
+    if not normalized.startswith("context."):
+        raise ValueError("unsupported_operand")
+    value: Any = context
+    for segment in normalized.split(".")[1:]:
+        key = segment.strip()
+        if not key:
+            raise ValueError("empty_context_segment")
+        if not isinstance(value, Mapping) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def _parse_expression_literal(token: str, context: Mapping[str, Any]) -> Any:
+    normalized = token.strip()
+    lowered = normalized.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    if normalized.startswith(("context.",)):
+        return _resolve_context_operand(normalized, context)
+    if normalized.startswith(("'", '"')) and normalized.endswith(("'", '"')) and len(normalized) >= 2:
+        return normalized[1:-1]
+    try:
+        if "." in normalized:
+            return float(normalized)
+        return int(normalized)
+    except ValueError:
+        return normalized
 
 
 def _execute_capability_tool(

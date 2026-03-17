@@ -6,6 +6,8 @@ import type {
   ComposerDraftNode,
   ComposerIssueFocus,
   ComposerInputBinding,
+  StudioControlCase,
+  StudioControlConfig,
 } from "./types";
 
 type StudioInspectorField = {
@@ -71,6 +73,14 @@ type StudioNodeInspectorProps = {
     patch: { key?: string; value?: string; description?: string }
   ) => void;
   removeNodeVariable: (nodeId: string, variableId: string) => void;
+  updateNodeControlConfig: (nodeId: string, patch: Partial<StudioControlConfig>) => void;
+  addSwitchCase: (nodeId: string) => void;
+  updateSwitchCase: (
+    nodeId: string,
+    caseId: string,
+    patch: Partial<Pick<StudioControlCase, "label" | "match">>
+  ) => void;
+  removeSwitchCase: (nodeId: string, caseId: string) => void;
 };
 
 const bindingModeForField = (binding: ComposerInputBinding | undefined) => {
@@ -119,6 +129,10 @@ export default function StudioNodeInspector({
   addNodeVariable,
   updateNodeVariable,
   removeNodeVariable,
+  updateNodeControlConfig,
+  addSwitchCase,
+  updateSwitchCase,
+  removeSwitchCase,
 }: StudioNodeInspectorProps) {
   const [pendingInputField, setPendingInputField] = useState("");
 
@@ -129,6 +143,15 @@ export default function StudioNodeInspector({
       </section>
     );
   }
+
+  const isControlNode = selectedDagNode.nodeKind === "control";
+  const controlConfig = selectedDagNode.controlConfig || {
+    expression: "",
+    trueLabel: "",
+    falseLabel: "",
+    parallelMode: "fan_out" as const,
+    switchCases: [],
+  };
 
   return (
     <section className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm">
@@ -192,12 +215,13 @@ export default function StudioNodeInspector({
         </label>
         <label className="block">
           <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-            Capability Id
+            {isControlNode ? "Control Node Id" : "Capability Id"}
           </div>
           <input
             className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:bg-white"
             list={capabilityIdOptionsId}
             value={selectedDagNode.capabilityId}
+            disabled={isControlNode}
             onChange={(event) =>
               updateNodeBasics(selectedDagNode.id, { capabilityId: event.target.value })
             }
@@ -221,6 +245,148 @@ export default function StudioNodeInspector({
           />
         </label>
       </div>
+
+      {isControlNode ? (
+        <div className="mt-6 rounded-2xl border border-amber-200 bg-amber-50/70 p-4">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-700">
+            Control Flow
+          </div>
+          <div className="mt-1 text-xs text-amber-900">
+            These nodes are design-time Studio controls. They do not compile into backend plans yet.
+          </div>
+          <div className="mt-4 grid gap-3">
+            <label className="block">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                Expression
+              </div>
+              <input
+                className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                value={controlConfig.expression || ""}
+                onChange={(event) =>
+                  updateNodeControlConfig(selectedDagNode.id, { expression: event.target.value })
+                }
+                placeholder={
+                  selectedDagNode.controlKind === "parallel"
+                    ? "Optional branch grouping note"
+                    : "context.approval === true"
+                }
+              />
+            </label>
+
+            {selectedDagNode.controlKind === "if_else" ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                    True Label
+                  </div>
+                  <input
+                    className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                    value={controlConfig.trueLabel || ""}
+                    onChange={(event) =>
+                      updateNodeControlConfig(selectedDagNode.id, { trueLabel: event.target.value })
+                    }
+                    placeholder="Approved"
+                  />
+                </label>
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                    False Label
+                  </div>
+                  <input
+                    className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                    value={controlConfig.falseLabel || ""}
+                    onChange={(event) =>
+                      updateNodeControlConfig(selectedDagNode.id, { falseLabel: event.target.value })
+                    }
+                    placeholder="Rejected"
+                  />
+                </label>
+              </div>
+            ) : null}
+
+            {selectedDagNode.controlKind === "parallel" ? (
+              <label className="block">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                  Parallel Mode
+                </div>
+                <select
+                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                  value={controlConfig.parallelMode || "fan_out"}
+                  onChange={(event) =>
+                    updateNodeControlConfig(selectedDagNode.id, {
+                      parallelMode: event.target.value as "fan_out" | "fan_in",
+                    })
+                  }
+                >
+                  <option value="fan_out">Fan Out</option>
+                  <option value="fan_in">Fan In</option>
+                </select>
+              </label>
+            ) : null}
+
+            {selectedDagNode.controlKind === "switch" ? (
+              <div className="rounded-2xl border border-slate-200 bg-white p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Cases
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500">Add labels and match values for each route.</div>
+                  </div>
+                  <button
+                    className="rounded-full border border-slate-300 px-3 py-1 text-[11px] font-semibold text-slate-700"
+                    onClick={() => addSwitchCase(selectedDagNode.id)}
+                  >
+                    Add Case
+                  </button>
+                </div>
+                <div className="mt-3 space-y-3">
+                  {(controlConfig.switchCases || []).map((item, index) => (
+                    <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                        <label className="block">
+                          <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                            Case Label
+                          </div>
+                          <input
+                            className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                            value={item.label}
+                            onChange={(event) =>
+                              updateSwitchCase(selectedDagNode.id, item.id, { label: event.target.value })
+                            }
+                            placeholder={`Case ${index + 1}`}
+                          />
+                        </label>
+                        <label className="block">
+                          <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                            Match Value
+                          </div>
+                          <input
+                            className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                            value={item.match}
+                            onChange={(event) =>
+                              updateSwitchCase(selectedDagNode.id, item.id, { match: event.target.value })
+                            }
+                            placeholder="approved"
+                          />
+                        </label>
+                        <div className="flex items-end">
+                          <button
+                            className="rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] font-semibold text-rose-700"
+                            onClick={() => removeSwitchCase(selectedDagNode.id, item.id)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       <div className="mt-6 border-t border-slate-100 pt-4">
         <div className="flex flex-wrap items-center justify-between gap-3">

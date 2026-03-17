@@ -60,11 +60,30 @@ export type ComposerInputBinding =
       key?: string;
     };
 
+export type StudioControlKind = "if" | "if_else" | "switch" | "parallel";
+
+export type StudioControlCase = {
+  id: string;
+  label: string;
+  match: string;
+};
+
+export type StudioControlConfig = {
+  expression: string;
+  trueLabel?: string;
+  falseLabel?: string;
+  parallelMode?: "fan_out" | "fan_in";
+  switchCases?: StudioControlCase[];
+};
+
 export type ComposerDraftNode = {
   id: string;
   taskName: string;
   capabilityId: string;
   outputPath: string;
+  nodeKind?: "capability" | "control";
+  controlKind?: StudioControlKind | null;
+  controlConfig?: StudioControlConfig | null;
   inputBindings: Record<string, ComposerInputBinding>;
   outputs: StudioNodeOutput[];
   variables: StudioNodeVariable[];
@@ -87,6 +106,7 @@ export type StudioNodeVariable = {
 export type ComposerDraftEdge = {
   fromNodeId: string;
   toNodeId: string;
+  branchLabel?: string;
 };
 
 export type ComposerDraft = {

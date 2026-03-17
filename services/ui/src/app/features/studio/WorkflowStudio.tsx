@@ -18,6 +18,9 @@ import type {
   ComposerDraftNode,
   ComposerInputBinding,
   ComposerIssueFocus,
+  StudioControlCase,
+  StudioControlConfig,
+  StudioControlKind,
 } from "./types";
 import {
   CHAINABLE_REQUIRED_FIELDS,
@@ -68,6 +71,51 @@ const createStudioVariable = () => ({
   value: "",
   description: "",
 });
+
+const createStudioControlCase = (): StudioControlCase => ({
+  id: `case-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  label: "",
+  match: "",
+});
+
+const defaultControlConfig = (kind: StudioControlKind): StudioControlConfig => {
+  if (kind === "if") {
+    return { expression: "", trueLabel: "true" };
+  }
+  if (kind === "if_else") {
+    return { expression: "", trueLabel: "true", falseLabel: "false" };
+  }
+  if (kind === "switch") {
+    return { expression: "", switchCases: [createStudioControlCase()] };
+  }
+  return { expression: "", parallelMode: "fan_out" };
+};
+
+const defaultBranchLabelForSourceNode = (
+  sourceNode: ComposerDraftNode | undefined,
+  existingEdges: ComposerDraftEdge[]
+): string => {
+  if (!sourceNode || sourceNode.nodeKind !== "control") {
+    return "";
+  }
+  const config = sourceNode.controlConfig || defaultControlConfig(sourceNode.controlKind || "if");
+  if (sourceNode.controlKind === "if") {
+    return String(config.trueLabel || "true").trim();
+  }
+  if (sourceNode.controlKind === "if_else") {
+    const outgoing = existingEdges.filter((edge) => edge.fromNodeId === sourceNode.id);
+    const used = new Set(outgoing.map((edge) => String(edge.branchLabel || "").trim().toLowerCase()));
+    const trueLabel = String(config.trueLabel || "true").trim();
+    const falseLabel = String(config.falseLabel || "false").trim();
+    if (!used.has(trueLabel.toLowerCase())) {
+      return trueLabel;
+    }
+    if (!used.has(falseLabel.toLowerCase())) {
+      return falseLabel;
+    }
+  }
+  return "";
+};
 
 const initialContextJson = () =>
   JSON.stringify(
@@ -729,17 +777,21 @@ export default function WorkflowStudio() {
         };
       });
 
+      const newNode: ComposerDraftNode = {
+        id: nodeId,
+        taskName: uniqueTaskName(taskNameFromCapability(capabilityId), prev.nodes),
+        capabilityId,
+        outputPath: inferCapabilityOutputPath(capabilityId),
+        nodeKind: "capability",
+        controlKind: null,
+        controlConfig: null,
+        inputBindings,
+        outputs: [],
+        variables: [],
+      };
       const nextNodes = [
         ...prev.nodes,
-        {
-          id: nodeId,
-          taskName: uniqueTaskName(taskNameFromCapability(capabilityId), prev.nodes),
-          capabilityId,
-          outputPath: inferCapabilityOutputPath(capabilityId),
-          inputBindings,
-          outputs: [],
-          variables: [],
-        },
+        newNode,
       ];
       const nextEdges = anchorNode ? [...prev.edges, { fromNodeId: anchorNode.id, toNodeId: nodeId }] : prev.edges;
       return {
@@ -765,6 +817,48 @@ export default function WorkflowStudio() {
     setStudioNotice(`Added ${capabilityId} to the workflow.`);
   };
 
+  const addControlNodeToStudio = (kind: StudioControlKind) => {
+    const nodeId = `studio-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const controlId = `studio.control.${kind}`;
+    setComposerDraft((prev) => {
+      const anchorNode =
+        prev.nodes.find((node) => node.id === selectedDagNodeId) || prev.nodes[prev.nodes.length - 1] || null;
+      const newNode: ComposerDraftNode = {
+        id: nodeId,
+        taskName: uniqueTaskName(taskNameFromCapability(controlId), prev.nodes),
+        capabilityId: controlId,
+        outputPath: "result",
+        nodeKind: "control",
+        controlKind: kind,
+        controlConfig: defaultControlConfig(kind),
+        inputBindings: {},
+        outputs: [],
+        variables: [],
+      };
+      const nextNodes = [
+        ...prev.nodes,
+        newNode,
+      ];
+      const nextEdges = anchorNode ? [...prev.edges, { fromNodeId: anchorNode.id, toNodeId: nodeId }] : prev.edges;
+      return {
+        ...prev,
+        nodes: nextNodes,
+        edges: normalizeComposerEdges(nextNodes, nextEdges),
+      };
+    });
+    setComposerNodePositions((prev) => {
+      const anchorPosition = selectedDagNodeId ? prev[selectedDagNodeId] : null;
+      return {
+        ...prev,
+        [nodeId]: anchorPosition
+          ? { x: anchorPosition.x + DAG_CANVAS_NODE_WIDTH + 64, y: anchorPosition.y }
+          : defaultDagNodePosition(Object.keys(prev).length),
+      };
+    });
+    setSelectedDagNodeId(nodeId);
+    setStudioNotice(`Added ${kind.replace("_", " ")} control node.`);
+  };
+
   const updateVisualChainNode = (
     nodeId: string,
     patch: Partial<Pick<ComposerDraftNode, "taskName" | "capabilityId" | "outputPath">>
@@ -782,7 +876,12 @@ export default function WorkflowStudio() {
           patch.taskName !== undefined ? uniqueTaskName(patch.taskName, prev, nodeId) : node.taskName;
         const nextCapabilityId = patch.capabilityId ?? node.capabilityId;
         let nextOutputPath = patch.outputPath ?? node.outputPath;
-        if (patch.capabilityId && patch.capabilityId !== node.capabilityId && !patch.outputPath) {
+        if (
+          patch.capabilityId &&
+          patch.capabilityId !== node.capabilityId &&
+          !patch.outputPath &&
+          node.nodeKind !== "control"
+        ) {
           nextOutputPath = inferCapabilityOutputPath(patch.capabilityId);
         }
         return {
@@ -793,6 +892,76 @@ export default function WorkflowStudio() {
         };
       });
     });
+  };
+
+  const updateNodeControlConfig = (nodeId: string, patch: Partial<StudioControlConfig>) => {
+    setVisualChainNodes((prev) =>
+      prev.map((node) =>
+        node.id === nodeId
+          ? {
+              ...node,
+              controlConfig: {
+                ...(node.controlConfig || defaultControlConfig(node.controlKind || "if")),
+                ...patch,
+              },
+            }
+          : node
+      )
+    );
+  };
+
+  const addSwitchCase = (nodeId: string) => {
+    setVisualChainNodes((prev) =>
+      prev.map((node) =>
+        node.id === nodeId
+          ? {
+              ...node,
+              controlConfig: {
+                ...(node.controlConfig || defaultControlConfig("switch")),
+                switchCases: [...(node.controlConfig?.switchCases || []), createStudioControlCase()],
+              },
+            }
+          : node
+      )
+    );
+  };
+
+  const updateSwitchCase = (
+    nodeId: string,
+    caseId: string,
+    patch: Partial<Pick<StudioControlCase, "label" | "match">>
+  ) => {
+    setVisualChainNodes((prev) =>
+      prev.map((node) =>
+        node.id === nodeId
+          ? {
+              ...node,
+              controlConfig: {
+                ...(node.controlConfig || defaultControlConfig("switch")),
+                switchCases: (node.controlConfig?.switchCases || []).map((item) =>
+                  item.id === caseId ? { ...item, ...patch } : item
+                ),
+              },
+            }
+          : node
+      )
+    );
+  };
+
+  const removeSwitchCase = (nodeId: string, caseId: string) => {
+    setVisualChainNodes((prev) =>
+      prev.map((node) =>
+        node.id === nodeId
+          ? {
+              ...node,
+              controlConfig: {
+                ...(node.controlConfig || defaultControlConfig("switch")),
+                switchCases: (node.controlConfig?.switchCases || []).filter((item) => item.id !== caseId),
+              },
+            }
+          : node
+      )
+    );
   };
 
   const removeVisualChainNode = (nodeId: string) => {
@@ -852,10 +1021,17 @@ export default function WorkflowStudio() {
     if (!fromNodeId || !toNodeId || fromNodeId === toNodeId) {
       return;
     }
-    setComposerDraft((prev) => ({
-      ...prev,
-      edges: normalizeComposerEdges(prev.nodes, [...prev.edges, { fromNodeId, toNodeId }]),
-    }));
+    setComposerDraft((prev) => {
+      const sourceNode = prev.nodes.find((node) => node.id === fromNodeId);
+      const branchLabel = defaultBranchLabelForSourceNode(sourceNode, prev.edges);
+      return {
+        ...prev,
+        edges: normalizeComposerEdges(prev.nodes, [
+          ...prev.edges,
+          { fromNodeId, toNodeId, ...(branchLabel ? { branchLabel } : {}) },
+        ]),
+      };
+    });
     const mapped = autoBindTargetFromSource(fromNodeId, toNodeId);
     setSelectedDagNodeId(toNodeId);
     centerDagNodeInView(toNodeId);
@@ -1006,6 +1182,13 @@ export default function WorkflowStudio() {
   const visualChainNodesWithStatus = useMemo(() => {
     const context = contextState.context;
     return visualChainNodes.map((node, index) => {
+      if (node.nodeKind === "control") {
+        return {
+          node,
+          index,
+          requiredStatus: [],
+        };
+      }
       const capability = capabilityById.get(node.capabilityId);
       const schemaProperties = capabilityInputSchemaProperties(capability);
       const required = getCapabilityRequiredInputs(capability);
@@ -1121,6 +1304,9 @@ export default function WorkflowStudio() {
     if (!selectedDagNode) {
       return [];
     }
+    if (selectedDagNode.nodeKind === "control") {
+      return [];
+    }
 
     const requiredStatusByField = new Map(
       (selectedDagNodeStatus?.requiredStatus || []).map((status) => [status.field, status])
@@ -1205,6 +1391,9 @@ export default function WorkflowStudio() {
     if (!selectedDagNode) {
       return false;
     }
+    if (selectedDagNode.nodeKind === "control") {
+      return false;
+    }
     if (!capabilityById.has("document.output.derive")) {
       return false;
     }
@@ -1228,6 +1417,10 @@ export default function WorkflowStudio() {
   const quickFixNodeBindings = (nodeId: string) => {
     const targetNode = visualChainNodes.find((node) => node.id === nodeId);
     if (!targetNode) {
+      return;
+    }
+    if (targetNode.nodeKind === "control") {
+      setStudioNotice("Quick Fix is only available for capability nodes.");
       return;
     }
     const context = contextState.context;
@@ -1275,6 +1468,10 @@ export default function WorkflowStudio() {
     const previousNode = visualChainNodes[targetIndex - 1];
     if (!targetNode || !previousNode) {
       setStudioNotice("Unable to auto-wire selected node.");
+      return;
+    }
+    if (targetNode.nodeKind === "control") {
+      setStudioNotice("Auto-wire is only available for capability nodes.");
       return;
     }
     const context = contextState.context;
@@ -1407,6 +1604,7 @@ export default function WorkflowStudio() {
             path: string;
             midX: number;
             midY: number;
+            branchLabel?: string;
           } => item !== null
         ),
     [composerDraftEdges, dagCanvasNodeById]
@@ -1467,6 +1665,9 @@ export default function WorkflowStudio() {
           id: node.id,
           taskName: node.taskName,
           capabilityId: node.capabilityId,
+          nodeKind: node.nodeKind || "capability",
+          controlKind: node.controlKind || undefined,
+          controlConfig: node.controlConfig || undefined,
           bindings: node.inputBindings,
         })),
         edges: composerDraftEdges,
@@ -1485,6 +1686,9 @@ export default function WorkflowStudio() {
           id: node.id,
           taskName: node.taskName,
           capabilityId: node.capabilityId,
+          nodeKind: node.nodeKind || "capability",
+          controlKind: node.controlKind || undefined,
+          controlConfig: node.controlConfig || undefined,
           bindings: node.inputBindings,
           outputPath: node.outputPath,
           outputs: node.outputs,
@@ -1518,7 +1722,82 @@ export default function WorkflowStudio() {
       } else {
         seenTaskNames.add(taskName);
       }
-      if (!capabilityById.has(node.capabilityId)) {
+      if (node.nodeKind === "control") {
+        const config = node.controlConfig || defaultControlConfig(node.controlKind || "if");
+        if ((node.controlKind === "if" || node.controlKind === "if_else" || node.controlKind === "switch") && !config.expression.trim()) {
+          localErrors.push(`Step ${index + 1} (${taskName || "unnamed"}): control expression is required.`);
+        }
+        if (node.controlKind === "switch") {
+          localErrors.push(
+            `Step ${index + 1} (${taskName || "unnamed"}): control-flow node 'switch' is not compiled yet.`
+          );
+        }
+        if (node.controlKind === "parallel") {
+          const parallelMode = config.parallelMode || "fan_out";
+          const incomingEdges = composerDraftEdges.filter((edge) => edge.toNodeId === node.id);
+          const outgoingEdges = composerDraftEdges.filter((edge) => edge.fromNodeId === node.id);
+          if (parallelMode === "fan_out" && outgoingEdges.length < 2) {
+            localErrors.push(
+              `Step ${index + 1} (${taskName || "unnamed"}): parallel fan_out needs at least two outgoing edges.`
+            );
+          }
+          if (parallelMode === "fan_in" && incomingEdges.length < 2) {
+            localErrors.push(
+              `Step ${index + 1} (${taskName || "unnamed"}): parallel fan_in needs at least two incoming edges.`
+            );
+          }
+          if (parallelMode === "fan_in" && outgoingEdges.length < 1) {
+            localErrors.push(
+              `Step ${index + 1} (${taskName || "unnamed"}): parallel fan_in needs at least one outgoing edge.`
+            );
+          }
+        }
+        if (node.controlKind === "switch") {
+          const cases = config.switchCases || [];
+          if (cases.length === 0) {
+            localErrors.push(`Step ${index + 1} (${taskName || "unnamed"}): switch needs at least one case.`);
+          }
+          const seenLabels = new Set<string>();
+          cases.forEach((item, caseIndex) => {
+            const label = item.label.trim();
+            const match = item.match.trim();
+            if (!label) {
+              localErrors.push(
+                `Step ${index + 1} (${taskName || "unnamed"}): switch case ${caseIndex + 1} needs a label.`
+              );
+            } else if (seenLabels.has(label)) {
+              localErrors.push(
+                `Step ${index + 1} (${taskName || "unnamed"}): duplicate switch case label '${label}'.`
+              );
+            } else {
+              seenLabels.add(label);
+            }
+            if (!match) {
+              localErrors.push(
+                `Step ${index + 1} (${taskName || "unnamed"}): switch case ${caseIndex + 1} needs a match value.`
+              );
+            }
+          });
+        }
+        if (node.controlKind === "if_else") {
+          const outgoingEdges = composerDraftEdges.filter((edge) => edge.fromNodeId === node.id);
+          const trueLabel = (config.trueLabel || "true").trim().toLowerCase();
+          const falseLabel = (config.falseLabel || "false").trim().toLowerCase();
+          const labels = new Set(
+            outgoingEdges.map((edge) => (edge.branchLabel || "").trim().toLowerCase()).filter(Boolean)
+          );
+          if (!labels.has(trueLabel)) {
+            localErrors.push(
+              `Step ${index + 1} (${taskName || "unnamed"}): missing '${config.trueLabel || "true"}' branch edge.`
+            );
+          }
+          if (!labels.has(falseLabel)) {
+            localErrors.push(
+              `Step ${index + 1} (${taskName || "unnamed"}): missing '${config.falseLabel || "false"}' branch edge.`
+            );
+          }
+        }
+      } else if (!capabilityById.has(node.capabilityId)) {
         localErrors.push(
           `Step ${index + 1} (${taskName || "unnamed"}): capability ${node.capabilityId} not found in catalog.`
         );
@@ -1572,6 +1851,9 @@ export default function WorkflowStudio() {
     });
 
     visualChainNodesWithStatus.forEach(({ node, requiredStatus }) => {
+      if (node.nodeKind === "control") {
+        return;
+      }
       requiredStatus
         .filter((entry) => entry.status === "missing")
         .forEach((entry) => {
@@ -1796,17 +2078,18 @@ export default function WorkflowStudio() {
       ) : null}
 
       <div className="grid gap-6 xl:grid-cols-[320px_minmax(0,1fr)_360px]">
-        <StudioCapabilityPalette
-          capabilities={paletteCapabilities}
-          groups={paletteGroups}
+            <StudioCapabilityPalette
+              capabilities={paletteCapabilities}
+              groups={paletteGroups}
           loading={capabilityLoading}
           error={capabilityError}
           query={paletteQuery}
           selectedGroup={paletteGroup}
-          onQueryChange={setPaletteQuery}
-          onGroupChange={setPaletteGroup}
-          onAddCapability={addCapabilityNodeToStudio}
-        />
+              onQueryChange={setPaletteQuery}
+              onGroupChange={setPaletteGroup}
+              onAddCapability={addCapabilityNodeToStudio}
+              onAddControl={addControlNodeToStudio}
+            />
 
         <div className="space-y-6">
           <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
@@ -2004,6 +2287,10 @@ export default function WorkflowStudio() {
             addNodeVariable={addNodeVariable}
             updateNodeVariable={updateNodeVariable}
             removeNodeVariable={removeNodeVariable}
+            updateNodeControlConfig={updateNodeControlConfig}
+            addSwitchCase={addSwitchCase}
+            updateSwitchCase={updateSwitchCase}
+            removeSwitchCase={removeSwitchCase}
           />
 
           <StudioCompilePanel
