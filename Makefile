@@ -79,6 +79,7 @@ configmap-from-env:
 	kubectl create configmap awe-config --from-env-file=.env --dry-run=client -o yaml | kubectl apply -f -
 
 k8s-apply-local:
+	./scripts/ensure_local_shared_node.sh
 	kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/local | kubectl apply -f -
 	./scripts/setup_k8s_env.sh
 

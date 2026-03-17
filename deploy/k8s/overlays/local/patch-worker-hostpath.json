@@ -1,6 +1,13 @@
 [
   {
     "op": "add",
+    "path": "/spec/template/spec/nodeSelector",
+    "value": {
+      "awe.shared-workspace": "true"
+    }
+  },
+  {
+    "op": "add",
     "path": "/spec/template/spec/initContainers",
     "value": [
       {

@@ -5,6 +5,8 @@ metadata:
 spec:
   template:
     spec:
+      nodeSelector:
+        awe.shared-workspace: "true"
       containers:
         - name: api
           volumeMounts:
