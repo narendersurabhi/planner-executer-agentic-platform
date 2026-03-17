@@ -14,7 +14,7 @@ from services.api.app import main, memory_store  # noqa: E402
 from services.api.app.database import Base, engine
 from services.api.app.database import SessionLocal
 from services.api.app.models import EventOutboxRecord, JobRecord, PlanRecord, TaskRecord
-from libs.core import events, models
+from libs.core import events, execution_contracts, models
 from libs.core import capability_registry as cap_registry
 from libs.core.llm_provider import LLMProvider, LLMRequest, LLMResponse
 
@@ -178,8 +178,7 @@ def test_workflow_trigger_create_invoke_and_list() -> None:
     assert runs[0]["trigger_id"] == trigger["id"]
 
 
-def test_build_workflow_interface_runtime_context_resolves_bindings(monkeypatch) -> None:
-    monkeypatch.setenv("TEST_WORKFLOW_SECRET", "secret-value")
+def test_build_workflow_interface_runtime_context_resolves_bindings() -> None:
     with SessionLocal() as db:
         memory_store.write_memory(
             db,
@@ -236,7 +235,9 @@ def test_build_workflow_interface_runtime_context_resolves_bindings(monkeypatch)
     assert diagnostics == []
     assert context["workflow"]["inputs"]["topic"] == "Release notes"
     assert context["workflow"]["inputs"]["profile"] == {"full_name": "Narender Rao Surabhi"}
-    assert context["workflow"]["inputs"]["api_key"] == "secret-value"
+    assert context["workflow"]["inputs"]["api_key"] == execution_contracts.build_secret_ref(
+        "TEST_WORKFLOW_SECRET"
+    )
     assert context["workflow"]["variables"]["topic_alias"] == "Release notes"
 
 

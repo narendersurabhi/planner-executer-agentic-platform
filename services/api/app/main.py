@@ -3381,6 +3381,9 @@ def _parse_workflow_typed_value(raw: Any, value_type: str) -> tuple[Any, str | N
     normalized = str(value_type or "string").strip().lower() or "string"
     if raw is None:
         return None, None
+    secret_ref = execution_contracts.parse_secret_ref(raw)
+    if secret_ref is not None:
+        return secret_ref.model_dump(), None
     if normalized == "string":
         if isinstance(raw, str):
             return raw, None
@@ -3807,10 +3810,9 @@ def _resolve_workflow_binding_value(
         return _resolve_workflow_memory_binding(db, binding, runtime_context=runtime_context)
     if kind == "secret":
         secret_name = str(binding.get("secret_name") or "").strip()
-        value = os.getenv(secret_name)
-        if value is None and preview:
+        if preview:
             return _workflow_placeholder_value(placeholder_type, key=placeholder_key), None
-        return value, None if value is not None else f"Secret '{secret_name}' is not set."
+        return execution_contracts.build_secret_ref(secret_name), None
     if kind == "workflow_input":
         input_key = str(binding.get("input_key") or "").strip()
         value = resolved_inputs.get(input_key) if isinstance(resolved_inputs, Mapping) else None
