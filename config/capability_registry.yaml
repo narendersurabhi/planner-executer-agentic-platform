@@ -771,6 +771,63 @@ capabilities:
         retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
+  - id: rag.index.markdown
+    description: Section-chunk markdown text by headings, embed it, and upsert it into Qdrant.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_markdown_capability_input
+    output_schema_ref: rag_index_markdown_capability_output
+    tags:
+      - rag
+      - markdown
+      - qdrant
+      - indexing
+      - embeddings
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: index_markdown
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 90
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: rag.index.workspace_directory
+    description: Walk a bounded shared-workspace directory, chunk eligible files, and upsert them into Qdrant.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_workspace_directory_capability_input
+    output_schema_ref: rag_index_workspace_directory_capability_output
+    tags:
+      - rag
+      - workspace
+      - directory
+      - qdrant
+      - indexing
+      - embeddings
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: index_workspace_directory
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 120
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
   - id: document.output.derive
     description: Derive a generic safe relative output path for generated document artifacts (set output_extension for pdf/md/etc.).
     risk_tier: read_only

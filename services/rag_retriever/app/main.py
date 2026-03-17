@@ -11,6 +11,10 @@ from libs.core import logging as core_logging
 from rag_retriever_core import (
     EnsureCollectionRequest,
     EnsureCollectionResponse,
+    IndexMarkdownRequest,
+    IndexMarkdownResponse,
+    IndexWorkspaceDirectoryRequest,
+    IndexWorkspaceDirectoryResponse,
     IndexWorkspaceFileRequest,
     IndexWorkspaceFileResponse,
     RetrieverError,
@@ -111,5 +115,23 @@ def upsert_texts_endpoint(request: UpsertTextsRequest) -> UpsertTextsResponse:
 def index_workspace_file_endpoint(request: IndexWorkspaceFileRequest) -> IndexWorkspaceFileResponse:
     try:
         return RETRIEVER_SERVICE.index_workspace_file(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/index/markdown", response_model=IndexMarkdownResponse)
+def index_markdown_endpoint(request: IndexMarkdownRequest) -> IndexMarkdownResponse:
+    try:
+        return RETRIEVER_SERVICE.index_markdown(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/index/workspace_directory", response_model=IndexWorkspaceDirectoryResponse)
+def index_workspace_directory_endpoint(
+    request: IndexWorkspaceDirectoryRequest,
+) -> IndexWorkspaceDirectoryResponse:
+    try:
+        return RETRIEVER_SERVICE.index_workspace_directory(request)
     except RetrieverError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

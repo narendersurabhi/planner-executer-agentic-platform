@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -13,6 +14,12 @@ from .errors import RetrieverError
 from .models import (
     EnsureCollectionRequest,
     EnsureCollectionResponse,
+    IndexMarkdownRequest,
+    IndexMarkdownResponse,
+    IndexWorkspaceDirectoryFileResult,
+    IndexWorkspaceDirectoryRequest,
+    IndexWorkspaceDirectoryResponse,
+    IndexWorkspaceDirectorySkippedFile,
     IndexWorkspaceFileRequest,
     IndexWorkspaceFileResponse,
     RetrieveMatch,
@@ -206,6 +213,20 @@ class RetrieverServiceConfig:
             payload_user_id_key=payload_user_id_key,
             payload_workspace_id_key=payload_workspace_id_key,
         )
+
+
+@dataclass(frozen=True)
+class _PreparedChunk:
+    text: str
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _MarkdownSection:
+    text: str
+    title: str | None
+    heading_level: int | None
+    heading_path: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -516,52 +537,248 @@ class RetrieverService:
     def index_workspace_file(self, request: IndexWorkspaceFileRequest) -> IndexWorkspaceFileResponse:
         normalized_path, content = _read_workspace_file(request.path, self.config)
         chunk_size = request.chunk_size_chars or self.config.workspace_chunk_size_chars
-        overlap = request.chunk_overlap_chars or self.config.workspace_chunk_overlap_chars
+        overlap = (
+            request.chunk_overlap_chars
+            if request.chunk_overlap_chars is not None
+            else self.config.workspace_chunk_overlap_chars
+        )
         max_chunks = request.max_chunks or self.config.workspace_max_chunks
-        chunks = _chunk_text(content, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
-        if not chunks:
-            raise RetrieverError("workspace_file_empty_after_chunking", status_code=400)
-        source_uri = request.source_uri or normalized_path
-        document_id = request.document_id or normalized_path
         base_metadata = dict(request.metadata or {})
         base_metadata.setdefault("path", normalized_path)
         base_metadata.setdefault("filename", Path(normalized_path).name)
         base_metadata.setdefault("extension", Path(normalized_path).suffix.lower())
-        entries: list[UpsertTextEntry] = []
-        for index, chunk_text in enumerate(chunks):
-            chunk_metadata = dict(base_metadata)
-            chunk_metadata["chunk_index"] = index
-            chunk_metadata["chunk_count"] = len(chunks)
-            entries.append(
-                UpsertTextEntry(
-                    document_id=document_id,
-                    text=chunk_text,
-                    source_uri=source_uri,
-                    namespace=request.namespace,
-                    tenant_id=request.tenant_id,
-                    user_id=request.user_id,
-                    workspace_id=request.workspace_id,
-                    metadata=chunk_metadata,
-                )
-            )
-        upsert_result = self.upsert_texts(
-            UpsertTextsRequest(
-                collection_name=request.collection_name,
-                ensure_collection=request.ensure_collection,
-                namespace=request.namespace,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
-                workspace_id=request.workspace_id,
-                entries=entries,
-            )
+        base_metadata.setdefault("chunking_strategy", "text")
+        prepared_chunks = _prepare_text_chunks(
+            content,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            max_chunks=max_chunks,
+            base_metadata=base_metadata,
+        )
+        if not prepared_chunks:
+            raise RetrieverError("workspace_file_empty_after_chunking", status_code=400)
+        source_uri = request.source_uri or normalized_path
+        document_id = request.document_id or normalized_path
+        upsert_result = self._index_prepared_chunks(
+            collection_name=request.collection_name,
+            ensure_collection=request.ensure_collection,
+            document_id=document_id,
+            source_uri=source_uri,
+            namespace=request.namespace,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+            prepared_chunks=prepared_chunks,
         )
         return IndexWorkspaceFileResponse(
             collection_name=upsert_result.collection_name,
             path=normalized_path,
             document_id=document_id,
-            chunk_count=len(chunks),
+            chunk_count=len(prepared_chunks),
             upserted_count=upsert_result.upserted_count,
             chunk_ids=upsert_result.chunk_ids,
+        )
+
+    def index_markdown(self, request: IndexMarkdownRequest) -> IndexMarkdownResponse:
+        markdown_text = request.markdown_text.strip()
+        if not markdown_text:
+            raise RetrieverError("markdown_text_empty", status_code=400)
+        chunk_size = request.chunk_size_chars or self.config.workspace_chunk_size_chars
+        overlap = (
+            request.chunk_overlap_chars
+            if request.chunk_overlap_chars is not None
+            else self.config.workspace_chunk_overlap_chars
+        )
+        max_chunks = request.max_chunks or self.config.workspace_max_chunks
+        source_uri = str(request.source_uri or request.document_id or "inline_markdown")
+        document_id = str(request.document_id or source_uri)
+        base_metadata = dict(request.metadata or {})
+        base_metadata.setdefault("content_type", "markdown")
+        base_metadata.setdefault("chunking_strategy", "markdown")
+        prepared_chunks, section_count = _prepare_markdown_chunks(
+            markdown_text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            max_chunks=max_chunks,
+            base_metadata=base_metadata,
+        )
+        if not prepared_chunks:
+            raise RetrieverError("markdown_empty_after_chunking", status_code=400)
+        upsert_result = self._index_prepared_chunks(
+            collection_name=request.collection_name,
+            ensure_collection=request.ensure_collection,
+            document_id=document_id,
+            source_uri=source_uri,
+            namespace=request.namespace,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+            prepared_chunks=prepared_chunks,
+        )
+        return IndexMarkdownResponse(
+            collection_name=upsert_result.collection_name,
+            document_id=document_id,
+            source_uri=source_uri,
+            section_count=section_count,
+            chunk_count=len(prepared_chunks),
+            upserted_count=upsert_result.upserted_count,
+            chunk_ids=upsert_result.chunk_ids,
+        )
+
+    def index_workspace_directory(
+        self,
+        request: IndexWorkspaceDirectoryRequest,
+    ) -> IndexWorkspaceDirectoryResponse:
+        directory = _safe_workspace_path(request.directory_path, self.config)
+        if not directory.exists():
+            raise RetrieverError("workspace_directory_not_found", status_code=404)
+        if not directory.is_dir():
+            raise RetrieverError("workspace_directory_is_file", status_code=400)
+        relative_directory = _relative_workspace_path(directory, self.config)
+        candidate_paths = _list_workspace_files(
+            directory,
+            root=_workspace_root(self.config),
+            recursive=request.recursive,
+        )
+        if not candidate_paths:
+            raise RetrieverError("workspace_directory_no_files", status_code=400)
+        max_files = request.max_files or 100
+        allowed_extensions = _normalize_extensions(request.extensions) or set(
+            self.config.workspace_allowed_extensions
+        )
+        collection = self._resolve_collection_name(request.collection_name)
+        if request.ensure_collection:
+            self.ensure_collection(EnsureCollectionRequest(collection_name=collection))
+        files: list[IndexWorkspaceDirectoryFileResult] = []
+        skipped: list[IndexWorkspaceDirectorySkippedFile] = []
+        for candidate in candidate_paths[:max_files]:
+            relative_path = _relative_workspace_path(candidate, self.config)
+            suffix = candidate.suffix.lower()
+            if allowed_extensions and suffix not in allowed_extensions:
+                skipped.append(
+                    IndexWorkspaceDirectorySkippedFile(
+                        path=relative_path,
+                        reason=f"extension_not_allowed:{suffix}",
+                    )
+                )
+                continue
+            try:
+                normalized_path, content = _read_workspace_file(relative_path, self.config)
+                base_metadata = dict(request.metadata or {})
+                base_metadata.setdefault("path", normalized_path)
+                base_metadata.setdefault("filename", Path(normalized_path).name)
+                base_metadata.setdefault("extension", suffix)
+                strategy = "markdown" if suffix in {".md", ".markdown", ".mdx"} else "text"
+                if strategy == "markdown":
+                    base_metadata.setdefault("content_type", "markdown")
+                    base_metadata.setdefault("chunking_strategy", "markdown")
+                    prepared_chunks, _section_count = _prepare_markdown_chunks(
+                        content,
+                        chunk_size=request.chunk_size_chars or self.config.workspace_chunk_size_chars,
+                        overlap=(
+                            request.chunk_overlap_chars
+                            if request.chunk_overlap_chars is not None
+                            else self.config.workspace_chunk_overlap_chars
+                        ),
+                        max_chunks=request.max_chunks_per_file or self.config.workspace_max_chunks,
+                        base_metadata=base_metadata,
+                    )
+                else:
+                    base_metadata.setdefault("chunking_strategy", "text")
+                    prepared_chunks = _prepare_text_chunks(
+                        content,
+                        chunk_size=request.chunk_size_chars or self.config.workspace_chunk_size_chars,
+                        overlap=(
+                            request.chunk_overlap_chars
+                            if request.chunk_overlap_chars is not None
+                            else self.config.workspace_chunk_overlap_chars
+                        ),
+                        max_chunks=request.max_chunks_per_file or self.config.workspace_max_chunks,
+                        base_metadata=base_metadata,
+                    )
+                if not prepared_chunks:
+                    skipped.append(
+                        IndexWorkspaceDirectorySkippedFile(
+                            path=normalized_path,
+                            reason="empty_after_chunking",
+                        )
+                    )
+                    continue
+                upsert_result = self._index_prepared_chunks(
+                    collection_name=collection,
+                    ensure_collection=False,
+                    document_id=normalized_path,
+                    source_uri=normalized_path,
+                    namespace=request.namespace,
+                    tenant_id=request.tenant_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    prepared_chunks=prepared_chunks,
+                )
+                files.append(
+                    IndexWorkspaceDirectoryFileResult(
+                        path=normalized_path,
+                        document_id=normalized_path,
+                        strategy=strategy,
+                        chunk_count=len(prepared_chunks),
+                        upserted_count=upsert_result.upserted_count,
+                        chunk_ids=upsert_result.chunk_ids,
+                    )
+                )
+            except RetrieverError as exc:
+                skipped.append(
+                    IndexWorkspaceDirectorySkippedFile(
+                        path=relative_path,
+                        reason=exc.detail,
+                    )
+                )
+        return IndexWorkspaceDirectoryResponse(
+            collection_name=collection,
+            directory_path=relative_directory,
+            indexed_file_count=len(files),
+            skipped_file_count=len(skipped),
+            total_chunk_count=sum(item.chunk_count for item in files),
+            total_upserted_count=sum(item.upserted_count for item in files),
+            files=files,
+            skipped=skipped,
+        )
+
+    def _index_prepared_chunks(
+        self,
+        *,
+        collection_name: str | None,
+        ensure_collection: bool,
+        document_id: str,
+        source_uri: str,
+        namespace: str | None,
+        tenant_id: str | None,
+        user_id: str | None,
+        workspace_id: str | None,
+        prepared_chunks: list[_PreparedChunk],
+    ) -> UpsertTextsResponse:
+        entries = [
+            UpsertTextEntry(
+                document_id=document_id,
+                text=chunk.text,
+                source_uri=source_uri,
+                namespace=namespace,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                metadata=chunk.metadata,
+            )
+            for chunk in prepared_chunks
+        ]
+        return self.upsert_texts(
+            UpsertTextsRequest(
+                collection_name=collection_name,
+                ensure_collection=ensure_collection,
+                namespace=namespace,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                entries=entries,
+            )
         )
 
     def ensure_default_collection(self) -> EnsureCollectionResponse | None:
@@ -863,6 +1080,156 @@ def _read_workspace_file(path: str, config: RetrieverServiceConfig) -> tuple[str
     except ValueError:
         relative_path = str(candidate)
     return relative_path, text
+
+
+def _relative_workspace_path(path: Path, config: RetrieverServiceConfig) -> str:
+    try:
+        return str(path.resolve().relative_to(_workspace_root(config)))
+    except ValueError:
+        return str(path.resolve())
+
+
+def _prepare_text_chunks(
+    text: str,
+    *,
+    chunk_size: int,
+    overlap: int,
+    max_chunks: int,
+    base_metadata: dict[str, Any],
+) -> list[_PreparedChunk]:
+    chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+    prepared: list[_PreparedChunk] = []
+    for index, chunk_text in enumerate(chunks):
+        chunk_metadata = dict(base_metadata)
+        chunk_metadata["chunk_index"] = index
+        chunk_metadata["chunk_count"] = len(chunks)
+        prepared.append(_PreparedChunk(text=chunk_text, metadata=chunk_metadata))
+    return prepared
+
+
+def _prepare_markdown_chunks(
+    markdown_text: str,
+    *,
+    chunk_size: int,
+    overlap: int,
+    max_chunks: int,
+    base_metadata: dict[str, Any],
+) -> tuple[list[_PreparedChunk], int]:
+    sections = _split_markdown_sections(markdown_text)
+    prepared: list[_PreparedChunk] = []
+    for section_index, section in enumerate(sections):
+        remaining = max_chunks - len(prepared)
+        if remaining <= 0:
+            break
+        section_base = dict(base_metadata)
+        section_base["section_index"] = section_index
+        section_base["section_count"] = len(sections)
+        if section.title:
+            section_base["section_title"] = section.title
+        if section.heading_level is not None:
+            section_base["heading_level"] = section.heading_level
+        if section.heading_path:
+            section_base["heading_path"] = list(section.heading_path)
+        section_chunks = _chunk_text(
+            section.text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            max_chunks=remaining,
+        )
+        for local_index, chunk_text in enumerate(section_chunks):
+            chunk_metadata = dict(section_base)
+            chunk_metadata["section_chunk_index"] = local_index
+            chunk_metadata["section_chunk_count"] = len(section_chunks)
+            prepared.append(_PreparedChunk(text=chunk_text, metadata=chunk_metadata))
+    for global_index, chunk in enumerate(prepared):
+        chunk.metadata["chunk_index"] = global_index
+        chunk.metadata["chunk_count"] = len(prepared)
+    return prepared, len(sections)
+
+
+def _split_markdown_sections(markdown_text: str) -> list[_MarkdownSection]:
+    normalized = markdown_text.strip()
+    if not normalized:
+        return []
+    sections: list[_MarkdownSection] = []
+    heading_stack: list[tuple[int, str]] = []
+    current_lines: list[str] = []
+    current_title: str | None = None
+    current_level: int | None = None
+    current_path: tuple[str, ...] = ()
+    in_code_block = False
+    heading_re = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+
+    def flush_section() -> None:
+        text = "\n".join(current_lines).strip()
+        if not text:
+            return
+        sections.append(
+            _MarkdownSection(
+                text=text,
+                title=current_title,
+                heading_level=current_level,
+                heading_path=current_path,
+            )
+        )
+
+    for line in normalized.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+        heading_match = None if in_code_block else heading_re.match(line)
+        if heading_match:
+            flush_section()
+            hashes, raw_title = heading_match.groups()
+            level = len(hashes)
+            title = raw_title.strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            current_lines = [line]
+            current_title = title
+            current_level = level
+            current_path = tuple(item[1] for item in heading_stack)
+            continue
+        current_lines.append(line)
+
+    flush_section()
+    return sections
+
+
+def _normalize_extensions(extensions: list[str] | None) -> set[str]:
+    normalized: set[str] = set()
+    if not extensions:
+        return normalized
+    for extension in extensions:
+        value = str(extension).strip().lower()
+        if not value:
+            continue
+        if not value.startswith("."):
+            value = f".{value}"
+        normalized.add(value)
+    return normalized
+
+
+def _list_workspace_files(directory: Path, *, root: Path, recursive: bool) -> list[Path]:
+    pattern = "**/*" if recursive else "*"
+    ignored_dir_names = {"node_modules", "__pycache__", ".git", ".next", ".venv", "venv"}
+    files: list[Path] = []
+    for candidate in sorted(directory.glob(pattern)):
+        if not candidate.is_file():
+            continue
+        try:
+            relative_parts = candidate.resolve().relative_to(root.resolve()).parts
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in relative_parts[:-1]):
+            continue
+        if any(part in ignored_dir_names for part in relative_parts[:-1]):
+            continue
+        if relative_parts and relative_parts[-1].startswith("."):
+            continue
+        files.append(candidate)
+    return files
 
 
 def _chunk_text(

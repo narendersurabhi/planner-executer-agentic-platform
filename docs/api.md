@@ -327,6 +327,22 @@ Use this family to:
 - preflight a candidate plan before execution
 - create plans directly when needed
 
+### Capability-backed RAG service endpoints
+
+The Qdrant retriever is exposed as a separate internal service and is usually
+reached through capability adapters rather than through the main control-plane
+API. Its current endpoint surface includes:
+
+- `POST /retrieve`
+- `POST /collections/ensure`
+- `POST /index/upsert_texts`
+- `POST /index/workspace_file`
+- `POST /index/markdown`
+- `POST /index/workspace_directory`
+
+These endpoints are implemented by the retriever service in
+[main.py](/Users/narendersurabhi/planner-executer-agentic-platform/services/rag_retriever/app/main.py).
+
 ## 8. Downloads and Event Streaming
 
 ### Artifact download

@@ -6,6 +6,8 @@ from typing import Any
 
 from rag_retriever_core import (
     EnsureCollectionRequest,
+    IndexMarkdownRequest,
+    IndexWorkspaceDirectoryRequest,
     IndexWorkspaceFileRequest,
     RetrieveRequest,
     UpsertTextEntry,
@@ -333,6 +335,85 @@ def test_index_workspace_file_rejects_path_outside_workspace(tmp_path: Path) -> 
         assert exc.detail == "invalid_workspace_path_outside_workspace"
     else:  # pragma: no cover
         raise AssertionError("Expected RetrieverError")
+
+
+def test_index_markdown_chunks_by_headings_and_records_section_metadata() -> None:
+    embedder = _EmbedderStub([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    vector_db = _VectorDbStub([])
+    service = RetrieverService(config=_config(), embedder=embedder, vector_db=vector_db)
+
+    result = service.index_markdown(
+        IndexMarkdownRequest(
+            markdown_text=(
+                "# Overview\n"
+                "Agentic Workflow Studio supports chat, compose, and Studio.\n\n"
+                "## RAG\n"
+                "RAG indexing supports markdown-aware chunking.\n"
+                "Directory indexing can recurse through docs folders.\n"
+            ),
+            user_id="narendersurabhi",
+            namespace="docs",
+            source_uri="docs/overview.md",
+            metadata={"repo": "agentic-workflow-studio"},
+            chunk_size_chars=220,
+            chunk_overlap_chars=20,
+        )
+    )
+
+    assert result.document_id == "docs/overview.md"
+    assert result.source_uri == "docs/overview.md"
+    assert result.section_count >= 2
+    assert result.chunk_count == result.upserted_count
+    upsert_points = vector_db.upsert_calls[0]["points"]
+    assert upsert_points[0]["payload"]["repo"] == "agentic-workflow-studio"
+    assert upsert_points[0]["payload"]["content_type"] == "markdown"
+    assert upsert_points[0]["payload"]["chunking_strategy"] == "markdown"
+    assert "heading_path" in upsert_points[0]["payload"]
+
+
+def test_index_workspace_directory_indexes_text_and_markdown_files(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspace"
+    docs_dir = workspace_dir / "docs"
+    docs_dir.mkdir(parents=True)
+    (docs_dir / "guide.md").write_text(
+        "# Guide\nWorkflow Studio supports saved drafts and versions.\n\n## RAG\nUse workspace directory indexing.",
+        encoding="utf-8",
+    )
+    (docs_dir / "notes.txt").write_text(
+        "This text file should be indexed with plain text chunking.",
+        encoding="utf-8",
+    )
+    (docs_dir / ".hidden.md").write_text("# Hidden\nThis should be ignored.", encoding="utf-8")
+    (docs_dir / "data.bin").write_bytes(b"\x00\x01\x02")
+    config = _config()
+    config = RetrieverServiceConfig(**{**config.__dict__, "workspace_dir": str(workspace_dir)})
+    embedder = _EmbedderStub([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    vector_db = _VectorDbStub([])
+    service = RetrieverService(config=config, embedder=embedder, vector_db=vector_db)
+
+    result = service.index_workspace_directory(
+        IndexWorkspaceDirectoryRequest(
+            directory_path="docs",
+            user_id="narendersurabhi",
+            namespace="docs",
+            recursive=True,
+            max_files=10,
+            metadata={"repo": "agentic-workflow-studio"},
+        )
+    )
+
+    assert result.directory_path == "docs"
+    assert result.indexed_file_count == 2
+    assert result.skipped_file_count == 1
+    assert {item.path for item in result.files} == {"docs/guide.md", "docs/notes.txt"}
+    strategies = {item.path: item.strategy for item in result.files}
+    assert strategies["docs/guide.md"] == "markdown"
+    assert strategies["docs/notes.txt"] == "text"
+    assert result.skipped[0].path == "docs/data.bin"
+    assert result.skipped[0].reason == "extension_not_allowed:.bin"
+    upsert_payloads = [call["points"][0]["payload"] for call in vector_db.upsert_calls]
+    assert any(payload["chunking_strategy"] == "markdown" for payload in upsert_payloads)
+    assert any(payload["chunking_strategy"] == "text" for payload in upsert_payloads)
 
 
 def test_ensure_collection_creates_collection_and_payload_indexes() -> None:

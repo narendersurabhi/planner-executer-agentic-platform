@@ -7,6 +7,8 @@ The RAG stack is intentionally split into separate capabilities:
 - `rag.collection.ensure`
 - `rag.index.upsert_texts`
 - `rag.index.workspace_file`
+- `rag.index.markdown`
+- `rag.index.workspace_directory`
 - `rag.retrieve`
 
 Use them together when you want an explicit retrieval pipeline instead of a hidden "retrieve and answer" agent.
@@ -143,18 +145,72 @@ This capability:
 - embeds the chunks
 - upserts them into the target Qdrant collection
 
+### `rag.index.markdown`
+
+Use this when the markdown content is already available as text and you want
+heading-aware chunk metadata instead of raw character windows only.
+
+Typical input:
+
+```json
+{
+  "markdown_text": "# Overview\nWorkflow Studio supports saved drafts.\n\n## RAG\nUse markdown-aware indexing.",
+  "source_uri": "docs/overview.md",
+  "namespace": "docs",
+  "user_id": "narendersurabhi",
+  "metadata": {
+    "repo": "agentic-workflow-studio"
+  }
+}
+```
+
+This capability:
+
+- splits markdown into sections by headings
+- preserves section metadata such as heading path and heading level
+- chunks large sections into bounded overlapping slices
+- embeds and upserts those section-aware chunks into Qdrant
+
+### `rag.index.workspace_directory`
+
+Use this when you want to index a whole directory under `WORKSPACE_DIR` instead
+of a single file.
+
+Typical input:
+
+```json
+{
+  "directory_path": "docs",
+  "namespace": "docs",
+  "user_id": "narendersurabhi",
+  "recursive": true,
+  "max_files": 50,
+  "metadata": {
+    "repo": "agentic-workflow-studio"
+  }
+}
+```
+
+This capability:
+
+- walks a bounded workspace directory
+- skips hidden and obvious junk paths such as `.git` and `node_modules`
+- uses markdown-aware chunking for `.md`, `.markdown`, and `.mdx`
+- uses plain text chunking for other allowed text-like files
+- returns per-file indexing results plus skipped-file reasons
+
 ## Recommended Workflow
 
 ### Minimal indexing flow
 
 1. `rag.collection.ensure`
-2. `rag.index.upsert_texts` or `rag.index.workspace_file`
+2. `rag.index.upsert_texts`, `rag.index.workspace_file`, `rag.index.markdown`, or `rag.index.workspace_directory`
 3. `rag.retrieve`
 
 ### Grounded answering flow
 
 1. `rag.collection.ensure`
-2. `rag.index.upsert_texts` or `rag.index.workspace_file`
+2. `rag.index.upsert_texts`, `rag.index.workspace_file`, `rag.index.markdown`, or `rag.index.workspace_directory`
 3. `rag.retrieve`
 4. `llm.text.generate` or another answer-generation capability
 
@@ -165,7 +221,7 @@ In the generation step, pass the retrieved chunks as explicit context. Do not hi
 In `Workflow Studio`, the clean graph is:
 
 1. `rag.collection.ensure`
-2. `rag.index.workspace_file`
+2. `rag.index.workspace_directory`
 3. `rag.retrieve`
 4. optional answer/render step
 
@@ -176,6 +232,8 @@ Recommended bindings:
   - literal JSON for small tests
   - memory/context for dynamic content
   - previous step output if you add a chunking/extraction step later
+- `rag.index.markdown.markdown_text` from a literal, memory entry, or previous extraction step
+- `rag.index.workspace_directory.directory_path` from a workflow input such as `docs` or `workspace/repo-docs`
 - `rag.retrieve.collection_name` should match the same collection
 - `rag.retrieve.namespace`, `tenant_id`, `workspace_id`, or `user_id` should match the scope used at index time
 
@@ -226,6 +284,7 @@ Good follow-up capabilities:
 
 - `rag.index.delete`
 - `rag.index.workspace_file`
-- `rag.index.markdown_document`
+- `rag.index.markdown`
+- `rag.index.workspace_directory`
 - `rag.retrieve.rerank`
 - `rag.answer.generate`
