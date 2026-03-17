@@ -8,6 +8,7 @@ from mcp.server.fastmcp.server import TransportSecuritySettings
 
 from rag_retriever_core import (
     EnsureCollectionRequest,
+    IndexWorkspaceFileRequest,
     RetrieverError,
     RetrieveRequest,
     UpsertTextEntry,
@@ -117,6 +118,45 @@ def create_mcp_asgi_app(service: Any, logger: Any):
             )
         except RetrieverError as exc:
             logger.error("rag_upsert_texts_failed", extra={"error": exc.detail})
+            raise RuntimeError(exc.detail) from exc
+        return result.model_dump()
+
+    @mcp.tool()
+    def index_workspace_file(
+        path: str,
+        collection_name: str | None = None,
+        ensure_collection: bool = True,
+        document_id: str | None = None,
+        source_uri: str | None = None,
+        namespace: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        chunk_size_chars: int | None = None,
+        chunk_overlap_chars: int | None = None,
+        max_chunks: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            result = service.index_workspace_file(
+                IndexWorkspaceFileRequest(
+                    path=path,
+                    collection_name=collection_name,
+                    ensure_collection=ensure_collection,
+                    document_id=document_id,
+                    source_uri=source_uri,
+                    namespace=namespace,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    chunk_size_chars=chunk_size_chars,
+                    chunk_overlap_chars=chunk_overlap_chars,
+                    max_chunks=max_chunks,
+                    metadata=metadata or {},
+                )
+            )
+        except RetrieverError as exc:
+            logger.error("rag_index_workspace_file_failed", extra={"error": exc.detail})
             raise RuntimeError(exc.detail) from exc
         return result.model_dump()
 

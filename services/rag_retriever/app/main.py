@@ -11,6 +11,8 @@ from libs.core import logging as core_logging
 from rag_retriever_core import (
     EnsureCollectionRequest,
     EnsureCollectionResponse,
+    IndexWorkspaceFileRequest,
+    IndexWorkspaceFileResponse,
     RetrieverError,
     RetrieveRequest,
     RetrieveResponse,
@@ -101,5 +103,13 @@ def ensure_collection_endpoint(request: EnsureCollectionRequest) -> EnsureCollec
 def upsert_texts_endpoint(request: UpsertTextsRequest) -> UpsertTextsResponse:
     try:
         return RETRIEVER_SERVICE.upsert_texts(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/index/workspace_file", response_model=IndexWorkspaceFileResponse)
+def index_workspace_file_endpoint(request: IndexWorkspaceFileRequest) -> IndexWorkspaceFileResponse:
+    try:
+        return RETRIEVER_SERVICE.index_workspace_file(request)
     except RetrieverError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

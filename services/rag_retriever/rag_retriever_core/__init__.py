@@ -2,6 +2,8 @@ from .errors import RetrieverError
 from .models import (
     EnsureCollectionRequest,
     EnsureCollectionResponse,
+    IndexWorkspaceFileRequest,
+    IndexWorkspaceFileResponse,
     RetrieveMatch,
     RetrieveRequest,
     RetrieveResponse,
@@ -20,6 +22,8 @@ from .service import (
 __all__ = [
     "EnsureCollectionRequest",
     "EnsureCollectionResponse",
+    "IndexWorkspaceFileRequest",
+    "IndexWorkspaceFileResponse",
     "OpenAIEmbeddingClient",
     "QdrantClient",
     "RetrieverError",

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -12,6 +13,8 @@ from .errors import RetrieverError
 from .models import (
     EnsureCollectionRequest,
     EnsureCollectionResponse,
+    IndexWorkspaceFileRequest,
+    IndexWorkspaceFileResponse,
     RetrieveMatch,
     RetrieveRequest,
     RetrieveResponse,
@@ -86,6 +89,12 @@ class RetrieverServiceConfig:
     top_k_default: int
     top_k_max: int
     require_scope: bool
+    workspace_dir: str
+    workspace_allowed_extensions: tuple[str, ...]
+    workspace_max_file_bytes: int
+    workspace_chunk_size_chars: int
+    workspace_chunk_overlap_chars: int
+    workspace_max_chunks: int
     payload_text_key: str
     payload_document_id_key: str
     payload_source_uri_key: str
@@ -163,6 +172,32 @@ class RetrieverServiceConfig:
             top_k_default=_int_with_default(os.getenv("RAG_TOP_K_DEFAULT"), 5),
             top_k_max=_int_with_default(os.getenv("RAG_TOP_K_MAX"), 20),
             require_scope=_bool_with_default(os.getenv("RAG_REQUIRE_SCOPE"), True),
+            workspace_dir=os.getenv("WORKSPACE_DIR", "/shared/workspace").strip()
+            or "/shared/workspace",
+            workspace_allowed_extensions=tuple(
+                _csv_values(
+                    os.getenv(
+                        "RAG_WORKSPACE_ALLOWED_EXTENSIONS",
+                        ".md,.txt,.rst,.json,.yaml,.yml,.toml,.py,.ts,.tsx,.js,.jsx,.css,.html,.sql,.sh",
+                    )
+                )
+            ),
+            workspace_max_file_bytes=_int_with_default(
+                os.getenv("RAG_WORKSPACE_MAX_FILE_BYTES"),
+                2_000_000,
+            ),
+            workspace_chunk_size_chars=_int_with_default(
+                os.getenv("RAG_WORKSPACE_CHUNK_SIZE_CHARS"),
+                1200,
+            ),
+            workspace_chunk_overlap_chars=_int_with_default(
+                os.getenv("RAG_WORKSPACE_CHUNK_OVERLAP_CHARS"),
+                200,
+            ),
+            workspace_max_chunks=_int_with_default(
+                os.getenv("RAG_WORKSPACE_MAX_CHUNKS"),
+                200,
+            ),
             payload_text_key=payload_text_key,
             payload_document_id_key=payload_document_id_key,
             payload_source_uri_key=payload_source_uri_key,
@@ -478,6 +513,57 @@ class RetrieverService:
             chunk_ids=chunk_ids,
         )
 
+    def index_workspace_file(self, request: IndexWorkspaceFileRequest) -> IndexWorkspaceFileResponse:
+        normalized_path, content = _read_workspace_file(request.path, self.config)
+        chunk_size = request.chunk_size_chars or self.config.workspace_chunk_size_chars
+        overlap = request.chunk_overlap_chars or self.config.workspace_chunk_overlap_chars
+        max_chunks = request.max_chunks or self.config.workspace_max_chunks
+        chunks = _chunk_text(content, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks)
+        if not chunks:
+            raise RetrieverError("workspace_file_empty_after_chunking", status_code=400)
+        source_uri = request.source_uri or normalized_path
+        document_id = request.document_id or normalized_path
+        base_metadata = dict(request.metadata or {})
+        base_metadata.setdefault("path", normalized_path)
+        base_metadata.setdefault("filename", Path(normalized_path).name)
+        base_metadata.setdefault("extension", Path(normalized_path).suffix.lower())
+        entries: list[UpsertTextEntry] = []
+        for index, chunk_text in enumerate(chunks):
+            chunk_metadata = dict(base_metadata)
+            chunk_metadata["chunk_index"] = index
+            chunk_metadata["chunk_count"] = len(chunks)
+            entries.append(
+                UpsertTextEntry(
+                    document_id=document_id,
+                    text=chunk_text,
+                    source_uri=source_uri,
+                    namespace=request.namespace,
+                    tenant_id=request.tenant_id,
+                    user_id=request.user_id,
+                    workspace_id=request.workspace_id,
+                    metadata=chunk_metadata,
+                )
+            )
+        upsert_result = self.upsert_texts(
+            UpsertTextsRequest(
+                collection_name=request.collection_name,
+                ensure_collection=request.ensure_collection,
+                namespace=request.namespace,
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                workspace_id=request.workspace_id,
+                entries=entries,
+            )
+        )
+        return IndexWorkspaceFileResponse(
+            collection_name=upsert_result.collection_name,
+            path=normalized_path,
+            document_id=document_id,
+            chunk_count=len(chunks),
+            upserted_count=upsert_result.upserted_count,
+            chunk_ids=upsert_result.chunk_ids,
+        )
+
     def ensure_default_collection(self) -> EnsureCollectionResponse | None:
         if not self.config.qdrant_collection:
             return None
@@ -737,6 +823,83 @@ def _csv_values(value: str | None) -> list[str]:
     if value is None:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _workspace_root(config: RetrieverServiceConfig) -> Path:
+    return Path(config.workspace_dir).resolve()
+
+
+def _safe_workspace_path(path: str, config: RetrieverServiceConfig) -> Path:
+    base_dir = _workspace_root(config)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    candidate = Path(path)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        resolved = (base_dir / candidate).resolve()
+    if not str(resolved).startswith(str(base_dir)):
+        raise RetrieverError("invalid_workspace_path_outside_workspace", status_code=400)
+    return resolved
+
+
+def _read_workspace_file(path: str, config: RetrieverServiceConfig) -> tuple[str, str]:
+    candidate = _safe_workspace_path(path, config)
+    if not candidate.exists():
+        raise RetrieverError("workspace_file_not_found", status_code=404)
+    if candidate.is_dir():
+        raise RetrieverError("workspace_file_is_directory", status_code=400)
+    suffix = candidate.suffix.lower()
+    allowed = set(config.workspace_allowed_extensions)
+    if allowed and suffix not in allowed:
+        raise RetrieverError(f"workspace_file_extension_not_allowed:{suffix}", status_code=400)
+    stat = candidate.stat()
+    if stat.st_size > config.workspace_max_file_bytes:
+        raise RetrieverError("workspace_file_too_large", status_code=400)
+    text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
+        raise RetrieverError("workspace_file_empty", status_code=400)
+    try:
+        relative_path = str(candidate.relative_to(_workspace_root(config)))
+    except ValueError:
+        relative_path = str(candidate)
+    return relative_path, text
+
+
+def _chunk_text(
+    text: str,
+    *,
+    chunk_size: int,
+    overlap: int,
+    max_chunks: int,
+) -> list[str]:
+    normalized = text.strip()
+    if not normalized:
+        return []
+    size = max(200, chunk_size)
+    effective_overlap = max(0, min(overlap, size - 1))
+    chunks: list[str] = []
+    start = 0
+    length = len(normalized)
+    while start < length and len(chunks) < max_chunks:
+        end = min(length, start + size)
+        if end < length:
+            split_window = normalized[start:end]
+            newline_break = split_window.rfind("\n\n")
+            line_break = split_window.rfind("\n")
+            space_break = split_window.rfind(" ")
+            preferred = max(newline_break, line_break, space_break)
+            if preferred > int(size * 0.6):
+                end = start + preferred
+        chunk = normalized[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= length:
+            break
+        next_start = max(start + 1, end - effective_overlap)
+        if next_start <= start:
+            next_start = end
+        start = next_start
+    return chunks
 
 
 def _int_with_default(value: str | None, default: int) -> int:

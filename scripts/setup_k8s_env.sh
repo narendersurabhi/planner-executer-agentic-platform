@@ -74,6 +74,21 @@ fi
 if ! grep -q '^RAG_TOP_K_MAX=' "$tmp_env"; then
   echo "RAG_TOP_K_MAX=20" >>"$tmp_env"
 fi
+if ! grep -q '^RAG_WORKSPACE_ALLOWED_EXTENSIONS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_ALLOWED_EXTENSIONS=.md,.txt,.rst,.json,.yaml,.yml,.toml,.py,.ts,.tsx,.js,.jsx,.css,.html,.sql,.sh" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_MAX_FILE_BYTES=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_MAX_FILE_BYTES=2000000" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_CHUNK_SIZE_CHARS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_CHUNK_SIZE_CHARS=1200" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_CHUNK_OVERLAP_CHARS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_CHUNK_OVERLAP_CHARS=200" >>"$tmp_env"
+fi
+if ! grep -q '^RAG_WORKSPACE_MAX_CHUNKS=' "$tmp_env"; then
+  echo "RAG_WORKSPACE_MAX_CHUNKS=200" >>"$tmp_env"
+fi
 if ! grep -q '^RAG_PAYLOAD_TEXT_KEY=' "$tmp_env"; then
   echo "RAG_PAYLOAD_TEXT_KEY=text" >>"$tmp_env"
 fi

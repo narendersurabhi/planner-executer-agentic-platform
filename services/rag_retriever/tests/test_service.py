@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from rag_retriever_core import (
     EnsureCollectionRequest,
+    IndexWorkspaceFileRequest,
     RetrieveRequest,
     UpsertTextEntry,
     UpsertTextsRequest,
@@ -26,7 +28,14 @@ class _EmbedderStub:
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(list(texts))
-        return [list(vector) for vector in self.vectors[: len(texts)]]
+        if not texts:
+            return []
+        if not self.vectors:
+            raise AssertionError("Embedder stub requires at least one vector")
+        vectors = [list(vector) for vector in self.vectors]
+        while len(vectors) < len(texts):
+            vectors.append(list(self.vectors[-1]))
+        return vectors[: len(texts)]
 
 
 @dataclass
@@ -149,6 +158,29 @@ def _config(require_scope: bool = True) -> RetrieverServiceConfig:
         top_k_default=5,
         top_k_max=20,
         require_scope=require_scope,
+        workspace_dir="/tmp/rag-workspace",
+        workspace_allowed_extensions=(
+            ".md",
+            ".txt",
+            ".rst",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".py",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".css",
+            ".html",
+            ".sql",
+            ".sh",
+        ),
+        workspace_max_file_bytes=2_000_000,
+        workspace_chunk_size_chars=1200,
+        workspace_chunk_overlap_chars=200,
+        workspace_max_chunks=200,
         payload_text_key="text",
         payload_document_id_key="document_id",
         payload_source_uri_key="source_uri",
@@ -228,6 +260,77 @@ def test_retrieve_requires_scope_when_configured() -> None:
         service.retrieve(RetrieveRequest(query="ungrounded query"))
     except RetrieverError as exc:
         assert exc.detail == "missing_scope:one_of_tenant_id_user_id_workspace_id_required"
+    else:  # pragma: no cover
+        raise AssertionError("Expected RetrieverError")
+
+
+def test_index_workspace_file_reads_chunks_and_upserts(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    source = workspace_dir / "docs" / "guide.md"
+    source.parent.mkdir()
+    source.write_text(
+        (
+            "Workflow Studio saves drafts and publishes versions. "
+            "Use triggers to invoke published workflows. "
+            "The workflow library now includes saved drafts, version history, and run history. "
+            "RAG indexing now supports workspace files so that repository and documentation content can be chunked and embedded. "
+            "This lets retrieval operate against the same shared workspace used by other services.\n\n"
+        )
+        * 3,
+        encoding="utf-8",
+    )
+    config = _config()
+    config = RetrieverServiceConfig(**{**config.__dict__, "workspace_dir": str(workspace_dir)})
+    embedder = _EmbedderStub([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    vector_db = _VectorDbStub([])
+    service = RetrieverService(config=config, embedder=embedder, vector_db=vector_db)
+
+    result = service.index_workspace_file(
+        IndexWorkspaceFileRequest(
+            path="docs/guide.md",
+            tenant_id="tenant-a",
+            workspace_id="ws-1",
+            namespace="docs",
+            chunk_size_chars=200,
+            chunk_overlap_chars=40,
+            metadata={"repo": "agentic-workflow-studio"},
+        )
+    )
+
+    assert result.path == "docs/guide.md"
+    assert result.document_id == "docs/guide.md"
+    assert result.chunk_count == result.upserted_count
+    assert result.chunk_count >= 2
+    assert embedder.calls
+    points = vector_db.upsert_calls[0]["points"]
+    assert points[0]["payload"]["path"] == "docs/guide.md"
+    assert points[0]["payload"]["repo"] == "agentic-workflow-studio"
+    assert points[0]["payload"]["chunk_index"] == 0
+    assert points[0]["payload"]["chunk_count"] == result.chunk_count
+
+
+def test_index_workspace_file_rejects_path_outside_workspace(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    config = _config()
+    config = RetrieverServiceConfig(**{**config.__dict__, "workspace_dir": str(workspace_dir)})
+    service = RetrieverService(
+        config=config,
+        embedder=_EmbedderStub([[0.1, 0.2, 0.3]]),
+        vector_db=_VectorDbStub([]),
+    )
+
+    try:
+        service.index_workspace_file(
+            IndexWorkspaceFileRequest(
+                path="../outside.txt",
+                tenant_id="tenant-a",
+                workspace_id="ws-1",
+            )
+        )
+    except RetrieverError as exc:
+        assert exc.detail == "invalid_workspace_path_outside_workspace"
     else:  # pragma: no cover
         raise AssertionError("Expected RetrieverError")
 

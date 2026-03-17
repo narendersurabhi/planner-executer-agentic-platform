@@ -76,3 +76,28 @@ class UpsertTextsResponse(BaseModel):
     collection_name: str
     upserted_count: int
     chunk_ids: list[str]
+
+
+class IndexWorkspaceFileRequest(BaseModel):
+    path: str = Field(min_length=1)
+    collection_name: str | None = None
+    ensure_collection: bool = True
+    document_id: str | None = None
+    source_uri: str | None = None
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    chunk_size_chars: int | None = Field(default=None, ge=200, le=20000)
+    chunk_overlap_chars: int | None = Field(default=None, ge=0, le=5000)
+    max_chunks: int | None = Field(default=None, ge=1, le=1000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IndexWorkspaceFileResponse(BaseModel):
+    collection_name: str
+    path: str
+    document_id: str
+    chunk_count: int
+    upserted_count: int
+    chunk_ids: list[str]

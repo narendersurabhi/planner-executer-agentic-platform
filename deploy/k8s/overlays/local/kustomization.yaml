@@ -102,6 +102,12 @@ patches:
     target:
       kind: Deployment
       name: api
+  - path: patch-rag-retriever-shared.json
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: rag-retriever-mcp
   - path: patch-pvc-postgres-hostpath.yaml
     target:
       kind: PersistentVolumeClaim

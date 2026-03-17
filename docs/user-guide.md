@@ -318,7 +318,7 @@ Use when you want grounded retrieval over your own indexed chunks.
 Recommended path:
 
 1. `rag.collection.ensure`
-2. `rag.index.upsert_texts`
+2. `rag.index.upsert_texts` or `rag.index.workspace_file`
 3. `rag.retrieve`
 4. optional answer-generation step
 

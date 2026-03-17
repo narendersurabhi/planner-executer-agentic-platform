@@ -6,6 +6,7 @@ The RAG stack is intentionally split into separate capabilities:
 
 - `rag.collection.ensure`
 - `rag.index.upsert_texts`
+- `rag.index.workspace_file`
 - `rag.retrieve`
 
 Use them together when you want an explicit retrieval pipeline instead of a hidden "retrieve and answer" agent.
@@ -117,18 +118,43 @@ Typical input:
 }
 ```
 
+### `rag.index.workspace_file`
+
+Use this when the source content already exists in the shared workspace.
+
+Typical input:
+
+```json
+{
+  "path": "docs/user-guide.md",
+  "namespace": "docs",
+  "tenant_id": "tenant-a",
+  "workspace_id": "workspace-1",
+  "metadata": {
+    "repo": "agentic-workflow-studio"
+  }
+}
+```
+
+This capability:
+
+- reads a text-like file under `WORKSPACE_DIR`
+- chunks it into overlapping text segments
+- embeds the chunks
+- upserts them into the target Qdrant collection
+
 ## Recommended Workflow
 
 ### Minimal indexing flow
 
 1. `rag.collection.ensure`
-2. `rag.index.upsert_texts`
+2. `rag.index.upsert_texts` or `rag.index.workspace_file`
 3. `rag.retrieve`
 
 ### Grounded answering flow
 
 1. `rag.collection.ensure`
-2. `rag.index.upsert_texts`
+2. `rag.index.upsert_texts` or `rag.index.workspace_file`
 3. `rag.retrieve`
 4. `llm.text.generate` or another answer-generation capability
 
@@ -139,7 +165,7 @@ In the generation step, pass the retrieved chunks as explicit context. Do not hi
 In `Workflow Studio`, the clean graph is:
 
 1. `rag.collection.ensure`
-2. `rag.index.upsert_texts`
+2. `rag.index.workspace_file`
 3. `rag.retrieve`
 4. optional answer/render step
 
