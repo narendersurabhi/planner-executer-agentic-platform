@@ -49,6 +49,10 @@ from .models import (
     JobRecord,
     PlanRecord,
     TaskRecord,
+    WorkflowDefinitionRecord,
+    WorkflowRunRecord,
+    WorkflowTriggerRecord,
+    WorkflowVersionRecord,
 )
 from . import chat_execution_service, chat_service, dispatch_service, intent_service, memory_store
 
@@ -66,7 +70,7 @@ async def _app_lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Agentic Planner Executor API", lifespan=_app_lifespan)
+app = FastAPI(title="Agentic Workflow Studio API", lifespan=_app_lifespan)
 
 cors_origins = [
     origin.strip()
@@ -499,6 +503,90 @@ def _plan_from_record(record: PlanRecord) -> models.Plan:
         tasks_summary=record.tasks_summary,
         dag_edges=record.dag_edges or [],
         policy_decision=record.policy_decision or None,
+    )
+
+
+def _workflow_definition_from_record(
+    record: WorkflowDefinitionRecord,
+) -> models.WorkflowDefinition:
+    return models.WorkflowDefinition(
+        id=record.id,
+        title=record.title,
+        goal=record.goal or "",
+        context_json=record.context_json or {},
+        draft=record.draft_json or {},
+        user_id=record.user_id,
+        metadata=record.metadata_json or {},
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _workflow_version_from_record(record: WorkflowVersionRecord) -> models.WorkflowVersion:
+    return models.WorkflowVersion(
+        id=record.id,
+        definition_id=record.definition_id,
+        version_number=record.version_number,
+        title=record.title,
+        goal=record.goal or "",
+        context_json=record.context_json or {},
+        draft=record.draft_json or {},
+        compiled_plan=record.compiled_plan_json or {},
+        user_id=record.user_id,
+        metadata=record.metadata_json or {},
+        created_at=record.created_at,
+    )
+
+
+def _workflow_trigger_from_record(
+    record: WorkflowTriggerRecord,
+) -> models.WorkflowTrigger:
+    trigger_type = record.trigger_type
+    if trigger_type not in {item.value for item in models.WorkflowTriggerType}:
+        trigger_type = models.WorkflowTriggerType.manual.value
+    return models.WorkflowTrigger(
+        id=record.id,
+        definition_id=record.definition_id,
+        title=record.title,
+        trigger_type=models.WorkflowTriggerType(trigger_type),
+        enabled=bool(record.enabled),
+        config=record.config_json or {},
+        user_id=record.user_id,
+        metadata=record.metadata_json or {},
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _workflow_run_from_record(
+    record: WorkflowRunRecord,
+    *,
+    job_record: JobRecord | None = None,
+) -> models.WorkflowRun:
+    job_status: models.JobStatus | None = None
+    updated_at = record.updated_at
+    if job_record is not None:
+        try:
+            job_status = models.JobStatus(job_record.status)
+        except ValueError:
+            job_status = None
+        if isinstance(job_record.updated_at, datetime) and job_record.updated_at > updated_at:
+            updated_at = job_record.updated_at
+    return models.WorkflowRun(
+        id=record.id,
+        definition_id=record.definition_id,
+        version_id=record.version_id,
+        trigger_id=record.trigger_id,
+        title=record.title,
+        goal=record.goal or "",
+        requested_context_json=record.requested_context_json or {},
+        job_id=record.job_id,
+        plan_id=record.plan_id,
+        job_status=job_status,
+        user_id=record.user_id,
+        metadata=record.metadata_json or {},
+        created_at=record.created_at,
+        updated_at=updated_at,
     )
 
 
@@ -3264,13 +3352,652 @@ def _composer_if_expression_supported(expression: str) -> bool:
     return False
 
 
+_WORKFLOW_INTERFACE_VALUE_TYPES = {"string", "number", "boolean", "object", "array"}
+
+
+def _get_nested_value(root: Mapping[str, Any] | None, segments: Sequence[str]) -> Any:
+    cursor: Any = root
+    for segment in segments:
+        if not isinstance(cursor, Mapping):
+            return None
+        cursor = cursor.get(segment)
+    return cursor
+
+
+def _workflow_placeholder_value(value_type: str, *, key: str = "value") -> Any:
+    normalized = str(value_type or "string").strip().lower() or "string"
+    if normalized == "number":
+        return 0
+    if normalized == "boolean":
+        return False
+    if normalized == "object":
+        return {}
+    if normalized == "array":
+        return []
+    return f"<{key}>"
+
+
+def _parse_workflow_typed_value(raw: Any, value_type: str) -> tuple[Any, str | None]:
+    normalized = str(value_type or "string").strip().lower() or "string"
+    if raw is None:
+        return None, None
+    secret_ref = execution_contracts.parse_secret_ref(raw)
+    if secret_ref is not None:
+        return secret_ref.model_dump(), None
+    if normalized == "string":
+        if isinstance(raw, str):
+            return raw, None
+        if isinstance(raw, (dict, list)):
+            return json.dumps(raw, ensure_ascii=True), None
+        return str(raw), None
+
+    parsed = raw
+    if isinstance(raw, str):
+        trimmed = raw.strip()
+        if not trimmed:
+            return None, None
+        if normalized == "boolean":
+            lowered = trimmed.lower()
+            if lowered in {"true", "false"}:
+                return lowered == "true", None
+        try:
+            parsed = json.loads(trimmed)
+        except Exception:
+            if normalized == "number":
+                try:
+                    return int(trimmed), None
+                except ValueError:
+                    try:
+                        return float(trimmed), None
+                    except ValueError:
+                        return None, f"Expected a number value, received '{trimmed}'."
+            return None, f"Expected valid JSON for {normalized} value."
+
+    if normalized == "number":
+        if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+            return None, "Expected a number value."
+        return parsed, None
+    if normalized == "boolean":
+        if not isinstance(parsed, bool):
+            return None, "Expected a boolean value."
+        return parsed, None
+    if normalized == "object":
+        if not isinstance(parsed, Mapping):
+            return None, "Expected an object value."
+        return dict(parsed), None
+    if normalized == "array":
+        if not isinstance(parsed, list):
+            return None, "Expected an array value."
+        return list(parsed), None
+    return parsed, None
+
+
+def _normalize_workflow_binding(
+    raw_binding: Any,
+    *,
+    field: str,
+    allowed_kinds: set[str],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    diagnostics: list[dict[str, Any]] = []
+    if raw_binding is None:
+        return None, diagnostics
+    if not isinstance(raw_binding, Mapping):
+        diagnostics.append(
+            {
+                "code": "draft.workflow_binding_invalid",
+                "field": field,
+                "message": "Workflow binding must be an object.",
+            }
+        )
+        return None, diagnostics
+    kind = str(raw_binding.get("kind") or raw_binding.get("mode") or "").strip()
+    if kind not in allowed_kinds:
+        diagnostics.append(
+            {
+                "code": "draft.workflow_binding_kind_unknown",
+                "field": field,
+                "message": f"Unsupported workflow binding kind: {kind or '<empty>'}",
+            }
+        )
+        return None, diagnostics
+    if kind == "literal":
+        return {"kind": "literal", "value": raw_binding.get("value")}, diagnostics
+    if kind == "context":
+        path = str(raw_binding.get("path") or raw_binding.get("contextPath") or "").strip()
+        if not path:
+            diagnostics.append(
+                {
+                    "code": "draft.workflow_binding_context_path_missing",
+                    "field": field,
+                    "message": "Workflow context binding requires a path.",
+                }
+            )
+            return None, diagnostics
+        return {"kind": "context", "path": path}, diagnostics
+    if kind == "memory":
+        scope = str(raw_binding.get("scope") or "job").strip() or "job"
+        name = str(raw_binding.get("name") or "").strip()
+        if not name:
+            diagnostics.append(
+                {
+                    "code": "draft.workflow_binding_memory_name_missing",
+                    "field": field,
+                    "message": "Workflow memory binding requires a memory name.",
+                }
+            )
+            return None, diagnostics
+        payload: dict[str, Any] = {"kind": "memory", "scope": scope, "name": name}
+        key = raw_binding.get("key")
+        if isinstance(key, str) and key.strip():
+            payload["key"] = key.strip()
+        user_id = _semantic_normalize_text(
+            raw_binding.get("userId") or raw_binding.get("user_id"),
+            max_len=120,
+        )
+        if user_id:
+            payload["user_id"] = user_id
+        return payload, diagnostics
+    if kind == "secret":
+        secret_name = str(
+            raw_binding.get("secretName") or raw_binding.get("secret_name") or ""
+        ).strip()
+        if not secret_name:
+            diagnostics.append(
+                {
+                    "code": "draft.workflow_binding_secret_name_missing",
+                    "field": field,
+                    "message": "Workflow secret binding requires a secret name.",
+                }
+            )
+            return None, diagnostics
+        return {"kind": "secret", "secret_name": secret_name}, diagnostics
+    if kind == "workflow_input":
+        input_key = str(raw_binding.get("inputKey") or raw_binding.get("input_key") or "").strip()
+        if not input_key:
+            diagnostics.append(
+                {
+                    "code": "draft.workflow_binding_input_key_missing",
+                    "field": field,
+                    "message": "Workflow-input binding requires an input key.",
+                }
+            )
+            return None, diagnostics
+        return {"kind": "workflow_input", "input_key": input_key}, diagnostics
+    if kind == "workflow_variable":
+        variable_key = str(
+            raw_binding.get("variableKey") or raw_binding.get("variable_key") or ""
+        ).strip()
+        if not variable_key:
+            diagnostics.append(
+                {
+                    "code": "draft.workflow_binding_variable_key_missing",
+                    "field": field,
+                    "message": "Workflow-variable binding requires a variable key.",
+                }
+            )
+            return None, diagnostics
+        return {"kind": "workflow_variable", "variable_key": variable_key}, diagnostics
+    if kind == "step_output":
+        source_node_id = str(
+            raw_binding.get("sourceNodeId") or raw_binding.get("nodeId") or ""
+        ).strip()
+        source_path = str(raw_binding.get("sourcePath") or raw_binding.get("path") or "").strip()
+        if not source_node_id or not source_path:
+            diagnostics.append(
+                {
+                    "code": "draft.workflow_binding_step_output_missing",
+                    "field": field,
+                    "message": "Workflow step-output binding requires source node id and source path.",
+                }
+            )
+            return None, diagnostics
+        return {
+            "kind": "step_output",
+            "source_node_id": source_node_id,
+            "source_path": source_path,
+        }, diagnostics
+    return {"kind": kind}, diagnostics
+
+
+def _coerce_workflow_interface(
+    value: Any,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], list[dict[str, Any]]]:
+    normalized: dict[str, list[dict[str, Any]]] = {"inputs": [], "variables": [], "outputs": []}
+    diagnostics_errors: list[dict[str, Any]] = []
+    diagnostics_warnings: list[dict[str, Any]] = []
+    if not isinstance(value, Mapping):
+        return normalized, diagnostics_errors, diagnostics_warnings
+
+    raw_inputs = value.get("inputs")
+    seen_input_keys: set[str] = set()
+    if isinstance(raw_inputs, list):
+        for index, raw_input in enumerate(raw_inputs):
+            field_prefix = f"workflowInterface.inputs[{index}]"
+            if not isinstance(raw_input, Mapping):
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_input_invalid",
+                        "field": field_prefix,
+                        "message": "Workflow input definition must be an object.",
+                    }
+                )
+                continue
+            key = str(raw_input.get("key") or "").strip()
+            if not key:
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_input_key_missing",
+                        "field": f"{field_prefix}.key",
+                        "message": "Workflow input key is required.",
+                    }
+                )
+                continue
+            if key in seen_input_keys:
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_input_key_duplicate",
+                        "field": f"{field_prefix}.key",
+                        "message": f"Duplicate workflow input key '{key}'.",
+                    }
+                )
+                continue
+            seen_input_keys.add(key)
+            value_type = str(raw_input.get("valueType") or raw_input.get("value_type") or "string").strip().lower() or "string"
+            if value_type not in _WORKFLOW_INTERFACE_VALUE_TYPES:
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_input_value_type_invalid",
+                        "field": f"{field_prefix}.valueType",
+                        "message": f"Unsupported workflow input value type '{value_type}'.",
+                    }
+                )
+                value_type = "string"
+            binding, binding_errors = _normalize_workflow_binding(
+                raw_input.get("binding"),
+                field=f"{field_prefix}.binding",
+                allowed_kinds={"literal", "context", "memory", "secret"},
+            )
+            diagnostics_errors.extend(binding_errors)
+            normalized["inputs"].append(
+                {
+                    "id": str(raw_input.get("id") or "").strip() or f"workflow-input-{index + 1}",
+                    "key": key,
+                    "label": str(raw_input.get("label") or key).strip() or key,
+                    "value_type": value_type,
+                    "required": bool(raw_input.get("required")),
+                    "description": str(raw_input.get("description") or "").strip(),
+                    "default_value": raw_input.get("defaultValue"),
+                    "binding": binding,
+                }
+            )
+
+    raw_variables = value.get("variables")
+    seen_variable_keys: set[str] = set()
+    if isinstance(raw_variables, list):
+        for index, raw_variable in enumerate(raw_variables):
+            field_prefix = f"workflowInterface.variables[{index}]"
+            if not isinstance(raw_variable, Mapping):
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_variable_invalid",
+                        "field": field_prefix,
+                        "message": "Workflow variable definition must be an object.",
+                    }
+                )
+                continue
+            key = str(raw_variable.get("key") or "").strip()
+            if not key:
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_variable_key_missing",
+                        "field": f"{field_prefix}.key",
+                        "message": "Workflow variable key is required.",
+                    }
+                )
+                continue
+            if key in seen_variable_keys:
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_variable_key_duplicate",
+                        "field": f"{field_prefix}.key",
+                        "message": f"Duplicate workflow variable key '{key}'.",
+                    }
+                )
+                continue
+            seen_variable_keys.add(key)
+            binding, binding_errors = _normalize_workflow_binding(
+                raw_variable.get("binding"),
+                field=f"{field_prefix}.binding",
+                allowed_kinds={"literal", "context", "memory", "secret", "workflow_input"},
+            )
+            diagnostics_errors.extend(binding_errors)
+            normalized["variables"].append(
+                {
+                    "id": str(raw_variable.get("id") or "").strip()
+                    or f"workflow-variable-{index + 1}",
+                    "key": key,
+                    "description": str(raw_variable.get("description") or "").strip(),
+                    "binding": binding,
+                }
+            )
+
+    raw_outputs = value.get("outputs")
+    seen_output_keys: set[str] = set()
+    if isinstance(raw_outputs, list):
+        for index, raw_output in enumerate(raw_outputs):
+            field_prefix = f"workflowInterface.outputs[{index}]"
+            if not isinstance(raw_output, Mapping):
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_output_invalid",
+                        "field": field_prefix,
+                        "message": "Workflow output definition must be an object.",
+                    }
+                )
+                continue
+            key = str(raw_output.get("key") or "").strip()
+            if not key:
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_output_key_missing",
+                        "field": f"{field_prefix}.key",
+                        "message": "Workflow output key is required.",
+                    }
+                )
+                continue
+            if key in seen_output_keys:
+                diagnostics_errors.append(
+                    {
+                        "code": "draft.workflow_output_key_duplicate",
+                        "field": f"{field_prefix}.key",
+                        "message": f"Duplicate workflow output key '{key}'.",
+                    }
+                )
+                continue
+            seen_output_keys.add(key)
+            binding, binding_errors = _normalize_workflow_binding(
+                raw_output.get("binding"),
+                field=f"{field_prefix}.binding",
+                allowed_kinds={
+                    "literal",
+                    "context",
+                    "workflow_input",
+                    "workflow_variable",
+                    "step_output",
+                },
+            )
+            diagnostics_errors.extend(binding_errors)
+            normalized["outputs"].append(
+                {
+                    "id": str(raw_output.get("id") or "").strip() or f"workflow-output-{index + 1}",
+                    "key": key,
+                    "label": str(raw_output.get("label") or key).strip() or key,
+                    "description": str(raw_output.get("description") or "").strip(),
+                    "binding": binding,
+                }
+            )
+
+    return normalized, diagnostics_errors, diagnostics_warnings
+
+
+def _resolve_workflow_memory_binding(
+    db: Session | None,
+    binding: Mapping[str, Any],
+    *,
+    runtime_context: Mapping[str, Any] | None,
+) -> tuple[Any, str | None]:
+    if db is None:
+        return None, "Memory bindings require a database session."
+    name = str(binding.get("name") or "").strip()
+    scope_raw = str(binding.get("scope") or "job").strip() or "job"
+    try:
+        scope = models.MemoryScope(scope_raw)
+    except ValueError:
+        return None, f"Unsupported memory scope '{scope_raw}'."
+    query = models.MemoryQuery(
+        name=name,
+        scope=scope,
+        key=str(binding.get("key") or "").strip() or None,
+        job_id=str(runtime_context.get("job_id") or "").strip() or None
+        if isinstance(runtime_context, Mapping)
+        else None,
+        user_id=_semantic_normalize_text(
+            binding.get("user_id") or _semantic_user_id_from_context(runtime_context),
+            max_len=120,
+        )
+        or None,
+        project_id=str(runtime_context.get("project_id") or "").strip() or None
+        if isinstance(runtime_context, Mapping)
+        else None,
+        limit=1,
+    )
+    try:
+        entries = memory_store.read_memory(db, query)
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+    if not entries:
+        return None, "Memory entry not found."
+    return entries[0].payload, None
+
+
+def _resolve_workflow_binding_value(
+    binding: Mapping[str, Any] | None,
+    *,
+    db: Session | None,
+    runtime_context: Mapping[str, Any] | None,
+    resolved_inputs: Mapping[str, Any] | None = None,
+    resolved_variables: Mapping[str, Any] | None = None,
+    preview: bool = False,
+    placeholder_type: str = "string",
+    placeholder_key: str = "value",
+) -> tuple[Any, str | None]:
+    if not isinstance(binding, Mapping):
+        return None, None
+    kind = str(binding.get("kind") or "").strip()
+    if kind == "literal":
+        return binding.get("value"), None
+    if kind == "context":
+        segments = _split_reference_path(str(binding.get("path") or "").strip())
+        if not segments:
+            return None, "Workflow context binding requires a path."
+        value = _get_nested_value(runtime_context, segments)
+        if value is None and preview:
+            return _workflow_placeholder_value(placeholder_type, key=placeholder_key), None
+        return value, None if value is not None else "Context value not found."
+    if kind == "memory":
+        if preview:
+            return _workflow_placeholder_value(placeholder_type, key=placeholder_key), None
+        return _resolve_workflow_memory_binding(db, binding, runtime_context=runtime_context)
+    if kind == "secret":
+        secret_name = str(binding.get("secret_name") or "").strip()
+        if preview:
+            return _workflow_placeholder_value(placeholder_type, key=placeholder_key), None
+        return execution_contracts.build_secret_ref(secret_name), None
+    if kind == "workflow_input":
+        input_key = str(binding.get("input_key") or "").strip()
+        value = resolved_inputs.get(input_key) if isinstance(resolved_inputs, Mapping) else None
+        if value is None and preview:
+            return _workflow_placeholder_value(placeholder_type, key=input_key or placeholder_key), None
+        return value, None if value is not None else f"Workflow input '{input_key}' is not resolved."
+    if kind == "workflow_variable":
+        variable_key = str(binding.get("variable_key") or "").strip()
+        value = (
+            resolved_variables.get(variable_key)
+            if isinstance(resolved_variables, Mapping)
+            else None
+        )
+        if value is None and preview:
+            return _workflow_placeholder_value(
+                placeholder_type,
+                key=variable_key or placeholder_key,
+            ), None
+        return (
+            value,
+            None if value is not None else f"Workflow variable '{variable_key}' is not resolved.",
+        )
+    if kind == "step_output":
+        if preview:
+            return _workflow_placeholder_value(placeholder_type, key=placeholder_key), None
+        return None, "Workflow outputs from step outputs are only available after execution."
+    return None, f"Unsupported workflow binding kind '{kind}'."
+
+
+def _build_workflow_interface_runtime_context(
+    workflow_interface: Mapping[str, Any] | None,
+    *,
+    base_context: Mapping[str, Any] | None,
+    db: Session | None = None,
+    explicit_inputs: Mapping[str, Any] | None = None,
+    preview: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    runtime_context = _coerce_context_object(base_context)
+    diagnostics_errors: list[dict[str, Any]] = []
+    workflow_payload = (
+        dict(runtime_context.get("workflow"))
+        if isinstance(runtime_context.get("workflow"), Mapping)
+        else {}
+    )
+    existing_inputs = (
+        dict(workflow_payload.get("inputs"))
+        if isinstance(workflow_payload.get("inputs"), Mapping)
+        else {}
+    )
+    existing_variables = (
+        dict(workflow_payload.get("variables"))
+        if isinstance(workflow_payload.get("variables"), Mapping)
+        else {}
+    )
+    resolved_inputs: dict[str, Any] = dict(existing_inputs)
+    input_defs = (
+        workflow_interface.get("inputs", [])
+        if isinstance(workflow_interface, Mapping)
+        else []
+    )
+    variable_defs = (
+        workflow_interface.get("variables", [])
+        if isinstance(workflow_interface, Mapping)
+        else []
+    )
+    normalized_explicit_inputs = (
+        dict(explicit_inputs) if isinstance(explicit_inputs, Mapping) else {}
+    )
+
+    for definition in input_defs:
+        if not isinstance(definition, Mapping):
+            continue
+        key = str(definition.get("key") or "").strip()
+        if not key:
+            continue
+        value_type = str(definition.get("value_type") or "string").strip().lower() or "string"
+        candidate = normalized_explicit_inputs.get(key, resolved_inputs.get(key))
+        value = None
+        error_message: str | None = None
+        if key in normalized_explicit_inputs or key in resolved_inputs:
+            value, error_message = _parse_workflow_typed_value(candidate, value_type)
+        if value is None and error_message is None:
+            binding_value, binding_error = _resolve_workflow_binding_value(
+                definition.get("binding"),
+                db=db,
+                runtime_context=runtime_context,
+                preview=preview,
+                placeholder_type=value_type,
+                placeholder_key=key,
+            )
+            if binding_error is None and binding_value is not None:
+                value, error_message = _parse_workflow_typed_value(binding_value, value_type)
+            elif binding_error and not preview:
+                error_message = binding_error
+        if value is None and error_message is None:
+            value, error_message = _parse_workflow_typed_value(
+                definition.get("default_value"),
+                value_type,
+            )
+        if value is None and preview:
+            value = _workflow_placeholder_value(value_type, key=key)
+        if value is None and bool(definition.get("required")):
+            diagnostics_errors.append(
+                {
+                    "code": "draft.workflow_input_value_missing",
+                    "field": f"workflowInterface.inputs.{key}",
+                    "message": error_message or f"Workflow input '{key}' is required.",
+                }
+            )
+        elif error_message is not None and not preview:
+            diagnostics_errors.append(
+                {
+                    "code": "draft.workflow_input_value_invalid",
+                    "field": f"workflowInterface.inputs.{key}",
+                    "message": f"Workflow input '{key}' is invalid: {error_message}",
+                }
+            )
+        resolved_inputs[key] = value
+
+    resolved_variables: dict[str, Any] = dict(existing_variables)
+    for definition in variable_defs:
+        if not isinstance(definition, Mapping):
+            continue
+        key = str(definition.get("key") or "").strip()
+        if not key:
+            continue
+        value, error_message = _resolve_workflow_binding_value(
+            definition.get("binding"),
+            db=db,
+            runtime_context=runtime_context,
+            resolved_inputs=resolved_inputs,
+            resolved_variables=resolved_variables,
+            preview=preview,
+            placeholder_key=key,
+        )
+        if value is None and preview:
+            value = _workflow_placeholder_value("string", key=key)
+        if error_message is not None and not preview:
+            diagnostics_errors.append(
+                {
+                    "code": "draft.workflow_variable_value_invalid",
+                    "field": f"workflowInterface.variables.{key}",
+                    "message": f"Workflow variable '{key}' could not be resolved: {error_message}",
+                }
+            )
+        resolved_variables[key] = value
+
+    workflow_payload["inputs"] = resolved_inputs
+    workflow_payload["variables"] = resolved_variables
+    if isinstance(workflow_interface, Mapping):
+        workflow_payload["interface"] = {
+            "inputs": list(input_defs),
+            "variables": list(variable_defs),
+            "outputs": list(workflow_interface.get("outputs", []))
+            if isinstance(workflow_interface.get("outputs"), list)
+            else [],
+        }
+    runtime_context["workflow"] = workflow_payload
+    return runtime_context, diagnostics_errors
+
+
 def _build_plan_from_composer_draft(
     draft: dict[str, Any],
     *,
     goal_text: str = "",
+    job_context: Mapping[str, Any] | None = None,
 ) -> tuple[models.PlanCreate | None, list[dict[str, Any]], list[dict[str, Any]]]:
     diagnostics_errors: list[dict[str, Any]] = []
     diagnostics_warnings: list[dict[str, Any]] = []
+    workflow_interface, workflow_interface_errors, workflow_interface_warnings = (
+        _coerce_workflow_interface(
+            draft.get("workflowInterface")
+            if "workflowInterface" in draft
+            else draft.get("workflow_interface")
+        )
+    )
+    diagnostics_errors.extend(workflow_interface_errors)
+    diagnostics_warnings.extend(workflow_interface_warnings)
+    preview_job_context, workflow_interface_context_errors = _build_workflow_interface_runtime_context(
+        workflow_interface,
+        base_context=job_context,
+        preview=True,
+    )
+    diagnostics_errors.extend(workflow_interface_context_errors)
+    job_context = preview_job_context
     raw_nodes = draft.get("nodes")
     if not isinstance(raw_nodes, list) or not raw_nodes:
         diagnostics_errors.append(
@@ -3621,6 +4348,42 @@ def _build_plan_from_composer_draft(
                     continue
                 tool_input_payload[field_name] = {"$from": ["job_context", *segments]}
                 continue
+            if binding_kind == "workflow_input":
+                input_key = str(
+                    raw_binding.get("inputKey") or raw_binding.get("input_key") or ""
+                ).strip()
+                if not input_key:
+                    diagnostics_errors.append(
+                        {
+                            "code": "draft.binding_workflow_input_key_missing",
+                            "node_id": node_id,
+                            "field": field_name,
+                            "message": "Workflow-input binding requires an input key.",
+                        }
+                    )
+                    continue
+                tool_input_payload[field_name] = {
+                    "$from": ["job_context", "workflow", "inputs", input_key]
+                }
+                continue
+            if binding_kind == "workflow_variable":
+                variable_key = str(
+                    raw_binding.get("variableKey") or raw_binding.get("variable_key") or ""
+                ).strip()
+                if not variable_key:
+                    diagnostics_errors.append(
+                        {
+                            "code": "draft.binding_workflow_variable_key_missing",
+                            "node_id": node_id,
+                            "field": field_name,
+                            "message": "Workflow-variable binding requires a variable key.",
+                        }
+                    )
+                    continue
+                tool_input_payload[field_name] = {
+                    "$from": ["job_context", "workflow", "variables", variable_key]
+                }
+                continue
             if binding_kind in {"step_output", "from"}:
                 source_id = str(
                     raw_binding.get("nodeId") or raw_binding.get("sourceNodeId") or ""
@@ -3684,13 +4447,22 @@ def _build_plan_from_composer_draft(
                         }
                     )
                     continue
+                memory_scope = str(raw_binding.get("scope") or "job").strip() or "job"
                 memory_payload: dict[str, Any] = {
-                    "scope": str(raw_binding.get("scope") or "job"),
+                    "scope": memory_scope,
                     "name": name,
                 }
                 key = raw_binding.get("key")
                 if isinstance(key, str) and key.strip():
                     memory_payload["key"] = key.strip()
+                explicit_user_id = _semantic_normalize_text(
+                    raw_binding.get("userId") or raw_binding.get("user_id"),
+                    max_len=120,
+                )
+                if explicit_user_id:
+                    memory_payload["user_id"] = explicit_user_id
+                elif memory_scope == "user":
+                    memory_payload["user_id"] = _semantic_user_id_from_context(job_context)
                 tool_input_payload[field_name] = memory_payload
                 continue
             diagnostics_errors.append(
@@ -5683,6 +6455,8 @@ def _create_job_internal(
     db: Session,
     *,
     require_clarification: bool = False,
+    emit_job_created_event: bool = True,
+    metadata_overrides: Mapping[str, Any] | None = None,
 ) -> models.Job:
     job_id = str(uuid.uuid4())
     now = _utcnow()
@@ -5749,6 +6523,8 @@ def _create_job_internal(
                 interaction_compaction,
             )
         metadata["goal_intent_graph"] = goal_intent_graph.model_dump(mode="json", exclude_none=True)
+    if isinstance(metadata_overrides, Mapping):
+        metadata.update(dict(metadata_overrides))
     record = JobRecord(
         id=job_id,
         goal=job.goal,
@@ -5785,7 +6561,8 @@ def _create_job_internal(
         except (KeyError, ValueError):
             pass
         _seed_task_output_memory(db, job_id, context_json_for_job)
-    _emit_event("job.created", _job_from_record(record).model_dump())
+    if emit_job_created_event:
+        _emit_event("job.created", _job_from_record(record).model_dump())
     return _job_from_record(record)
 
 
@@ -6728,6 +7505,594 @@ def decompose_intent(
     }
 
 
+def _workflow_title_fallback(goal: str, title: str) -> str:
+    candidate = str(title or "").strip() or str(goal or "").strip()
+    return candidate[:120] or "Workflow Studio draft"
+
+
+def _compile_workflow_definition_version(
+    definition: WorkflowDefinitionRecord,
+) -> tuple[models.PlanCreate, dict[str, Any]]:
+    raw_draft = definition.draft_json if isinstance(definition.draft_json, dict) else {}
+    goal_text = str(definition.goal or "").strip()
+    job_context = dict(definition.context_json) if isinstance(definition.context_json, dict) else {}
+    workflow_interface, workflow_interface_errors, workflow_interface_warnings = (
+        _coerce_workflow_interface(
+            raw_draft.get("workflowInterface")
+            if "workflowInterface" in raw_draft
+            else raw_draft.get("workflow_interface")
+        )
+    )
+    if workflow_interface_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "workflow_compile_failed",
+                "diagnostics": {
+                    "errors": workflow_interface_errors,
+                    "warnings": workflow_interface_warnings,
+                },
+            },
+        )
+    preview_job_context, workflow_context_errors = _build_workflow_interface_runtime_context(
+        workflow_interface,
+        base_context=job_context,
+        preview=True,
+    )
+    if workflow_context_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "workflow_compile_failed",
+                "diagnostics": {
+                    "errors": workflow_context_errors,
+                    "warnings": workflow_interface_warnings,
+                },
+            },
+        )
+    plan, diagnostics_errors, diagnostics_warnings = _build_plan_from_composer_draft(
+        raw_draft,
+        goal_text=goal_text,
+        job_context=job_context,
+    )
+    if plan is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "workflow_compile_failed",
+                "diagnostics": {
+                    "errors": diagnostics_errors,
+                    "warnings": diagnostics_warnings,
+                },
+            },
+        )
+    preflight_errors = _compile_plan_preflight(
+        plan,
+        preview_job_context,
+        goal_text=goal_text,
+        goal_intent_graph=None,
+    )
+    if preflight_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "workflow_preflight_failed",
+                "preflight_errors": preflight_errors,
+                "diagnostics": {
+                    "errors": diagnostics_errors,
+                    "warnings": diagnostics_warnings,
+                },
+            },
+        )
+    return plan, {
+        "workflow_interface": workflow_interface,
+        "diagnostics": {
+            "errors": diagnostics_errors,
+            "warnings": diagnostics_warnings,
+        },
+        "preflight_errors": preflight_errors,
+    }
+
+
+@app.post("/workflows/definitions", response_model=models.WorkflowDefinition)
+def create_workflow_definition(
+    payload: models.WorkflowDefinitionCreate,
+    db: Session = Depends(get_db),
+) -> models.WorkflowDefinition:
+    now = _utcnow()
+    normalized_user_id = _semantic_normalize_text(payload.user_id, max_len=120) or _semantic_user_id_from_context(
+        payload.context_json
+    )
+    record = WorkflowDefinitionRecord(
+        id=str(uuid.uuid4()),
+        title=_workflow_title_fallback(payload.goal, payload.title),
+        goal=str(payload.goal or "").strip(),
+        context_json=dict(payload.context_json) if isinstance(payload.context_json, dict) else {},
+        draft_json=dict(payload.draft) if isinstance(payload.draft, dict) else {},
+        user_id=normalized_user_id or None,
+        metadata_json=dict(payload.metadata) if isinstance(payload.metadata, dict) else {},
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _workflow_definition_from_record(record)
+
+
+@app.get("/workflows/definitions", response_model=List[models.WorkflowDefinition])
+def list_workflow_definitions(
+    user_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+) -> List[models.WorkflowDefinition]:
+    query = db.query(WorkflowDefinitionRecord)
+    normalized_user_id = _semantic_normalize_text(user_id, max_len=120)
+    if normalized_user_id:
+        query = query.filter(WorkflowDefinitionRecord.user_id == normalized_user_id)
+    records = query.order_by(WorkflowDefinitionRecord.updated_at.desc()).all()
+    return [_workflow_definition_from_record(record) for record in records]
+
+
+@app.get("/workflows/definitions/{definition_id}", response_model=models.WorkflowDefinition)
+def get_workflow_definition(
+    definition_id: str,
+    db: Session = Depends(get_db),
+) -> models.WorkflowDefinition:
+    record = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    return _workflow_definition_from_record(record)
+
+
+@app.put("/workflows/definitions/{definition_id}", response_model=models.WorkflowDefinition)
+def update_workflow_definition(
+    definition_id: str,
+    payload: models.WorkflowDefinitionUpdate,
+    db: Session = Depends(get_db),
+) -> models.WorkflowDefinition:
+    record = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    next_goal = str(payload.goal if payload.goal is not None else record.goal or "").strip()
+    next_title = (
+        str(payload.title).strip()
+        if payload.title is not None
+        else str(record.title or "").strip()
+    )
+    record.title = _workflow_title_fallback(next_goal, next_title)
+    record.goal = next_goal
+    if payload.context_json is not None and isinstance(payload.context_json, dict):
+        record.context_json = dict(payload.context_json)
+    if payload.draft is not None and isinstance(payload.draft, dict):
+        record.draft_json = dict(payload.draft)
+    if payload.user_id is not None:
+        record.user_id = _semantic_normalize_text(payload.user_id, max_len=120) or None
+    if payload.metadata is not None and isinstance(payload.metadata, dict):
+        record.metadata_json = dict(payload.metadata)
+    record.updated_at = _utcnow()
+    db.commit()
+    db.refresh(record)
+    return _workflow_definition_from_record(record)
+
+
+@app.get(
+    "/workflows/definitions/{definition_id}/versions",
+    response_model=List[models.WorkflowVersion],
+)
+def list_workflow_versions(
+    definition_id: str,
+    db: Session = Depends(get_db),
+) -> List[models.WorkflowVersion]:
+    definition = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    records = (
+        db.query(WorkflowVersionRecord)
+        .filter(WorkflowVersionRecord.definition_id == definition_id)
+        .order_by(WorkflowVersionRecord.version_number.desc())
+        .all()
+    )
+    return [_workflow_version_from_record(record) for record in records]
+
+
+@app.post(
+    "/workflows/definitions/{definition_id}/publish",
+    response_model=models.WorkflowVersion,
+)
+def publish_workflow_definition(
+    definition_id: str,
+    payload: dict[str, Any] = Body(default_factory=dict),
+    db: Session = Depends(get_db),
+) -> models.WorkflowVersion:
+    definition = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    compiled_plan, publish_meta = _compile_workflow_definition_version(definition)
+    latest = (
+        db.query(WorkflowVersionRecord)
+        .filter(WorkflowVersionRecord.definition_id == definition_id)
+        .order_by(WorkflowVersionRecord.version_number.desc())
+        .first()
+    )
+    next_version_number = 1 if latest is None else int(latest.version_number) + 1
+    merged_metadata = dict(definition.metadata_json or {})
+    if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
+        merged_metadata.update(dict(payload["metadata"]))
+    merged_metadata["publish"] = publish_meta
+    record = WorkflowVersionRecord(
+        id=str(uuid.uuid4()),
+        definition_id=definition.id,
+        version_number=next_version_number,
+        title=definition.title,
+        goal=definition.goal,
+        context_json=dict(definition.context_json or {}),
+        draft_json=dict(definition.draft_json or {}),
+        compiled_plan_json=compiled_plan.model_dump(mode="json"),
+        user_id=definition.user_id,
+        metadata_json=merged_metadata,
+        created_at=_utcnow(),
+    )
+    definition.updated_at = _utcnow()
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _workflow_version_from_record(record)
+
+
+@app.post(
+    "/workflows/definitions/{definition_id}/triggers",
+    response_model=models.WorkflowTrigger,
+)
+def create_workflow_trigger(
+    definition_id: str,
+    payload: models.WorkflowTriggerCreate,
+    db: Session = Depends(get_db),
+) -> models.WorkflowTrigger:
+    definition = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    now = _utcnow()
+    trigger_title = str(payload.title or "").strip() or f"{definition.title} trigger"
+    record = WorkflowTriggerRecord(
+        id=str(uuid.uuid4()),
+        definition_id=definition.id,
+        title=trigger_title,
+        trigger_type=payload.trigger_type.value,
+        enabled=bool(payload.enabled),
+        config_json=dict(payload.config) if isinstance(payload.config, dict) else {},
+        user_id=_semantic_normalize_text(
+            payload.user_id if payload.user_id is not None else definition.user_id,
+            max_len=120,
+        )
+        or None,
+        metadata_json=dict(payload.metadata) if isinstance(payload.metadata, dict) else {},
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _workflow_trigger_from_record(record)
+
+
+@app.get(
+    "/workflows/definitions/{definition_id}/triggers",
+    response_model=List[models.WorkflowTrigger],
+)
+def list_workflow_triggers(
+    definition_id: str,
+    db: Session = Depends(get_db),
+) -> List[models.WorkflowTrigger]:
+    definition = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    records = (
+        db.query(WorkflowTriggerRecord)
+        .filter(WorkflowTriggerRecord.definition_id == definition_id)
+        .order_by(WorkflowTriggerRecord.updated_at.desc())
+        .all()
+    )
+    return [_workflow_trigger_from_record(record) for record in records]
+
+
+@app.put("/workflows/triggers/{trigger_id}", response_model=models.WorkflowTrigger)
+def update_workflow_trigger(
+    trigger_id: str,
+    payload: models.WorkflowTriggerUpdate,
+    db: Session = Depends(get_db),
+) -> models.WorkflowTrigger:
+    record = (
+        db.query(WorkflowTriggerRecord)
+        .filter(WorkflowTriggerRecord.id == trigger_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="workflow_trigger_not_found")
+    if payload.title is not None:
+        record.title = str(payload.title).strip() or record.title
+    if payload.enabled is not None:
+        record.enabled = bool(payload.enabled)
+    if payload.config is not None and isinstance(payload.config, dict):
+        record.config_json = dict(payload.config)
+    if payload.user_id is not None:
+        record.user_id = _semantic_normalize_text(payload.user_id, max_len=120) or None
+    if payload.metadata is not None and isinstance(payload.metadata, dict):
+        record.metadata_json = dict(payload.metadata)
+    record.updated_at = _utcnow()
+    db.commit()
+    db.refresh(record)
+    return _workflow_trigger_from_record(record)
+
+
+@app.get(
+    "/workflows/definitions/{definition_id}/runs",
+    response_model=List[models.WorkflowRun],
+)
+def list_workflow_runs(
+    definition_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> List[models.WorkflowRun]:
+    definition = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    records = (
+        db.query(WorkflowRunRecord)
+        .filter(WorkflowRunRecord.definition_id == definition_id)
+        .order_by(WorkflowRunRecord.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    job_ids = [record.job_id for record in records if isinstance(record.job_id, str)]
+    job_map = {
+        job.id: job
+        for job in db.query(JobRecord).filter(JobRecord.id.in_(job_ids)).all()
+    } if job_ids else {}
+    return [
+        _workflow_run_from_record(record, job_record=job_map.get(record.job_id))
+        for record in records
+    ]
+
+
+def _run_workflow_version_internal(
+    *,
+    version: WorkflowVersionRecord,
+    definition: WorkflowDefinitionRecord,
+    db: Session,
+    payload: dict[str, Any],
+    trigger: WorkflowTriggerRecord | None = None,
+    source: str,
+) -> models.WorkflowRunResult:
+    compiled_plan = _parse_plan_payload(version.compiled_plan_json or {})
+    if compiled_plan is None:
+        raise HTTPException(status_code=400, detail="workflow_version_plan_invalid")
+    context_json = dict(version.context_json or {})
+    if isinstance(trigger, WorkflowTriggerRecord) and isinstance(trigger.config_json, dict):
+        trigger_context = trigger.config_json.get("context_json")
+        if isinstance(trigger_context, dict):
+            context_json.update(dict(trigger_context))
+    if isinstance(payload, dict) and isinstance(payload.get("context_json"), dict):
+        context_json.update(dict(payload["context_json"]))
+    workflow_interface, workflow_interface_errors, _workflow_interface_warnings = (
+        _coerce_workflow_interface(
+            version.draft_json.get("workflowInterface")
+            if isinstance(version.draft_json, dict) and "workflowInterface" in version.draft_json
+            else version.draft_json.get("workflow_interface")
+            if isinstance(version.draft_json, dict)
+            else None
+        )
+    )
+    if workflow_interface_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "workflow_interface_invalid",
+                "diagnostics": {"errors": workflow_interface_errors, "warnings": []},
+            },
+        )
+    runtime_inputs: dict[str, Any] = {}
+    if isinstance(trigger, WorkflowTriggerRecord) and isinstance(trigger.config_json, dict):
+        trigger_inputs = trigger.config_json.get("inputs")
+        if isinstance(trigger_inputs, dict):
+            runtime_inputs.update(dict(trigger_inputs))
+    if isinstance(payload, dict) and isinstance(payload.get("inputs"), dict):
+        runtime_inputs.update(dict(payload["inputs"]))
+    context_json, workflow_context_errors = _build_workflow_interface_runtime_context(
+        workflow_interface,
+        base_context=context_json,
+        db=db,
+        explicit_inputs=runtime_inputs,
+        preview=False,
+    )
+    if workflow_context_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "workflow_inputs_invalid",
+                "diagnostics": {"errors": workflow_context_errors, "warnings": []},
+            },
+        )
+    priority_raw = payload.get("priority", 0) if isinstance(payload, dict) else 0
+    try:
+        priority = int(priority_raw)
+    except (TypeError, ValueError):
+        priority = 0
+    idempotency_key = (
+        str(payload.get("idempotency_key") or "").strip()
+        if isinstance(payload, dict)
+        else ""
+    )
+    metadata_overrides = {
+        "workflow_source": "studio",
+        "workflow_definition_id": definition.id,
+        "workflow_version_id": version.id,
+        "goal_intent_graph": None,
+    }
+    if trigger is not None:
+        metadata_overrides["workflow_trigger_id"] = trigger.id
+    job = _create_job_internal(
+        models.JobCreate(
+            goal=version.goal or definition.goal or definition.title,
+            context_json=context_json,
+            priority=priority,
+            idempotency_key=idempotency_key or None,
+        ),
+        db,
+        emit_job_created_event=False,
+        metadata_overrides=metadata_overrides,
+    )
+    plan_record = _create_plan_internal(compiled_plan, job_id=job.id, db=db)
+    now = _utcnow()
+    run_metadata = {"source": source}
+    if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
+        run_metadata.update(dict(payload["metadata"]))
+    if trigger is not None:
+        run_metadata["trigger_type"] = trigger.trigger_type
+    if runtime_inputs:
+        run_metadata["workflow_input_keys"] = sorted(str(key) for key in runtime_inputs.keys())
+    run_record = WorkflowRunRecord(
+        id=str(uuid.uuid4()),
+        definition_id=definition.id,
+        version_id=version.id,
+        trigger_id=trigger.id if trigger is not None else None,
+        title=version.title or definition.title,
+        goal=version.goal or definition.goal or definition.title,
+        requested_context_json=context_json,
+        job_id=job.id,
+        plan_id=plan_record.id,
+        user_id=version.user_id or definition.user_id,
+        metadata_json=run_metadata,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(run_record)
+    job_record = db.query(JobRecord).filter(JobRecord.id == job.id).first()
+    if job_record is not None:
+        job_metadata = dict(job_record.metadata_json or {})
+        job_metadata["workflow_run_id"] = run_record.id
+        if trigger is not None:
+            job_metadata["workflow_trigger_id"] = trigger.id
+        job_record.metadata_json = job_metadata
+        job_record.updated_at = now
+    db.commit()
+    db.refresh(run_record)
+    if job_record is not None:
+        db.refresh(job_record)
+        job = _job_from_record(job_record)
+    return models.WorkflowRunResult(
+        workflow_definition=_workflow_definition_from_record(definition),
+        workflow_version=_workflow_version_from_record(version),
+        workflow_run=_workflow_run_from_record(run_record, job_record=job_record),
+        job=job,
+        plan=plan_record,
+    )
+
+
+@app.post(
+    "/workflows/versions/{version_id}/run",
+    response_model=models.WorkflowRunResult,
+)
+def run_workflow_version(
+    version_id: str,
+    payload: dict[str, Any] = Body(default_factory=dict),
+    db: Session = Depends(get_db),
+) -> models.WorkflowRunResult:
+    version = (
+        db.query(WorkflowVersionRecord)
+        .filter(WorkflowVersionRecord.id == version_id)
+        .first()
+    )
+    if version is None:
+        raise HTTPException(status_code=404, detail="workflow_version_not_found")
+    definition = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == version.definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    return _run_workflow_version_internal(
+        version=version,
+        definition=definition,
+        db=db,
+        payload=payload if isinstance(payload, dict) else {},
+        trigger=None,
+        source="workflow_version_run",
+    )
+
+
+@app.post(
+    "/workflows/triggers/{trigger_id}/invoke",
+    response_model=models.WorkflowRunResult,
+)
+def invoke_workflow_trigger(
+    trigger_id: str,
+    payload: dict[str, Any] = Body(default_factory=dict),
+    db: Session = Depends(get_db),
+) -> models.WorkflowRunResult:
+    trigger = (
+        db.query(WorkflowTriggerRecord)
+        .filter(WorkflowTriggerRecord.id == trigger_id)
+        .first()
+    )
+    if trigger is None:
+        raise HTTPException(status_code=404, detail="workflow_trigger_not_found")
+    if not bool(trigger.enabled):
+        raise HTTPException(status_code=400, detail="workflow_trigger_disabled")
+    definition = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == trigger.definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    requested_version_id = str(payload.get("version_id") or "").strip() if isinstance(payload, dict) else ""
+    version_query = db.query(WorkflowVersionRecord).filter(
+        WorkflowVersionRecord.definition_id == definition.id
+    )
+    if requested_version_id:
+        version_query = version_query.filter(WorkflowVersionRecord.id == requested_version_id)
+    version = version_query.order_by(WorkflowVersionRecord.version_number.desc()).first()
+    if version is None:
+        raise HTTPException(status_code=404, detail="workflow_version_not_found")
+    return _run_workflow_version_internal(
+        version=version,
+        definition=definition,
+        db=db,
+        payload=payload if isinstance(payload, dict) else {},
+        trigger=trigger,
+        source="workflow_trigger_invoke",
+    )
+
+
 @app.post("/composer/compile")
 def compile_composer_draft(
     payload: dict[str, Any],
@@ -6764,15 +8129,32 @@ def compile_composer_draft(
         if job and isinstance(job.metadata_json, dict):
             provided_graph = job.metadata_json.get("goal_intent_graph")
 
+    workflow_interface, workflow_interface_errors, workflow_interface_warnings = (
+        _coerce_workflow_interface(
+            raw_draft.get("workflowInterface")
+            if "workflowInterface" in raw_draft
+            else raw_draft.get("workflow_interface")
+        )
+    )
+    preview_job_context, workflow_context_errors = _build_workflow_interface_runtime_context(
+        workflow_interface,
+        base_context=job_context,
+        explicit_inputs=payload.get("inputs") if isinstance(payload.get("inputs"), dict) else None,
+        preview=True,
+    )
     plan, diagnostics_errors, diagnostics_warnings = _build_plan_from_composer_draft(
         raw_draft,
         goal_text=goal_text,
+        job_context=job_context,
     )
+    diagnostics_errors.extend(workflow_interface_errors)
+    diagnostics_errors.extend(workflow_context_errors)
+    diagnostics_warnings.extend(workflow_interface_warnings)
     preflight_errors: dict[str, str] = {}
     if plan is not None:
         preflight_errors = _compile_plan_preflight(
             plan,
-            job_context,
+            preview_job_context,
             goal_text=goal_text,
             goal_intent_graph=provided_graph if isinstance(provided_graph, Mapping) else None,
         )
@@ -6876,8 +8258,12 @@ def recommend_composer_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-@app.post("/plans", response_model=models.Plan)
-def create_plan(plan: models.PlanCreate, job_id: str, db: Session = Depends(get_db)) -> models.Plan:
+def _create_plan_internal(
+    plan: models.PlanCreate,
+    *,
+    job_id: str,
+    db: Session,
+) -> models.Plan:
     job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
     job_context = job.context_json if job and isinstance(job.context_json, dict) else {}
     goal_text = job.goal if job and isinstance(job.goal, str) else ""
@@ -6971,3 +8357,8 @@ def create_plan(plan: models.PlanCreate, job_id: str, db: Session = Depends(get_
     payload["correlation_id"] = str(uuid.uuid4())
     _emit_event("plan.created", payload)
     return _plan_from_record(record)
+
+
+@app.post("/plans", response_model=models.Plan)
+def create_plan(plan: models.PlanCreate, job_id: str, db: Session = Depends(get_db)) -> models.Plan:
+    return _create_plan_internal(plan, job_id=job_id, db=db)

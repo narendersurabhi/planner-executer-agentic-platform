@@ -1,17 +1,17 @@
-# Why AWE (Goal-Driven Agentic Workflow Engine)
+# Why Agentic Workflow Studio
 
-AWE is a production-style framework for building agentic workflows that are reliable, observable, and deployable. It treats “agents” as a distributed system: plans are explicit, tool contracts are validated, failures are classified and retried deterministically, and every run is traceable end-to-end.
+Agentic Workflow Studio is a production-style framework for building agentic workflows that are reliable, observable, and deployable. It treats “agents” as a distributed system: plans are explicit, tool contracts are validated, failures are classified and retried deterministically, and every run is traceable end-to-end.
 
-This document makes the case for using AWE as the foundation for new AI-enabled automation, and for investing in it as a shared platform rather than building one-off agents.
+This document makes the case for using Agentic Workflow Studio as the foundation for new AI-enabled automation, and for investing in it as a shared platform rather than building one-off agents.
 
 ## Executive Summary
 
-- **Move from “prompt scripts” to an execution platform:** AWE models work as a typed task DAG, not an unstructured chat loop.
+- **Move from “prompt scripts” to an execution platform:** Agentic Workflow Studio models work as a typed task DAG, not an unstructured chat loop.
 - **Improve reliability and operability:** retries, DLQs, timeouts, stale-claim recovery, and isolation for risky tool calls.
 - **Make runs explainable:** plans, tool calls, schemas, and events are first-class and queryable.
 - **Enable production deployment:** Docker Compose for local dev and Kubernetes manifests with autoscaling for production-style environments.
 
-## The Problem AWE Solves
+## The Problem Agentic Workflow Studio Solves
 
 Most agent implementations start as a single process that calls an LLM, then calls tools, and “hopes for the best”. This breaks down quickly:
 
@@ -20,22 +20,22 @@ Most agent implementations start as a single process that calls an LLM, then cal
 - **No contract surface:** tool inputs/outputs drift, and model updates silently break workflows.
 - **Hard to scale:** concurrency increases tool flakiness, and scale changes behavior without a control plane.
 
-AWE’s position is simple: if you want agents in production, you need **plans, contracts, and operations**.
+The platform's position is simple: if you want agents in production, you need **plans, contracts, and operations**.
 
-## What AWE Is (And What It Is Not)
+## What Agentic Workflow Studio Is (And What It Is Not)
 
-**AWE is:**
+**Agentic Workflow Studio is:**
 
 - A **goal → plan → execute** workflow engine with explicit tasks, dependencies, and tool requests.
 - A **tool-orchestration runtime** that can call local tools and MCP-backed services.
 - A set of services that provide: job management, state, event streaming, artifacts, and observability.
 
-**AWE is not:**
+**It is not:**
 
 - A “single-agent chat app” where state lives only in a prompt.
 - A generic data pipeline engine (it can run pipelines, but its core value is agent-tool orchestration).
 
-## Key Capabilities That Make AWE Worth Building On
+## Key Capabilities That Make Agentic Workflow Studio Worth Building On
 
 ### 1) Explicit planning (typed task DAG)
 
@@ -59,7 +59,7 @@ Workers execute ready tasks and emit structured events. Reliability features are
 
 ### 3) Tool contracts and schema validation
 
-Agents fail most often at tool boundaries. AWE makes tool I/O explicit:
+Agents fail most often at tool boundaries. Agentic Workflow Studio makes tool I/O explicit:
 
 - tool input validation (schema-driven)
 - output validation (schema-driven)
@@ -69,7 +69,7 @@ This is the difference between “it worked yesterday” and “it keeps working
 
 ### 4) MCP tool orchestration (timeouts + isolation)
 
-MCP-backed tools behave like external dependencies. AWE provides guardrails:
+MCP-backed tools behave like external dependencies. Agentic Workflow Studio provides guardrails:
 
 - deadline-budgeted tool calls
 - deterministic retry classification for transport/session failures
@@ -77,7 +77,7 @@ MCP-backed tools behave like external dependencies. AWE provides guardrails:
 
 ### 5) Artifacts and download paths
 
-Many workflows produce files (DOCX, reports, exports). AWE supports:
+Many workflows produce files (DOCX, reports, exports). Agentic Workflow Studio supports:
 
 - shared artifacts/workspace directories
 - API download endpoints for artifacts and workspace files
@@ -85,7 +85,7 @@ Many workflows produce files (DOCX, reports, exports). AWE supports:
 
 ### 6) Production-style deployment and scaling
 
-Running agent systems locally is easy; running them reliably is the hard part. AWE includes:
+Running agent systems locally is easy; running them reliably is the hard part. Agentic Workflow Studio includes:
 
 - local `docker compose` workflow for development
 - Kubernetes manifests (`deploy/k8s`) for production-style runtime
@@ -99,9 +99,9 @@ Agents need distributed-systems observability:
 - Prometheus metrics for core SLOs (latency/error/throughput)
 - Grafana dashboards and Jaeger tracing for debugging and postmortems
 
-## Why Invest in Developing AWE (Instead of One-Off Agents)
+## Why Invest in Developing Agentic Workflow Studio (Instead of One-Off Agents)
 
-Building one agent solves one problem. Building AWE solves many problems faster and safer.
+Building one agent solves one problem. Building Agentic Workflow Studio solves many problems faster and safer.
 
 Platform investments pay off when you have any combination of:
 
@@ -110,16 +110,16 @@ Platform investments pay off when you have any combination of:
 - real users and operational requirements
 - compliance/security constraints
 
-With AWE, improvements become reusable primitives:
+With Agentic Workflow Studio, improvements become reusable primitives:
 
 - new tool contracts benefit every workflow
 - improved timeouts/retries reduce platform-wide failures
 - stronger policy gates reduce security risk for all agents
 - dashboards and traces accelerate every incident response
 
-## Where AWE Fits (Use Cases)
+## Where Agentic Workflow Studio Fits (Use Cases)
 
-Examples that benefit immediately from AWE’s structure:
+Examples that benefit immediately from the platform's structure:
 
 - document generation with structured validation and artifact delivery
 - code generation/patching workflows with bounded timeouts and artifact outputs
@@ -150,6 +150,6 @@ Examples that benefit immediately from AWE’s structure:
 
 ## Call to Action
 
-Adopt AWE as the standard runtime for agentic automation where reliability, auditability, and operational control matter. Treat workflows as production software: define contracts, emit traces, and scale safely.
+Adopt Agentic Workflow Studio as the standard runtime for agentic automation where reliability, auditability, and operational control matter. Treat workflows as production software: define contracts, emit traces, and scale safely.
 
-If you want to extend AWE, start by adding one new tool with a strict schema, tests, and observability around its calls. That single investment strengthens the platform for every future workflow.
+If you want to extend Agentic Workflow Studio, start by adding one new tool with a strict schema, tests, and observability around its calls. That single investment strengthens the platform for every future workflow.

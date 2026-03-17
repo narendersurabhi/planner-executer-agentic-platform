@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -10,6 +10,45 @@ from libs.core import intent_contract, workflow_contracts
 
 EXECUTION_BINDINGS_KEY = "__capability_bindings__"
 EXECUTION_GATE_KEY = "__execution_gate__"
+SECRET_REF_KIND = "secret_ref"
+DEFAULT_SECRET_PROVIDER = "env"
+
+
+class SecretRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["secret_ref"] = SECRET_REF_KIND
+    provider: str = DEFAULT_SECRET_PROVIDER
+    name: str
+
+
+def build_secret_ref(
+    name: str,
+    *,
+    provider: str = DEFAULT_SECRET_PROVIDER,
+) -> dict[str, str]:
+    return SecretRef(
+        provider=_string_value(provider) or DEFAULT_SECRET_PROVIDER,
+        name=_string_value(name),
+    ).model_dump()
+
+
+def parse_secret_ref(value: Any) -> SecretRef | None:
+    if isinstance(value, SecretRef):
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        candidate = SecretRef.model_validate(dict(value))
+    except ValidationError:
+        return None
+    if candidate.kind != SECRET_REF_KIND or not candidate.name:
+        return None
+    return candidate
+
+
+def is_secret_ref(value: Any) -> bool:
+    return parse_secret_ref(value) is not None
 
 
 class CapabilityBinding(BaseModel):

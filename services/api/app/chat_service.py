@@ -159,6 +159,7 @@ def handle_turn(
             if isinstance(turn_plan.get("arguments"), Mapping)
             else {}
         )
+        arguments = _enrich_memory_arguments(capability_id, arguments, merged_context)
         try:
             direct_result = runtime.execute_direct_capability(
                 capability_id=capability_id,
@@ -256,6 +257,25 @@ def _default_session_title(goal: str) -> str:
     if not title:
         return "New chat"
     return title[:80]
+
+
+def _enrich_memory_arguments(
+    capability_id: str,
+    arguments: dict[str, Any],
+    merged_context: Mapping[str, Any],
+) -> dict[str, Any]:
+    if capability_id not in {"memory.read", "memory.semantic.search"}:
+        return arguments
+    normalized_user_id = str(
+        merged_context.get("user_id") or merged_context.get("semantic_user_id") or ""
+    ).strip()
+    if not normalized_user_id or str(arguments.get("user_id") or "").strip():
+        return arguments
+    enriched = dict(arguments)
+    enriched["user_id"] = normalized_user_id
+    if capability_id == "memory.read" and not str(enriched.get("scope") or "").strip():
+        enriched["scope"] = "user"
+    return enriched
 
 
 def _session_from_record(

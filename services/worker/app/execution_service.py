@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from collections.abc import Mapping
@@ -15,6 +16,7 @@ from libs.core import (
     models,
     tracing as core_tracing,
 )
+from libs.framework.tool_runtime import sanitize_payload as sanitize_tool_payload
 from services.worker.app import capability_runtime_adapter, tool_runtime_adapter
 
 
@@ -455,12 +457,39 @@ def _execute_capability_tool(
         task_payload,
         _request_tool_inputs(request, request_id, tool_name),
     )
+    recorded_payload = _sanitize_recorded_payload(payload)
+    payload, secret_error = _resolve_payload_secret_refs(payload)
+    if secret_error:
+        outputs[request_id] = {
+            "error": secret_error,
+            "error_code": secret_error.split(":", 1)[0],
+        }
+        tool_calls.append(
+            _failed_tool_call(
+                tool_name=tool_name,
+                input_payload=recorded_payload,
+                trace_id=trace_id,
+                started_at=started_at,
+                error=secret_error,
+                error_code=secret_error.split(":", 1)[0],
+            )
+        )
+        core_tracing.set_span_attributes(
+            tool_span,
+            {
+                "tool.error": secret_error,
+                "tool.error_code": secret_error.split(":", 1)[0],
+                "capability.id": capability_spec.capability_id,
+            },
+        )
+        return secret_error
     payload, capability_payload_error, dropped_payload_keys = (
         callbacks.enforce_capability_input_contract(
             capability_spec,
             payload,
         )
     )
+    recorded_payload = _drop_recorded_payload_keys(recorded_payload, dropped_payload_keys)
     if dropped_payload_keys:
         core_logging.log_event(
             context.logger,
@@ -483,7 +512,7 @@ def _execute_capability_tool(
         tool_calls.append(
             _failed_tool_call(
                 tool_name=tool_name,
-                input_payload=payload,
+                input_payload=recorded_payload,
                 trace_id=trace_id,
                 started_at=started_at,
                 error=capability_payload_error,
@@ -516,7 +545,7 @@ def _execute_capability_tool(
         tool_calls.append(
             _failed_tool_call(
                 tool_name=tool_name,
-                input_payload=payload,
+                input_payload=recorded_payload,
                 trace_id=trace_id,
                 started_at=started_at,
                 error=tool_error,
@@ -571,6 +600,7 @@ def _execute_capability_tool(
         task_payload=task_payload,
         tool_runtime=context.tool_runtime,
     )
+    call.input = recorded_payload
     duration_ms = int((time.monotonic() - tool_started_at) * 1000)
     core_logging.log_event(
         context.logger,
@@ -757,6 +787,7 @@ def _execute_native_tool(
         payload.setdefault("memory", {}).update(memory_payload)
         payload = callbacks.apply_memory_defaults(tool.spec.name, payload)
         missing = callbacks.missing_memory_only_inputs(tool.spec.name, payload)
+        recorded_payload = _sanitize_recorded_payload(payload)
         if missing:
             tool_error = (
                 f"contract.input_missing:memory_only_inputs_missing:{','.join(missing)}"
@@ -765,7 +796,7 @@ def _execute_native_tool(
             tool_calls.append(
                 _failed_tool_call(
                     tool_name=tool_name,
-                    input_payload=payload,
+                    input_payload=recorded_payload,
                     trace_id=trace_id,
                     started_at=started_at,
                     error=tool_error,
@@ -773,6 +804,32 @@ def _execute_native_tool(
             )
             core_tracing.set_span_attributes(tool_span, {"tool.error": tool_error})
             return tool_error
+    else:
+        recorded_payload = _sanitize_recorded_payload(payload)
+    payload, secret_error = _resolve_payload_secret_refs(payload)
+    if secret_error:
+        outputs[request_id] = {
+            "error": secret_error,
+            "error_code": secret_error.split(":", 1)[0],
+        }
+        tool_calls.append(
+            _failed_tool_call(
+                tool_name=tool_name,
+                input_payload=recorded_payload,
+                trace_id=trace_id,
+                started_at=started_at,
+                error=secret_error,
+                error_code=secret_error.split(":", 1)[0],
+            )
+        )
+        core_tracing.set_span_attributes(
+            tool_span,
+            {
+                "tool.error": secret_error,
+                "tool.error_code": secret_error.split(":", 1)[0],
+            },
+        )
+        return secret_error
     segment_contract_error = intent_contract.validate_intent_segment_contract(
         segment=task_intent_segment,
         task_intent=task_intent,
@@ -790,7 +847,7 @@ def _execute_native_tool(
         tool_calls.append(
             _failed_tool_call(
                 tool_name=tool_name,
-                input_payload=payload,
+                input_payload=recorded_payload,
                 trace_id=trace_id,
                 started_at=started_at,
                 error=tool_error,
@@ -842,6 +899,7 @@ def _execute_native_tool(
         trace_id=trace_id,
         max_output_bytes=context.config.output_size_cap,
     )
+    call.input = recorded_payload
     duration_ms = int((time.monotonic() - tool_started_at) * 1000)
     core_logging.log_event(
         context.logger,
@@ -916,6 +974,55 @@ def _execute_native_tool(
         },
     )
     return tool_error
+
+
+def _sanitize_recorded_payload(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    return sanitize_tool_payload(dict(payload))
+
+
+def _drop_recorded_payload_keys(
+    payload: dict[str, Any],
+    dropped_keys: list[str],
+) -> dict[str, Any]:
+    if not dropped_keys:
+        return payload
+    dropped = set(dropped_keys)
+    return {key: value for key, value in payload.items() if key not in dropped}
+
+
+def _resolve_secret_value(secret_ref: execution_contracts.SecretRef) -> tuple[Any, str | None]:
+    provider = str(secret_ref.provider or execution_contracts.DEFAULT_SECRET_PROVIDER).strip()
+    if provider != execution_contracts.DEFAULT_SECRET_PROVIDER:
+        return None, f"runtime.secret_provider_not_supported:{provider}"
+    value = os.getenv(secret_ref.name)
+    if value is None:
+        return None, f"runtime.secret_not_found:{secret_ref.name}"
+    return value, None
+
+
+def _resolve_payload_secret_refs(value: Any) -> tuple[Any, str | None]:
+    secret_ref = execution_contracts.parse_secret_ref(value)
+    if secret_ref is not None:
+        return _resolve_secret_value(secret_ref)
+    if isinstance(value, Mapping):
+        resolved: dict[str, Any] = {}
+        for key, item in value.items():
+            resolved_item, error = _resolve_payload_secret_refs(item)
+            if error is not None:
+                return None, error
+            resolved[key] = resolved_item
+        return resolved, None
+    if isinstance(value, list):
+        resolved_items: list[Any] = []
+        for item in value:
+            resolved_item, error = _resolve_payload_secret_refs(item)
+            if error is not None:
+                return None, error
+            resolved_items.append(resolved_item)
+        return resolved_items, None
+    return value, None
 
 
 def _request_tool_inputs(

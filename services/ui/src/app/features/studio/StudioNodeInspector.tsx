@@ -8,6 +8,7 @@ import type {
   ComposerInputBinding,
   StudioControlCase,
   StudioControlConfig,
+  WorkflowInterface,
 } from "./types";
 
 type StudioInspectorField = {
@@ -30,6 +31,7 @@ type StudioNodeInspectorProps = {
   visualChainNodes: ComposerDraftNode[];
   outputPathSuggestionsForNode: (node: ComposerDraftNode | undefined) => string[];
   contextPathSuggestions: string[];
+  workflowInterface: WorkflowInterface;
   autoWireNodeBindings: (nodeId: string) => void;
   quickFixNodeBindings: (nodeId: string) => void;
   setSelectedDagNodeId: React.Dispatch<React.SetStateAction<string | null>>;
@@ -42,7 +44,13 @@ type StudioNodeInspectorProps = {
   setVisualBindingMode: (
     nodeId: string,
     field: string,
-    mode: "context" | "from" | "literal" | "memory"
+    mode:
+      | "context"
+      | "from"
+      | "literal"
+      | "memory"
+      | "workflow_input"
+      | "workflow_variable"
   ) => void;
   clearVisualBinding: (nodeId: string, field: string) => void;
   removeCustomInputField: (nodeId: string, field: string) => void;
@@ -54,7 +62,13 @@ type StudioNodeInspectorProps = {
   updateVisualBindingMemory: (
     nodeId: string,
     field: string,
-    patch: { scope?: "job" | "global"; name?: string; key?: string }
+    patch: { scope?: "job" | "user" | "global"; name?: string; key?: string }
+  ) => void;
+  updateVisualBindingWorkflowInput: (nodeId: string, field: string, inputKey: string) => void;
+  updateVisualBindingWorkflowVariable: (
+    nodeId: string,
+    field: string,
+    variableKey: string
   ) => void;
   setVisualBindingFromPrevious: (nodeId: string, field: string) => void;
   canInsertDeriveOutputPath: boolean;
@@ -93,6 +107,12 @@ const bindingModeForField = (binding: ComposerInputBinding | undefined) => {
   if (binding?.kind === "memory") {
     return "memory";
   }
+  if (binding?.kind === "workflow_input") {
+    return "workflow_input";
+  }
+  if (binding?.kind === "workflow_variable") {
+    return "workflow_variable";
+  }
   return "context";
 };
 
@@ -105,6 +125,7 @@ export default function StudioNodeInspector({
   visualChainNodes,
   outputPathSuggestionsForNode,
   contextPathSuggestions,
+  workflowInterface,
   autoWireNodeBindings,
   quickFixNodeBindings,
   setSelectedDagNodeId,
@@ -120,6 +141,8 @@ export default function StudioNodeInspector({
   updateVisualBindingLiteral,
   updateVisualBindingContextPath,
   updateVisualBindingMemory,
+  updateVisualBindingWorkflowInput,
+  updateVisualBindingWorkflowVariable,
   setVisualBindingFromPrevious,
   canInsertDeriveOutputPath,
   onInsertDeriveOutputPath,
@@ -532,7 +555,13 @@ export default function StudioNodeInspector({
                       setVisualBindingMode(
                         selectedDagNode.id,
                         status.field,
-                        event.target.value as "context" | "from" | "literal" | "memory"
+                        event.target.value as
+                          | "context"
+                          | "from"
+                          | "literal"
+                          | "memory"
+                          | "workflow_input"
+                          | "workflow_variable"
                       )
                     }
                   >
@@ -542,6 +571,8 @@ export default function StudioNodeInspector({
                     </option>
                     <option value="literal">Literal value</option>
                     <option value="memory">Memory</option>
+                    <option value="workflow_input">Workflow input</option>
+                    <option value="workflow_variable">Workflow variable</option>
                   </select>
                 </div>
 
@@ -621,11 +652,12 @@ export default function StudioNodeInspector({
                         value={binding?.kind === "memory" ? binding.scope : "job"}
                         onChange={(event) =>
                           updateVisualBindingMemory(selectedDagNode.id, status.field, {
-                            scope: event.target.value as "job" | "global",
+                            scope: event.target.value as "job" | "user" | "global",
                           })
                         }
                       >
                         <option value="job">job</option>
+                        <option value="user">user</option>
                         <option value="global">global</option>
                       </select>
                       <input
@@ -648,6 +680,58 @@ export default function StudioNodeInspector({
                         }
                         placeholder="optional key"
                       />
+                    </div>
+                  </div>
+                ) : null}
+
+                {bindingMode === "workflow_input" ? (
+                  <div className="mt-3 grid gap-2">
+                    <select
+                      className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                      value={binding?.kind === "workflow_input" ? binding.inputKey : ""}
+                      onChange={(event) =>
+                        updateVisualBindingWorkflowInput(
+                          selectedDagNode.id,
+                          status.field,
+                          event.target.value
+                        )
+                      }
+                    >
+                      <option value="">Select workflow input</option>
+                      {workflowInterface.inputs.map((input) => (
+                        <option key={`workflow-input-${input.id}`} value={input.key}>
+                          {input.key || input.label || "Untitled input"}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="text-[11px] text-slate-500">
+                      Bind this field to a workflow-level input.
+                    </div>
+                  </div>
+                ) : null}
+
+                {bindingMode === "workflow_variable" ? (
+                  <div className="mt-3 grid gap-2">
+                    <select
+                      className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                      value={binding?.kind === "workflow_variable" ? binding.variableKey : ""}
+                      onChange={(event) =>
+                        updateVisualBindingWorkflowVariable(
+                          selectedDagNode.id,
+                          status.field,
+                          event.target.value
+                        )
+                      }
+                    >
+                      <option value="">Select workflow variable</option>
+                      {workflowInterface.variables.map((variable) => (
+                        <option key={`workflow-variable-${variable.id}`} value={variable.key}>
+                          {variable.key || "Untitled variable"}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="text-[11px] text-slate-500">
+                      Bind this field to a workflow-level variable.
                     </div>
                   </div>
                 ) : null}

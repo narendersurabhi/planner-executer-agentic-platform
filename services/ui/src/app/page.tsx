@@ -24,6 +24,8 @@ const grafanaLokiDatasource = process.env.NEXT_PUBLIC_GRAFANA_LOKI_DATASOURCE ||
 const TEMPLATE_STORAGE_KEY = "ape.templates.v1";
 const TEMPLATE_ORDER_KEY = "ape.templates.order.v1";
 const TEMPLATE_DEFAULTS_KEY = "ape.template.defaults.v1";
+const MEMORY_USER_ID_KEY = "ape.memory.user_id.v1";
+const DEFAULT_WORKSPACE_USER_ID = "narendersurabhi";
 const MEMORY_LIMIT_STORAGE_KEY = "ape.memory.limit.v1";
 const SIDEBAR_MIN_WIDTH = 260;
 const DAG_CANVAS_NODE_WIDTH = 220;
@@ -1993,6 +1995,7 @@ function HomeContent() {
   const showChatScreen = initialScreen === "chat";
   const [goal, setGoal] = useState("");
   const [contextJson, setContextJson] = useState("{}");
+  const [workspaceUserId, setWorkspaceUserId] = useState(DEFAULT_WORKSPACE_USER_ID);
   const [showRawContextPreview, setShowRawContextPreview] = useState(false);
   const [contextBuilderFieldEditor, setContextBuilderFieldEditor] = useState<ContextBuilderFieldEditor>({
     originalKey: "",
@@ -2067,6 +2070,35 @@ function HomeContent() {
   const [expandedMemoryEntries, setExpandedMemoryEntries] = useState<
     Record<string, Set<number>>
   >({});
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const stored = window.localStorage.getItem(MEMORY_USER_ID_KEY);
+    if (stored && stored.trim()) {
+      setWorkspaceUserId(stored.trim());
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(MEMORY_USER_ID_KEY, workspaceUserId);
+  }, [workspaceUserId]);
+
+  const withWorkspaceUserContext = (value: Record<string, unknown>) => {
+    const normalizedUserId = workspaceUserId.trim();
+    if (!normalizedUserId) {
+      return value;
+    }
+    const existing = value.user_id;
+    if (typeof existing === "string" && existing.trim()) {
+      return value;
+    }
+    return { ...value, user_id: normalizedUserId };
+  };
   const [memoryEntries, setMemoryEntries] = useState<Record<string, MemoryEntry[]>>({});
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryError, setMemoryError] = useState<string | null>(null);
@@ -2854,7 +2886,7 @@ function HomeContent() {
   };
 
   function readContextObject() {
-    return parseContextJsonObject(contextJson).context;
+    return withWorkspaceUserContext(parseContextJsonObject(contextJson).context);
   }
 
   const contextBuilderSnapshot = useMemo(
@@ -4534,7 +4566,7 @@ function HomeContent() {
     try {
       const parsed = JSON.parse(contextJson || "{}");
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        parsedContext = parsed as Record<string, unknown>;
+        parsedContext = withWorkspaceUserContext(parsed as Record<string, unknown>);
       } else {
         localErrors.push("Context JSON must be an object.");
       }
@@ -5130,11 +5162,11 @@ function HomeContent() {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         return null;
       }
-      return parsed as Record<string, unknown>;
+      return withWorkspaceUserContext(parsed as Record<string, unknown>);
     } catch {
       return null;
     }
-  }, [contextJson]);
+  }, [contextJson, workspaceUserId]);
 
   const detectedCapabilities = useMemo(() => {
     const catalogItems = capabilityCatalog?.items || [];
@@ -5612,7 +5644,9 @@ function HomeContent() {
       setJobSubmitLoading(true);
 
       let submissionGoal = goal.trim();
-      const submissionContext = { ...(parsedContext as Record<string, unknown>) };
+      const submissionContext = withWorkspaceUserContext({
+        ...(parsedContext as Record<string, unknown>)
+      });
       if (assessmentForSubmit?.needs_clarification && areClarificationsAnswered(assessmentForSubmit)) {
         const clarificationLines = assessmentForSubmit.questions.map(
           (question, index) => `- ${question}: ${normalizedAnswers[index]}`
@@ -6063,7 +6097,9 @@ const openTemplateModal = (template: Template) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           content,
-          context_json: chatUseComposeContext ? parsedContextForCapabilities || {} : {},
+          context_json: chatUseComposeContext
+            ? parsedContextForCapabilities || withWorkspaceUserContext({})
+            : withWorkspaceUserContext({}),
           priority
         })
       });
@@ -6553,9 +6589,9 @@ const openTemplateModal = (template: Template) => {
         <div className="pointer-events-none absolute top-48 -left-16 h-80 w-80 rounded-full bg-amber-200/50 blur-3xl animate-float-soft" />
         <div className="mx-auto max-w-7xl px-4 py-12 sm:px-6 lg:px-8">
           <ScreenHeader
-            eyebrow="Agentic Planner Executor"
+            eyebrow="Agentic Workflow Studio"
             title="Welcome"
-            description="Choose the surface you want to work in. Compose, Chat, and Workflow Studio now open as dedicated screens."
+            description="Choose the surface you want to work in. Compose, Chat, Workflow Studio, and Memory each open as dedicated screens in the same planner-executor workflow platform."
             activeScreen="home"
           >
             <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
@@ -8182,11 +8218,11 @@ const openTemplateModal = (template: Template) => {
         }}
       >
         <ScreenHeader
-          eyebrow="Agentic Planner Executor"
+          eyebrow="Agentic Workflow Studio"
           title={showComposeScreen ? "Compose Workflow Jobs" : "Chat Operator"}
           description={
             showComposeScreen
-              ? "Craft a goal, attach context, validate the chain, and submit a workflow without leaving the screen."
+              ? "Craft a goal, attach context, validate the chain, and submit a workflow from a structured planner-executor workspace."
               : "Stay conversational until the operator needs a tool call or workflow, then track the resulting jobs in the same workspace."
           }
           activeScreen={showComposeScreen ? "compose" : "chat"}
@@ -8223,6 +8259,25 @@ const openTemplateModal = (template: Template) => {
             </>
           }
         >
+            <div className="mt-6 rounded-2xl border border-white/15 bg-white/10 px-4 py-4 text-white/95">
+              <div className="flex flex-wrap items-end gap-3">
+                <label className="min-w-[220px] flex-1">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100">
+                    Memory User ID
+                  </div>
+                  <input
+                    className="mt-2 w-full rounded-2xl border border-white/15 bg-white/10 px-3 py-2 text-sm text-white outline-none transition placeholder:text-white/45 focus:border-white/40 focus:bg-white/15"
+                    value={workspaceUserId}
+                    onChange={(event) => setWorkspaceUserId(event.target.value)}
+                    placeholder="narendersurabhi"
+                  />
+                </label>
+                <div className="max-w-xl text-xs leading-5 text-slate-200">
+                  Chat, Compose, and direct memory reads will use this user id by default unless a
+                  request overrides it explicitly.
+                </div>
+              </div>
+            </div>
             <div className={`mt-6 grid gap-6 ${showComposeScreen && showChatScreen ? "xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]" : "xl:grid-cols-1"}`}>
               {showComposeScreen ? (
               <div className="rounded-2xl bg-white/95 p-6 text-slate-900 shadow-lg ring-1 ring-white/30">

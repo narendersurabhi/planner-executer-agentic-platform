@@ -14,7 +14,7 @@ from services.api.app import main, memory_store  # noqa: E402
 from services.api.app.database import Base, engine
 from services.api.app.database import SessionLocal
 from services.api.app.models import EventOutboxRecord, JobRecord, PlanRecord, TaskRecord
-from libs.core import events, models
+from libs.core import events, execution_contracts, models
 from libs.core import capability_registry as cap_registry
 from libs.core.llm_provider import LLMProvider, LLMRequest, LLMResponse
 
@@ -36,6 +36,209 @@ def test_create_job():
     assert response.status_code == 200
     data = response.json()
     assert data["goal"] == "demo"
+
+
+def test_workflow_definition_publish_and_run_bypasses_planner_job_event() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Workspace listing",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Workspace listing",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+    assert version["version_number"] == 1
+    assert version["compiled_plan"]["tasks"][0]["name"] == "ListWorkspace"
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 2},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    job_id = run_body["job"]["id"]
+    assert run_body["workflow_run"]["definition_id"] == definition["id"]
+    assert run_body["workflow_run"]["version_id"] == version["id"]
+    assert run_body["workflow_run"]["job_id"] == job_id
+    assert run_body["job"]["metadata"]["workflow_source"] == "studio"
+    assert run_body["job"]["metadata"]["workflow_definition_id"] == definition["id"]
+    assert run_body["job"]["metadata"]["workflow_version_id"] == version["id"]
+    assert run_body["job"]["metadata"]["workflow_run_id"] == run_body["workflow_run"]["id"]
+    assert run_body["plan"]["job_id"] == job_id
+
+    with SessionLocal() as db:
+        task_records = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        assert len(task_records) == 1
+        event_records = db.query(EventOutboxRecord).all()
+    matching_events = [
+        row
+        for row in event_records
+        if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id
+    ]
+    event_types = {row.event_type for row in matching_events}
+    assert "plan.created" in event_types
+    assert "job.created" not in event_types
+
+    runs_response = client.get(f"/workflows/definitions/{definition['id']}/runs")
+    assert runs_response.status_code == 200
+    runs = runs_response.json()
+    assert len(runs) >= 1
+    assert runs[0]["job_id"] == job_id
+    assert runs[0]["job_status"] in {
+        models.JobStatus.queued.value,
+        models.JobStatus.running.value,
+        models.JobStatus.planning.value,
+    }
+
+
+def test_workflow_trigger_create_invoke_and_list() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Triggered workspace listing",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Triggered workspace listing",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    trigger_response = client.post(
+        f"/workflows/definitions/{definition['id']}/triggers",
+        json={
+            "title": "Run latest workspace listing",
+            "trigger_type": "manual",
+            "enabled": True,
+            "config": {"version_mode": "latest_published"},
+            "metadata": {"source": "test"},
+        },
+    )
+    assert trigger_response.status_code == 200
+    trigger = trigger_response.json()
+    assert trigger["definition_id"] == definition["id"]
+    assert trigger["trigger_type"] == "manual"
+
+    list_triggers_response = client.get(f"/workflows/definitions/{definition['id']}/triggers")
+    assert list_triggers_response.status_code == 200
+    trigger_items = list_triggers_response.json()
+    assert len(trigger_items) >= 1
+    assert trigger_items[0]["id"] == trigger["id"]
+
+    invoke_response = client.post(
+        f"/workflows/triggers/{trigger['id']}/invoke",
+        json={"version_id": version["id"], "priority": 1},
+    )
+    assert invoke_response.status_code == 200
+    invoke_body = invoke_response.json()
+    assert invoke_body["workflow_run"]["trigger_id"] == trigger["id"]
+    assert invoke_body["job"]["metadata"]["workflow_trigger_id"] == trigger["id"]
+    assert invoke_body["workflow_run"]["job_id"] == invoke_body["job"]["id"]
+
+    runs_response = client.get(f"/workflows/definitions/{definition['id']}/runs?limit=5")
+    assert runs_response.status_code == 200
+    runs = runs_response.json()
+    assert len(runs) >= 1
+    assert runs[0]["trigger_id"] == trigger["id"]
+
+
+def test_build_workflow_interface_runtime_context_resolves_bindings() -> None:
+    with SessionLocal() as db:
+        memory_store.write_memory(
+            db,
+            models.MemoryWrite(
+                name="user_profile",
+                scope=models.MemoryScope.user,
+                user_id="narendersurabhi",
+                key="profile",
+                payload={"full_name": "Narender Rao Surabhi"},
+                metadata={},
+            ),
+        )
+        workflow_interface, errors, _warnings = main._coerce_workflow_interface(
+            {
+                "inputs": [
+                    {
+                        "key": "topic",
+                        "valueType": "string",
+                        "required": True,
+                        "binding": {"kind": "context", "path": "topic"},
+                    },
+                    {
+                        "key": "profile",
+                        "valueType": "object",
+                        "binding": {
+                            "kind": "memory",
+                            "scope": "user",
+                            "name": "user_profile",
+                            "key": "profile",
+                        },
+                    },
+                    {
+                        "key": "api_key",
+                        "valueType": "string",
+                        "binding": {"kind": "secret", "secretName": "TEST_WORKFLOW_SECRET"},
+                    },
+                ],
+                "variables": [
+                    {
+                        "key": "topic_alias",
+                        "binding": {"kind": "workflow_input", "inputKey": "topic"},
+                    }
+                ],
+            }
+        )
+        assert errors == []
+        context, diagnostics = main._build_workflow_interface_runtime_context(
+            workflow_interface,
+            base_context={"topic": "Release notes", "user_id": "narendersurabhi"},
+            db=db,
+            preview=False,
+        )
+
+    assert diagnostics == []
+    assert context["workflow"]["inputs"]["topic"] == "Release notes"
+    assert context["workflow"]["inputs"]["profile"] == {"full_name": "Narender Rao Surabhi"}
+    assert context["workflow"]["inputs"]["api_key"] == execution_contracts.build_secret_ref(
+        "TEST_WORKFLOW_SECRET"
+    )
+    assert context["workflow"]["variables"]["topic_alias"] == "Release notes"
 
 
 def test_intent_clarify_endpoint_validates_goal():
@@ -2364,6 +2567,206 @@ def test_build_plan_from_composer_draft_requires_parallel_fan_in_sources(monkeyp
     assert plan is None
     codes = {entry["code"] for entry in errors}
     assert "draft.control_parallel_fan_in_sources_missing" in codes
+
+
+def test_build_plan_from_composer_draft_injects_user_id_for_user_memory_bindings(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "nodes": [
+                {
+                    "id": "n1",
+                    "capabilityId": "json_transform",
+                    "taskName": "LoadProfile",
+                    "bindings": {
+                        "profile": {"kind": "memory", "scope": "user", "name": "user_profile", "key": "profile"}
+                    },
+                }
+            ]
+        },
+        job_context={"user_id": "narendersurabhi"},
+    )
+
+    assert errors == []
+    assert plan is not None
+    assert plan.tasks[0].tool_inputs["json_transform"]["profile"] == {
+        "scope": "user",
+        "name": "user_profile",
+        "key": "profile",
+        "user_id": "narendersurabhi",
+    }
+
+
+def test_build_plan_from_composer_draft_lowers_workflow_inputs_and_variables(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "workflowInterface": {
+                "inputs": [
+                    {
+                        "key": "topic",
+                        "valueType": "string",
+                        "required": True,
+                    }
+                ],
+                "variables": [
+                    {
+                        "key": "topic_alias",
+                        "binding": {"kind": "workflow_input", "inputKey": "topic"},
+                    }
+                ],
+                "outputs": [],
+            },
+            "nodes": [
+                {
+                    "id": "n1",
+                    "capabilityId": "json_transform",
+                    "taskName": "UseInterface",
+                    "bindings": {
+                        "topic": {"kind": "workflow_input", "inputKey": "topic"},
+                        "alias": {
+                            "kind": "workflow_variable",
+                            "variableKey": "topic_alias",
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+    assert errors == []
+    assert plan is not None
+    assert plan.tasks[0].tool_inputs["json_transform"]["topic"] == {
+        "$from": ["job_context", "workflow", "inputs", "topic"]
+    }
+    assert plan.tasks[0].tool_inputs["json_transform"]["alias"] == {
+        "$from": ["job_context", "workflow", "variables", "topic_alias"]
+    }
+
+
+def test_workflow_version_run_accepts_explicit_inputs(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Workflow inputs demo",
+            "goal": "Use workflow inputs",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Workflow inputs demo",
+                "workflowInterface": {
+                    "inputs": [
+                        {
+                            "key": "topic",
+                            "valueType": "string",
+                            "required": True,
+                        }
+                    ],
+                    "variables": [
+                        {
+                            "key": "topic_alias",
+                            "binding": {"kind": "workflow_input", "inputKey": "topic"},
+                        }
+                    ],
+                    "outputs": [],
+                },
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "Transform",
+                        "capabilityId": "json_transform",
+                        "bindings": {
+                            "input": {
+                                "kind": "workflow_variable",
+                                "variableKey": "topic_alias",
+                            },
+                        },
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"inputs": {"topic": "Quarterly update"}},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    assert run_body["job"]["context_json"]["workflow"]["inputs"]["topic"] == "Quarterly update"
+    assert (
+        run_body["job"]["context_json"]["workflow"]["variables"]["topic_alias"]
+        == "Quarterly update"
+    )
+    assert run_body["workflow_run"]["metadata"]["workflow_input_keys"] == ["topic"]
+
+    with SessionLocal() as db:
+        task_record = db.query(TaskRecord).filter(TaskRecord.job_id == run_body["job"]["id"]).first()
+        assert task_record is not None
+        assert task_record.tool_inputs["json_transform"]["input"] == {
+            "$from": ["job_context", "workflow", "variables", "topic_alias"]
+        }
 
 
 def test_task_payload_from_record_flags_unresolved_reference_inputs() -> None:

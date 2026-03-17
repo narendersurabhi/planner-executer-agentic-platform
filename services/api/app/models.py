@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -52,6 +52,84 @@ class ChatMessageRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
     session: Mapped[ChatSessionRecord] = relationship("ChatSessionRecord", back_populates="messages")
+
+
+class WorkflowDefinitionRecord(Base):
+    __tablename__ = "workflow_definitions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    title: Mapped[str] = mapped_column(String)
+    goal: Mapped[str] = mapped_column(String, default="")
+    context_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    draft_json: Mapped[Dict[str, Any]] = mapped_column("draft", JSON, default=dict)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+
+    versions: Mapped[List["WorkflowVersionRecord"]] = relationship(
+        "WorkflowVersionRecord",
+        back_populates="definition",
+        cascade="all, delete-orphan",
+    )
+
+
+class WorkflowVersionRecord(Base):
+    __tablename__ = "workflow_versions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    definition_id: Mapped[str] = mapped_column(ForeignKey("workflow_definitions.id"), index=True)
+    version_number: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String)
+    goal: Mapped[str] = mapped_column(String, default="")
+    context_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    draft_json: Mapped[Dict[str, Any]] = mapped_column("draft", JSON, default=dict)
+    compiled_plan_json: Mapped[Dict[str, Any]] = mapped_column("compiled_plan", JSON, default=dict)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+    definition: Mapped[WorkflowDefinitionRecord] = relationship(
+        "WorkflowDefinitionRecord",
+        back_populates="versions",
+    )
+
+
+class WorkflowTriggerRecord(Base):
+    __tablename__ = "workflow_triggers"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    definition_id: Mapped[str] = mapped_column(ForeignKey("workflow_definitions.id"), index=True)
+    title: Mapped[str] = mapped_column(String)
+    trigger_type: Mapped[str] = mapped_column(String)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    config_json: Mapped[Dict[str, Any]] = mapped_column("config", JSON, default=dict)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class WorkflowRunRecord(Base):
+    __tablename__ = "workflow_runs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    definition_id: Mapped[str] = mapped_column(ForeignKey("workflow_definitions.id"), index=True)
+    version_id: Mapped[str] = mapped_column(ForeignKey("workflow_versions.id"), index=True)
+    trigger_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflow_triggers.id"), nullable=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String)
+    goal: Mapped[str] = mapped_column(String, default="")
+    requested_context_json: Mapped[Dict[str, Any]] = mapped_column(
+        "requested_context", JSON, default=dict
+    )
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), index=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("plans.id"), index=True)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
 
 
 class PlanRecord(Base):

@@ -8,7 +8,7 @@ os.environ["ORCHESTRATOR_ENABLED"] = "false"
 os.environ["JOB_RECOVERY_ENABLED"] = "false"
 os.environ["POLICY_GATE_ENABLED"] = "false"
 
-from services.api.app import main  # noqa: E402
+from services.api.app import chat_service, main  # noqa: E402
 from services.api.app.database import Base, engine  # noqa: E402
 
 
@@ -170,3 +170,18 @@ def test_chat_turn_can_execute_direct_capability(monkeypatch) -> None:
     assert body["assistant_message"]["metadata"]["tool_output"]["entries"][0]["path"].endswith(
         "README.md"
     )
+
+
+def test_chat_memory_arguments_inherit_user_id_from_context() -> None:
+    enriched = chat_service._enrich_memory_arguments(
+        "memory.read",
+        {"name": "user_profile", "key": "profile"},
+        {"user_id": "narendersurabhi"},
+    )
+
+    assert enriched == {
+        "name": "user_profile",
+        "key": "profile",
+        "user_id": "narendersurabhi",
+        "scope": "user",
+    }

@@ -1,4 +1,4 @@
-# AWE Attention Router — Implementation Plan (Concrete, Class-Level)
+# Agentic Workflow Studio Attention Router — Implementation Plan (Concrete, Class-Level)
 
 This document translates the architecture proposal into specific code insertion points in the current codebase.
 
@@ -159,4 +159,3 @@ Add env vars in API/Planner/Worker:
 - Keep output contract unchanged first pass.
 - Keep deterministic path stable and reversible.
 - If you want, next step is adding schema changes and dashboards only after Phase B is stable.
-

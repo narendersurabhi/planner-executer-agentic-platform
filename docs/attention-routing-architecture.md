@@ -1,6 +1,6 @@
-# Attention-Driven Routing Architecture for AWE
+# Attention-Driven Routing Architecture for Agentic Workflow Studio
 
-This document proposes a focused architecture to add attention-inspired decision logic to AWE
+This document proposes a focused architecture to add attention-inspired decision logic to Agentic Workflow Studio
 without replacing the existing plan-and-execute stack.
 
 ## 1) Problem to solve
