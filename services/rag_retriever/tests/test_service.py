@@ -9,6 +9,8 @@ from rag_retriever_core import (
     IndexMarkdownRequest,
     IndexWorkspaceDirectoryRequest,
     IndexWorkspaceFileRequest,
+    RerankRequest,
+    RetrieveMatch,
     RetrieveRequest,
     UpsertTextEntry,
     UpsertTextsRequest,
@@ -264,6 +266,79 @@ def test_retrieve_requires_scope_when_configured() -> None:
         assert exc.detail == "missing_scope:one_of_tenant_id_user_id_workspace_id_required"
     else:  # pragma: no cover
         raise AssertionError("Expected RetrieverError")
+
+
+def test_rerank_prioritizes_lexical_and_metadata_matches() -> None:
+    service = RetrieverService(
+        config=_config(),
+        embedder=_EmbedderStub([[0.1, 0.2, 0.3]]),
+        vector_db=_VectorDbStub([]),
+    )
+
+    result = service.rerank(
+        RerankRequest(
+            query="workflow studio versions",
+            matches=[
+                RetrieveMatch(
+                    chunk_id="chunk-1",
+                    document_id="readme",
+                    text="Deployment uses Kubernetes overlays and local registry tags.",
+                    score=0.96,
+                    metadata={"path": "README.md"},
+                    source_uri="README.md#kubernetes",
+                ),
+                RetrieveMatch(
+                    chunk_id="chunk-2",
+                    document_id="docs/user-guide.md",
+                    text="Workflow Studio supports saved drafts, published versions, and run history.",
+                    score=0.72,
+                    metadata={"heading_path": ["Studio", "Versions"]},
+                    source_uri="docs/user-guide.md#studio",
+                ),
+            ],
+            top_k=1,
+        )
+    )
+
+    assert result.strategy == "heuristic_lexical_v1"
+    assert len(result.matches) == 1
+    assert result.matches[0].chunk_id == "chunk-2"
+    assert result.matches[0].rerank_score > 0.5
+
+
+def test_rerank_preserves_best_base_score_when_matches_are_ungrounded() -> None:
+    service = RetrieverService(
+        config=_config(),
+        embedder=_EmbedderStub([[0.1, 0.2, 0.3]]),
+        vector_db=_VectorDbStub([]),
+    )
+
+    result = service.rerank(
+        RerankRequest(
+            query="unrelated query",
+            matches=[
+                RetrieveMatch(
+                    chunk_id="chunk-1",
+                    document_id="doc-1",
+                    text="alpha beta",
+                    score=0.91,
+                    metadata={},
+                    source_uri="doc-1",
+                ),
+                RetrieveMatch(
+                    chunk_id="chunk-2",
+                    document_id="doc-2",
+                    text="gamma delta",
+                    score=0.47,
+                    metadata={},
+                    source_uri="doc-2",
+                ),
+            ],
+        )
+    )
+
+    assert [match.chunk_id for match in result.matches] == ["chunk-1", "chunk-2"]
+    assert result.matches[0].rerank_score >= result.matches[1].rerank_score
 
 
 def test_index_workspace_file_reads_chunks_and_upserts(tmp_path: Path) -> None:

@@ -320,7 +320,8 @@ Recommended path:
 1. `rag.collection.ensure`
 2. `rag.index.upsert_texts`, `rag.index.workspace_file`, `rag.index.markdown`, or `rag.index.workspace_directory`
 3. `rag.retrieve`
-4. optional answer-generation step
+4. optional `rag.retrieve.rerank`
+5. optional answer-generation step
 
 Use `tenant_id`, `workspace_id`, `user_id`, and `namespace` consistently at both index time and retrieval time.
 

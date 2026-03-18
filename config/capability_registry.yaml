@@ -687,6 +687,34 @@ capabilities:
         retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
+  - id: rag.retrieve.rerank
+    description: Rerank retrieved RAG matches with deterministic lexical and metadata-aware scoring.
+    risk_tier: read_only
+    idempotency: read
+    group: rag
+    subgroup: retrieval
+    input_schema_ref: rag_rerank_capability_input
+    output_schema_ref: rag_rerank_capability_output
+    tags:
+      - rag
+      - retrieval
+      - rerank
+      - grounding
+      - citations
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: rerank
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 20
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
   - id: rag.collection.ensure
     description: Ensure a Qdrant collection exists with the configured vector shape and payload indexes.
     risk_tier: bounded_write

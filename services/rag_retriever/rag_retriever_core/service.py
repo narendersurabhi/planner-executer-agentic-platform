@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import json
 import os
@@ -22,6 +23,9 @@ from .models import (
     IndexWorkspaceDirectorySkippedFile,
     IndexWorkspaceFileRequest,
     IndexWorkspaceFileResponse,
+    RerankMatch,
+    RerankRequest,
+    RerankResponse,
     RetrieveMatch,
     RetrieveRequest,
     RetrieveResponse,
@@ -439,6 +443,40 @@ class RetrieverService:
             for point in points
         ]
         return RetrieveResponse(matches=matches)
+
+    def rerank(self, request: RerankRequest) -> RerankResponse:
+        query = request.query.strip()
+        if not query:
+            raise RetrieverError("missing_query")
+        if not request.matches:
+            raise RetrieverError("missing_matches", status_code=400)
+        max_base_score = max((match.score for match in request.matches), default=0.0)
+        reranked = [
+            (
+                _compute_rerank_score(query, match, max_base_score=max_base_score),
+                index,
+                match,
+            )
+            for index, match in enumerate(request.matches)
+        ]
+        reranked.sort(key=lambda item: (-item[0], -item[2].score, item[1]))
+        limit = request.top_k or len(reranked)
+        limited = reranked[: max(1, min(limit, len(reranked)))]
+        return RerankResponse(
+            strategy="heuristic_lexical_v1",
+            matches=[
+                RerankMatch(
+                    chunk_id=match.chunk_id,
+                    document_id=match.document_id,
+                    text=match.text,
+                    score=match.score,
+                    rerank_score=score,
+                    metadata=match.metadata,
+                    source_uri=match.source_uri,
+                )
+                for score, _index, match in limited
+            ],
+        )
 
     def ensure_collection(self, request: EnsureCollectionRequest | None = None) -> EnsureCollectionResponse:
         normalized = request or EnsureCollectionRequest()
@@ -894,6 +932,120 @@ def normalize_match(
         metadata=metadata,
         source_uri=source_uri,
     )
+
+
+_RERANK_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "use",
+    "what",
+    "with",
+}
+
+
+def _compute_rerank_score(
+    query: str,
+    match: RetrieveMatch,
+    *,
+    max_base_score: float,
+) -> float:
+    query_terms = _tokenize_rerank_text(query)
+    if not query_terms:
+        return round(_normalized_base_score(match.score, max_base_score), 6)
+
+    primary_text = " ".join(
+        part
+        for part in [
+            match.text,
+            match.document_id,
+            match.source_uri,
+        ]
+        if part
+    )
+    primary_terms = _tokenize_rerank_text(primary_text)
+    primary_counter = Counter(primary_terms)
+    unique_query_terms = set(query_terms)
+    overlap_terms = unique_query_terms.intersection(primary_counter.keys())
+    overlap_ratio = len(overlap_terms) / len(unique_query_terms)
+    frequency_ratio = sum(min(primary_counter[term], 3) for term in unique_query_terms) / (
+        len(unique_query_terms) * 3
+    )
+
+    metadata_text = _stringify_metadata_for_rerank(match.metadata)
+    metadata_terms = set(_tokenize_rerank_text(metadata_text))
+    metadata_overlap = len(unique_query_terms.intersection(metadata_terms)) / len(unique_query_terms)
+
+    normalized_query = _normalize_rerank_phrase(query)
+    normalized_text = _normalize_rerank_phrase(f"{primary_text} {metadata_text}")
+    phrase_bonus = 0.18 if normalized_query and normalized_query in normalized_text else 0.0
+
+    base_score = _normalized_base_score(match.score, max_base_score)
+    rerank_score = (
+        0.45 * overlap_ratio
+        + 0.15 * frequency_ratio
+        + 0.12 * metadata_overlap
+        + 0.18 * base_score
+        + phrase_bonus
+    )
+    return round(rerank_score, 6)
+
+
+def _normalized_base_score(score: float, max_base_score: float) -> float:
+    if max_base_score <= 0:
+        return max(0.0, float(score))
+    return max(0.0, min(float(score) / max_base_score, 1.0))
+
+
+def _stringify_metadata_for_rerank(metadata: dict[str, Any]) -> str:
+    if not isinstance(metadata, dict) or not metadata:
+        return ""
+    parts: list[str] = []
+    for key in (
+        "title",
+        "heading",
+        "heading_path",
+        "section",
+        "filename",
+        "path",
+        "repo",
+        "content_type",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            parts.append(str(value))
+        elif isinstance(value, list):
+            parts.extend(str(item) for item in value if isinstance(item, (str, int, float, bool)))
+    return " ".join(parts)
+
+
+def _tokenize_rerank_text(text: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9_]+", str(text or "").lower())
+        if len(token) > 1 and token not in _RERANK_STOPWORDS
+    ]
+
+
+def _normalize_rerank_phrase(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())).strip()
 
 
 def _merge_upsert_scope(entry: UpsertTextEntry, request: UpsertTextsRequest) -> UpsertTextEntry:

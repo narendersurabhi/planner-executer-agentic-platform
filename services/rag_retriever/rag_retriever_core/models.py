@@ -31,6 +31,27 @@ class RetrieveResponse(BaseModel):
     matches: list[RetrieveMatch]
 
 
+class RerankRequest(BaseModel):
+    query: str = Field(min_length=1)
+    matches: list[RetrieveMatch] = Field(min_length=1, max_length=50)
+    top_k: int | None = Field(default=None, ge=1, le=20)
+
+
+class RerankMatch(BaseModel):
+    chunk_id: str
+    document_id: str
+    text: str
+    score: float
+    rerank_score: float
+    metadata: dict[str, Any]
+    source_uri: str
+
+
+class RerankResponse(BaseModel):
+    strategy: str
+    matches: list[RerankMatch]
+
+
 class EnsureCollectionRequest(BaseModel):
     collection_name: str | None = None
     vector_size: int | None = Field(default=None, ge=1)

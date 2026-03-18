@@ -334,6 +334,7 @@ reached through capability adapters rather than through the main control-plane
 API. Its current endpoint surface includes:
 
 - `POST /retrieve`
+- `POST /retrieve/rerank`
 - `POST /collections/ensure`
 - `POST /index/upsert_texts`
 - `POST /index/workspace_file`

@@ -17,6 +17,8 @@ from rag_retriever_core import (
     IndexWorkspaceDirectoryResponse,
     IndexWorkspaceFileRequest,
     IndexWorkspaceFileResponse,
+    RerankRequest,
+    RerankResponse,
     RetrieverError,
     RetrieveRequest,
     RetrieveResponse,
@@ -46,7 +48,7 @@ async def _optional_bearer_auth(request: Request, call_next):
     if not expected:
         return await call_next(request)
     path = request.url.path
-    protected = path.startswith("/mcp") or path == "/retrieve"
+    protected = path.startswith("/mcp") or path.startswith("/retrieve")
     if not protected:
         return await call_next(request)
     actual = request.headers.get("Authorization", "").strip()
@@ -91,6 +93,14 @@ def healthz() -> dict[str, str]:
 def retrieve_endpoint(request: RetrieveRequest) -> RetrieveResponse:
     try:
         return RETRIEVER_SERVICE.retrieve(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/retrieve/rerank", response_model=RerankResponse)
+def rerank_endpoint(request: RerankRequest) -> RerankResponse:
+    try:
+        return RETRIEVER_SERVICE.rerank(request)
     except RetrieverError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

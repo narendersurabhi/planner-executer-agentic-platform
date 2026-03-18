@@ -11,6 +11,7 @@ from rag_retriever_core import (
     IndexMarkdownRequest,
     IndexWorkspaceDirectoryRequest,
     IndexWorkspaceFileRequest,
+    RerankRequest,
     RetrieverError,
     RetrieveRequest,
     UpsertTextEntry,
@@ -65,6 +66,25 @@ def create_mcp_asgi_app(service: Any, logger: Any):
             result = service.retrieve(request)
         except RetrieverError as exc:
             logger.error("rag_retrieve_failed", extra={"error": exc.detail})
+            raise RuntimeError(exc.detail) from exc
+        return result.model_dump()
+
+    @mcp.tool()
+    def rerank(
+        query: str,
+        matches: list[dict[str, Any]],
+        top_k: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            result = service.rerank(
+                RerankRequest(
+                    query=query,
+                    matches=matches,
+                    top_k=top_k,
+                )
+            )
+        except RetrieverError as exc:
+            logger.error("rag_rerank_failed", extra={"error": exc.detail})
             raise RuntimeError(exc.detail) from exc
         return result.model_dump()
 
