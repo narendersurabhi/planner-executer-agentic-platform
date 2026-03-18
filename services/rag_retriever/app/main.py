@@ -9,6 +9,12 @@ from prometheus_client import make_asgi_app
 from app.mcp import create_mcp_asgi_app
 from libs.core import logging as core_logging
 from rag_retriever_core import (
+    DeleteDocumentRequest,
+    DeleteDocumentResponse,
+    DocumentChunksRequest,
+    DocumentChunksResponse,
+    DocumentListRequest,
+    DocumentListResponse,
     EnsureCollectionRequest,
     EnsureCollectionResponse,
     IndexMarkdownRequest,
@@ -101,6 +107,30 @@ def retrieve_endpoint(request: RetrieveRequest) -> RetrieveResponse:
 def rerank_endpoint(request: RerankRequest) -> RerankResponse:
     try:
         return RETRIEVER_SERVICE.rerank(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/documents/list", response_model=DocumentListResponse)
+def list_documents_endpoint(request: DocumentListRequest) -> DocumentListResponse:
+    try:
+        return RETRIEVER_SERVICE.list_documents(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/documents/chunks", response_model=DocumentChunksResponse)
+def document_chunks_endpoint(request: DocumentChunksRequest) -> DocumentChunksResponse:
+    try:
+        return RETRIEVER_SERVICE.get_document_chunks(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/documents/delete", response_model=DeleteDocumentResponse)
+def delete_document_endpoint(request: DeleteDocumentRequest) -> DeleteDocumentResponse:
+    try:
+        return RETRIEVER_SERVICE.delete_document(request)
     except RetrieverError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

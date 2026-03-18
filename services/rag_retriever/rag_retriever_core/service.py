@@ -6,6 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -13,6 +14,14 @@ from urllib.request import Request, urlopen
 
 from .errors import RetrieverError
 from .models import (
+    DeleteDocumentRequest,
+    DeleteDocumentResponse,
+    DocumentChunk,
+    DocumentChunksRequest,
+    DocumentChunksResponse,
+    DocumentListRequest,
+    DocumentListResponse,
+    DocumentSummary,
     EnsureCollectionRequest,
     EnsureCollectionResponse,
     IndexMarkdownRequest,
@@ -54,6 +63,17 @@ class VectorDatabase(Protocol):
 
     def get_collection(self, collection: str) -> dict[str, Any] | None: ...
 
+    def scroll(
+        self,
+        *,
+        collection: str,
+        limit: int,
+        offset: str | int | None,
+        filter_obj: dict[str, Any] | None,
+        with_payload: bool,
+        vector_name: str | None,
+    ) -> tuple[list[dict[str, Any]], str | int | None]: ...
+
     def create_collection(
         self,
         *,
@@ -77,6 +97,13 @@ class VectorDatabase(Protocol):
         *,
         collection: str,
         points: list[dict[str, Any]],
+    ) -> None: ...
+
+    def delete_points(
+        self,
+        *,
+        collection: str,
+        filter_obj: dict[str, Any],
     ) -> None: ...
 
 
@@ -332,6 +359,47 @@ class QdrantClient:
                 return None
             raise
 
+    def scroll(
+        self,
+        *,
+        collection: str,
+        limit: int,
+        offset: str | int | None,
+        filter_obj: dict[str, Any] | None,
+        with_payload: bool,
+        vector_name: str | None,
+    ) -> tuple[list[dict[str, Any]], str | int | None]:
+        if not self.base_url:
+            raise RetrieverError("qdrant_url_missing", status_code=503)
+        if not collection:
+            raise RetrieverError("qdrant_collection_missing", status_code=503)
+        payload: dict[str, Any] = {
+            "limit": limit,
+            "with_payload": with_payload,
+            "with_vector": False,
+        }
+        if filter_obj:
+            payload["filter"] = filter_obj
+        if offset is not None:
+            payload["offset"] = offset
+        if vector_name:
+            payload["using"] = vector_name
+        data = self._request(
+            method="POST",
+            path=f"/collections/{collection}/points/scroll",
+            payload=payload,
+        )
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise RetrieverError("qdrant_response_invalid", status_code=502)
+        points = result.get("points")
+        next_page_offset = result.get("next_page_offset")
+        if not isinstance(points, list):
+            raise RetrieverError("qdrant_response_invalid", status_code=502)
+        return [point for point in points if isinstance(point, dict)], (
+            next_page_offset if isinstance(next_page_offset, (str, int)) else None
+        )
+
     def create_collection(
         self,
         *,
@@ -378,6 +446,18 @@ class QdrantClient:
             method="PUT",
             path=f"/collections/{collection}/points?wait=true",
             payload={"points": points},
+        )
+
+    def delete_points(
+        self,
+        *,
+        collection: str,
+        filter_obj: dict[str, Any],
+    ) -> None:
+        self._request(
+            method="POST",
+            path=f"/collections/{collection}/points/delete?wait=true",
+            payload={"filter": filter_obj},
         )
 
     def _request(
@@ -478,6 +558,118 @@ class RetrieverService:
             ],
         )
 
+    def list_documents(self, request: DocumentListRequest) -> DocumentListResponse:
+        self._validate_scope(
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+        )
+        collection = self._resolve_collection_name(request.collection_name)
+        filter_obj = build_scope_filter(
+            config=self.config,
+            namespace=request.namespace,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+        )
+        limit = max(1, min(request.limit, 500))
+        scan_limit = max(limit * 50, 1000)
+        points, truncated = self._scroll_points(
+            collection=collection,
+            filter_obj=filter_obj,
+            limit=scan_limit,
+        )
+        documents = _summarize_documents(points, self.config)
+        query = str(request.query or "").strip().lower()
+        if query:
+            documents = [
+                document for document in documents if _document_matches_query(document, query)
+            ]
+        documents.sort(
+            key=lambda item: (
+                item.indexed_at or "",
+                item.document_id.lower(),
+            ),
+            reverse=True,
+        )
+        return DocumentListResponse(
+            collection_name=collection,
+            truncated=truncated,
+            scanned_point_count=len(points),
+            documents=documents[:limit],
+        )
+
+    def get_document_chunks(self, request: DocumentChunksRequest) -> DocumentChunksResponse:
+        self._validate_scope(
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+        )
+        collection = self._resolve_collection_name(request.collection_name)
+        filter_obj = build_scope_filter(
+            config=self.config,
+            namespace=request.namespace,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+            extra_conditions=[
+                _match_condition(self.config.payload_document_id_key, request.document_id)
+            ],
+        )
+        points, truncated = self._scroll_points(
+            collection=collection,
+            filter_obj=filter_obj,
+            limit=request.limit,
+        )
+        if not points:
+            raise RetrieverError("document_not_found", status_code=404)
+        if truncated:
+            raise RetrieverError("document_chunk_limit_exceeded", status_code=400)
+        summary = _summarize_documents(points, self.config)[0]
+        chunks = [
+            _normalize_document_chunk(point, self.config)
+            for point in sorted(points, key=_document_chunk_sort_key)
+        ]
+        return DocumentChunksResponse(
+            collection_name=collection,
+            document=summary,
+            chunks=chunks,
+        )
+
+    def delete_document(self, request: DeleteDocumentRequest) -> DeleteDocumentResponse:
+        chunks_response = self.get_document_chunks(
+            DocumentChunksRequest(
+                collection_name=request.collection_name,
+                document_id=request.document_id,
+                namespace=request.namespace,
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                workspace_id=request.workspace_id,
+                limit=2000,
+            )
+        )
+        filter_obj = build_scope_filter(
+            config=self.config,
+            namespace=request.namespace,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            workspace_id=request.workspace_id,
+            extra_conditions=[
+                _match_condition(self.config.payload_document_id_key, request.document_id)
+            ],
+        )
+        if filter_obj is None:
+            raise RetrieverError("delete_filter_missing", status_code=400)
+        self.vector_db.delete_points(
+            collection=chunks_response.collection_name,
+            filter_obj=filter_obj,
+        )
+        return DeleteDocumentResponse(
+            collection_name=chunks_response.collection_name,
+            document_id=request.document_id,
+            deleted_chunk_count=len(chunks_response.chunks),
+        )
+
     def ensure_collection(self, request: EnsureCollectionRequest | None = None) -> EnsureCollectionResponse:
         normalized = request or EnsureCollectionRequest()
         collection = self._resolve_collection_name(normalized.collection_name)
@@ -534,6 +726,7 @@ class RetrieverService:
         vectors = self.embedder.embed_texts(texts)
         if len(vectors) != len(request.entries):
             raise RetrieverError("embedding_batch_size_mismatch", status_code=502)
+        indexed_at = datetime.now(UTC).isoformat()
         points: list[dict[str, Any]] = []
         chunk_ids: list[str] = []
         for entry, vector in zip(request.entries, vectors, strict=False):
@@ -555,6 +748,7 @@ class RetrieverService:
                 workspace_id=normalized.workspace_id,
             )
             payload = _build_payload_from_entry(normalized, self.config)
+            payload.setdefault("indexed_at", indexed_at)
             point: dict[str, Any] = {
                 "id": chunk_id,
                 "payload": payload,
@@ -824,6 +1018,46 @@ class RetrieverService:
             return None
         return self.ensure_collection(EnsureCollectionRequest(collection_name=self.config.qdrant_collection))
 
+    def _scroll_points(
+        self,
+        *,
+        collection: str,
+        filter_obj: dict[str, Any] | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        points: list[dict[str, Any]] = []
+        offset: str | int | None = None
+        truncated = False
+        while len(points) < limit:
+            batch_limit = min(256, limit - len(points))
+            batch, next_offset = self.vector_db.scroll(
+                collection=collection,
+                limit=batch_limit,
+                offset=offset,
+                filter_obj=filter_obj,
+                with_payload=True,
+                vector_name=self.config.qdrant_vector_name,
+            )
+            if not batch:
+                break
+            points.extend(batch)
+            if next_offset is None:
+                break
+            offset = next_offset
+        if offset is not None and len(points) >= limit:
+            truncated = True
+        return points, truncated
+
+    def _validate_scope(
+        self,
+        *,
+        tenant_id: str | None,
+        user_id: str | None,
+        workspace_id: str | None,
+    ) -> None:
+        if self.config.require_scope and not any([tenant_id, user_id, workspace_id]):
+            raise RetrieverError("missing_scope:one_of_tenant_id_user_id_workspace_id_required")
+
     def _resolve_collection_name(self, collection_name: str | None) -> str:
         collection = str(collection_name or self.config.qdrant_collection).strip()
         if not collection:
@@ -860,16 +1094,13 @@ def build_qdrant_filter(
     request: RetrieveRequest,
     config: RetrieverServiceConfig,
 ) -> dict[str, Any] | None:
-    must: list[dict[str, Any]] = []
-    if request.namespace:
-        must.append(_match_condition(config.payload_namespace_key, request.namespace))
-    if request.tenant_id:
-        must.append(_match_condition(config.payload_tenant_id_key, request.tenant_id))
-    if request.user_id:
-        must.append(_match_condition(config.payload_user_id_key, request.user_id))
-    if request.workspace_id:
-        must.append(_match_condition(config.payload_workspace_id_key, request.workspace_id))
-
+    must = _scope_filter_conditions(
+        config=config,
+        namespace=request.namespace,
+        tenant_id=request.tenant_id,
+        user_id=request.user_id,
+        workspace_id=request.workspace_id,
+    )
     raw_filters = request.filters if isinstance(request.filters, dict) else None
     if raw_filters:
         if any(
@@ -892,6 +1123,49 @@ def build_qdrant_filter(
     if not must:
         return None
     return {"must": must}
+
+
+def build_scope_filter(
+    *,
+    config: RetrieverServiceConfig,
+    namespace: str | None = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    extra_conditions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    must = _scope_filter_conditions(
+        config=config,
+        namespace=namespace,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    if extra_conditions:
+        must.extend(extra_conditions)
+    if not must:
+        return None
+    return {"must": must}
+
+
+def _scope_filter_conditions(
+    *,
+    config: RetrieverServiceConfig,
+    namespace: str | None,
+    tenant_id: str | None,
+    user_id: str | None,
+    workspace_id: str | None,
+) -> list[dict[str, Any]]:
+    must: list[dict[str, Any]] = []
+    if namespace:
+        must.append(_match_condition(config.payload_namespace_key, namespace))
+    if tenant_id:
+        must.append(_match_condition(config.payload_tenant_id_key, tenant_id))
+    if user_id:
+        must.append(_match_condition(config.payload_user_id_key, user_id))
+    if workspace_id:
+        must.append(_match_condition(config.payload_workspace_id_key, workspace_id))
+    return must
 
 
 def normalize_match(
@@ -932,6 +1206,143 @@ def normalize_match(
         metadata=metadata,
         source_uri=source_uri,
     )
+
+
+def _normalize_document_chunk(
+    point: dict[str, Any],
+    config: RetrieverServiceConfig,
+) -> DocumentChunk:
+    payload = point.get("payload")
+    payload_dict = dict(payload) if isinstance(payload, dict) else {}
+    chunk_id = str(point.get("id") or payload_dict.get("chunk_id") or "")
+    chunk_index_value = payload_dict.get("chunk_index")
+    chunk_index = chunk_index_value if isinstance(chunk_index_value, int) else None
+    return DocumentChunk(
+        chunk_id=chunk_id,
+        document_id=str(payload_dict.get(config.payload_document_id_key) or chunk_id),
+        source_uri=str(
+            payload_dict.get(config.payload_source_uri_key)
+            or payload_dict.get("path")
+            or payload_dict.get("source")
+            or payload_dict.get(config.payload_document_id_key)
+            or chunk_id
+        ),
+        text=str(payload_dict.get(config.payload_text_key) or ""),
+        chunk_index=chunk_index,
+        metadata=payload_dict,
+    )
+
+
+def _document_chunk_sort_key(point: dict[str, Any]) -> tuple[int, int, str]:
+    payload = point.get("payload")
+    payload_dict = dict(payload) if isinstance(payload, dict) else {}
+    chunk_index = payload_dict.get("chunk_index")
+    section_index = payload_dict.get("section_index")
+    return (
+        int(chunk_index) if isinstance(chunk_index, int) else 10**9,
+        int(section_index) if isinstance(section_index, int) else 10**9,
+        str(point.get("id") or ""),
+    )
+
+
+def _summarize_documents(
+    points: list[dict[str, Any]],
+    config: RetrieverServiceConfig,
+) -> list[DocumentSummary]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for point in points:
+        payload = point.get("payload")
+        payload_dict = dict(payload) if isinstance(payload, dict) else {}
+        document_id = str(
+            payload_dict.get(config.payload_document_id_key)
+            or payload_dict.get("doc_id")
+            or point.get("id")
+            or ""
+        ).strip()
+        if not document_id:
+            continue
+        grouped.setdefault(document_id, []).append(point)
+
+    summaries: list[DocumentSummary] = []
+    for document_id, document_points in grouped.items():
+        payload = document_points[0].get("payload")
+        payload_dict = dict(payload) if isinstance(payload, dict) else {}
+        indexed_candidates = [
+            str(point_payload.get("indexed_at") or "").strip()
+            for point_payload in (
+                dict(point.get("payload")) if isinstance(point.get("payload"), dict) else {}
+                for point in document_points
+            )
+            if str(point_payload.get("indexed_at") or "").strip()
+        ]
+        summaries.append(
+            DocumentSummary(
+                document_id=document_id,
+                source_uri=str(
+                    payload_dict.get(config.payload_source_uri_key)
+                    or payload_dict.get("path")
+                    or payload_dict.get("source")
+                    or document_id
+                ),
+                namespace=_maybe_str(payload_dict.get(config.payload_namespace_key)),
+                tenant_id=_maybe_str(payload_dict.get(config.payload_tenant_id_key)),
+                user_id=_maybe_str(payload_dict.get(config.payload_user_id_key)),
+                workspace_id=_maybe_str(payload_dict.get(config.payload_workspace_id_key)),
+                chunk_count=len(document_points),
+                chunking_strategy=_maybe_str(payload_dict.get("chunking_strategy")),
+                content_type=_maybe_str(payload_dict.get("content_type")),
+                filename=_maybe_str(payload_dict.get("filename")),
+                path=_maybe_str(payload_dict.get("path")),
+                repo=_maybe_str(payload_dict.get("repo")),
+                indexed_at=max(indexed_candidates) if indexed_candidates else None,
+                metadata=_document_summary_metadata(payload_dict, config),
+            )
+        )
+    return summaries
+
+
+def _document_summary_metadata(
+    payload: dict[str, Any],
+    config: RetrieverServiceConfig,
+) -> dict[str, Any]:
+    excluded = {
+        config.payload_text_key,
+        config.payload_document_id_key,
+        config.payload_source_uri_key,
+        config.payload_namespace_key,
+        config.payload_tenant_id_key,
+        config.payload_user_id_key,
+        config.payload_workspace_id_key,
+        "chunk_index",
+        "chunk_count",
+        "section_index",
+        "section_count",
+        "section_chunk_index",
+        "section_chunk_count",
+        "indexed_at",
+    }
+    metadata: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in excluded:
+            continue
+        metadata[key] = value
+    return metadata
+
+
+def _document_matches_query(document: DocumentSummary, query: str) -> bool:
+    haystack = " ".join(
+        part
+        for part in [
+            document.document_id,
+            document.source_uri,
+            document.filename or "",
+            document.path or "",
+            document.repo or "",
+            json.dumps(document.metadata, ensure_ascii=True, sort_keys=True),
+        ]
+        if part
+    ).lower()
+    return query in haystack
 
 
 _RERANK_STOPWORDS = {
@@ -1184,6 +1595,15 @@ def _match_condition(key: str, value: str | int | float | bool) -> dict[str, Any
 def _optional_str(value: str | None) -> str | None:
     if value is None:
         return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _maybe_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
     stripped = value.strip()
     return stripped or None
 

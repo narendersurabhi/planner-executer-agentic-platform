@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any
 
 from rag_retriever_core import (
+    DeleteDocumentRequest,
+    DocumentChunksRequest,
+    DocumentListRequest,
     EnsureCollectionRequest,
     IndexMarkdownRequest,
     IndexWorkspaceDirectoryRequest,
@@ -49,9 +52,11 @@ class _VectorDbStub:
 
     def __post_init__(self) -> None:
         self.query_calls: list[dict[str, Any]] = []
+        self.scroll_calls: list[dict[str, Any]] = []
         self.created_collections: list[dict[str, Any]] = []
         self.created_payload_indexes: list[dict[str, Any]] = []
         self.upsert_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[dict[str, Any]] = []
 
     def query(
         self,
@@ -79,6 +84,32 @@ class _VectorDbStub:
 
     def get_collection(self, collection: str) -> dict[str, Any] | None:
         return self.existing_collection
+
+    def scroll(
+        self,
+        *,
+        collection: str,
+        limit: int,
+        offset: str | int | None,
+        filter_obj: dict | None,
+        with_payload: bool,
+        vector_name: str | None,
+    ) -> tuple[list[dict[str, Any]], str | int | None]:
+        self.scroll_calls.append(
+            {
+                "collection": collection,
+                "limit": limit,
+                "offset": offset,
+                "filter_obj": filter_obj,
+                "with_payload": with_payload,
+                "vector_name": vector_name,
+            }
+        )
+        matched = [point for point in self.points if _matches_filter(point, filter_obj)]
+        start_index = int(offset) if isinstance(offset, int) else 0
+        batch = matched[start_index : start_index + limit]
+        next_offset = start_index + limit if start_index + limit < len(matched) else None
+        return batch, next_offset
 
     def create_collection(
         self,
@@ -133,6 +164,35 @@ class _VectorDbStub:
         points: list[dict[str, Any]],
     ) -> None:
         self.upsert_calls.append({"collection": collection, "points": points})
+
+    def delete_points(
+        self,
+        *,
+        collection: str,
+        filter_obj: dict[str, Any],
+    ) -> None:
+        self.delete_calls.append({"collection": collection, "filter_obj": filter_obj})
+        self.points = [point for point in self.points if not _matches_filter(point, filter_obj)]
+
+
+def _matches_filter(point: dict[str, Any], filter_obj: dict[str, Any] | None) -> bool:
+    if not isinstance(filter_obj, dict):
+        return True
+    must = filter_obj.get("must")
+    if not isinstance(must, list):
+        return True
+    payload = point.get("payload")
+    payload_dict = dict(payload) if isinstance(payload, dict) else {}
+    for condition in must:
+        if not isinstance(condition, dict):
+            continue
+        key = condition.get("key")
+        match = condition.get("match")
+        if not isinstance(key, str) or not isinstance(match, dict):
+            continue
+        if payload_dict.get(key) != match.get("value"):
+            return False
+    return True
 
 
 def _config(require_scope: bool = True) -> RetrieverServiceConfig:
@@ -339,6 +399,179 @@ def test_rerank_preserves_best_base_score_when_matches_are_ungrounded() -> None:
 
     assert [match.chunk_id for match in result.matches] == ["chunk-1", "chunk-2"]
     assert result.matches[0].rerank_score >= result.matches[1].rerank_score
+
+
+def test_list_documents_aggregates_chunks_into_document_summaries() -> None:
+    service = RetrieverService(
+        config=_config(),
+        embedder=_EmbedderStub([[0.1, 0.2, 0.3]]),
+        vector_db=_VectorDbStub(
+            [
+                {
+                    "id": "chunk-1",
+                    "payload": {
+                        "document_id": "docs/user-guide.md",
+                        "text": "Workflow Studio supports saved drafts.",
+                        "source_uri": "docs/user-guide.md",
+                        "user_id": "narendersurabhi",
+                        "namespace": "docs",
+                        "path": "docs/user-guide.md",
+                        "filename": "user-guide.md",
+                        "repo": "agentic-workflow-studio",
+                        "chunking_strategy": "markdown",
+                        "indexed_at": "2026-03-17T20:00:00+00:00",
+                    },
+                },
+                {
+                    "id": "chunk-2",
+                    "payload": {
+                        "document_id": "docs/user-guide.md",
+                        "text": "Published versions can be run manually.",
+                        "source_uri": "docs/user-guide.md",
+                        "user_id": "narendersurabhi",
+                        "namespace": "docs",
+                        "path": "docs/user-guide.md",
+                        "filename": "user-guide.md",
+                        "repo": "agentic-workflow-studio",
+                        "chunking_strategy": "markdown",
+                        "indexed_at": "2026-03-17T20:00:01+00:00",
+                    },
+                },
+                {
+                    "id": "chunk-3",
+                    "payload": {
+                        "document_id": "docs/rag-playbook.md",
+                        "text": "rag.retrieve reranks grounded chunks.",
+                        "source_uri": "docs/rag-playbook.md",
+                        "user_id": "narendersurabhi",
+                        "namespace": "docs",
+                        "path": "docs/rag-playbook.md",
+                        "filename": "rag-playbook.md",
+                        "repo": "agentic-workflow-studio",
+                        "chunking_strategy": "markdown",
+                        "indexed_at": "2026-03-17T19:59:59+00:00",
+                    },
+                },
+            ]
+        ),
+    )
+
+    result = service.list_documents(
+        DocumentListRequest(
+            user_id="narendersurabhi",
+            namespace="docs",
+            query="user-guide",
+        )
+    )
+
+    assert result.collection_name == "rag_default"
+    assert result.truncated is False
+    assert result.scanned_point_count == 3
+    assert len(result.documents) == 1
+    assert result.documents[0].document_id == "docs/user-guide.md"
+    assert result.documents[0].chunk_count == 2
+    assert result.documents[0].indexed_at == "2026-03-17T20:00:01+00:00"
+
+
+def test_get_document_chunks_returns_sorted_chunks() -> None:
+    service = RetrieverService(
+        config=_config(),
+        embedder=_EmbedderStub([[0.1, 0.2, 0.3]]),
+        vector_db=_VectorDbStub(
+            [
+                {
+                    "id": "chunk-2",
+                    "payload": {
+                        "document_id": "docs/user-guide.md",
+                        "text": "Second chunk",
+                        "source_uri": "docs/user-guide.md",
+                        "user_id": "narendersurabhi",
+                        "namespace": "docs",
+                        "chunk_index": 1,
+                        "path": "docs/user-guide.md",
+                    },
+                },
+                {
+                    "id": "chunk-1",
+                    "payload": {
+                        "document_id": "docs/user-guide.md",
+                        "text": "First chunk",
+                        "source_uri": "docs/user-guide.md",
+                        "user_id": "narendersurabhi",
+                        "namespace": "docs",
+                        "chunk_index": 0,
+                        "path": "docs/user-guide.md",
+                    },
+                },
+            ]
+        ),
+    )
+
+    result = service.get_document_chunks(
+        DocumentChunksRequest(
+            document_id="docs/user-guide.md",
+            user_id="narendersurabhi",
+            namespace="docs",
+        )
+    )
+
+    assert result.document.document_id == "docs/user-guide.md"
+    assert [chunk.chunk_id for chunk in result.chunks] == ["chunk-1", "chunk-2"]
+    assert result.chunks[0].chunk_index == 0
+
+
+def test_delete_document_removes_all_matching_points() -> None:
+    vector_db = _VectorDbStub(
+        [
+            {
+                "id": "chunk-1",
+                "payload": {
+                    "document_id": "docs/user-guide.md",
+                    "text": "First chunk",
+                    "source_uri": "docs/user-guide.md",
+                    "user_id": "narendersurabhi",
+                    "namespace": "docs",
+                },
+            },
+            {
+                "id": "chunk-2",
+                "payload": {
+                    "document_id": "docs/user-guide.md",
+                    "text": "Second chunk",
+                    "source_uri": "docs/user-guide.md",
+                    "user_id": "narendersurabhi",
+                    "namespace": "docs",
+                },
+            },
+            {
+                "id": "chunk-3",
+                "payload": {
+                    "document_id": "docs/rag-playbook.md",
+                    "text": "Other doc",
+                    "source_uri": "docs/rag-playbook.md",
+                    "user_id": "narendersurabhi",
+                    "namespace": "docs",
+                },
+            },
+        ]
+    )
+    service = RetrieverService(
+        config=_config(),
+        embedder=_EmbedderStub([[0.1, 0.2, 0.3]]),
+        vector_db=vector_db,
+    )
+
+    result = service.delete_document(
+        DeleteDocumentRequest(
+            document_id="docs/user-guide.md",
+            user_id="narendersurabhi",
+            namespace="docs",
+        )
+    )
+
+    assert result.deleted_chunk_count == 2
+    remaining_ids = [point["id"] for point in vector_db.points]
+    assert remaining_ids == ["chunk-3"]
 
 
 def test_index_workspace_file_reads_chunks_and_upserts(tmp_path: Path) -> None:

@@ -52,6 +52,80 @@ class RerankResponse(BaseModel):
     matches: list[RerankMatch]
 
 
+class DocumentListRequest(BaseModel):
+    collection_name: str | None = None
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    query: str | None = None
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class DocumentSummary(BaseModel):
+    document_id: str
+    source_uri: str
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    chunk_count: int
+    chunking_strategy: str | None = None
+    content_type: str | None = None
+    filename: str | None = None
+    path: str | None = None
+    repo: str | None = None
+    indexed_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentListResponse(BaseModel):
+    collection_name: str
+    truncated: bool = False
+    scanned_point_count: int = 0
+    documents: list[DocumentSummary]
+
+
+class DocumentChunksRequest(BaseModel):
+    collection_name: str | None = None
+    document_id: str = Field(min_length=1)
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    limit: int = Field(default=500, ge=1, le=2000)
+
+
+class DocumentChunk(BaseModel):
+    chunk_id: str
+    document_id: str
+    source_uri: str
+    text: str
+    chunk_index: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentChunksResponse(BaseModel):
+    collection_name: str
+    document: DocumentSummary
+    chunks: list[DocumentChunk]
+
+
+class DeleteDocumentRequest(BaseModel):
+    collection_name: str | None = None
+    document_id: str = Field(min_length=1)
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+
+
+class DeleteDocumentResponse(BaseModel):
+    collection_name: str
+    document_id: str
+    deleted_chunk_count: int
+
+
 class EnsureCollectionRequest(BaseModel):
     collection_name: str | None = None
     vector_size: int | None = Field(default=None, ge=1)

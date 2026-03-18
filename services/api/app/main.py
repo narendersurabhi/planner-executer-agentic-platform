@@ -12,6 +12,9 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Mapping, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 
 import redis
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -29,6 +32,7 @@ from libs.core import (
     events,
     intent_contract,
     logging as core_logging,
+    mcp_gateway,
     models,
     payload_resolver,
     state_machine,
@@ -343,6 +347,55 @@ def _build_chat_direct_executor() -> chat_execution_service.ChatDirectExecutor |
 
 
 _chat_direct_executor = _build_chat_direct_executor()
+
+
+def _rag_retriever_request_json(
+    path: str,
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    query: Mapping[str, Any] | None = None,
+    timeout_s: float = 20.0,
+) -> Any:
+    server = mcp_gateway.load_mcp_server_registry().get("rag_retriever_qdrant")
+    if server is None or not server.enabled:
+        raise HTTPException(status_code=503, detail="rag_retriever_service_unavailable")
+    url = f"{server.base_url.rstrip('/')}{path}"
+    if query:
+        normalized_query = {
+            key: value
+            for key, value in dict(query).items()
+            if value is not None and str(value).strip() != ""
+        }
+        if normalized_query:
+            url = f"{url}?{urlencode(normalized_query, doseq=True)}"
+    headers: dict[str, str] = {}
+    token = (
+        os.getenv(server.bearer_env, "").strip()
+        if isinstance(server.bearer_env, str) and server.bearer_env
+        else ""
+    )
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    request = UrlRequest(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            raw = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8") if exc.fp else str(exc)
+        raise HTTPException(status_code=exc.code, detail=f"rag_retriever_error:{detail}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=f"rag_retriever_unreachable:{exc}") from exc
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="rag_retriever_invalid_json") from exc
 
 
 def _init_db() -> None:
@@ -7395,6 +7448,235 @@ def search_semantic_memory(
         "matches": matches,
         "user_id": user_id,
     }
+
+
+@app.get("/rag/documents")
+def list_rag_documents(
+    collection_name: str | None = Query(None),
+    namespace: str | None = Query(None),
+    tenant_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+    workspace_id: str | None = Query(None),
+    query: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    result = _rag_retriever_request_json(
+        "/documents/list",
+        method="POST",
+        body={
+            "collection_name": collection_name,
+            "namespace": namespace,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "query": query,
+            "limit": limit,
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="rag_retriever_invalid_list_response")
+    return result
+
+
+@app.get("/rag/documents/chunks")
+def get_rag_document_chunks(
+    document_id: str = Query(..., min_length=1),
+    collection_name: str | None = Query(None),
+    namespace: str | None = Query(None),
+    tenant_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+    workspace_id: str | None = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict[str, Any]:
+    result = _rag_retriever_request_json(
+        "/documents/chunks",
+        method="POST",
+        body={
+            "document_id": document_id,
+            "collection_name": collection_name,
+            "namespace": namespace,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "limit": limit,
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="rag_retriever_invalid_chunks_response")
+    return result
+
+
+@app.delete("/rag/documents")
+def delete_rag_document(
+    document_id: str = Query(..., min_length=1),
+    collection_name: str | None = Query(None),
+    namespace: str | None = Query(None),
+    tenant_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+    workspace_id: str | None = Query(None),
+) -> dict[str, Any]:
+    result = _rag_retriever_request_json(
+        "/documents/delete",
+        method="POST",
+        body={
+            "document_id": document_id,
+            "collection_name": collection_name,
+            "namespace": namespace,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="rag_retriever_invalid_delete_response")
+    return result
+
+
+@app.post("/rag/index")
+def index_rag_document(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_rag_index_payload")
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in {"markdown", "text", "workspace_file", "workspace_directory"}:
+        raise HTTPException(status_code=400, detail="unsupported_rag_index_mode")
+    collection_name = payload.get("collection_name")
+    ensure_collection = bool(payload.get("ensure_collection", True))
+    namespace = payload.get("namespace")
+    tenant_id = payload.get("tenant_id")
+    user_id = payload.get("user_id")
+    workspace_id = payload.get("workspace_id")
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    result: Any
+    if mode == "markdown":
+        markdown_text = str(payload.get("markdown_text") or payload.get("content") or "").strip()
+        if not markdown_text:
+            raise HTTPException(status_code=400, detail="markdown_text_required")
+        result = _rag_retriever_request_json(
+            "/index/markdown",
+            method="POST",
+            body={
+                "markdown_text": markdown_text,
+                "collection_name": collection_name,
+                "ensure_collection": ensure_collection,
+                "document_id": payload.get("document_id"),
+                "source_uri": payload.get("source_uri"),
+                "namespace": namespace,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "workspace_id": workspace_id,
+                "chunk_size_chars": payload.get("chunk_size_chars"),
+                "chunk_overlap_chars": payload.get("chunk_overlap_chars"),
+                "max_chunks": payload.get("max_chunks"),
+                "metadata": metadata,
+            },
+        )
+    elif mode == "text":
+        text = str(payload.get("text") or payload.get("content") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="text_required")
+        document_id = str(
+            payload.get("document_id")
+            or payload.get("source_uri")
+            or f"manual/{uuid.uuid4()}"
+        ).strip()
+        result = _rag_retriever_request_json(
+            "/index/upsert_texts",
+            method="POST",
+            body={
+                "collection_name": collection_name,
+                "ensure_collection": ensure_collection,
+                "namespace": namespace,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "workspace_id": workspace_id,
+                "entries": [
+                    {
+                        "document_id": document_id,
+                        "text": text,
+                        "source_uri": payload.get("source_uri"),
+                        "metadata": metadata,
+                    }
+                ],
+            },
+        )
+    elif mode == "workspace_file":
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="path_required")
+        result = _rag_retriever_request_json(
+            "/index/workspace_file",
+            method="POST",
+            body={
+                "path": path,
+                "collection_name": collection_name,
+                "ensure_collection": ensure_collection,
+                "document_id": payload.get("document_id"),
+                "source_uri": payload.get("source_uri"),
+                "namespace": namespace,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "workspace_id": workspace_id,
+                "chunk_size_chars": payload.get("chunk_size_chars"),
+                "chunk_overlap_chars": payload.get("chunk_overlap_chars"),
+                "max_chunks": payload.get("max_chunks"),
+                "metadata": metadata,
+            },
+        )
+    else:
+        directory_path = str(payload.get("directory_path") or "").strip()
+        if not directory_path:
+            raise HTTPException(status_code=400, detail="directory_path_required")
+        result = _rag_retriever_request_json(
+            "/index/workspace_directory",
+            method="POST",
+            body={
+                "directory_path": directory_path,
+                "collection_name": collection_name,
+                "ensure_collection": ensure_collection,
+                "namespace": namespace,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "workspace_id": workspace_id,
+                "recursive": bool(payload.get("recursive", True)),
+                "extensions": payload.get("extensions"),
+                "max_files": payload.get("max_files"),
+                "chunk_size_chars": payload.get("chunk_size_chars"),
+                "chunk_overlap_chars": payload.get("chunk_overlap_chars"),
+                "max_chunks_per_file": payload.get("max_chunks_per_file"),
+                "metadata": metadata,
+            },
+        )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="rag_retriever_invalid_index_response")
+    return result
+
+
+@app.put("/rag/documents")
+def replace_rag_document(
+    document_id: str = Query(..., min_length=1),
+    payload: dict[str, Any] = Body(default_factory=dict),
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_rag_replace_payload")
+    delete_result = _rag_retriever_request_json(
+        "/documents/delete",
+        method="POST",
+        body={
+            "document_id": document_id,
+            "collection_name": payload.get("collection_name"),
+            "namespace": payload.get("namespace"),
+            "tenant_id": payload.get("tenant_id"),
+            "user_id": payload.get("user_id"),
+            "workspace_id": payload.get("workspace_id"),
+        },
+    )
+    if not isinstance(delete_result, dict):
+        raise HTTPException(status_code=502, detail="rag_retriever_invalid_delete_response")
+    normalized_payload = dict(payload)
+    normalized_payload["document_id"] = document_id
+    normalized_payload.setdefault("source_uri", document_id)
+    index_result = index_rag_document(normalized_payload)
+    return {"deleted": delete_result, "indexed": index_result}
 
 
 @app.get("/jobs/{job_id}/tasks/dlq", response_model=List[models.TaskDlqEntry])

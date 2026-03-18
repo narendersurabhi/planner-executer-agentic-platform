@@ -3558,3 +3558,170 @@ def test_retry_task_from_dlq_requires_failed_status():
     response = client.post(f"/jobs/{job_id}/tasks/{task_id}/retry", json={"stream_id": "100-0"})
     assert response.status_code == 400
     assert response.json()["detail"] == "Task is not failed"
+
+
+def test_list_rag_documents_proxies_to_retriever(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_rag_request(path: str, **kwargs: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(kwargs)
+        return {
+            "collection_name": "rag_default",
+            "truncated": False,
+            "scanned_point_count": 2,
+            "documents": [
+                {
+                    "document_id": "docs/user-guide.md",
+                    "source_uri": "docs/user-guide.md",
+                    "namespace": "docs",
+                    "user_id": "narendersurabhi",
+                    "chunk_count": 4,
+                    "metadata": {},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _fake_rag_request)
+
+    response = client.get(
+        "/rag/documents",
+        params={
+            "namespace": "docs",
+            "user_id": "narendersurabhi",
+            "query": "guide",
+            "limit": 25,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["documents"][0]["document_id"] == "docs/user-guide.md"
+    assert captured["path"] == "/documents/list"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {
+        "collection_name": None,
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+        "query": "guide",
+        "limit": 25,
+    }
+
+
+def test_index_rag_text_mode_builds_single_entry_upsert(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_rag_request(path: str, **kwargs: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(kwargs)
+        return {
+            "collection_name": "rag_default",
+            "upserted_count": 1,
+            "chunk_ids": ["chunk-1"],
+        }
+
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _fake_rag_request)
+
+    response = client.post(
+        "/rag/index",
+        json={
+            "mode": "text",
+            "collection_name": "rag_default",
+            "namespace": "docs",
+            "user_id": "narendersurabhi",
+            "document_id": "manual/doc-1",
+            "source_uri": "manual/doc-1",
+            "text": "Agentic Workflow Studio ships a visual DAG editor.",
+            "metadata": {"doc_type": "note"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["upserted_count"] == 1
+    assert captured["path"] == "/index/upsert_texts"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {
+        "collection_name": "rag_default",
+        "ensure_collection": True,
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+        "entries": [
+            {
+                "document_id": "manual/doc-1",
+                "text": "Agentic Workflow Studio ships a visual DAG editor.",
+                "source_uri": "manual/doc-1",
+                "metadata": {"doc_type": "note"},
+            }
+        ],
+    }
+
+
+def test_replace_rag_document_deletes_then_reindexes(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_rag_request(path: str, **kwargs: object) -> dict[str, object]:
+        calls.append((path, dict(kwargs)))
+        if path == "/documents/delete":
+            return {
+                "collection_name": "rag_default",
+                "document_id": "docs/user-guide.md",
+                "deleted_chunk_count": 3,
+            }
+        if path == "/index/markdown":
+            return {
+                "collection_name": "rag_default",
+                "document_id": "docs/user-guide.md",
+                "source_uri": "docs/user-guide.md",
+                "section_count": 2,
+                "chunk_count": 3,
+                "upserted_count": 3,
+                "chunk_ids": ["c1", "c2", "c3"],
+            }
+        raise AssertionError(f"Unexpected path: {path}")
+
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _fake_rag_request)
+
+    response = client.put(
+        "/rag/documents",
+        params={"document_id": "docs/user-guide.md"},
+        json={
+            "mode": "markdown",
+            "collection_name": "rag_default",
+            "namespace": "docs",
+            "user_id": "narendersurabhi",
+            "markdown_text": "# User Guide\n\nUpdated content.",
+            "metadata": {"doc_type": "markdown"},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"]["deleted_chunk_count"] == 3
+    assert body["indexed"]["upserted_count"] == 3
+    assert [path for path, _kwargs in calls] == ["/documents/delete", "/index/markdown"]
+    assert calls[0][1]["body"] == {
+        "document_id": "docs/user-guide.md",
+        "collection_name": "rag_default",
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+    }
+    assert calls[1][1]["body"] == {
+        "markdown_text": "# User Guide\n\nUpdated content.",
+        "collection_name": "rag_default",
+        "ensure_collection": True,
+        "document_id": "docs/user-guide.md",
+        "source_uri": "docs/user-guide.md",
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+        "chunk_size_chars": None,
+        "chunk_overlap_chars": None,
+        "max_chunks": None,
+        "metadata": {"doc_type": "markdown"},
+    }

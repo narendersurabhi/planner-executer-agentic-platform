@@ -6591,10 +6591,10 @@ const openTemplateModal = (template: Template) => {
           <ScreenHeader
             eyebrow="Agentic Workflow Studio"
             title="Welcome"
-            description="Choose the surface you want to work in. Compose, Chat, Workflow Studio, and Memory each open as dedicated screens in the same planner-executor workflow platform."
+            description="Choose the surface you want to work in. Compose, Chat, Workflow Studio, RAG, and Memory each open as dedicated screens in the same planner-executor workflow platform."
             activeScreen="home"
           >
-            <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+            <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-5">
                 <Link
                   href="/compose"
                   className="group rounded-3xl border border-white/15 bg-white/10 p-6 transition hover:bg-white/15"
@@ -6642,6 +6642,22 @@ const openTemplateModal = (template: Template) => {
                     Inspect and edit user-scoped memory entries like profile data and semantic facts.
                   </p>
                   <div className="mt-6 text-sm font-semibold text-white">Open Memory</div>
+                </Link>
+                <Link
+                  href="/rag"
+                  className="group rounded-3xl border border-white/15 bg-white/10 p-6 transition hover:bg-white/15"
+                >
+                  <div className="text-xs font-semibold uppercase tracking-[0.24em] text-cyan-200">
+                    RAG
+                  </div>
+                  <h2 className="mt-4 font-display text-2xl text-white">
+                    Manage indexed knowledge.
+                  </h2>
+                  <p className="mt-3 text-sm text-slate-200">
+                    Index markdown, text, and workspace content into the vector store, then inspect
+                    and update stored documents.
+                  </p>
+                  <div className="mt-6 text-sm font-semibold text-white">Open RAG</div>
                 </Link>
             </div>
           </ScreenHeader>

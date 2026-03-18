@@ -1,5 +1,13 @@
 from .errors import RetrieverError
 from .models import (
+    DeleteDocumentRequest,
+    DeleteDocumentResponse,
+    DocumentChunk,
+    DocumentChunksRequest,
+    DocumentChunksResponse,
+    DocumentListRequest,
+    DocumentListResponse,
+    DocumentSummary,
     EnsureCollectionRequest,
     EnsureCollectionResponse,
     IndexMarkdownRequest,
@@ -29,6 +37,14 @@ from .service import (
 )
 
 __all__ = [
+    "DeleteDocumentRequest",
+    "DeleteDocumentResponse",
+    "DocumentChunk",
+    "DocumentChunksRequest",
+    "DocumentChunksResponse",
+    "DocumentListRequest",
+    "DocumentListResponse",
+    "DocumentSummary",
     "EnsureCollectionRequest",
     "EnsureCollectionResponse",
     "IndexMarkdownRequest",
