@@ -48,6 +48,8 @@ from libs.core.llm_provider import (
 )
 from .database import Base, SessionLocal, engine
 from .models import (
+    ChatMessageRecord,
+    ChatSessionRecord,
     EventOutboxRecord,
     JobRecord,
     PlanRecord,
@@ -6612,6 +6614,12 @@ def _refresh_job_status(job_id: str) -> None:
                 tasks=tasks,
                 status=next_status,
             )
+            _deliver_chat_workflow_terminal_message(
+                db,
+                job=job,
+                tasks=tasks,
+                status=next_status,
+            )
         job.updated_at = now
         db.commit()
 
@@ -6620,6 +6628,365 @@ def _set_job_status(job: JobRecord, status: models.JobStatus) -> None:
     current = models.JobStatus(job.status)
     if state_machine.validate_job_transition(current, status):
         job.status = status.value
+
+
+def _deliver_chat_workflow_terminal_message(
+    db: Session,
+    *,
+    job: JobRecord,
+    tasks: Sequence[TaskRecord],
+    status: models.JobStatus,
+) -> None:
+    if status not in {
+        models.JobStatus.succeeded,
+        models.JobStatus.failed,
+        models.JobStatus.canceled,
+    }:
+        return
+    metadata = dict(job.metadata_json) if isinstance(job.metadata_json, dict) else {}
+    if metadata.get("chat_workflow_terminal_message_id"):
+        return
+    workflow_run = (
+        db.query(WorkflowRunRecord)
+        .filter(WorkflowRunRecord.job_id == job.id)
+        .order_by(WorkflowRunRecord.created_at.desc())
+        .first()
+    )
+    if workflow_run is None:
+        return
+    run_metadata = dict(workflow_run.metadata_json or {})
+    chat_session_id = str(run_metadata.get("chat_session_id") or "").strip()
+    if not chat_session_id:
+        return
+    session = db.query(ChatSessionRecord).filter(ChatSessionRecord.id == chat_session_id).first()
+    if session is None:
+        return
+    version = (
+        db.query(WorkflowVersionRecord)
+        .filter(WorkflowVersionRecord.id == workflow_run.version_id)
+        .first()
+    )
+    content = _build_chat_workflow_terminal_message(
+        job=job,
+        tasks=tasks,
+        workflow_run=workflow_run,
+        workflow_version=version,
+        status=status,
+    )
+    if not content:
+        return
+    now = _utcnow()
+    workflow_run_model = _workflow_run_from_record(workflow_run, job_record=job)
+    message = ChatMessageRecord(
+        id=str(uuid.uuid4()),
+        session_id=session.id,
+        role=chat_contracts.ChatRole.assistant.value,
+        content=content,
+        metadata_json={
+            "workflow_run": workflow_run_model.model_dump(mode="json", exclude_none=True),
+            "workflow_delivery": {
+                "source": "workflow_terminal_message",
+                "job_status": status.value,
+            },
+        },
+        action_json=None,
+        job_id=job.id,
+        created_at=now,
+    )
+    db.add(message)
+    session_metadata = dict(session.metadata_json or {})
+    if str(session_metadata.get("active_job_id") or "").strip() == job.id:
+        session_metadata.pop("active_job_id", None)
+    if str(session_metadata.get("active_workflow_run_id") or "").strip() == workflow_run.id:
+        session_metadata.pop("active_workflow_run_id", None)
+    session.metadata_json = session_metadata
+    session.updated_at = now
+    metadata["chat_workflow_terminal_message_at"] = now.isoformat()
+    metadata["chat_workflow_terminal_message_id"] = message.id
+    job.metadata_json = metadata
+
+
+def _build_chat_workflow_terminal_message(
+    *,
+    job: JobRecord,
+    tasks: Sequence[TaskRecord],
+    workflow_run: WorkflowRunRecord,
+    workflow_version: WorkflowVersionRecord | None,
+    status: models.JobStatus,
+) -> str:
+    workflow_title = str(workflow_run.title or workflow_run.goal or "Workflow").strip() or "Workflow"
+    if status == models.JobStatus.succeeded:
+        payload = _resolve_chat_workflow_success_payload(
+            job=job,
+            tasks=tasks,
+            workflow_version=workflow_version,
+        )
+        rendered = _render_chat_workflow_payload(payload)
+        if rendered:
+            return rendered
+        return f"Workflow `{workflow_title}` completed."
+    if status == models.JobStatus.canceled:
+        return f"Workflow `{workflow_title}` was canceled."
+    failure_detail = _chat_workflow_failure_detail(tasks)
+    if failure_detail:
+        return f"Workflow `{workflow_title}` failed.\n\n{failure_detail}"
+    return f"Workflow `{workflow_title}` failed."
+
+
+def _resolve_chat_workflow_success_payload(
+    *,
+    job: JobRecord,
+    tasks: Sequence[TaskRecord],
+    workflow_version: WorkflowVersionRecord | None,
+) -> Any:
+    workflow_outputs = _resolve_chat_workflow_interface_outputs(
+        job=job,
+        tasks=tasks,
+        workflow_version=workflow_version,
+    )
+    if workflow_outputs:
+        if len(workflow_outputs) == 1:
+            return next(iter(workflow_outputs.values()))
+        return workflow_outputs
+    ordered_tasks = sorted(
+        tasks,
+        key=lambda task: (task.created_at or datetime.min.replace(tzinfo=UTC), task.id),
+    )
+    for task in reversed(ordered_tasks):
+        task_result = _load_task_result(task.id)
+        preferred = _extract_chat_workflow_preferred_payload(task_result.get("outputs"))
+        if preferred is not None:
+            return preferred
+        tool_calls = task_result.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in reversed(tool_calls):
+                if not isinstance(call, Mapping):
+                    continue
+                preferred = _extract_chat_workflow_preferred_payload(call.get("output_or_error"))
+                if preferred is not None:
+                    return preferred
+    return None
+
+
+def _resolve_chat_workflow_interface_outputs(
+    *,
+    job: JobRecord,
+    tasks: Sequence[TaskRecord],
+    workflow_version: WorkflowVersionRecord | None,
+) -> dict[str, Any]:
+    if workflow_version is None or not isinstance(workflow_version.draft_json, dict):
+        return {}
+    workflow_interface, workflow_interface_errors, _workflow_interface_warnings = (
+        _coerce_workflow_interface(
+            workflow_version.draft_json.get("workflowInterface")
+            if "workflowInterface" in workflow_version.draft_json
+            else workflow_version.draft_json.get("workflow_interface")
+        )
+    )
+    if workflow_interface_errors:
+        return {}
+    output_defs = workflow_interface.get("outputs", [])
+    if not isinstance(output_defs, list) or not output_defs:
+        return {}
+    job_context = job.context_json if isinstance(job.context_json, dict) else {}
+    workflow_payload = (
+        dict(job_context.get("workflow"))
+        if isinstance(job_context.get("workflow"), Mapping)
+        else {}
+    )
+    task_outputs_by_name = {
+        task.name: _load_task_output(task.id)
+        for task in sorted(tasks, key=lambda item: (item.created_at, item.id))
+    }
+    task_names_by_node_id = _workflow_task_names_by_node_id(workflow_version.draft_json)
+    resolved: dict[str, Any] = {}
+    for output_def in output_defs:
+        if not isinstance(output_def, Mapping):
+            continue
+        key = str(output_def.get("key") or "").strip()
+        if not key:
+            continue
+        value = _resolve_chat_workflow_output_binding(
+            output_def.get("binding"),
+            job_context=job_context,
+            workflow_payload=workflow_payload,
+            task_outputs_by_name=task_outputs_by_name,
+            task_names_by_node_id=task_names_by_node_id,
+        )
+        if value is not None:
+            resolved[key] = value
+    return resolved
+
+
+def _resolve_chat_workflow_output_binding(
+    binding: Any,
+    *,
+    job_context: Mapping[str, Any],
+    workflow_payload: Mapping[str, Any],
+    task_outputs_by_name: Mapping[str, Any],
+    task_names_by_node_id: Mapping[str, str],
+) -> Any:
+    if not isinstance(binding, Mapping):
+        return None
+    kind = str(binding.get("kind") or "").strip()
+    if kind == "literal":
+        return binding.get("value")
+    if kind == "context":
+        return _get_nested_value(job_context, _split_reference_path(str(binding.get("path") or "")))
+    if kind == "workflow_input":
+        key = str(binding.get("input_key") or "").strip()
+        inputs = workflow_payload.get("inputs")
+        return inputs.get(key) if isinstance(inputs, Mapping) else None
+    if kind == "workflow_variable":
+        key = str(binding.get("variable_key") or "").strip()
+        variables = workflow_payload.get("variables")
+        return variables.get(key) if isinstance(variables, Mapping) else None
+    if kind == "step_output":
+        source_node_id = str(binding.get("source_node_id") or "").strip()
+        source_path = str(binding.get("source_path") or "").strip()
+        task_name = task_names_by_node_id.get(source_node_id)
+        if not task_name or not source_path:
+            return None
+        task_output = task_outputs_by_name.get(task_name)
+        if not isinstance(task_output, Mapping):
+            return None
+        return _get_nested_value(task_output, _split_reference_path(source_path))
+    return None
+
+
+def _workflow_task_names_by_node_id(draft_json: Mapping[str, Any]) -> dict[str, str]:
+    raw_nodes = draft_json.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return {}
+    task_names: dict[str, str] = {}
+    for index, raw_node in enumerate(raw_nodes):
+        if not isinstance(raw_node, Mapping):
+            continue
+        node_id = str(raw_node.get("id") or "").strip()
+        if not node_id:
+            continue
+        capability_id = str(
+            raw_node.get("capabilityId") or raw_node.get("capability_id") or ""
+        ).strip()
+        task_name = str(raw_node.get("taskName") or raw_node.get("task_name") or "").strip()
+        if not task_name:
+            task_name = _composer_default_task_name(capability_id, index)
+        task_names[node_id] = task_name
+    return task_names
+
+
+def _extract_chat_workflow_preferred_payload(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "markdown", "message", "summary", "result"):
+            if key in value:
+                preferred = _extract_chat_workflow_preferred_payload(value.get(key))
+                if preferred is not None:
+                    return preferred
+        if len(value) == 1:
+            only_value = next(iter(value.values()))
+            preferred = _extract_chat_workflow_preferred_payload(only_value)
+            if preferred is not None:
+                return preferred
+        return value
+    if isinstance(value, list):
+        if not value:
+            return None
+        if len(value) == 1:
+            preferred = _extract_chat_workflow_preferred_payload(value[0])
+            if preferred is not None:
+                return preferred
+        return value
+    return str(value)
+
+
+def _render_chat_workflow_payload(value: Any, *, max_chars: int = 4000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _truncate_chat_workflow_text(value.strip(), max_chars=max_chars)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, Mapping):
+        preferred = _extract_chat_workflow_preferred_payload(value)
+        if preferred is not None and preferred is not value:
+            return _render_chat_workflow_payload(preferred, max_chars=max_chars)
+        items = value.get("items")
+        if isinstance(items, list) and items:
+            lines: list[str] = []
+            for item in items[:10]:
+                if isinstance(item, Mapping):
+                    label = (
+                        str(
+                            item.get("text")
+                            or item.get("title")
+                            or item.get("name")
+                            or item.get("path")
+                            or item.get("id")
+                            or ""
+                        ).strip()
+                    )
+                    if not label:
+                        label = json.dumps(dict(item), ensure_ascii=True)
+                else:
+                    label = str(item).strip()
+                if label:
+                    lines.append(f"- {label}")
+            if lines:
+                return _truncate_chat_workflow_text("\n".join(lines), max_chars=max_chars)
+        rendered = json.dumps(dict(value), ensure_ascii=True, indent=2)
+        return _truncate_chat_workflow_text(rendered, max_chars=max_chars)
+    if isinstance(value, list):
+        lines = [
+            _render_chat_workflow_payload(item, max_chars=max_chars // 2).strip()
+            for item in value[:10]
+        ]
+        lines = [line for line in lines if line]
+        if not lines:
+            return ""
+        if all("\n" not in line for line in lines):
+            return _truncate_chat_workflow_text(
+                "\n".join(f"- {line}" for line in lines),
+                max_chars=max_chars,
+            )
+        rendered = json.dumps(list(value[:10]), ensure_ascii=True, indent=2)
+        return _truncate_chat_workflow_text(rendered, max_chars=max_chars)
+    return _truncate_chat_workflow_text(str(value), max_chars=max_chars)
+
+
+def _truncate_chat_workflow_text(value: str, *, max_chars: int) -> str:
+    normalized = str(value or "").strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[:max_chars].rstrip()}\n\n[truncated]"
+
+
+def _chat_workflow_failure_detail(tasks: Sequence[TaskRecord]) -> str:
+    ordered_tasks = sorted(
+        tasks,
+        key=lambda task: (task.updated_at or task.created_at, task.id),
+    )
+    for task in reversed(ordered_tasks):
+        task_result = _load_task_result(task.id)
+        error = str(task_result.get("error") or "").strip()
+        if error:
+            return f"Task `{task.name}` failed: {error}"
+        outputs = task_result.get("outputs")
+        if isinstance(outputs, Mapping):
+            tool_error = outputs.get("tool_error")
+            if isinstance(tool_error, Mapping):
+                message = str(tool_error.get("error") or "").strip()
+                if message:
+                    return f"Task `{task.name}` failed: {message}"
+    return ""
 
 
 def _parse_task_dlq_entry(stream_id: str, record: Mapping[str, str]) -> models.TaskDlqEntry | None:

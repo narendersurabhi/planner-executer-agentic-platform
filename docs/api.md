@@ -165,6 +165,12 @@ chat is waiting on a workflow input and the user replies with `use default`,
 `leave blank`, or `skip it`, chat leaves that input unset so the workflow can
 fall back to its own defaults or optional behavior when possible.
 
+When a chat-started workflow reaches a terminal state, the chat session also
+receives a follow-up assistant message. On success, chat prefers declared
+workflow-interface outputs and otherwise falls back to the last task output that
+looks displayable (for example generated text). On failure, chat posts a short
+failure summary.
+
 To run a published Studio workflow from chat, provide a workflow reference in
 `context_json` using one of:
 

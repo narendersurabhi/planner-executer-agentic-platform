@@ -2025,6 +2025,7 @@ function HomeContent() {
   const [selectedTasks, setSelectedTasks] = useState<Task[]>([]);
   const [taskResults, setTaskResults] = useState<Record<string, TaskResult>>({});
   const selectedJobIdRef = useRef<string | null>(null);
+  const chatSessionRef = useRef<ChatSession | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [jobDebugger, setJobDebugger] = useState<JobDebuggerPayload | null>(null);
@@ -2435,6 +2436,10 @@ function HomeContent() {
   useEffect(() => {
     selectedJobIdRef.current = selectedJobId;
   }, [selectedJobId]);
+
+  useEffect(() => {
+    chatSessionRef.current = chatSession;
+  }, [chatSession]);
 
   useEffect(() => {
     const node = chatTranscriptRef.current;
@@ -5315,7 +5320,7 @@ function HomeContent() {
         const envelope = JSON.parse(event.data) as EventEnvelope;
         setEvents((prev) => [envelope, ...prev].slice(0, 50));
         const activeJobId = selectedJobIdRef.current;
-        if (!activeJobId || !envelope?.type) {
+        if (!envelope?.type) {
           return;
         }
         if (envelope.type === "task.heartbeat") {
@@ -5326,7 +5331,19 @@ function HomeContent() {
           (typeof envelope.payload?.job_id === "string" && envelope.payload.job_id) ||
           (typeof envelope.payload?.id === "string" && envelope.payload.id) ||
           null;
-        if (payloadJobId && payloadJobId === activeJobId) {
+        const activeChatSession = chatSessionRef.current;
+        if (
+          activeChatSession?.id &&
+          activeChatSession.active_job_id &&
+          payloadJobId &&
+          payloadJobId === activeChatSession.active_job_id &&
+          (envelope.type === "task.completed" || envelope.type === "task.failed")
+        ) {
+          window.setTimeout(() => {
+            void loadChatSession(activeChatSession.id);
+          }, 250);
+        }
+        if (activeJobId && payloadJobId && payloadJobId === activeJobId) {
           loadJobDetails(activeJobId);
         }
       } catch {
@@ -6086,6 +6103,15 @@ const openTemplateModal = (template: Template) => {
     setChatError(null);
   };
 
+  const loadChatSession = async (sessionId: string) => {
+    const response = await fetch(`${apiUrl}/chat/sessions/${encodeURIComponent(sessionId)}`);
+    if (!response.ok) {
+      return;
+    }
+    const session = (await response.json()) as ChatSession;
+    setChatSession(session);
+  };
+
   const submitChatTurn = async () => {
     const content = chatInput.trim();
     if (!content) {
@@ -6146,14 +6172,17 @@ const openTemplateModal = (template: Template) => {
     setJobDetailsIntentGraphCollapsed(true);
     setShowDebugger(false);
     setDebuggerActionNotice(null);
+    let terminalJobStatus: string | null = null;
 
     const detailsResult = await fetchJson(`${apiUrl}/jobs/${jobId}/details`);
     if (detailsResult.ok && detailsResult.data && typeof detailsResult.data === "object") {
       const payload = detailsResult.data as JobDetailsPayload;
-      setSelectedJobStatus(
+      terminalJobStatus =
         typeof payload.job_status === "string" && payload.job_status.trim()
           ? payload.job_status.trim()
-          : null
+          : null;
+      setSelectedJobStatus(
+        terminalJobStatus
       );
       setSelectedJobPlanError(
         typeof payload.job_error === "string" && payload.job_error.trim()
@@ -6179,6 +6208,17 @@ const openTemplateModal = (template: Template) => {
     }
 
     await Promise.all([loadMemoryEntries(jobId), loadDlqEntries(jobId), loadJobDebugger(jobId)]);
+
+    const currentChatSession = chatSessionRef.current;
+    if (
+      currentChatSession?.id &&
+      currentChatSession.active_job_id === jobId &&
+      (terminalJobStatus === "succeeded" ||
+        terminalJobStatus === "failed" ||
+        terminalJobStatus === "canceled")
+    ) {
+      await loadChatSession(currentChatSession.id);
+    }
 
     setDetailsLoading(false);
   };

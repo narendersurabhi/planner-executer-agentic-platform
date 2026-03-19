@@ -97,6 +97,7 @@ Practical notes:
   - `workflow_definition_id`
 - If the target workflow has required workflow-interface inputs that are still missing, chat asks follow-up clarification questions before starting the run.
 - When chat is waiting on one workflow input, the user can reply with `use default`, `leave blank`, or `skip it` to leave that input unset and let workflow defaults or optional behavior apply when available.
+- When a chat-started workflow finishes, chat appends a final assistant message with the workflow result when it can resolve one cleanly. Declared workflow outputs win; otherwise chat falls back to a displayable last-step output such as generated text.
 - Non-control fields in `context_json` are passed through as workflow run context. Use `workflow_inputs` for workflow interface inputs and `workflow_context_json` for explicit context overrides.
 - If a request needs a multi-step workflow, chat creates a job instead of improvising a hidden workflow.
 - If you enable context attachment, Compose context is sent along with the chat turn.

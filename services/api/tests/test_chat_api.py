@@ -135,6 +135,95 @@ def test_chat_turn_can_run_published_workflow_by_version_reference() -> None:
     assert body["assistant_message"]["metadata"]["workflow_run"]["id"] == body["workflow_run"]["id"]
 
 
+def test_chat_started_workflow_posts_terminal_output_back_into_session(monkeypatch) -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Chat workflow reply",
+            "goal": "Return generated text to chat",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Chat workflow reply",
+                "workflowInterface": {
+                    "inputs": [],
+                    "variables": [],
+                    "outputs": [
+                        {
+                            "key": "reply",
+                            "label": "Reply",
+                            "binding": {
+                                "kind": "step_output",
+                                "sourceNodeId": "n1",
+                                "sourcePath": "result.text",
+                            },
+                        }
+                    ],
+                },
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "GenerateReply",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Run the chat reply workflow",
+            "context_json": {"workflow_version_id": version["id"]},
+            "priority": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    job_id = body["job"]["id"]
+
+    tasks_response = client.get(f"/jobs/{job_id}/tasks")
+    assert tasks_response.status_code == 200
+    task_id = tasks_response.json()[0]["id"]
+    monkeypatch.setattr(
+        main,
+        "_load_task_output",
+        lambda current_task_id: (
+            {"result": {"text": "Workflow generated answer."}} if current_task_id == task_id else {}
+        ),
+    )
+
+    main._handle_task_completed(
+        {
+            "task_id": task_id,
+            "payload": {
+                "task_id": task_id,
+                "outputs": {"result": {"text": "Workflow generated answer."}},
+            },
+        }
+    )
+
+    session_response = client.get(f"/chat/sessions/{session['id']}")
+    assert session_response.status_code == 200
+    session_body = session_response.json()
+    assert session_body["active_job_id"] is None
+    assert len(session_body["messages"]) == 3
+    assert session_body["messages"][-1]["role"] == "assistant"
+    assert session_body["messages"][-1]["content"] == "Workflow generated answer."
+    assert session_body["messages"][-1]["job_id"] == job_id
+
+
 def test_chat_turn_asks_for_missing_workflow_input_and_uses_followup_reply() -> None:
     create_response = client.post(
         "/workflows/definitions",
