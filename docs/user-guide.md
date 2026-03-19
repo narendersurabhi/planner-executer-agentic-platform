@@ -85,11 +85,19 @@ Chat can currently resolve a turn into one of these modes:
 - `respond`: normal conversation, no tool or workflow
 - `tool_call`: direct safe read-only capability execution
 - `ask_clarification`: the request likely needs execution, but more detail is needed
+- `run_workflow`: invoke an already published Studio workflow when chat already has a workflow reference
 - `submit_job`: create a normal job and let the platform run it
 
 Practical notes:
 
 - Chat only uses direct tools for bounded, safe, usually read-only actions.
+- Chat can start a published Studio workflow directly when `context_json` includes one of:
+  - `workflow_trigger_id`
+  - `workflow_version_id`
+  - `workflow_definition_id`
+- If the target workflow has required workflow-interface inputs that are still missing, chat asks follow-up clarification questions before starting the run.
+- When chat is waiting on one workflow input, the user can reply with `use default`, `leave blank`, or `skip it` to leave that input unset and let workflow defaults or optional behavior apply when available.
+- Non-control fields in `context_json` are passed through as workflow run context. Use `workflow_inputs` for workflow interface inputs and `workflow_context_json` for explicit context overrides.
 - If a request needs a multi-step workflow, chat creates a job instead of improvising a hidden workflow.
 - If you enable context attachment, Compose context is sent along with the chat turn.
 

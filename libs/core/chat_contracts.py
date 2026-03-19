@@ -20,6 +20,7 @@ class AssistantActionType(str, Enum):
     tool_call = "tool_call"
     ask_clarification = "ask_clarification"
     submit_job = "submit_job"
+    run_workflow = "run_workflow"
     attach_to_job = "attach_to_job"
     summarize_job = "summarize_job"
 
@@ -28,6 +29,10 @@ class AssistantAction(BaseModel):
     type: AssistantActionType
     goal: str | None = None
     job_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_definition_id: str | None = None
+    workflow_version_id: str | None = None
+    workflow_trigger_id: str | None = None
     capability_id: str | None = None
     tool_name: str | None = None
     clarification_questions: list[str] = Field(default_factory=list)
@@ -74,3 +79,4 @@ class ChatTurnResponse(BaseModel):
     user_message: ChatMessage
     assistant_message: ChatMessage
     job: models.Job | None = None
+    workflow_run: models.WorkflowRun | None = None

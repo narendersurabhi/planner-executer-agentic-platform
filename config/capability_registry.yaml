@@ -1158,6 +1158,27 @@ capabilities:
         tool_name: llm_generate
         arg_map: {}
         enabled: true
+  - id: llm.prompt.generate
+    description: Generate free-form text from an explicit prompt and context payload.
+    risk_tier: read_only
+    idempotency: read
+    group: llm
+    subgroup: prompt
+    input_schema_ref: llm_prompt_generate_capability_input
+    output_schema_ref: llm_prompt_generate_capability_output
+    tags:
+      - llm
+      - prompt
+      - context
+      - generation
+      - high_cost
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_generate_with_context
+        arg_map: {}
+        enabled: true
   - id: codegen.generate
     description: Generate code changes using the coding agent service.
     risk_tier: high_risk

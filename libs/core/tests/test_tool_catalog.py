@@ -21,6 +21,22 @@ def test_register_default_tools_adds_builtin_specs() -> None:
     assert "docx_generate_from_spec" in specs
 
 
+def test_register_default_tools_adds_llm_contextual_tool_when_enabled() -> None:
+    registry = ToolRegistry()
+
+    tool_catalog.register_default_tools(
+        registry,
+        handlers=tool_registry._default_catalog_handlers(),
+        http_fetch_enabled=False,
+        llm_enabled=True,
+        llm_provider=tool_registry.LLMProvider(),
+    )
+
+    specs = {spec.name for spec in registry.list_specs()}
+    assert "llm_generate" in specs
+    assert "llm_generate_with_context" in specs
+
+
 def test_register_default_tools_requires_provider_when_llm_enabled() -> None:
     registry = ToolRegistry()
 

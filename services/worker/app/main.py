@@ -113,7 +113,7 @@ SEMANTIC_MEMORY_AUTO_WRITE_TOOL_PATTERNS = [
     for value in os.getenv(
         "SEMANTIC_MEMORY_AUTO_WRITE_TOOLS",
         "llm.text.generate,document.spec.generate,document.spec.improve,"
-        "document.spec.generate_iterative,llm_generate,llm_generate_document_spec,"
+        "document.spec.generate_iterative,llm.prompt.generate,llm_generate,llm_generate_with_context,llm_generate_document_spec,"
         "llm_improve_document_spec,llm_iterative_improve_document_spec,openapi.iterative.improve",
     ).split(",")
     if value.strip()

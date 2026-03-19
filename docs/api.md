@@ -154,7 +154,30 @@ Important response behavior:
 - chat may return a conversational assistant response only
 - chat may return a direct `tool_call` action for safe read-only capabilities
 - chat may ask for clarification
+- chat may return a `run_workflow` action and start a published Studio workflow directly
 - chat may create and attach to a durable job
+
+When chat targets a published workflow and required workflow-interface inputs are
+missing, the assistant returns `ask_clarification` first. The follow-up turn can
+provide those values through `context_json.workflow_inputs`, matching top-level
+context keys, or a plain-text answer when only one workflow input is pending. If
+chat is waiting on a workflow input and the user replies with `use default`,
+`leave blank`, or `skip it`, chat leaves that input unset so the workflow can
+fall back to its own defaults or optional behavior when possible.
+
+To run a published Studio workflow from chat, provide a workflow reference in
+`context_json` using one of:
+
+- `workflow_trigger_id`
+- `workflow_version_id`
+- `workflow_definition_id`
+
+Optional chat workflow fields:
+
+- `workflow_inputs`: workflow interface inputs for the run
+- `workflow_context_json`: explicit workflow context overrides
+- `workflow_run_metadata`: metadata attached to the workflow run record
+- `workflow_idempotency_key`: idempotency key forwarded to job creation
 
 ## 5. Workflow Studio API
 

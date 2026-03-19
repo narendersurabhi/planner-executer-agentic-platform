@@ -330,6 +330,7 @@ def _default_catalog_handlers() -> tool_catalog.ToolCatalogHandlers:
         resolve_coding_agent_timeout_s=_resolve_coding_agent_timeout_s,
         resolve_llm_iterative_timeout_s=_resolve_llm_iterative_tool_timeout_s,
         llm_generate=_llm_generate,
+        llm_generate_with_context=_llm_generate_with_context,
         coding_agent_generate=_coding_agent_generate,
         coding_agent_autonomous=_coding_agent_autonomous,
         coding_agent_publish_pr=_coding_agent_publish_pr,
@@ -1432,6 +1433,58 @@ def _llm_generate(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, A
         )
     )
     return {"text": response.content}
+
+
+def _llm_generate_with_context(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:
+    prompt = str(payload.get("prompt") or payload.get("text") or "").strip()
+    if not prompt:
+        raise ToolExecutionError("missing_prompt")
+    context_value = payload.get("context")
+    prompt_with_context = _render_prompt_with_context(prompt, context_value)
+    system_prompt = payload.get("system_prompt")
+    if not isinstance(system_prompt, str) or not system_prompt.strip():
+        system_prompt = None
+    raw_temperature = payload.get("temperature")
+    temperature = raw_temperature if isinstance(raw_temperature, (int, float)) and not isinstance(raw_temperature, bool) else None
+    raw_max_tokens = payload.get("max_output_tokens")
+    max_output_tokens = raw_max_tokens if isinstance(raw_max_tokens, int) and not isinstance(raw_max_tokens, bool) else None
+    response = provider.generate_request(
+        LLMRequest(
+            prompt=prompt_with_context,
+            system_prompt=system_prompt,
+            temperature=float(temperature) if temperature is not None else None,
+            max_output_tokens=max_output_tokens,
+            metadata={
+                "component": "tools",
+                "tool": "llm_generate_with_context",
+                "operation": "generate_text_with_context",
+                "prompt_len": len(prompt),
+                "has_context": context_value is not None,
+            },
+        )
+    )
+    return {"text": response.content}
+
+
+def _render_prompt_with_context(prompt: str, context_value: Any) -> str:
+    if context_value is None:
+        return prompt
+    if isinstance(context_value, str):
+        context_text = context_value.strip()
+        if not context_text:
+            return prompt
+    elif isinstance(context_value, (dict, list)):
+        if not context_value:
+            return prompt
+        try:
+            context_text = json.dumps(context_value, indent=2, ensure_ascii=True)
+        except (TypeError, ValueError):
+            context_text = str(context_value)
+    else:
+        context_text = str(context_value).strip()
+        if not context_text:
+            return prompt
+    return f"{prompt}\n\nContext:\n{context_text}"
 
 
 def _llm_generate_document_spec(payload: Dict[str, Any], provider: LLMProvider) -> Dict[str, Any]:

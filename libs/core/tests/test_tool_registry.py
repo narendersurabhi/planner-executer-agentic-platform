@@ -972,3 +972,39 @@ def test_llm_generate_tool_uses_request_based_provider() -> None:
         "operation": "generate_text",
         "prompt_len": len("hello world"),
     }
+
+
+def test_llm_generate_with_context_tool_uses_request_based_provider() -> None:
+    provider = _RequestOnlyProvider("generated text")
+    registry = default_registry(llm_enabled=True, llm_provider=provider)
+
+    call = registry.execute(
+        "llm_generate_with_context",
+        {
+            "prompt": "Summarize the status",
+            "context": {"repo": "agentic-workflow-studio", "branch": "main"},
+            "system_prompt": "You are a concise release assistant.",
+            "temperature": 0.3,
+            "max_output_tokens": 240,
+        },
+        "id",
+        "trace",
+    )
+
+    assert call.status == "completed"
+    assert call.output_or_error == {"text": "generated text"}
+    assert provider.requests
+    request = provider.requests[0]
+    assert request.system_prompt == "You are a concise release assistant."
+    assert request.temperature == 0.3
+    assert request.max_output_tokens == 240
+    assert "Summarize the status" in request.prompt
+    assert "Context:" in request.prompt
+    assert '"repo": "agentic-workflow-studio"' in request.prompt
+    assert request.metadata == {
+        "component": "tools",
+        "tool": "llm_generate_with_context",
+        "operation": "generate_text_with_context",
+        "prompt_len": len("Summarize the status"),
+        "has_context": True,
+    }

@@ -80,6 +80,214 @@ def test_chat_turn_can_submit_job() -> None:
     assert len(body["session"]["messages"]) == 2
 
 
+def test_chat_turn_can_run_published_workflow_by_version_reference() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Chat-started workspace listing",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Chat-started workspace listing",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Run the published workflow now",
+            "context_json": {
+                "workflow_version_id": version["id"],
+                "topic": "Release readiness",
+            },
+            "priority": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "run_workflow"
+    assert body["assistant_message"]["action"]["workflow_version_id"] == version["id"]
+    assert body["job"]["metadata"]["workflow_source"] == "studio"
+    assert body["workflow_run"]["version_id"] == version["id"]
+    assert body["workflow_run"]["requested_context_json"]["topic"] == "Release readiness"
+    assert "workflow_version_id" not in body["workflow_run"]["requested_context_json"]
+    assert body["session"]["active_job_id"] == body["job"]["id"]
+    assert body["session"]["metadata"]["active_workflow_run_id"] == body["workflow_run"]["id"]
+    assert body["assistant_message"]["metadata"]["workflow_run"]["id"] == body["workflow_run"]["id"]
+
+
+def test_chat_turn_asks_for_missing_workflow_input_and_uses_followup_reply() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Clarified workflow",
+            "goal": "List a workspace subdirectory",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Clarified workflow",
+                "workflowInterface": {
+                    "inputs": [
+                        {
+                            "key": "path",
+                            "label": "Workspace Path",
+                            "valueType": "string",
+                            "required": True,
+                            "description": "Relative workspace path to inspect.",
+                        }
+                    ],
+                    "variables": [],
+                    "outputs": [],
+                },
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {
+                            "path": {"kind": "workflow_input", "inputKey": "path"}
+                        },
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    session = client.post("/chat/sessions", json={}).json()
+    clarification_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Run the clarified workflow",
+            "context_json": {"workflow_version_id": version["id"]},
+            "priority": 1,
+        },
+    )
+
+    assert clarification_response.status_code == 200
+    clarification_body = clarification_response.json()
+    assert clarification_body["job"] is None
+    assert clarification_body["workflow_run"] is None
+    assert clarification_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "path" in clarification_body["assistant_message"]["content"].lower()
+    assert clarification_body["session"]["metadata"]["pending_workflow_input"]["key"] == "path"
+
+    run_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "reports", "context_json": {}, "priority": 1},
+    )
+
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    assert run_body["assistant_message"]["action"]["type"] == "run_workflow"
+    assert run_body["workflow_run"]["version_id"] == version["id"]
+    assert run_body["job"]["context_json"]["workflow"]["inputs"]["path"] == "reports"
+    assert run_body["session"]["metadata"]["active_workflow_run_id"] == run_body["workflow_run"]["id"]
+    assert "pending_workflow_input" not in run_body["session"]["metadata"]
+
+
+def test_chat_turn_can_skip_optional_workflow_input_with_use_default_reply() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Optional recursive listing",
+            "goal": "List workspace files with optional recursion",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Optional recursive listing",
+                "workflowInterface": {
+                    "inputs": [
+                        {
+                            "key": "recursive",
+                            "label": "Recursive",
+                            "valueType": "boolean",
+                            "required": False,
+                            "description": "Whether to recurse into subdirectories.",
+                        }
+                    ],
+                    "variables": [],
+                    "outputs": [],
+                },
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {
+                            "recursive": {"kind": "workflow_input", "inputKey": "recursive"}
+                        },
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    session = client.post("/chat/sessions", json={}).json()
+    clarification_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Run the optional workflow",
+            "context_json": {
+                "workflow_version_id": version["id"],
+                "workflow_inputs": {"recursive": "sometimes"},
+            },
+            "priority": 1,
+        },
+    )
+
+    assert clarification_response.status_code == 200
+    clarification_body = clarification_response.json()
+    assert clarification_body["job"] is None
+    assert clarification_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "use default" in clarification_body["assistant_message"]["content"].lower()
+    assert clarification_body["session"]["metadata"]["pending_workflow_input"]["key"] == "recursive"
+
+    run_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "use default", "context_json": {}, "priority": 1},
+    )
+
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    assert run_body["assistant_message"]["action"]["type"] == "run_workflow"
+    assert run_body["workflow_run"]["version_id"] == version["id"]
+    assert run_body["job"]["context_json"]["workflow"]["inputs"]["recursive"] is None
+    assert "pending_workflow_input" not in run_body["session"]["metadata"]
+
+
 def test_chat_turn_uses_pending_clarification_context_to_submit_job() -> None:
     session = client.post("/chat/sessions", json={}).json()
     client.post(
@@ -97,6 +305,70 @@ def test_chat_turn_uses_pending_clarification_context_to_submit_job() -> None:
     assert body["job"] is not None
     assert body["assistant_message"]["action"]["type"] == "submit_job"
     assert "User clarification:" in body["job"]["goal"]
+
+
+def test_chat_turn_can_run_published_workflow_by_trigger_reference() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Chat-triggered workspace listing",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Chat-triggered workspace listing",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    trigger_response = client.post(
+        f"/workflows/definitions/{definition['id']}/triggers",
+        json={
+            "title": "Manual trigger",
+            "trigger_type": "manual",
+            "enabled": True,
+            "config": {"version_mode": "latest_published"},
+        },
+    )
+    assert trigger_response.status_code == 200
+    trigger = trigger_response.json()
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Kick off the saved workflow",
+            "context_json": {
+                "workflow_trigger_id": trigger["id"],
+                "workflow_context_json": {"channel": "chat"},
+            },
+            "priority": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "run_workflow"
+    assert body["assistant_message"]["action"]["workflow_trigger_id"] == trigger["id"]
+    assert body["workflow_run"]["trigger_id"] == trigger["id"]
+    assert body["workflow_run"]["version_id"] == version["id"]
+    assert body["workflow_run"]["requested_context_json"]["channel"] == "chat"
+    assert body["job"]["metadata"]["workflow_trigger_id"] == trigger["id"]
 
 
 def test_chat_turn_can_use_llm_router_for_conversational_reply(monkeypatch) -> None:

@@ -651,9 +651,20 @@ type Job = {
 };
 
 type ChatAssistantAction = {
-  type: "respond" | "tool_call" | "ask_clarification" | "submit_job" | "attach_to_job" | "summarize_job";
+  type:
+    | "respond"
+    | "tool_call"
+    | "ask_clarification"
+    | "submit_job"
+    | "run_workflow"
+    | "attach_to_job"
+    | "summarize_job";
   goal?: string | null;
   job_id?: string | null;
+  workflow_run_id?: string | null;
+  workflow_definition_id?: string | null;
+  workflow_version_id?: string | null;
+  workflow_trigger_id?: string | null;
   capability_id?: string | null;
   tool_name?: string | null;
   clarification_questions?: string[];
@@ -687,6 +698,7 @@ type ChatTurnResponse = {
   user_message: ChatMessage;
   assistant_message: ChatMessage;
   job?: Job | null;
+  workflow_run?: Record<string, unknown> | null;
 };
 
 type Plan = {

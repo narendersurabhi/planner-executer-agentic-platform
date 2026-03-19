@@ -1059,12 +1059,14 @@ def _route_chat_turn(
         content=content,
         candidate_goal=candidate_goal,
         session_metadata=session_metadata,
+        merged_context=merged_context,
     )
     if _chat_router_provider is None:
         return fallback
     pending_clarification = bool(
         isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
     )
+    workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     try:
         prompt = _build_chat_router_prompt(
             content=content,
@@ -1081,6 +1083,7 @@ def _route_chat_turn(
                     "Return JSON only. "
                     "Use route='respond' for normal conversation or explanation when no tools/workflow are needed. "
                     "Use route='tool_call' only for a single safe read-only capability from the allowed catalog. "
+                    "Use route='run_workflow' only when the user wants to invoke a published Studio workflow and the provided context already includes workflow_trigger_id, workflow_version_id, or workflow_definition_id. "
                     "Use route='submit_job' only when the user wants the system to perform work, create artifacts, inspect systems, or run automation. "
                     "Use route='ask_clarification' only when workflow execution is needed but essential details are missing. "
                     "Never choose tool_call for writes, multi-step work, or anything outside the allowed direct catalog."
@@ -1096,6 +1099,7 @@ def _route_chat_turn(
             content=content,
             candidate_goal=candidate_goal,
             fallback=fallback,
+            workflow_invocation_available=workflow_invocation is not None,
         )
     except Exception:  # noqa: BLE001
         logger.exception("chat_router_failed")
@@ -1107,6 +1111,7 @@ def _fallback_chat_turn_route(
     content: str,
     candidate_goal: str,
     session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     pending_clarification = bool(
         isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
@@ -1114,6 +1119,13 @@ def _fallback_chat_turn_route(
     assessment = _assess_goal_intent(candidate_goal)
     assessment_json = workflow_contracts.dump_goal_intent_profile(assessment) or {}
     if pending_clarification or not _looks_like_conversational_turn(content):
+        if chat_service.workflow_invocation_from_context(merged_context) is not None:
+            return {
+                "type": "run_workflow",
+                "assistant_content": "",
+                "clarification_questions": [],
+                "goal_intent_profile": assessment_json,
+            }
         if bool(assessment.requires_blocking_clarification):
             questions = [
                 str(question).strip()
@@ -1148,6 +1160,7 @@ def _build_chat_router_prompt(
     merged_context: Mapping[str, Any] | None,
     messages: Sequence[chat_contracts.ChatMessage] | None,
 ) -> str:
+    workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     recent_messages: list[dict[str, str]] = []
     for message in list(messages or [])[-6:]:
         recent_messages.append(
@@ -1171,7 +1184,7 @@ def _build_chat_router_prompt(
         "recent_messages": recent_messages,
         "direct_capabilities": direct_capabilities,
         "response_schema": {
-            "route": "respond | tool_call | ask_clarification | submit_job",
+            "route": "respond | tool_call | ask_clarification | submit_job | run_workflow",
             "assistant_response": "string",
             "intent": "generate | transform | validate | render | io | other",
             "risk_level": "read_only | bounded_write | high_risk_write",
@@ -1179,9 +1192,21 @@ def _build_chat_router_prompt(
             "output_format": "string",
             "target_system": "string",
             "safety_constraints": "string",
+            "workflow_reference": "use run_workflow only when workflow_context.target_available is true",
             "capability_id": "string",
             "arguments": {"any": "json object"},
             "clarification_questions": ["string"],
+        },
+        "workflow_context": {
+            "target_available": workflow_invocation is not None,
+            "trigger_id": workflow_invocation.trigger_id if workflow_invocation is not None else None,
+            "version_id": workflow_invocation.version_id if workflow_invocation is not None else None,
+            "definition_id": workflow_invocation.definition_id
+            if workflow_invocation is not None
+            else None,
+            "input_keys": sorted(workflow_invocation.inputs.keys())
+            if workflow_invocation is not None
+            else [],
         },
     }
     return (
@@ -1189,11 +1214,14 @@ def _build_chat_router_prompt(
         "Rules:\n"
         "- respond: answer normally, no workflow/job needed.\n"
         "- tool_call: perform exactly one safe read-only capability from direct_capabilities.\n"
+        "- run_workflow: invoke the referenced published Studio workflow from workflow_context.\n"
         "- ask_clarification: workflow is needed, but essential details are missing.\n"
         "- submit_job: workflow/job should be created now.\n"
         "- If pending_clarification is true, treat the user message as an attempt to complete an existing workflow request.\n"
         "- Ask for safety constraints only when a high-risk write workflow is actually being requested.\n"
         "- Use tool_call only when one direct capability is sufficient and no durable workflow is needed.\n"
+        "- Use run_workflow only when workflow_context.target_available is true.\n"
+        "- Prefer run_workflow over submit_job when the user wants to run an already-published Studio workflow.\n"
         "- Return JSON only.\n\n"
         f"{json.dumps(payload, ensure_ascii=True)}"
     )
@@ -1205,10 +1233,11 @@ def _normalize_chat_route(
     content: str,
     candidate_goal: str,
     fallback: Mapping[str, Any],
+    workflow_invocation_available: bool,
 ) -> dict[str, Any]:
     heuristic = _assess_goal_intent(candidate_goal)
     route = str(parsed.get("route") or parsed.get("type") or "").strip().lower()
-    if route not in {"respond", "tool_call", "ask_clarification", "submit_job"}:
+    if route not in {"respond", "tool_call", "ask_clarification", "submit_job", "run_workflow"}:
         route = str(fallback.get("type") or "respond")
     if route == "respond" and not _looks_like_conversational_turn(content):
         route = str(fallback.get("type") or "respond")
@@ -1216,6 +1245,8 @@ def _normalize_chat_route(
     if route == "tool_call" and capability_id not in CHAT_DIRECT_CAPABILITIES:
         route = str(fallback.get("type") or "respond")
         capability_id = ""
+    if route == "run_workflow" and not workflow_invocation_available:
+        route = str(fallback.get("type") or "respond")
     arguments = dict(parsed.get("arguments")) if isinstance(parsed.get("arguments"), Mapping) else {}
 
     intent = str(parsed.get("intent") or heuristic.intent or "").strip().lower()
@@ -1267,7 +1298,7 @@ def _normalize_chat_route(
     assistant_response = str(parsed.get("assistant_response") or "").strip()
     if route == "respond" and not assistant_response:
         assistant_response = _fallback_chat_response(content)
-    if route in {"respond", "tool_call"}:
+    if route in {"respond", "tool_call", "run_workflow"}:
         blocking_slots = []
         missing_slots = []
         clarification_questions = []
@@ -1337,6 +1368,8 @@ def _chat_runtime() -> chat_service.ChatServiceRuntime:
         route_turn=_route_chat_turn,
         execute_direct_capability=_execute_chat_direct_capability,
         create_job=_create_job_internal,
+        run_workflow=_run_chat_workflow,
+        inspect_workflow=_inspect_chat_workflow,
         utcnow=_utcnow,
         make_id=lambda: str(uuid.uuid4()),
     )
@@ -1361,6 +1394,263 @@ def _execute_chat_direct_capability(
         "output": result.output,
         "assistant_response": result.assistant_response,
     }
+
+
+def _run_chat_workflow(
+    *,
+    db: Session,
+    workflow_trigger_id: str | None = None,
+    workflow_version_id: str | None = None,
+    workflow_definition_id: str | None = None,
+    inputs: Mapping[str, Any] | None = None,
+    context_json: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    idempotency_key: str | None = None,
+    priority: int = 0,
+) -> models.WorkflowRunResult:
+    definition, version, trigger = _resolve_chat_workflow_reference(
+        db=db,
+        workflow_trigger_id=workflow_trigger_id,
+        workflow_version_id=workflow_version_id,
+        workflow_definition_id=workflow_definition_id,
+    )
+    payload: dict[str, Any] = {
+        "inputs": dict(inputs) if isinstance(inputs, Mapping) else {},
+        "context_json": dict(context_json) if isinstance(context_json, Mapping) else {},
+        "priority": priority,
+        "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+    }
+    normalized_idempotency_key = str(idempotency_key or "").strip()
+    if normalized_idempotency_key:
+        payload["idempotency_key"] = normalized_idempotency_key
+
+    workflow_interface, _chat_context_json, runtime_inputs = _prepare_chat_workflow_runtime_inputs(
+        version=version,
+        trigger=trigger,
+        context_json=payload["context_json"] if isinstance(payload["context_json"], Mapping) else {},
+        inputs=payload["inputs"] if isinstance(payload["inputs"], Mapping) else {},
+    )
+    if workflow_interface.get("inputs"):
+        payload["inputs"] = runtime_inputs
+
+    if trigger is not None:
+        return _run_workflow_version_internal(
+            version=version,
+            definition=definition,
+            db=db,
+            payload=payload,
+            trigger=trigger,
+            source="chat_workflow_trigger",
+        )
+    source = (
+        "chat_workflow_version"
+        if str(workflow_version_id or "").strip()
+        else "chat_workflow_definition"
+    )
+    return _run_workflow_version_internal(
+        version=version,
+        definition=definition,
+        db=db,
+        payload=payload,
+        trigger=None,
+        source=source,
+    )
+
+
+def _inspect_chat_workflow(
+    *,
+    db: Session,
+    workflow_trigger_id: str | None = None,
+    workflow_version_id: str | None = None,
+    workflow_definition_id: str | None = None,
+    inputs: Mapping[str, Any] | None = None,
+    context_json: Mapping[str, Any] | None = None,
+) -> chat_service.ChatWorkflowInspection:
+    definition, version, trigger = _resolve_chat_workflow_reference(
+        db=db,
+        workflow_trigger_id=workflow_trigger_id,
+        workflow_version_id=workflow_version_id,
+        workflow_definition_id=workflow_definition_id,
+    )
+    workflow_interface, merged_context_json, runtime_inputs = _prepare_chat_workflow_runtime_inputs(
+        version=version,
+        trigger=trigger,
+        context_json=context_json,
+        inputs=inputs,
+    )
+    _preview_context, workflow_context_errors = _build_workflow_interface_runtime_context(
+        workflow_interface,
+        base_context=merged_context_json,
+        db=db,
+        explicit_inputs=runtime_inputs,
+        preview=False,
+    )
+    input_defs = {
+        str(item.get("key") or "").strip(): item
+        for item in workflow_interface.get("inputs", [])
+        if isinstance(item, Mapping)
+    }
+    missing_inputs: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for error in workflow_context_errors:
+        if not isinstance(error, Mapping):
+            continue
+        code = str(error.get("code") or "").strip()
+        if code not in {"draft.workflow_input_value_missing", "draft.workflow_input_value_invalid"}:
+            continue
+        field = str(error.get("field") or "").strip()
+        if not field.startswith("workflowInterface.inputs."):
+            continue
+        key = field.removeprefix("workflowInterface.inputs.").strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        definition_input = input_defs.get(key, {})
+        missing_inputs.append(
+            {
+                "key": key,
+                "label": str(definition_input.get("label") or key).strip() or key,
+                "value_type": str(definition_input.get("value_type") or "string").strip().lower()
+                or "string",
+                "description": str(definition_input.get("description") or "").strip(),
+                "message": str(error.get("message") or "").strip(),
+            }
+        )
+    return chat_service.ChatWorkflowInspection(
+        trigger_id=trigger.id if trigger is not None else None,
+        version_id=version.id,
+        definition_id=definition.id,
+        missing_inputs=missing_inputs,
+    )
+
+
+def _resolve_chat_workflow_reference(
+    *,
+    db: Session,
+    workflow_trigger_id: str | None = None,
+    workflow_version_id: str | None = None,
+    workflow_definition_id: str | None = None,
+) -> tuple[WorkflowDefinitionRecord, WorkflowVersionRecord, WorkflowTriggerRecord | None]:
+    normalized_trigger_id = str(workflow_trigger_id or "").strip()
+    if normalized_trigger_id:
+        trigger = (
+            db.query(WorkflowTriggerRecord)
+            .filter(WorkflowTriggerRecord.id == normalized_trigger_id)
+            .first()
+        )
+        if trigger is None:
+            raise HTTPException(status_code=404, detail="workflow_trigger_not_found")
+        if not bool(trigger.enabled):
+            raise HTTPException(status_code=400, detail="workflow_trigger_disabled")
+        definition = (
+            db.query(WorkflowDefinitionRecord)
+            .filter(WorkflowDefinitionRecord.id == trigger.definition_id)
+            .first()
+        )
+        if definition is None:
+            raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+        requested_version_id = str(workflow_version_id or "").strip()
+        version_query = db.query(WorkflowVersionRecord).filter(
+            WorkflowVersionRecord.definition_id == definition.id
+        )
+        if requested_version_id:
+            version_query = version_query.filter(WorkflowVersionRecord.id == requested_version_id)
+        version = version_query.order_by(WorkflowVersionRecord.version_number.desc()).first()
+        if version is None:
+            raise HTTPException(status_code=404, detail="workflow_version_not_found")
+        return definition, version, trigger
+
+    normalized_version_id = str(workflow_version_id or "").strip()
+    if normalized_version_id:
+        version = (
+            db.query(WorkflowVersionRecord)
+            .filter(WorkflowVersionRecord.id == normalized_version_id)
+            .first()
+        )
+        if version is None:
+            raise HTTPException(status_code=404, detail="workflow_version_not_found")
+        definition = (
+            db.query(WorkflowDefinitionRecord)
+            .filter(WorkflowDefinitionRecord.id == version.definition_id)
+            .first()
+        )
+        if definition is None:
+            raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+        return definition, version, None
+
+    normalized_definition_id = str(workflow_definition_id or "").strip()
+    if normalized_definition_id:
+        definition = (
+            db.query(WorkflowDefinitionRecord)
+            .filter(WorkflowDefinitionRecord.id == normalized_definition_id)
+            .first()
+        )
+        if definition is None:
+            raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+        version = (
+            db.query(WorkflowVersionRecord)
+            .filter(WorkflowVersionRecord.definition_id == definition.id)
+            .order_by(WorkflowVersionRecord.version_number.desc())
+            .first()
+        )
+        if version is None:
+            raise HTTPException(status_code=404, detail="workflow_version_not_found")
+        return definition, version, None
+
+    raise HTTPException(status_code=400, detail="chat_workflow_reference_missing")
+
+
+def _prepare_chat_workflow_runtime_inputs(
+    *,
+    version: WorkflowVersionRecord,
+    trigger: WorkflowTriggerRecord | None,
+    context_json: Mapping[str, Any] | None,
+    inputs: Mapping[str, Any] | None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any], dict[str, Any]]:
+    merged_context_json = dict(version.context_json or {})
+    if isinstance(trigger, WorkflowTriggerRecord) and isinstance(trigger.config_json, dict):
+        trigger_context = trigger.config_json.get("context_json")
+        if isinstance(trigger_context, Mapping):
+            merged_context_json.update(dict(trigger_context))
+    if isinstance(context_json, Mapping):
+        merged_context_json.update(dict(context_json))
+
+    workflow_interface, workflow_interface_errors, _workflow_interface_warnings = (
+        _coerce_workflow_interface(
+            version.draft_json.get("workflowInterface")
+            if isinstance(version.draft_json, dict) and "workflowInterface" in version.draft_json
+            else version.draft_json.get("workflow_interface")
+            if isinstance(version.draft_json, dict)
+            else None
+        )
+    )
+    if workflow_interface_errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "workflow_interface_invalid",
+                "diagnostics": {"errors": workflow_interface_errors, "warnings": []},
+            },
+        )
+
+    runtime_inputs: dict[str, Any] = {}
+    if isinstance(trigger, WorkflowTriggerRecord) and isinstance(trigger.config_json, dict):
+        trigger_inputs = trigger.config_json.get("inputs")
+        if isinstance(trigger_inputs, Mapping):
+            runtime_inputs.update(dict(trigger_inputs))
+    if isinstance(inputs, Mapping):
+        runtime_inputs.update(dict(inputs))
+
+    for definition in workflow_interface.get("inputs", []):
+        if not isinstance(definition, Mapping):
+            continue
+        key = str(definition.get("key") or "").strip()
+        if not key or key in runtime_inputs:
+            continue
+        if key in merged_context_json:
+            runtime_inputs[key] = merged_context_json[key]
+
+    return workflow_interface, merged_context_json, runtime_inputs
 
 
 def _dispatch_callbacks() -> dispatch_service.ApiDispatchCallbacks:

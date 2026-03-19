@@ -94,6 +94,22 @@ def resolve_tool_payload(
     payload = _merge_payload_from_task(payload, task_payload, instruction)
     payload = _fill_payload_from_context(payload, context)
     payload = _promote_document_job_fields(payload, tool_name=tool_name)
+    if tool_name == "llm_generate_with_context":
+        base_prompt = payload.get("prompt") or payload.get("text") or instruction
+        normalized: dict[str, Any] = {"prompt": str(base_prompt or "")}
+        if "context" in payload:
+            normalized["context"] = payload.get("context")
+        elif context:
+            normalized["context"] = context
+        if isinstance(payload.get("system_prompt"), str) and str(payload.get("system_prompt")).strip():
+            normalized["system_prompt"] = str(payload.get("system_prompt"))
+        temperature = payload.get("temperature")
+        if isinstance(temperature, (int, float)) and not isinstance(temperature, bool):
+            normalized["temperature"] = temperature
+        max_output_tokens = payload.get("max_output_tokens")
+        if isinstance(max_output_tokens, int) and not isinstance(max_output_tokens, bool):
+            normalized["max_output_tokens"] = max_output_tokens
+        return normalized
     if tool_name == "llm_generate":
         base_text = payload.get("text") or payload.get("prompt") or instruction
         if context:

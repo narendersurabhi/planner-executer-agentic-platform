@@ -10,7 +10,11 @@ from libs.tools.document_spec_iterative import register_document_spec_iterative_
 from libs.tools.document_spec_llm import register_document_spec_llm_tools
 from libs.tools.document_spec_validate import register_document_spec_tools
 from libs.tools.github_tools import register_github_tools
-from libs.tools.llm_tool_groups import register_coding_agent_tools, register_llm_text_tool
+from libs.tools.llm_tool_groups import (
+    register_coding_agent_tools,
+    register_llm_contextual_text_tool,
+    register_llm_text_tool,
+)
 from libs.tools.openapi_iterative import register_openapi_iterative_tools
 from libs.tools.pdf_generate_from_spec import register_pdf_tools
 
@@ -25,6 +29,7 @@ class ToolCatalogHandlers:
     resolve_coding_agent_timeout_s: Callable[[], int]
     resolve_llm_iterative_timeout_s: Callable[[Optional[LLMProvider]], int]
     llm_generate: Callable[[Dict[str, Any], LLMProvider], Dict[str, Any]]
+    llm_generate_with_context: Callable[[Dict[str, Any], LLMProvider], Dict[str, Any]]
     coding_agent_generate: Callable[[Dict[str, Any]], Dict[str, Any]]
     coding_agent_autonomous: Callable[[Dict[str, Any], LLMProvider], Dict[str, Any]]
     coding_agent_publish_pr: Callable[[Dict[str, Any]], Dict[str, Any]]
@@ -92,6 +97,11 @@ def register_default_tools(
         registry,
         timeout_s=llm_timeout_s,
         handler=lambda payload, provider=llm_provider: handlers.llm_generate(payload, provider),
+    )
+    register_llm_contextual_text_tool(
+        registry,
+        timeout_s=llm_timeout_s,
+        handler=lambda payload, provider=llm_provider: handlers.llm_generate_with_context(payload, provider),
     )
     register_coding_agent_tools(
         registry,
