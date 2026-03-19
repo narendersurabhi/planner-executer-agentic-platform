@@ -23,8 +23,10 @@ type StudioWorkflowLibraryProps = {
   workflowRunsError: string | null;
   activeWorkflowDefinitionId: string | null;
   activeWorkflowVersionId: string | null;
+  deletingWorkflowDefinitionId: string | null;
   onRefresh: () => void;
   onOpenDefinition: (definition: WorkflowDefinition) => void;
+  onDeleteDefinition: (definition: WorkflowDefinition) => void;
   onOpenVersion: (version: WorkflowVersion) => void;
   onCreateManualTrigger: () => void;
   onInvokeTrigger: (trigger: WorkflowTrigger) => void;
@@ -45,8 +47,10 @@ export default function StudioWorkflowLibrary({
   workflowRunsError,
   activeWorkflowDefinitionId,
   activeWorkflowVersionId,
+  deletingWorkflowDefinitionId,
   onRefresh,
   onOpenDefinition,
+  onDeleteDefinition,
   onOpenVersion,
   onCreateManualTrigger,
   onInvokeTrigger,
@@ -133,6 +137,13 @@ export default function StudioWorkflowLibrary({
                       onClick={() => onOpenDefinition(definition)}
                     >
                       Open Draft
+                    </button>
+                    <button
+                      className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:border-rose-400 hover:text-rose-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={() => onDeleteDefinition(definition)}
+                      disabled={deletingWorkflowDefinitionId === definition.id}
+                    >
+                      {deletingWorkflowDefinitionId === definition.id ? "Deleting..." : "Delete"}
                     </button>
                   </div>
                 </article>

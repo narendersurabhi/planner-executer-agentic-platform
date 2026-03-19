@@ -185,6 +185,15 @@ Currently supported execution control patterns:
 - `parallel` with `fan_out`
 - `parallel` with `fan_in`
 
+Expression support for `if` and `if_else` is intentionally narrow:
+
+- allowed roots: `context.*`, `workflow.input.*`, `workflow.variable.*`
+- allowed forms:
+  - truthy check like `context.approval`
+  - equality like `workflow.input.mode == "publish"`
+  - inequality like `workflow.variable.channel != "email"`
+- workflow input and variable references must match declared keys from the workflow interface
+
 Current limitation:
 
 - `switch` can still appear as an authoring concept, but is not yet lowered into executable runtime behavior

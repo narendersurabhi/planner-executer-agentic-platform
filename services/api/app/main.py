@@ -3255,6 +3255,7 @@ def _composer_default_task_name(capability_id: str, index: int) -> str:
 
 
 _COMPOSER_CONTROL_KINDS = {"if", "if_else", "switch", "parallel"}
+_COMPOSER_EXPRESSION_ROOTS = ("context.", "workflow.input.", "workflow.variable.")
 
 
 def _composer_control_kind(raw_node: Mapping[str, Any]) -> str:
@@ -3289,6 +3290,8 @@ def _validate_composer_control_node(
     task_name: str,
     control_kind: str,
     control_config: Mapping[str, Any],
+    workflow_input_keys: set[str] | None = None,
+    workflow_variable_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     expression = str(control_config.get("expression") or "").strip()
@@ -3302,13 +3305,20 @@ def _validate_composer_control_node(
                 "message": "Control-flow node requires a non-empty expression.",
             }
         )
-    if control_kind in {"if", "if_else"} and expression and not _composer_if_expression_supported(expression):
+    if control_kind in {"if", "if_else"} and expression and not _composer_if_expression_supported(
+        expression,
+        workflow_input_keys=workflow_input_keys,
+        workflow_variable_keys=workflow_variable_keys,
+    ):
         diagnostics.append(
             {
                 "code": "draft.control_expression_unsupported",
                 "node_id": node_id,
                 "field": "expression",
-                "message": "Conditional control-flow currently supports only context-based expressions.",
+                "message": (
+                    "Conditional control-flow supports only context.*, workflow.input.*, "
+                    "and workflow.variable.* expressions, with declared workflow keys."
+                ),
             }
         )
     if control_kind == "parallel" and parallel_mode not in {"fan_out", "fan_in"}:
@@ -3389,19 +3399,77 @@ def _validate_composer_control_node(
                 )
     return diagnostics
 
+def _composer_expression_operand(
+    token: str,
+) -> tuple[str, str] | None:
+    normalized = token.strip()
+    for prefix, root in (
+        ("context.", "context"),
+        ("workflow.input.", "workflow_input"),
+        ("workflow.variable.", "workflow_variable"),
+    ):
+        if not normalized.startswith(prefix):
+            continue
+        remainder = normalized[len(prefix) :].strip()
+        if not remainder:
+            return None
+        key = remainder.split(".", 1)[0].strip()
+        if not key:
+            return None
+        return root, key
+    return None
 
-def _composer_if_expression_supported(expression: str) -> bool:
+
+def _composer_expression_operand_supported(
+    token: str,
+    *,
+    workflow_input_keys: set[str] | None = None,
+    workflow_variable_keys: set[str] | None = None,
+) -> bool:
+    operand = _composer_expression_operand(token)
+    if operand is None:
+        return False
+    root, key = operand
+    if root == "workflow_input":
+        return bool(workflow_input_keys) and key in workflow_input_keys
+    if root == "workflow_variable":
+        return bool(workflow_variable_keys) and key in workflow_variable_keys
+    return True
+
+
+def _composer_if_expression_supported(
+    expression: str,
+    *,
+    workflow_input_keys: set[str] | None = None,
+    workflow_variable_keys: set[str] | None = None,
+) -> bool:
     normalized = expression.strip()
     if not normalized:
         return False
-    if normalized.startswith("context."):
-        return True
     if "==" in normalized or "!=" in normalized:
         left, right = normalized.split("==" if "==" in normalized else "!=", 1)
         left = left.strip()
         right = right.strip()
-        return left.startswith("context.") and bool(right)
-    return False
+        if not _composer_expression_operand_supported(
+            left,
+            workflow_input_keys=workflow_input_keys,
+            workflow_variable_keys=workflow_variable_keys,
+        ):
+            return False
+        if not right:
+            return False
+        if right.startswith(_COMPOSER_EXPRESSION_ROOTS):
+            return _composer_expression_operand_supported(
+                right,
+                workflow_input_keys=workflow_input_keys,
+                workflow_variable_keys=workflow_variable_keys,
+            )
+        return True
+    return _composer_expression_operand_supported(
+        normalized,
+        workflow_input_keys=workflow_input_keys,
+        workflow_variable_keys=workflow_variable_keys,
+    )
 
 
 _WORKFLOW_INTERFACE_VALUE_TYPES = {"string", "number", "boolean", "object", "array"}
@@ -4041,6 +4109,16 @@ def _build_plan_from_composer_draft(
             else draft.get("workflow_interface")
         )
     )
+    workflow_input_keys = {
+        str(definition.get("key") or "").strip()
+        for definition in workflow_interface.get("inputs", [])
+        if isinstance(definition, Mapping) and str(definition.get("key") or "").strip()
+    }
+    workflow_variable_keys = {
+        str(definition.get("key") or "").strip()
+        for definition in workflow_interface.get("variables", [])
+        if isinstance(definition, Mapping) and str(definition.get("key") or "").strip()
+    }
     diagnostics_errors.extend(workflow_interface_errors)
     diagnostics_warnings.extend(workflow_interface_warnings)
     preview_job_context, workflow_interface_context_errors = _build_workflow_interface_runtime_context(
@@ -4103,6 +4181,8 @@ def _build_plan_from_composer_draft(
                     task_name=task_name or capability_id,
                     control_kind=control_kind,
                     control_config=control_config,
+                    workflow_input_keys=workflow_input_keys,
+                    workflow_variable_keys=workflow_variable_keys,
                 )
             )
         else:
@@ -4282,7 +4362,11 @@ def _build_plan_from_composer_draft(
         if not node.get("is_control") or node.get("control_kind") != "if":
             continue
         expression = str(node.get("control_config", {}).get("expression") or "").strip()
-        if not expression or not _composer_if_expression_supported(expression):
+        if not expression or not _composer_if_expression_supported(
+            expression,
+            workflow_input_keys=workflow_input_keys,
+            workflow_variable_keys=workflow_variable_keys,
+        ):
             continue
         queue = list(children_by_node_id.get(node["node_id"], set()))
         visited: set[str] = set()
@@ -4302,7 +4386,11 @@ def _build_plan_from_composer_draft(
         if not node.get("is_control") or node.get("control_kind") != "if_else":
             continue
         expression = str(node.get("control_config", {}).get("expression") or "").strip()
-        if not expression or not _composer_if_expression_supported(expression):
+        if not expression or not _composer_if_expression_supported(
+            expression,
+            workflow_input_keys=workflow_input_keys,
+            workflow_variable_keys=workflow_variable_keys,
+        ):
             continue
         config = node.get("control_config", {})
         true_label = str(config.get("trueLabel") or "true").strip().lower()
@@ -7962,6 +8050,32 @@ def update_workflow_definition(
     db.commit()
     db.refresh(record)
     return _workflow_definition_from_record(record)
+
+
+@app.delete("/workflows/definitions/{definition_id}")
+def delete_workflow_definition(
+    definition_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    record = (
+        db.query(WorkflowDefinitionRecord)
+        .filter(WorkflowDefinitionRecord.id == definition_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="workflow_definition_not_found")
+    db.query(WorkflowRunRecord).filter(
+        WorkflowRunRecord.definition_id == definition_id
+    ).delete(synchronize_session=False)
+    db.query(WorkflowTriggerRecord).filter(
+        WorkflowTriggerRecord.definition_id == definition_id
+    ).delete(synchronize_session=False)
+    db.query(WorkflowVersionRecord).filter(
+        WorkflowVersionRecord.definition_id == definition_id
+    ).delete(synchronize_session=False)
+    db.delete(record)
+    db.commit()
+    return {"ok": True}
 
 
 @app.get(

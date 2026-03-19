@@ -16,6 +16,8 @@ import StudioWorkflowLibrary from "./StudioWorkflowLibrary";
 import type {
   CanvasPoint,
   CapabilityCatalog,
+  CapabilityItem,
+  CapabilitySchemaField,
   ChainPreflightResult,
   ComposerCompileResponse,
   ComposerDraft,
@@ -47,6 +49,7 @@ import {
   DAG_CANVAS_PADDING,
   DAG_CANVAS_SNAP,
   capabilityInputSchemaProperties,
+  capabilityOutputSchemaFields,
   collectContextPathSuggestions,
   collectComposerValidationIssues,
   defaultDagNodePosition,
@@ -59,7 +62,7 @@ import {
   isInteractiveCanvasTarget,
   isPathOutputReference,
   normalizeComposerEdges,
-  outputPathSuggestionsForNode,
+  outputPathSuggestionsForNodeWithCapability,
   readContextObject,
   schemaPropertyTypeLabel,
   taskNameFromCapability,
@@ -590,8 +593,9 @@ export default function WorkflowStudio() {
   const [workflowRunsLoading, setWorkflowRunsLoading] = useState(false);
   const [workflowRunsError, setWorkflowRunsError] = useState<string | null>(null);
   const [workflowActionLoading, setWorkflowActionLoading] = useState<
-    "save" | "publish" | "run" | null
+    "save" | "publish" | "run" | "delete" | null
   >(null);
+  const [workflowDefinitionDeleteId, setWorkflowDefinitionDeleteId] = useState<string | null>(null);
   const [activeComposerIssueFocus, setActiveComposerIssueFocus] = useState<ComposerIssueFocus | null>(
     null
   );
@@ -1447,6 +1451,41 @@ export default function WorkflowStudio() {
     );
   };
 
+  const upsertNodeOutputFromSchema = (nodeId: string, field: CapabilitySchemaField) => {
+    const normalizedPath = String(field.path || "").trim();
+    if (!normalizedPath) {
+      return;
+    }
+    const normalizedName = normalizedPath.split(/[.[\]]/)[0]?.trim() || normalizedPath;
+    setVisualChainNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId) {
+          return node;
+        }
+        const alreadyPresent = node.outputs.some(
+          (output) =>
+            output.path.trim() === normalizedPath ||
+            output.name.trim() === normalizedName
+        );
+        if (alreadyPresent) {
+          return node;
+        }
+        return {
+          ...node,
+          outputs: [
+            ...node.outputs,
+            {
+              ...createStudioOutput(),
+              name: normalizedName,
+              path: normalizedPath,
+              description: field.description || "",
+            },
+          ],
+        };
+      })
+    );
+  };
+
   const addNodeVariable = (nodeId: string) => {
     setVisualChainNodes((prev) =>
       prev.map((node) =>
@@ -2122,6 +2161,13 @@ export default function WorkflowStudio() {
     [selectedDagNodeId, visualChainNodes]
   );
 
+  const selectedCapability = useMemo<CapabilityItem | null>(() => {
+    if (!selectedDagNode || selectedDagNode.nodeKind === "control") {
+      return null;
+    }
+    return capabilityById.get(selectedDagNode.capabilityId) || null;
+  }, [capabilityById, selectedDagNode]);
+
   const selectedDagNodeStatus = useMemo(() => {
     if (!selectedDagNodeId) {
       return null;
@@ -2137,108 +2183,151 @@ export default function WorkflowStudio() {
       return [];
     }
 
-    const requiredStatusByField = new Map(
-      (selectedDagNodeStatus?.requiredStatus || []).map((status) => [status.field, status])
+    const context = contextState.context;
+    const schemaProperties = capabilityInputSchemaProperties(selectedCapability);
+    const requiredFieldSet = new Set(getCapabilityRequiredInputs(selectedCapability));
+    const schemaFields = Array.from(
+      new Set([...Object.keys(schemaProperties), ...Array.from(requiredFieldSet)])
     );
-    const capability = capabilityById.get(selectedDagNode.capabilityId);
-    const schemaProperties = capabilityInputSchemaProperties(capability);
     const customFields = Object.keys(selectedDagNode.inputBindings).filter(
-      (field) => !requiredStatusByField.has(field)
+      (field) => !requiredFieldSet.has(field) && !schemaFields.includes(field)
     );
 
-    const customFieldStatus = customFields.map((field) => {
-      const property = schemaProperties[field];
-      const schemaType = schemaPropertyTypeLabel(property);
+    const buildFieldStatus = (field: string, required: boolean, custom: boolean) => {
+      const property = schemaProperties[field] || null;
+      const schemaType = schemaPropertyTypeLabel(property || undefined);
       const schemaDescription =
         property && typeof property.description === "string"
           ? property.description
-          : "Custom Studio binding";
+          : custom
+            ? "Custom Studio binding"
+            : "";
       const binding = selectedDagNode.inputBindings[field];
       if (binding?.kind === "step_output") {
         const source = visualChainNodes.find((candidate) => candidate.id === binding.sourceNodeId);
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: "from_chain" as const,
           detail: source ? `${source.taskName}.${binding.sourcePath}` : binding.sourcePath,
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "literal") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.value.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.value.trim() ? "literal value" : "literal value missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "memory") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.name.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.name.trim()
             ? `memory:${binding.scope}/${binding.name}${binding.key ? `/${binding.key}` : ""}`
             : "memory name missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "workflow_input") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.inputKey.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.inputKey.trim()
             ? `workflow.input.${binding.inputKey}`
             : "workflow input key missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "workflow_variable") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.variableKey.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.variableKey.trim()
             ? `workflow.variable.${binding.variableKey}`
             : "workflow variable key missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "context") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.path.trim() ? ("from_context" as const) : ("missing" as const),
           detail: binding.path.trim() || "context path missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
+        };
+      }
+      if (isContextInputPresent(context[field])) {
+        return {
+          field,
+          required,
+          custom,
+          status: "from_context" as const,
+          detail: "context_json",
+          schemaType,
+          schemaDescription,
+          schemaProperty: property,
         };
       }
       return {
         field,
-        required: false,
+        required,
+        custom,
         status: "missing" as const,
         detail: "missing",
         schemaType,
         schemaDescription,
+        schemaProperty: property,
       };
-    });
+    };
+
+    const schemaFieldStatus = schemaFields.map((field) =>
+      buildFieldStatus(field, requiredFieldSet.has(field), false)
+    );
+    const customFieldStatus = customFields.map((field) => buildFieldStatus(field, false, true));
 
     return [
-      ...(selectedDagNodeStatus?.requiredStatus || []).map((status) => ({
-        ...status,
-        required: true,
-      })),
+      ...schemaFieldStatus.filter((field) => field.required),
+      ...schemaFieldStatus.filter((field) => !field.required),
       ...customFieldStatus,
     ];
-  }, [capabilityById, selectedDagNode, selectedDagNodeStatus, visualChainNodes]);
+  }, [contextState.context, selectedCapability, selectedDagNode, visualChainNodes]);
+
+  const selectedDagNodeOutputSchemaFields = useMemo(
+    () => capabilityOutputSchemaFields(selectedCapability),
+    [selectedCapability]
+  );
+
+  const studioOutputPathSuggestionsForNode = (node: ComposerDraftNode | undefined) =>
+    outputPathSuggestionsForNodeWithCapability(
+      node,
+      node ? capabilityById.get(node.capabilityId) : undefined
+    );
 
   const canInsertDeriveForSelectedNode = useMemo(() => {
     if (!selectedDagNode) {
@@ -2654,6 +2743,46 @@ export default function WorkflowStudio() {
     setLoadedWorkflowVersionId(null);
     resetStudioTransientState();
     setStudioNotice(`Opened saved draft ${definition.title}.`);
+  };
+
+  const deleteWorkflowDefinition = async (definition: WorkflowDefinition) => {
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        `Delete saved draft "${definition.title}" and its published versions, triggers, and run history?`
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+    setWorkflowActionLoading("delete");
+    setWorkflowDefinitionDeleteId(definition.id);
+    try {
+      const response = await fetch(
+        `${apiUrl}/workflows/definitions/${encodeURIComponent(definition.id)}`,
+        { method: "DELETE" }
+      );
+      const body = response.status === 204 ? null : ((await response.json()) as { detail?: unknown } | null);
+      if (!response.ok) {
+        const detail = body && typeof body.detail === "string" ? body.detail : null;
+        throw new Error(detail || `Delete draft failed (${response.status}).`);
+      }
+      setWorkflowDefinitions((prev) => prev.filter((item) => item.id !== definition.id));
+      if (savedWorkflowDefinition?.id === definition.id) {
+        setSavedWorkflowDefinition(null);
+        setPublishedWorkflowVersion(null);
+        setLoadedWorkflowVersionId(null);
+        setWorkflowVersions([]);
+        setWorkflowTriggers([]);
+        setWorkflowRuns([]);
+      }
+      void refreshWorkflowDefinitions();
+      setStudioNotice(`Deleted saved draft ${definition.title}.`);
+    } catch (error) {
+      setStudioNotice(error instanceof Error ? error.message : "Failed to delete saved draft.");
+    } finally {
+      setWorkflowDefinitionDeleteId(null);
+      setWorkflowActionLoading(null);
+    }
   };
 
   const restoreWorkflowVersion = async (version: WorkflowVersion) => {
@@ -3462,7 +3591,7 @@ export default function WorkflowStudio() {
             workflowInterface={workflowInterface}
             contextPathSuggestions={contextPathSuggestions}
             visualChainNodes={visualChainNodes}
-            outputPathSuggestionsForNode={outputPathSuggestionsForNode}
+            outputPathSuggestionsForNode={studioOutputPathSuggestionsForNode}
             onAddInput={addWorkflowInputDefinition}
             onUpdateInput={updateWorkflowInputDefinition}
             onRemoveInput={removeWorkflowInputDefinition}
@@ -3578,6 +3707,7 @@ export default function WorkflowStudio() {
             workflowRunsError={workflowRunsError}
             activeWorkflowDefinitionId={activeWorkflowDefinitionId}
             activeWorkflowVersionId={activeWorkflowVersionId}
+            deletingWorkflowDefinitionId={workflowDefinitionDeleteId}
             onRefresh={() => {
               void refreshWorkflowDefinitions();
               if (activeWorkflowDefinitionId) {
@@ -3587,6 +3717,9 @@ export default function WorkflowStudio() {
               }
             }}
             onOpenDefinition={restoreWorkflowDefinition}
+            onDeleteDefinition={(definition) => {
+              void deleteWorkflowDefinition(definition);
+            }}
             onOpenVersion={(version) => {
               void restoreWorkflowVersion(version);
             }}
@@ -3600,10 +3733,12 @@ export default function WorkflowStudio() {
             selectedDagNode={selectedDagNode}
             selectedDagNodeStatus={selectedDagNodeStatus}
             inputFields={selectedDagNodeInspectorFields}
+            selectedCapability={selectedCapability}
+            outputSchemaFields={selectedDagNodeOutputSchemaFields}
             activeComposerIssueFocus={activeComposerIssueFocus}
             inspectorBindingRefs={inspectorBindingRefs}
             visualChainNodes={visualChainNodes}
-            outputPathSuggestionsForNode={outputPathSuggestionsForNode}
+            outputPathSuggestionsForNode={studioOutputPathSuggestionsForNode}
             contextPathSuggestions={contextPathSuggestions}
             workflowInterface={workflowInterface}
             autoWireNodeBindings={autoWireNodeBindings}
@@ -3627,6 +3762,7 @@ export default function WorkflowStudio() {
             canInsertDeriveOutputPath={canInsertDeriveForSelectedNode}
             onInsertDeriveOutputPath={insertDeriveOutputPathStepForNode}
             addNodeOutput={addNodeOutput}
+            upsertNodeOutputFromSchema={upsertNodeOutputFromSchema}
             updateNodeOutput={updateNodeOutput}
             removeNodeOutput={removeNodeOutput}
             addNodeVariable={addNodeVariable}

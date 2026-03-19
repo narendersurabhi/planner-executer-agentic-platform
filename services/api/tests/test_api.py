@@ -13,7 +13,16 @@ os.environ["POLICY_GATE_ENABLED"] = "false"
 from services.api.app import main, memory_store  # noqa: E402
 from services.api.app.database import Base, engine
 from services.api.app.database import SessionLocal
-from services.api.app.models import EventOutboxRecord, JobRecord, PlanRecord, TaskRecord
+from services.api.app.models import (
+    EventOutboxRecord,
+    JobRecord,
+    PlanRecord,
+    TaskRecord,
+    WorkflowDefinitionRecord,
+    WorkflowRunRecord,
+    WorkflowTriggerRecord,
+    WorkflowVersionRecord,
+)
 from libs.core import events, execution_contracts, models
 from libs.core import capability_registry as cap_registry
 from libs.core.llm_provider import LLMProvider, LLMRequest, LLMResponse
@@ -176,6 +185,94 @@ def test_workflow_trigger_create_invoke_and_list() -> None:
     runs = runs_response.json()
     assert len(runs) >= 1
     assert runs[0]["trigger_id"] == trigger["id"]
+
+
+def test_delete_workflow_definition_removes_related_records() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Delete me",
+            "goal": "Delete workflow definition",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Delete me",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    trigger_response = client.post(
+        f"/workflows/definitions/{definition['id']}/triggers",
+        json={
+            "title": "Delete trigger",
+            "trigger_type": "manual",
+            "enabled": True,
+            "config": {"version_mode": "latest_published"},
+        },
+    )
+    assert trigger_response.status_code == 200
+    trigger = trigger_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 0},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    assert run_body["workflow_run"]["definition_id"] == definition["id"]
+
+    delete_response = client.delete(f"/workflows/definitions/{definition['id']}")
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"ok": True}
+
+    with SessionLocal() as db:
+        assert (
+            db.query(WorkflowDefinitionRecord)
+            .filter(WorkflowDefinitionRecord.id == definition["id"])
+            .count()
+            == 0
+        )
+        assert (
+            db.query(WorkflowVersionRecord)
+            .filter(WorkflowVersionRecord.definition_id == definition["id"])
+            .count()
+            == 0
+        )
+        assert (
+            db.query(WorkflowTriggerRecord)
+            .filter(WorkflowTriggerRecord.definition_id == definition["id"])
+            .count()
+            == 0
+        )
+        assert (
+            db.query(WorkflowRunRecord)
+            .filter(WorkflowRunRecord.definition_id == definition["id"])
+            .count()
+            == 0
+        )
+
+    get_response = client.get(f"/workflows/definitions/{definition['id']}")
+    assert get_response.status_code == 404
+
+    list_response = client.get("/workflows/definitions?user_id=narendersurabhi")
+    assert list_response.status_code == 200
+    definition_ids = {item["id"] for item in list_response.json()}
+    assert definition["id"] not in definition_ids
 
 
 def test_build_workflow_interface_runtime_context_resolves_bindings() -> None:
@@ -2313,6 +2410,134 @@ def test_build_plan_from_composer_draft_lowers_if_control_to_execution_gate(monk
     assert plan.tasks[1].tool_inputs[main.execution_contracts.EXECUTION_GATE_KEY] == {
         "json_transform": {"expression": "context.approved == true"}
     }
+
+
+def test_build_plan_from_composer_draft_allows_workflow_variable_expression(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "workflowInterface": {
+                "variables": [
+                    {
+                        "key": "should_publish",
+                        "valueType": "boolean",
+                        "binding": {"kind": "literal", "value": True},
+                    }
+                ]
+            },
+            "nodes": [
+                {
+                    "id": "source",
+                    "capabilityId": "json_transform",
+                    "taskName": "LoadData",
+                },
+                {
+                    "id": "gate",
+                    "taskName": "OnlyIfPublishRequested",
+                    "nodeKind": "control",
+                    "controlKind": "if",
+                    "capabilityId": "studio.control.if",
+                    "controlConfig": {"expression": "workflow.variable.should_publish == true"},
+                },
+                {
+                    "id": "target",
+                    "capabilityId": "json_transform",
+                    "taskName": "PublishData",
+                },
+            ],
+            "edges": [
+                {"fromNodeId": "source", "toNodeId": "gate"},
+                {"fromNodeId": "gate", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert errors == []
+    assert plan is not None
+    assert plan.tasks[1].tool_inputs[main.execution_contracts.EXECUTION_GATE_KEY] == {
+        "json_transform": {"expression": "workflow.variable.should_publish == true"}
+    }
+
+
+def test_build_plan_from_composer_draft_rejects_undefined_workflow_expression_key(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "workflowInterface": {
+                "variables": [
+                    {
+                        "key": "should_publish",
+                        "valueType": "boolean",
+                        "binding": {"kind": "literal", "value": True},
+                    }
+                ]
+            },
+            "nodes": [
+                {
+                    "id": "source",
+                    "capabilityId": "json_transform",
+                    "taskName": "LoadData",
+                },
+                {
+                    "id": "gate",
+                    "taskName": "OnlyIfApproved",
+                    "nodeKind": "control",
+                    "controlKind": "if",
+                    "capabilityId": "studio.control.if",
+                    "controlConfig": {"expression": "workflow.variable.missing_flag == true"},
+                },
+                {
+                    "id": "target",
+                    "capabilityId": "json_transform",
+                    "taskName": "PublishData",
+                },
+            ],
+            "edges": [
+                {"fromNodeId": "source", "toNodeId": "gate"},
+                {"fromNodeId": "gate", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert plan is None
+    codes = {entry["code"] for entry in errors}
+    assert "draft.control_expression_unsupported" in codes
 
 
 def test_build_plan_from_composer_draft_lowers_if_else_to_branch_gates(monkeypatch) -> None:

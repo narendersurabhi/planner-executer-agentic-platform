@@ -275,10 +275,18 @@ export default function ComposerDagCanvas({
               dagConnectorDrag &&
               dagConnectorDrag.sourceNodeId !== node.id &&
               dagConnectorHoverTargetNodeId === node.id;
+            const statusLabel = isControlNode
+              ? `control ${node.controlKind || "node"}`
+              : requiredCount > 0
+                ? missingCount > 0
+                  ? `${missingCount} missing`
+                  : `${requiredCount}/${requiredCount} ready`
+                : "no required inputs";
+            const outputLabel = node.outputPath.trim() || "result";
             return (
               <div
                 key={`composer-node-${node.id}`}
-                className={`absolute rounded-xl border bg-white shadow-sm ${
+                className={`absolute rounded-[999px] border bg-white/95 shadow-sm backdrop-blur ${
                   isConnectorHoverTarget
                     ? "border-emerald-400 ring-2 ring-emerald-100"
                     : isSelected
@@ -330,7 +338,7 @@ export default function ComposerDagCanvas({
                 />
                 <button
                   type="button"
-                  className={`absolute -right-2 top-1/2 h-4 w-4 -translate-y-1/2 rounded-full border text-[10px] ${
+                  className={`absolute -right-2 top-1/2 h-5 w-5 -translate-y-1/2 rounded-full border text-[10px] ${
                     dagConnectorDrag?.sourceNodeId === node.id
                       ? "border-sky-500 bg-sky-500 text-white"
                       : "border-slate-300 bg-white text-slate-600 hover:border-sky-400 hover:text-sky-600"
@@ -343,49 +351,53 @@ export default function ComposerDagCanvas({
                 >
                   +
                 </button>
-                <div className={`border-b px-2 py-1 ${isControlNode ? "border-amber-200 bg-amber-50" : "border-slate-200 bg-slate-50"}`}>
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="text-[11px] font-semibold text-slate-800">{node.taskName}</div>
-                    <span className="rounded-full border border-slate-200 bg-white px-1.5 py-0.5 text-[9px] text-slate-500">
-                      in {incomingCount} • out {outgoingCount}
-                    </span>
-                  </div>
-                  {isControlNode ? (
-                    <div className="mt-1 inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] text-amber-700">
-                      control {node.controlKind || "node"}
+                <div className="flex h-full items-center gap-3 px-5 py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <div className="truncate text-sm font-semibold text-slate-900">{node.taskName}</div>
+                      {isControlNode ? (
+                        <span className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-amber-700">
+                          {node.controlKind || "control"}
+                        </span>
+                      ) : null}
                     </div>
-                  ) : requiredCount > 0 ? (
-                    <div
-                      className={`mt-1 inline-flex rounded-full px-1.5 py-0.5 text-[9px] ${
-                        missingCount > 0 ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"
+                    <div className="mt-1 truncate text-[11px] text-slate-500">
+                      {node.capabilityId} • output:{` `}
+                      <span className="font-medium text-slate-600">{outputLabel}</span>
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${
+                        isControlNode
+                          ? "bg-amber-100 text-amber-700"
+                          : missingCount > 0
+                            ? "bg-rose-100 text-rose-700"
+                            : requiredCount > 0
+                              ? "bg-emerald-100 text-emerald-700"
+                              : "bg-slate-100 text-slate-600"
                       }`}
                     >
-                      {missingCount > 0
-                        ? `${missingCount} missing`
-                        : `${requiredCount}/${requiredCount} ready`}
-                    </div>
-                  ) : (
-                    <div className="mt-1 inline-flex rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] text-slate-600">
-                      no required inputs
-                    </div>
-                  )}
-                  <div className="text-[10px] text-slate-500">{node.capabilityId}</div>
-                </div>
-                <div className="space-y-1 px-2 py-1">
-                  <div className="text-[10px] text-slate-500">output: {node.outputPath}</div>
-                  <div className="text-[10px] text-slate-500">Drag card to move node</div>
-                  <div className="flex flex-wrap gap-1">
+                      {statusLabel}
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[10px] text-slate-600">
+                      {incomingCount} in • {outgoingCount} out
+                    </span>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1">
                     <button
-                      className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] text-slate-700"
+                      className="rounded-full border border-slate-300 px-2.5 py-1 text-[10px] font-semibold text-slate-700"
                       onClick={() => {
                         setSelectedDagNodeId(node.id);
                         centerDagNodeInView(node.id);
                       }}
                     >
-                      Center
+                      Focus
                     </button>
                     <button
-                      className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                      className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold ${
                         dagEdgeDraftSourceNodeId === node.id
                           ? "border-amber-300 bg-amber-50 text-amber-700"
                           : "border-slate-300 text-slate-700"
@@ -395,11 +407,11 @@ export default function ComposerDagCanvas({
                         setDagEdgeDraftSourceNodeId(node.id);
                       }}
                     >
-                      {dagEdgeDraftSourceNodeId === node.id ? "Edge Source" : "Start Edge"}
+                      {dagEdgeDraftSourceNodeId === node.id ? "Source" : "Edge"}
                     </button>
                     {dagEdgeDraftSourceNodeId && dagEdgeDraftSourceNodeId !== node.id ? (
                       <button
-                        className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                        className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold ${
                           edgeFromSource
                             ? "border-rose-300 bg-rose-50 text-rose-700"
                             : "border-emerald-300 bg-emerald-50 text-emerald-700"

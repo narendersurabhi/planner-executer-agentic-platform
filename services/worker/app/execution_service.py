@@ -317,10 +317,19 @@ def _resolve_context_operand(token: str, context: Mapping[str, Any]) -> Any:
     normalized = token.strip()
     if not normalized:
         return None
-    if not normalized.startswith("context."):
+    if normalized.startswith("context."):
+        base = _gate_job_context(context)
+        segments = normalized.split(".")[1:]
+    elif normalized.startswith("workflow.input."):
+        base = _gate_workflow_scope(context, "inputs")
+        segments = normalized.split(".")[2:]
+    elif normalized.startswith("workflow.variable."):
+        base = _gate_workflow_scope(context, "variables")
+        segments = normalized.split(".")[2:]
+    else:
         raise ValueError("unsupported_operand")
-    value: Any = context
-    for segment in normalized.split(".")[1:]:
+    value: Any = base
+    for segment in segments:
         key = segment.strip()
         if not key:
             raise ValueError("empty_context_segment")
@@ -339,7 +348,7 @@ def _parse_expression_literal(token: str, context: Mapping[str, Any]) -> Any:
         return False
     if lowered == "null":
         return None
-    if normalized.startswith(("context.",)):
+    if normalized.startswith(("context.", "workflow.input.", "workflow.variable.")):
         return _resolve_context_operand(normalized, context)
     if normalized.startswith(("'", '"')) and normalized.endswith(("'", '"')) and len(normalized) >= 2:
         return normalized[1:-1]
@@ -349,6 +358,22 @@ def _parse_expression_literal(token: str, context: Mapping[str, Any]) -> Any:
         return int(normalized)
     except ValueError:
         return normalized
+
+
+def _gate_job_context(context: Mapping[str, Any]) -> Mapping[str, Any]:
+    nested = context.get("job_context")
+    if isinstance(nested, Mapping):
+        return nested
+    return context
+
+
+def _gate_workflow_scope(context: Mapping[str, Any], scope: str) -> Mapping[str, Any]:
+    job_context = _gate_job_context(context)
+    workflow = job_context.get("workflow")
+    if not isinstance(workflow, Mapping):
+        return {}
+    value = workflow.get(scope)
+    return value if isinstance(value, Mapping) else {}
 
 
 def _execute_capability_tool(
