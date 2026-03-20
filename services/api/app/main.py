@@ -242,9 +242,13 @@ SEMANTIC_MEMORY_DEFAULT_USER_ID = os.getenv("SEMANTIC_MEMORY_DEFAULT_USER_ID", "
 RUNTIME_CONFORMANCE_ENABLED = (
     os.getenv("RUNTIME_CONFORMANCE_ENABLED", "true").lower() == "true"
 )
+STUDIO_RUN_SCHEDULER_ENABLED = (
+    os.getenv("STUDIO_RUN_SCHEDULER_ENABLED", "false").lower() == "true"
+)
 RUNTIME_CONFORMANCE_SERVICE = (
     os.getenv("RUNTIME_CONFORMANCE_SERVICE", "worker").strip().lower() or "worker"
 )
+POSTGRES_RUN_SPEC_SCHEDULER_MODE = "postgres_run_spec"
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 TASK_OUTPUT_KEY_PREFIX = "task_output:"
 TASK_RESULT_KEY_PREFIX = "task_result:"
@@ -635,6 +639,30 @@ def _workflow_version_plan(record: WorkflowVersionRecord) -> models.PlanCreate |
         except ValueError:
             pass
     return _parse_plan_payload(record.compiled_plan_json or {})
+
+
+def _scheduler_mode_from_metadata(metadata: Mapping[str, Any] | None) -> str:
+    if not isinstance(metadata, Mapping):
+        return ""
+    return str(metadata.get("scheduler_mode") or "").strip()
+
+
+def _workflow_run_uses_postgres_scheduler(record: WorkflowRunRecord | None) -> bool:
+    if record is None:
+        return False
+    return _scheduler_mode_from_metadata(record.metadata_json) == POSTGRES_RUN_SPEC_SCHEDULER_MODE
+
+
+def _job_uses_postgres_scheduler(job: JobRecord | None) -> bool:
+    if job is None:
+        return False
+    return _scheduler_mode_from_metadata(job.metadata_json) == POSTGRES_RUN_SPEC_SCHEDULER_MODE
+
+
+def _job_workflow_run_id(job: JobRecord | None) -> str | None:
+    metadata = job.metadata_json if job and isinstance(job.metadata_json, dict) else {}
+    workflow_run_id = str(metadata.get("workflow_run_id") or "").strip()
+    return workflow_run_id or None
 
 
 def _workflow_trigger_from_record(
@@ -5273,7 +5301,7 @@ def _handle_plan_created(envelope: dict) -> None:
         if existing:
             plan_id = existing.id
             db.commit()
-            _enqueue_ready_tasks(job_id, plan_id, envelope.get("correlation_id"))
+            _dispatch_ready_work_for_job(job_id, plan_id, envelope.get("correlation_id"))
             _refresh_job_status(job_id)
             return
         record = PlanRecord(
@@ -5354,7 +5382,7 @@ def _handle_plan_created(envelope: dict) -> None:
         db.commit()
     for capability_id in selected_capabilities:
         planner_capability_selection_total.labels(capability=capability_id).inc()
-    _enqueue_ready_tasks(job_id, plan_record_id, envelope.get("correlation_id"))
+    _dispatch_ready_work_for_job(job_id, plan_record_id, envelope.get("correlation_id"))
     _refresh_job_status(job_id)
 
 
@@ -5413,7 +5441,7 @@ def _handle_task_completed(envelope: dict) -> None:
         db.commit()
         job_id = task.job_id
         plan_id = task.plan_id
-    _enqueue_ready_tasks(job_id, plan_id, envelope.get("correlation_id"))
+    _dispatch_ready_work_for_job(job_id, plan_id, envelope.get("correlation_id"))
     _refresh_job_status(job_id)
 
 
@@ -5600,7 +5628,7 @@ def _handle_task_accepted(envelope: dict) -> None:
         db.commit()
         job_id = task.job_id
         plan_id = task.plan_id
-    _enqueue_ready_tasks(job_id, plan_id, envelope.get("correlation_id"))
+    _dispatch_ready_work_for_job(job_id, plan_id, envelope.get("correlation_id"))
     _refresh_job_status(job_id)
 
 
@@ -5637,7 +5665,7 @@ def _handle_task_rework(envelope: dict) -> None:
         db.commit()
         job_id = task.job_id
         plan_id = task.plan_id
-    _enqueue_ready_tasks(job_id, plan_id, envelope.get("correlation_id"))
+    _dispatch_ready_work_for_job(job_id, plan_id, envelope.get("correlation_id"))
 
 
 def _parse_plan_payload(payload: dict) -> models.PlanCreate | None:
@@ -5661,6 +5689,211 @@ def _enqueue_ready_tasks(job_id: str, plan_id: str, correlation_id: str | None) 
         runtime=_dispatch_runtime(),
         callbacks=_dispatch_callbacks(),
     )
+
+
+def _latest_step_attempts_for_steps(
+    db: Session,
+    step_ids: Sequence[str],
+) -> dict[str, StepAttemptRecord]:
+    normalized_step_ids = [str(step_id).strip() for step_id in step_ids if str(step_id).strip()]
+    if not normalized_step_ids:
+        return {}
+    rows = (
+        db.query(StepAttemptRecord)
+        .filter(StepAttemptRecord.step_id.in_(normalized_step_ids))
+        .order_by(
+            StepAttemptRecord.step_id.asc(),
+            StepAttemptRecord.attempt_number.desc(),
+            StepAttemptRecord.started_at.desc(),
+        )
+        .all()
+    )
+    latest: dict[str, StepAttemptRecord] = {}
+    for row in rows:
+        latest.setdefault(row.step_id, row)
+    return latest
+
+
+def _scheduler_effective_task_status(
+    task: TaskRecord,
+    latest_attempt: StepAttemptRecord | None,
+) -> str:
+    task_status = str(task.status or "").strip() or models.TaskStatus.pending.value
+    if task_status != models.TaskStatus.pending.value:
+        return task_status
+    latest_status = str(latest_attempt.status or "").strip() if latest_attempt is not None else ""
+    if latest_status in {
+        models.TaskStatus.running.value,
+        models.TaskStatus.completed.value,
+        models.TaskStatus.accepted.value,
+    }:
+        return latest_status
+    return task_status
+
+
+def _schedule_workflow_run(workflow_run_id: str, *, correlation_id: str | None = None) -> None:
+    now = _utcnow()
+    events_to_emit: list[tuple[str, dict[str, Any]]] = []
+    job_id: str | None = None
+    with SessionLocal() as db:
+        workflow_run = (
+            db.query(WorkflowRunRecord).filter(WorkflowRunRecord.id == workflow_run_id).first()
+        )
+        if workflow_run is None or not _workflow_run_uses_postgres_scheduler(workflow_run):
+            return
+        version = (
+            db.query(WorkflowVersionRecord)
+            .filter(WorkflowVersionRecord.id == workflow_run.version_id)
+            .first()
+        )
+        if version is None:
+            return
+        run_spec = _workflow_version_run_spec(version)
+        if run_spec is None:
+            logger.warning(
+                "studio_scheduler_run_spec_missing",
+                extra={"workflow_run_id": workflow_run.id, "version_id": workflow_run.version_id},
+            )
+            return
+        job = db.query(JobRecord).filter(JobRecord.id == workflow_run.job_id).first()
+        plan = db.query(PlanRecord).filter(PlanRecord.id == workflow_run.plan_id).first()
+        if job is None or plan is None:
+            return
+        job_id = job.id
+        task_records = db.query(TaskRecord).filter(TaskRecord.plan_id == plan.id).all()
+        if not task_records:
+            return
+        task_by_name = {record.name: record for record in task_records}
+        latest_attempts = _latest_step_attempts_for_steps(db, [record.id for record in task_records])
+        tasks = _resolve_task_deps(task_records)
+        task_map = {task.id: task for task in tasks}
+        id_to_name = {record.id: record.name for record in task_records}
+        job_context = job.context_json if isinstance(job.context_json, dict) else {}
+        job_goal = job.goal if isinstance(job.goal, str) else ""
+        task_intent_profiles = _coerce_task_intent_profiles(
+            job.metadata_json if isinstance(job.metadata_json, dict) else {}
+        )
+        completed_step_ids: set[str] = set()
+        effective_status_by_step_id: dict[str, str] = {}
+        record_by_step_id: dict[str, TaskRecord] = {}
+        for step in run_spec.steps:
+            record = task_by_name.get(step.name)
+            if record is None:
+                logger.warning(
+                    "studio_scheduler_task_missing",
+                    extra={
+                        "workflow_run_id": workflow_run.id,
+                        "job_id": job.id,
+                        "step_id": step.step_id,
+                        "step_name": step.name,
+                    },
+                )
+                continue
+            effective_status = _scheduler_effective_task_status(
+                record,
+                latest_attempts.get(record.id),
+            )
+            if effective_status in {
+                models.TaskStatus.running.value,
+                models.TaskStatus.completed.value,
+                models.TaskStatus.accepted.value,
+            } and record.status != effective_status:
+                record.status = effective_status
+                record.updated_at = now
+            effective_status_by_step_id[step.step_id] = effective_status
+            record_by_step_id[step.step_id] = record
+            if effective_status in {models.TaskStatus.completed.value, models.TaskStatus.accepted.value}:
+                completed_step_ids.add(step.step_id)
+        for step in run_spec.steps:
+            record = record_by_step_id.get(step.step_id)
+            if record is None:
+                continue
+            if effective_status_by_step_id.get(step.step_id) != models.TaskStatus.pending.value:
+                continue
+            if any(dependency_id not in completed_step_ids for dependency_id in step.depends_on):
+                continue
+            max_attempts = int(record.max_attempts or 0)
+            if max_attempts <= 0:
+                max_attempts = max(1, int(step.retry_policy.max_attempts or 1))
+                record.max_attempts = max_attempts
+            next_attempt = (record.attempts or 0) + 1
+            if _limit_exceeded(next_attempt, max_attempts):
+                record.status = models.TaskStatus.failed.value
+                record.updated_at = now
+                events_to_emit.append(
+                    (
+                        "task.failed",
+                        _task_payload_with_error(
+                            record,
+                            correlation_id,
+                            "max_attempts_exceeded",
+                        ),
+                    )
+                )
+                effective_status_by_step_id[step.step_id] = models.TaskStatus.failed.value
+                continue
+            context = _build_task_context(record.id, task_map, id_to_name, job_context)
+            if POLICY_GATE_ENABLED:
+                record.status = models.TaskStatus.blocked.value
+                record.updated_at = now
+                payload = _task_payload_from_record(
+                    record,
+                    correlation_id,
+                    context,
+                    goal_text=job_goal,
+                    intent_profile=task_intent_profiles.get(record.id),
+                )
+                events_to_emit.append(("task.policy_check", payload))
+                effective_status_by_step_id[step.step_id] = models.TaskStatus.blocked.value
+                continue
+            record.attempts = next_attempt
+            record.status = models.TaskStatus.ready.value
+            record.updated_at = now
+            payload = _task_payload_from_record(
+                record,
+                correlation_id,
+                context,
+                goal_text=job_goal,
+                intent_profile=task_intent_profiles.get(record.id),
+            )
+            if TOOL_INPUT_VALIDATION_ENABLED and payload.get("tool_inputs_validation"):
+                record.status = models.TaskStatus.failed.value
+                record.updated_at = now
+                failed_payload = dict(payload)
+                failed_payload["error"] = "tool_inputs_invalid"
+                events_to_emit.append(("task.failed", failed_payload))
+                effective_status_by_step_id[step.step_id] = models.TaskStatus.failed.value
+                continue
+            events_to_emit.append(("task.ready", payload))
+            effective_status_by_step_id[step.step_id] = models.TaskStatus.ready.value
+        db.commit()
+    for event_type, event_payload in events_to_emit:
+        _emit_event(event_type, event_payload)
+    if job_id:
+        _refresh_job_status(job_id)
+
+
+def _dispatch_ready_work_for_job(
+    job_id: str,
+    plan_id: str | None,
+    correlation_id: str | None,
+) -> None:
+    workflow_run_id: str | None = None
+    resolved_plan_id = plan_id
+    with SessionLocal() as db:
+        job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+        if job is None:
+            return
+        if _job_uses_postgres_scheduler(job):
+            workflow_run_id = _job_workflow_run_id(job)
+        if resolved_plan_id is None:
+            plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
+            resolved_plan_id = plan.id if plan is not None else None
+    if workflow_run_id:
+        _schedule_workflow_run(workflow_run_id, correlation_id=correlation_id)
+        return
+    if resolved_plan_id:
+        _enqueue_ready_tasks(job_id, resolved_plan_id, correlation_id)
 
 
 def _task_payload_from_record(
@@ -5809,7 +6042,7 @@ def _recover_jobs() -> None:
         for job in jobs:
             plan = db.query(PlanRecord).filter(PlanRecord.job_id == job.id).first()
             if plan:
-                _enqueue_ready_tasks(job.id, plan.id, None)
+                _dispatch_ready_work_for_job(job.id, plan.id, None)
                 continue
             _emit_event("job.created", _job_from_record(job).model_dump())
 
@@ -8710,7 +8943,7 @@ def resume_job(job_id: str, db: Session = Depends(get_db)) -> models.Job:
     db.commit()
     plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
     if plan:
-        _enqueue_ready_tasks(job_id, plan.id, None)
+        _dispatch_ready_work_for_job(job_id, plan.id, None)
     return _job_from_record(job)
 
 
@@ -8733,7 +8966,7 @@ def retry_job(job_id: str, db: Session = Depends(get_db)) -> models.Job:
     db.commit()
     plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
     if plan:
-        _enqueue_ready_tasks(job_id, plan.id, None)
+        _dispatch_ready_work_for_job(job_id, plan.id, None)
     return _job_from_record(job)
 
 
@@ -8763,7 +8996,7 @@ def retry_failed_tasks(job_id: str, db: Session = Depends(get_db)) -> models.Job
     db.commit()
     plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
     if plan:
-        _enqueue_ready_tasks(job_id, plan.id, None)
+        _dispatch_ready_work_for_job(job_id, plan.id, None)
     return _job_from_record(job)
 
 
@@ -8805,7 +9038,7 @@ def retry_task(
     if not plan:
         plan = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).first()
     if plan:
-        _enqueue_ready_tasks(job_id, plan.id, None)
+        _dispatch_ready_work_for_job(job_id, plan.id, None)
     return _job_from_record(job)
 
 
@@ -9952,6 +10185,8 @@ def _run_workflow_version_internal(
     compiled_plan = _workflow_version_plan(version)
     if compiled_plan is None:
         raise HTTPException(status_code=400, detail="workflow_version_plan_invalid")
+    run_spec = _workflow_version_run_spec(version)
+    use_postgres_scheduler = STUDIO_RUN_SCHEDULER_ENABLED and run_spec is not None
     context_json = dict(version.context_json or {})
     if isinstance(trigger, WorkflowTriggerRecord) and isinstance(trigger.config_json, dict):
         trigger_context = trigger.config_json.get("context_json")
@@ -10035,6 +10270,8 @@ def _run_workflow_version_internal(
         "workflow_version_id": version.id,
         "goal_intent_graph": None,
     }
+    if use_postgres_scheduler:
+        metadata_overrides["scheduler_mode"] = POSTGRES_RUN_SPEC_SCHEDULER_MODE
     if trigger is not None:
         metadata_overrides["workflow_trigger_id"] = trigger.id
     job = _create_job_internal(
@@ -10048,9 +10285,16 @@ def _run_workflow_version_internal(
         emit_job_created_event=False,
         metadata_overrides=metadata_overrides,
     )
-    plan_record = _create_plan_internal(compiled_plan, job_id=job.id, db=db)
+    plan_record = _create_plan_internal(
+        compiled_plan,
+        job_id=job.id,
+        db=db,
+        emit_plan_created_event=not use_postgres_scheduler,
+    )
     now = _utcnow()
     run_metadata = {"source": source}
+    if use_postgres_scheduler:
+        run_metadata["scheduler_mode"] = POSTGRES_RUN_SPEC_SCHEDULER_MODE
     if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
         run_metadata.update(dict(payload["metadata"]))
     if trigger is not None:
@@ -10083,6 +10327,8 @@ def _run_workflow_version_internal(
         job_record.updated_at = now
     db.commit()
     db.refresh(run_record)
+    if use_postgres_scheduler:
+        _schedule_workflow_run(run_record.id, correlation_id=str(uuid.uuid4()))
     if job_record is not None:
         db.refresh(job_record)
         job = _job_from_record(job_record)
@@ -10353,6 +10599,7 @@ def _create_plan_internal(
     *,
     job_id: str,
     db: Session,
+    emit_plan_created_event: bool = True,
 ) -> models.Plan:
     job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
     job_context = job.context_json if job and isinstance(job.context_json, dict) else {}
@@ -10443,9 +10690,10 @@ def _create_plan_internal(
         _merge_task_intent_profiles_into_job_metadata(job, task_intent_profiles)
         job.updated_at = now
     db.commit()
-    payload = _plan_created_payload(plan, job_id)
-    payload["correlation_id"] = str(uuid.uuid4())
-    _emit_event("plan.created", payload)
+    if emit_plan_created_event:
+        payload = _plan_created_payload(plan, job_id)
+        payload["correlation_id"] = str(uuid.uuid4())
+        _emit_event("plan.created", payload)
     return _plan_from_record(record)
 
 

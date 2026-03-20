@@ -128,6 +128,165 @@ def test_workflow_definition_publish_and_run_bypasses_planner_job_event() -> Non
     }
 
 
+def test_workflow_run_uses_postgres_scheduler_when_flag_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(main, "STUDIO_RUN_SCHEDULER_ENABLED", True)
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Scheduled workspace listing",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Scheduled workspace listing",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 1},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    job_id = run_body["job"]["id"]
+    assert (
+        run_body["workflow_run"]["metadata"]["scheduler_mode"]
+        == main.POSTGRES_RUN_SPEC_SCHEDULER_MODE
+    )
+    assert run_body["job"]["metadata"]["scheduler_mode"] == main.POSTGRES_RUN_SPEC_SCHEDULER_MODE
+
+    with SessionLocal() as db:
+        task_records = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        assert len(task_records) == 1
+        assert task_records[0].status == models.TaskStatus.ready.value
+        assert task_records[0].attempts == 1
+        event_records = db.query(EventOutboxRecord).all()
+    matching_events = [
+        row
+        for row in event_records
+        if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id
+    ]
+    event_types = {row.event_type for row in matching_events}
+    assert "task.ready" in event_types
+    assert "plan.created" not in event_types
+
+
+def test_studio_scheduler_advances_dependency_from_durable_step_state(monkeypatch) -> None:
+    monkeypatch.setattr(main, "STUDIO_RUN_SCHEDULER_ENABLED", True)
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Durable dependency scheduling",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Durable dependency scheduling",
+                "nodes": [
+                    {
+                        "id": "source",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    },
+                    {
+                        "id": "target",
+                        "taskName": "CaptureWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    },
+                ],
+                "edges": [{"fromNodeId": "source", "toNodeId": "target"}],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 1},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    workflow_run_id = run_body["workflow_run"]["id"]
+    job_id = run_body["job"]["id"]
+    now = _utcnow()
+
+    with SessionLocal() as db:
+        tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        tasks_by_name = {task.name: task for task in tasks}
+        source_task = tasks_by_name["ListWorkspace"]
+        target_task = tasks_by_name["CaptureWorkspace"]
+        assert source_task.status == models.TaskStatus.ready.value
+        assert target_task.status == models.TaskStatus.pending.value
+        source_task.status = models.TaskStatus.pending.value
+        source_task.updated_at = now
+        db.add(
+            StepAttemptRecord(
+                id=main._step_attempt_record_id(source_task.id, 1),
+                run_id=workflow_run_id,
+                job_id=job_id,
+                step_id=source_task.id,
+                attempt_number=1,
+                status=models.TaskStatus.completed.value,
+                worker_id="worker-a",
+                started_at=now,
+                finished_at=now,
+                error_code=None,
+                error_message=None,
+                retry_classification="succeeded",
+                result_summary_json={},
+            )
+        )
+        for row in db.query(EventOutboxRecord).all():
+            if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id:
+                db.delete(row)
+        db.commit()
+
+    main._schedule_workflow_run(workflow_run_id, correlation_id="corr-durable")
+
+    with SessionLocal() as db:
+        tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        tasks_by_name = {task.name: task for task in tasks}
+        assert tasks_by_name["ListWorkspace"].status == models.TaskStatus.completed.value
+        assert tasks_by_name["CaptureWorkspace"].status == models.TaskStatus.ready.value
+        assert tasks_by_name["CaptureWorkspace"].attempts == 1
+        event_records = db.query(EventOutboxRecord).all()
+    matching_events = [
+        row
+        for row in event_records
+        if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id
+    ]
+    ready_payloads = [
+        row.envelope_json.get("payload", {})
+        for row in matching_events
+        if row.event_type == "task.ready"
+    ]
+    assert len(ready_payloads) == 1
+    assert ready_payloads[0]["name"] == "CaptureWorkspace"
+
+
 def test_workflow_trigger_create_invoke_and_list() -> None:
     create_response = client.post(
         "/workflows/definitions",
