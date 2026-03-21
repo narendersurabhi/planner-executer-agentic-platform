@@ -111,6 +111,33 @@ def test_build_plan_request_prefers_normalized_envelope_graph_when_present() -> 
     assert planner_contracts.goal_intent_sequence(request) == ["render"]
 
 
+def test_build_plan_request_supports_envelope_only_job_metadata() -> None:
+    job = _job()
+    job.metadata = {
+        "normalized_intent_envelope": {
+            "goal": job.goal,
+            "profile": {"intent": "validate", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "env-only-seg",
+                        "intent": "validate",
+                        "objective": "Validate repository state",
+                        "suggested_capabilities": ["github.repo.list"],
+                    }
+                ]
+            },
+        }
+    }
+
+    request = planner_contracts.build_plan_request(job, tools=[], capabilities={})
+
+    assert request.normalized_intent_envelope is not None
+    assert request.goal_intent_graph is not None
+    assert request.goal_intent_graph.segments[0].id == "env-only-seg"
+    assert planner_contracts.goal_intent_sequence(request) == ["validate"]
+
+
 def test_governance_context_uses_request_metadata() -> None:
     request = planner_contracts.build_plan_request(_job(), tools=[], capabilities={})
 

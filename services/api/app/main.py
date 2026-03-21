@@ -2729,14 +2729,12 @@ def _persist_intent_workflow_memory(
         return
     if metadata.get("intent_memory_persisted"):
         return
-    profile = metadata.get("goal_intent_profile")
-    graph = metadata.get("goal_intent_graph")
-    segments = (
-        _goal_intent_segments_from_metadata(metadata)
-        if isinstance(graph, Mapping)
-        else []
-    )
-    if not isinstance(profile, Mapping) and not segments:
+    normalized_envelope = _normalized_intent_envelope_from_metadata(metadata, goal=job.goal)
+    if normalized_envelope is None:
+        return
+    profile = workflow_contracts.dump_goal_intent_profile(normalized_envelope.profile) or {}
+    segments = _goal_intent_segments_from_metadata(metadata)
+    if not profile and not segments:
         return
     user_id = _semantic_user_id_from_context(job.context_json if isinstance(job.context_json, Mapping) else None)
     intent_order = [
@@ -6101,6 +6099,10 @@ def _handle_plan_created(envelope: dict) -> None:
             plan,
             job_context,
             goal_text=job_goal,
+            normalized_intent_envelope=_normalized_intent_envelope_from_metadata(
+                job.metadata_json if job and isinstance(job.metadata_json, dict) else None,
+                goal=job_goal,
+            ),
             goal_intent_graph=job.metadata_json.get("goal_intent_graph")
             if job and isinstance(job.metadata_json, dict)
             else None,
@@ -7189,6 +7191,9 @@ def _compile_plan_preflight(
     job_context: dict[str, Any] | None,
     *,
     goal_text: str = "",
+    normalized_intent_envelope: workflow_contracts.NormalizedIntentEnvelope
+    | Mapping[str, Any]
+    | None = None,
     goal_intent_graph: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     errors: dict[str, str] = {}
@@ -7218,7 +7223,8 @@ def _compile_plan_preflight(
         return errors
 
     goal_intent_segments = _goal_intent_segments_for_preflight(
-        goal_intent_graph=goal_intent_graph
+        normalized_intent_envelope=normalized_intent_envelope,
+        goal_intent_graph=goal_intent_graph,
     )
     for task_index, task in enumerate(plan.tasks):
         dependency_names = _collect_ancestor_task_names(task, tasks_by_name)
@@ -7559,9 +7565,17 @@ def _preflight_task_intent(task: models.TaskCreate, *, goal_text: str = "") -> s
 
 def _goal_intent_segments_for_preflight(
     *,
+    normalized_intent_envelope: workflow_contracts.NormalizedIntentEnvelope
+    | Mapping[str, Any]
+    | None = None,
     goal_intent_graph: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    graph = workflow_contracts.parse_intent_graph(goal_intent_graph)
+    graph: workflow_contracts.IntentGraph | None = None
+    envelope = workflow_contracts.parse_normalized_intent_envelope(normalized_intent_envelope)
+    if envelope is not None and envelope.graph.segments:
+        graph = envelope.graph
+    if graph is None:
+        graph = workflow_contracts.parse_intent_graph(goal_intent_graph)
     if graph is None:
         return []
     segments: list[dict[str, Any]] = []
@@ -7954,16 +7968,17 @@ def _record_intent_confidence_outcome(job: JobRecord, status: models.JobStatus) 
         return
     if metadata.get("intent_confidence_outcome_recorded"):
         return
-    profile = metadata.get("goal_intent_profile")
-    if not isinstance(profile, Mapping):
+    normalized_envelope = _normalized_intent_envelope_from_metadata(metadata, goal=job.goal)
+    if normalized_envelope is None:
         return
-    intent = intent_contract.normalize_task_intent(profile.get("intent")) or "generate"
-    risk_level = _normalize_risk_level(profile.get("risk_level"))
+    profile = normalized_envelope.profile
+    intent = intent_contract.normalize_task_intent(profile.intent) or "generate"
+    risk_level = _normalize_risk_level(profile.risk_level)
     try:
-        confidence = float(profile.get("confidence"))
+        confidence = float(profile.confidence)
     except (TypeError, ValueError):
         return
-    threshold_raw = profile.get("threshold")
+    threshold_raw = profile.threshold
     try:
         threshold = float(threshold_raw)
     except (TypeError, ValueError):
@@ -10547,25 +10562,30 @@ def preflight_plan(
     job_context: dict[str, Any] = (
         provided_job_context if isinstance(provided_job_context, dict) else {}
     )
-    if not job_context and isinstance(job_id, str) and job_id.strip():
+    job: JobRecord | None = None
+    if isinstance(job_id, str) and job_id.strip():
         job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
-        if job and isinstance(job.context_json, dict):
-            job_context = job.context_json
+    if not job_context and job and isinstance(job.context_json, dict):
+        job_context = job.context_json
     goal_text = str(payload.get("goal") or "").strip()
-    if not goal_text and isinstance(job_id, str) and job_id.strip():
-        job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
-        if job and isinstance(job.goal, str):
-            goal_text = job.goal
+    if not goal_text and job and isinstance(job.goal, str):
+        goal_text = job.goal
 
+    provided_envelope = _normalized_intent_envelope_from_metadata(payload, goal=goal_text)
     provided_graph = payload.get("goal_intent_graph") or payload.get("intent_graph")
-    if not isinstance(provided_graph, Mapping) and isinstance(job_id, str) and job_id.strip():
-        job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
-        if job and isinstance(job.metadata_json, dict):
+    if job and isinstance(job.metadata_json, dict):
+        if provided_envelope is None:
+            provided_envelope = _normalized_intent_envelope_from_metadata(
+                job.metadata_json,
+                goal=goal_text or (job.goal if isinstance(job.goal, str) else ""),
+            )
+        if not isinstance(provided_graph, Mapping):
             provided_graph = job.metadata_json.get("goal_intent_graph")
     preflight_errors = _compile_plan_preflight(
         plan,
         job_context,
         goal_text=goal_text,
+        normalized_intent_envelope=provided_envelope,
         goal_intent_graph=provided_graph if isinstance(provided_graph, Mapping) else None,
     )
     diagnostics = _preflight_error_diagnostics(preflight_errors)
@@ -11320,23 +11340,29 @@ def compile_composer_draft(
         job_context = _coerce_context_object(
             raw_draft.get("contextJson") if "contextJson" in raw_draft else raw_draft.get("context_json")
         )
-    if not job_context and isinstance(job_id, str) and job_id.strip():
+    job: JobRecord | None = None
+    if isinstance(job_id, str) and job_id.strip():
         job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
-        if job and isinstance(job.context_json, dict):
-            job_context = job.context_json
+    if not job_context and job and isinstance(job.context_json, dict):
+        job_context = job.context_json
     goal_text = str(payload.get("goal") or "").strip()
     if not goal_text:
         goal_text = str(raw_draft.get("goal") or raw_draft.get("job_goal") or "").strip()
-    if not goal_text and isinstance(job_id, str) and job_id.strip():
-        job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
-        if job and isinstance(job.goal, str):
-            goal_text = job.goal
+    if not goal_text and job and isinstance(job.goal, str):
+        goal_text = job.goal
+    provided_envelope = _normalized_intent_envelope_from_metadata(payload, goal=goal_text)
+    if provided_envelope is None and isinstance(raw_draft, Mapping):
+        provided_envelope = _normalized_intent_envelope_from_metadata(raw_draft, goal=goal_text)
     provided_graph = payload.get("goal_intent_graph") or payload.get("intent_graph")
     if not isinstance(provided_graph, Mapping):
         provided_graph = raw_draft.get("goal_intent_graph") or raw_draft.get("intent_graph")
-    if not isinstance(provided_graph, Mapping) and isinstance(job_id, str) and job_id.strip():
-        job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
-        if job and isinstance(job.metadata_json, dict):
+    if job and isinstance(job.metadata_json, dict):
+        if provided_envelope is None:
+            provided_envelope = _normalized_intent_envelope_from_metadata(
+                job.metadata_json,
+                goal=goal_text or (job.goal if isinstance(job.goal, str) else ""),
+            )
+        if not isinstance(provided_graph, Mapping):
             provided_graph = job.metadata_json.get("goal_intent_graph")
 
     workflow_interface, workflow_interface_errors, workflow_interface_warnings = (
@@ -11376,6 +11402,7 @@ def compile_composer_draft(
             plan,
             preview_job_context,
             goal_text=goal_text,
+            normalized_intent_envelope=provided_envelope,
             goal_intent_graph=provided_graph if isinstance(provided_graph, Mapping) else None,
         )
         for diagnostic in _preflight_error_diagnostics(preflight_errors):
@@ -11493,6 +11520,10 @@ def _create_plan_internal(
         plan,
         job_context,
         goal_text=goal_text,
+        normalized_intent_envelope=_normalized_intent_envelope_from_metadata(
+            job.metadata_json if job and isinstance(job.metadata_json, dict) else None,
+            goal=goal_text,
+        ),
         goal_intent_graph=job.metadata_json.get("goal_intent_graph")
         if job and isinstance(job.metadata_json, dict)
         else None,

@@ -3093,6 +3093,62 @@ def test_preflight_plan_endpoint_returns_intent_segment_slot_diagnostics() -> No
     assert diagnostics[0]["field"] == "GenerateText"
 
 
+def test_preflight_plan_endpoint_accepts_normalized_envelope_without_legacy_graph() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "segment contract",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "GenerateText",
+                    "description": "Generate text",
+                    "instruction": "Generate the content",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "generate",
+                    "deps": [],
+                    "tool_requests": ["llm_generate"],
+                    "tool_inputs": {"llm_generate": {"text": "hello"}},
+                    "critic_required": False,
+                }
+            ],
+        },
+        "normalized_intent_envelope": {
+            "goal": "Generate report text",
+            "profile": {"intent": "generate", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "s1",
+                        "intent": "generate",
+                        "objective": "Generate report text",
+                        "required_inputs": ["instruction"],
+                        "suggested_capabilities": ["llm.text.generate"],
+                        "slots": {
+                            "entity": "report",
+                            "artifact_type": "content",
+                            "output_format": "txt",
+                            "risk_level": "read_only",
+                            "must_have_inputs": ["path"],
+                        },
+                    }
+                ]
+            },
+        },
+        "job_context": {},
+    }
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm_generate")
+    diagnostics = body.get("diagnostics", [])
+    assert isinstance(diagnostics, list) and diagnostics
+    assert diagnostics[0]["code"] == "intent_segment.must_have_inputs_missing"
+    assert diagnostics[0]["field"] == "GenerateText"
+
+
 def test_preflight_plan_endpoint_accepts_intent_segment_tool_inputs_requirement() -> None:
     payload = {
         "plan": {
