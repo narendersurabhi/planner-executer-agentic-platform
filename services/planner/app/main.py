@@ -336,9 +336,12 @@ def _ensure_task_intents(
     tools: List[models.ToolSpec],
     goal_text: str = "",
     goal_intent_sequence: list[str] | None = None,
+    goal_intent_segments: list[dict[str, Any]] | None = None,
+    capabilities: Mapping[str, Any] | None = None,
 ) -> models.PlanCreate:
     logger = core_logging.get_logger("planner")
     tool_map = {tool.name: tool for tool in tools}
+    total_tasks = len(plan.tasks)
     updated_tasks: list[models.TaskCreate] = []
     changed = False
     for index, task in enumerate(plan.tasks):
@@ -347,6 +350,20 @@ def _ensure_task_intents(
             for tool_name in (task.tool_requests or [])
             if tool_name in tool_map
         }
+        goal_segment_intent = None
+        if goal_intent_segments:
+            matched_segment = planner_service.select_goal_intent_segment_for_task(
+                task=task,
+                task_index=index,
+                task_intent="",
+                goal_intent_segments=list(goal_intent_segments),
+                total_tasks=total_tasks,
+                capabilities=capabilities,
+            )
+            if matched_segment is not None:
+                goal_segment_intent = intent_contract.normalize_task_intent(
+                    matched_segment.get("intent")
+                )
         inference = intent_contract.infer_task_intent_for_task_with_metadata(
             explicit_intent=task.intent,
             description=task.description,
@@ -357,8 +374,12 @@ def _ensure_task_intents(
         inferred = inference.intent
         intent_source = inference.source
         intent_confidence = float(inference.confidence)
+        if goal_segment_intent and not task.intent:
+            inferred = goal_segment_intent
+            intent_source = "normalized_envelope"
+            intent_confidence = max(intent_confidence, 0.92)
         # If text inference falls back to generate, prefer known tool intent where unambiguous.
-        if inferred == models.ToolIntent.generate.value and not task.intent:
+        if inferred == models.ToolIntent.generate.value and not task.intent and not goal_segment_intent:
             if len(unique_tool_intents) == 1:
                 inferred = next(iter(unique_tool_intents)).value
                 intent_source = "tool_intent"
@@ -418,14 +439,23 @@ def _ensure_task_intents_for_request(
         request.tools,
         goal_text=request.goal,
         goal_intent_sequence=planner_contracts.goal_intent_sequence(request),
+        goal_intent_segments=planner_contracts.goal_intent_segments(request),
+        capabilities=planner_contracts.capability_map(request),
     )
 
 
+def _job_normalized_intent_envelope(
+    job: models.Job,
+) -> workflow_contracts.NormalizedIntentEnvelope | None:
+    return planner_contracts.normalized_intent_envelope_for_job(job)
+
+
 def _job_goal_intent_graph(job: models.Job) -> workflow_contracts.IntentGraph | None:
-    if not isinstance(job.metadata, dict):
+    envelope = _job_normalized_intent_envelope(job)
+    if envelope is None:
         return None
-    graph = workflow_contracts.parse_intent_graph(job.metadata.get("goal_intent_graph"))
-    if graph is None or not graph.segments:
+    graph = envelope.graph
+    if not graph.segments:
         return None
     return graph
 

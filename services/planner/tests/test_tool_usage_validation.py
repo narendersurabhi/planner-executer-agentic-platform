@@ -418,6 +418,28 @@ def test_job_goal_intent_sequence_reads_job_metadata() -> None:
     assert _job_goal_intent_sequence(job) == ["io", "render"]
 
 
+def test_job_goal_intent_sequence_prefers_normalized_envelope_metadata() -> None:
+    job = _job()
+    job.metadata = {
+        "goal_intent_graph": {
+            "segments": [
+                {"id": "legacy", "intent": "generate"},
+            ]
+        },
+        "normalized_intent_envelope": {
+            "goal": job.goal,
+            "profile": {"intent": "io", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {"id": "s1", "intent": "io"},
+                    {"id": "s2", "intent": "render"},
+                ]
+            },
+        },
+    }
+    assert _job_goal_intent_sequence(job) == ["io", "render"]
+
+
 def test_llm_prompt_includes_intent_mismatch_recovery_constraints() -> None:
     job = _job()
     job.metadata = {

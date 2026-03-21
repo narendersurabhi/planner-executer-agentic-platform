@@ -75,6 +75,42 @@ def test_build_plan_request_extracts_intent_graph_and_capabilities() -> None:
     assert request.max_dependency_depth == 4
 
 
+def test_build_plan_request_prefers_normalized_envelope_graph_when_present() -> None:
+    job = _job()
+    job.metadata = {
+        "goal_intent_graph": {
+            "segments": [
+                {
+                    "id": "legacy-seg",
+                    "intent": "generate",
+                    "objective": "Legacy graph segment",
+                }
+            ]
+        },
+        "normalized_intent_envelope": {
+            "goal": job.goal,
+            "profile": {"intent": "render", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "env-seg",
+                        "intent": "render",
+                        "objective": "Render the document",
+                        "suggested_capabilities": ["document.docx.generate"],
+                    }
+                ]
+            },
+        },
+    }
+
+    request = planner_contracts.build_plan_request(job, tools=[], capabilities={})
+
+    assert request.normalized_intent_envelope is not None
+    assert request.goal_intent_graph is not None
+    assert request.goal_intent_graph.segments[0].id == "env-seg"
+    assert planner_contracts.goal_intent_sequence(request) == ["render"]
+
+
 def test_governance_context_uses_request_metadata() -> None:
     request = planner_contracts.build_plan_request(_job(), tools=[], capabilities={})
 

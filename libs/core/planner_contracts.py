@@ -41,9 +41,59 @@ class PlanRequest(BaseModel):
     job_payload: dict[str, Any] = Field(default_factory=dict)
     tools: list[models.ToolSpec] = Field(default_factory=list)
     capabilities: list[PlanRequestCapability] = Field(default_factory=list)
+    normalized_intent_envelope: workflow_contracts.NormalizedIntentEnvelope | None = None
     goal_intent_graph: workflow_contracts.IntentGraph | None = None
     semantic_capability_hints: list[dict[str, Any]] = Field(default_factory=list)
     max_dependency_depth: int | None = None
+
+
+def _candidate_capabilities_from_graph(
+    graph: workflow_contracts.IntentGraph | None,
+) -> dict[str, list[str]]:
+    if graph is None:
+        return {}
+    candidates: dict[str, list[str]] = {}
+    for segment in graph.segments:
+        deduped: list[str] = []
+        for capability_id in segment.suggested_capabilities:
+            normalized = str(capability_id or "").strip()
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+        if deduped:
+            candidates[segment.id] = deduped
+    return candidates
+
+
+def normalized_intent_envelope_for_job(
+    job: models.Job,
+) -> workflow_contracts.NormalizedIntentEnvelope | None:
+    metadata = job.metadata if isinstance(job.metadata, Mapping) else {}
+    envelope = workflow_contracts.parse_normalized_intent_envelope(
+        metadata.get("normalized_intent_envelope")
+    )
+    if envelope is not None:
+        return envelope
+    profile = workflow_contracts.parse_goal_intent_profile(metadata.get("goal_intent_profile"))
+    graph = workflow_contracts.parse_intent_graph(metadata.get("goal_intent_graph"))
+    if profile is None and graph is None:
+        return None
+    graph = graph or workflow_contracts.IntentGraph()
+    profile = profile or workflow_contracts.GoalIntentProfile()
+    return workflow_contracts.NormalizedIntentEnvelope(
+        goal=str(job.goal or "").strip(),
+        profile=profile,
+        graph=graph,
+        candidate_capabilities=_candidate_capabilities_from_graph(graph),
+        clarification=workflow_contracts.ClarificationState(
+            needs_clarification=bool(profile.needs_clarification),
+            requires_blocking_clarification=bool(profile.requires_blocking_clarification),
+            missing_inputs=list(profile.missing_slots),
+            questions=list(profile.questions),
+            blocking_slots=list(profile.blocking_slots),
+            slot_values=dict(profile.slot_values),
+            clarification_mode=profile.clarification_mode,
+        ),
+    )
 
 
 def build_plan_request(
@@ -64,7 +114,12 @@ def build_plan_request(
     else:
         capability_values = list(capabilities)
     job_metadata = job.metadata if isinstance(job.metadata, dict) else {}
-    goal_intent_graph = workflow_contracts.parse_intent_graph(job_metadata.get("goal_intent_graph"))
+    normalized_intent_envelope = normalized_intent_envelope_for_job(job)
+    goal_intent_graph = None
+    if normalized_intent_envelope is not None and normalized_intent_envelope.graph.segments:
+        goal_intent_graph = normalized_intent_envelope.graph
+    if goal_intent_graph is None:
+        goal_intent_graph = workflow_contracts.parse_intent_graph(job_metadata.get("goal_intent_graph"))
     return PlanRequest(
         job_id=job.id,
         goal=job.goal,
@@ -97,6 +152,7 @@ def build_plan_request(
             )
             for spec in capability_values
         ],
+        normalized_intent_envelope=normalized_intent_envelope,
         goal_intent_graph=goal_intent_graph,
         semantic_capability_hints=[
             dict(item) for item in semantic_capability_hints or [] if isinstance(item, Mapping)
@@ -109,8 +165,23 @@ def capability_map(request: PlanRequest) -> dict[str, PlanRequestCapability]:
     return {capability.capability_id: capability for capability in request.capabilities}
 
 
+def normalized_intent_envelope(
+    request: PlanRequest,
+) -> workflow_contracts.NormalizedIntentEnvelope | None:
+    return request.normalized_intent_envelope
+
+
+def normalized_intent_graph(
+    request: PlanRequest,
+) -> workflow_contracts.IntentGraph | None:
+    envelope = normalized_intent_envelope(request)
+    if envelope is not None and envelope.graph.segments:
+        return envelope.graph
+    return request.goal_intent_graph
+
+
 def goal_intent_sequence(request: PlanRequest) -> list[str]:
-    graph = request.goal_intent_graph
+    graph = normalized_intent_graph(request)
     if graph is None:
         return []
     sequence: list[str] = []
@@ -122,7 +193,7 @@ def goal_intent_sequence(request: PlanRequest) -> list[str]:
 
 
 def goal_intent_segments(request: PlanRequest) -> list[dict[str, Any]]:
-    graph = request.goal_intent_graph
+    graph = normalized_intent_graph(request)
     if graph is None:
         return []
     return [segment.model_dump(mode="json", exclude_none=True) for segment in graph.segments]

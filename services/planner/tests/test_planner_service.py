@@ -152,6 +152,73 @@ def test_validate_plan_request_uses_service_owned_capability_rules() -> None:
     assert reason.startswith("capability_intent_invalid:github.repo.list:CheckRepo:")
 
 
+def test_validate_plan_request_prefers_normalized_goal_segment_for_ambiguous_task_text(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        planner_service.tool_registry,
+        "evaluate_tool_allowlist",
+        lambda *_args, **_kwargs: planner_service.tool_registry.ToolAllowDecision(
+            allowed=True,
+            reason="allowed_for_test",
+        ),
+    )
+    request = planner_contracts.PlanRequest(
+        job_id="job-1",
+        goal="Handle repository work",
+        tools=[
+            models.ToolSpec(
+                name="github.repo.list",
+                description="List repositories",
+                input_schema={},
+                output_schema={},
+                tool_intent=models.ToolIntent.io,
+            )
+        ],
+        normalized_intent_envelope={
+            "goal": "Handle repository work",
+            "profile": {"intent": "io", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "s1",
+                        "intent": "io",
+                        "objective": "List repositories",
+                        "suggested_capabilities": ["github.repo.list"],
+                    }
+                ]
+            },
+        },
+    )
+    plan = models.PlanCreate(
+        planner_version="1.0.0",
+        tasks_summary="repo",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="CheckRepo",
+                description="Handle it",
+                instruction="Do the work.",
+                acceptance_criteria=["Repo checked"],
+                expected_output_schema_ref="schemas/test",
+                intent=None,
+                deps=[],
+                tool_requests=["github.repo.list"],
+                tool_inputs={"github.repo.list": {}},
+                critic_required=False,
+            )
+        ],
+    )
+
+    valid, reason = planner_service.validate_plan_request(
+        plan,
+        request,
+        schema_registry_path="schemas",
+    )
+
+    assert valid, reason
+
+
 def test_build_validation_payload_projects_explicit_document_generation_fields() -> None:
     request = planner_contracts.PlanRequest(
         job_id="job-1",

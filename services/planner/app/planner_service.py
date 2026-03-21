@@ -212,10 +212,25 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
     depth_hint = ""
     if request.max_dependency_depth:
         depth_hint = f"Max dependency chain depth: {request.max_dependency_depth}.\n"
+    normalized_intent_block = ""
+    normalized_envelope = planner_contracts.normalized_intent_envelope(request)
+    if normalized_envelope is not None:
+        normalized_intent_json = json.dumps(
+            normalized_envelope.model_dump(mode="json", exclude_none=True),
+            ensure_ascii=False,
+            indent=2,
+            default=_json_fallback,
+        )
+        normalized_intent_block = (
+            "Normalized intent envelope (source of truth for planner intent guidance):\n"
+            f"{normalized_intent_json}\n"
+            "Prefer its segment order, candidate capabilities, and clarification state when composing tasks.\n"
+        )
     intent_graph_block = ""
-    if request.goal_intent_graph is not None:
+    normalized_graph = planner_contracts.normalized_intent_graph(request)
+    if normalized_graph is not None:
         intent_graph_json = json.dumps(
-            request.goal_intent_graph.model_dump(mode="json", exclude_none=True),
+            normalized_graph.model_dump(mode="json", exclude_none=True),
             ensure_ascii=False,
             indent=2,
             default=_json_fallback,
@@ -295,6 +310,7 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
         "criteria short bullets.\n"
         "\n"
         f"{depth_hint}"
+        f"{normalized_intent_block}"
         f"{intent_graph_block}"
         f"{intent_repair_block}"
         f"Allowed tool names: {tool_names}\n"
@@ -337,9 +353,20 @@ def resolve_task_intent_for_validation(
     tool_map: Mapping[str, models.ToolSpec],
     *,
     goal_text: str = "",
+    goal_intent_segment: Mapping[str, Any] | None = None,
 ) -> str:
+    explicit_intent = intent_contract.normalize_task_intent(task.intent)
+    if explicit_intent:
+        return explicit_intent
+    segment_intent = (
+        intent_contract.normalize_task_intent(goal_intent_segment.get("intent"))
+        if isinstance(goal_intent_segment, Mapping)
+        else None
+    )
+    if segment_intent:
+        return segment_intent
     inference = intent_contract.infer_task_intent_for_task_with_metadata(
-        explicit_intent=task.intent,
+        explicit_intent=None,
         description=task.description,
         instruction=task.instruction,
         acceptance_criteria=task.acceptance_criteria,
@@ -684,21 +711,31 @@ def validate_plan_request(
     for task_index, task in enumerate(plan.tasks):
         if not task.tool_requests:
             continue
-        task_intent = resolve_task_intent_for_validation(
-            task,
-            tool_map,
-            goal_text=request.goal,
-        )
-        if not task_intent:
-            return False, f"missing_task_intent:{task.name}"
         goal_intent_segment = select_goal_intent_segment_for_task(
             task=task,
             task_index=task_index,
-            task_intent=task_intent,
+            task_intent="",
             goal_intent_segments=goal_intent_segments,
             total_tasks=len(plan.tasks),
             capabilities=capabilities,
         )
+        task_intent = resolve_task_intent_for_validation(
+            task,
+            tool_map,
+            goal_text=request.goal,
+            goal_intent_segment=goal_intent_segment,
+        )
+        if not task_intent:
+            return False, f"missing_task_intent:{task.name}"
+        if goal_intent_segment is None:
+            goal_intent_segment = select_goal_intent_segment_for_task(
+                task=task,
+                task_index=task_index,
+                task_intent=task_intent,
+                goal_intent_segments=goal_intent_segments,
+                total_tasks=len(plan.tasks),
+                capabilities=capabilities,
+            )
         for tool_name in task.tool_requests:
             tool = tool_map.get(tool_name)
             capability = capabilities.get(tool_name)
