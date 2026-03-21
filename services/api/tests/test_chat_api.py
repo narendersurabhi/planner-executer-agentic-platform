@@ -474,6 +474,7 @@ def test_chat_turn_can_use_llm_router_for_conversational_reply(monkeypatch) -> N
                 "confidence": 0.93,
             }
 
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
     monkeypatch.setattr(main, "_chat_router_provider", _Router())
     session = client.post("/chat/sessions", json={}).json()
 
@@ -487,6 +488,162 @@ def test_chat_turn_can_use_llm_router_for_conversational_reply(monkeypatch) -> N
     assert body["job"] is None
     assert body["assistant_message"]["action"]["type"] == "respond"
     assert body["assistant_message"]["content"] == "This stays in chat."
+
+
+def test_chat_turn_uses_separate_response_provider_for_conversational_reply(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert "current_user_message" in request.prompt
+            return {
+                "route": "respond",
+                "assistant_response": "Router fallback response.",
+                "intent": "other",
+                "risk_level": "read_only",
+                "confidence": 0.93,
+            }
+
+    class _Responder:
+        def generate_request(self, request):
+            assert request.metadata == {"component": "chat_response"}
+            assert "current_user_message" in request.prompt
+            return type("_Response", (), {"content": "Response model answer."})()
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Explain the planner at a high level.", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert body["assistant_message"]["content"] == "Response model answer."
+
+
+def test_chat_turn_response_first_skips_router_for_conversational_turn(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            raise AssertionError("router should not run for conversational turns in response_first mode")
+
+    class _Responder:
+        def generate_request(self, request):
+            assert request.metadata == {"component": "chat_response"}
+            return type("_Response", (), {"content": "Direct response model answer."})()
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Can you explain the architecture?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert body["assistant_message"]["content"] == "Direct response model answer."
+
+
+def test_chat_turn_response_first_still_uses_router_for_execution_turn(monkeypatch) -> None:
+    calls = {"router": 0}
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            calls["router"] += 1
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "render",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+            }
+
+    class _Responder:
+        def generate_request(self, request):
+            raise AssertionError("response provider should not run for execution turns")
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Render a PDF deployment report",
+            "context_json": {"topic": "Deployment report"},
+            "priority": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert calls["router"] == 1
+    assert body["job"]["goal"] == "Render a PDF deployment report"
+    assert body["assistant_message"]["action"]["type"] == "submit_job"
+
+
+def test_chat_turn_tool_call_does_not_use_chat_response_provider(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert "direct_capabilities" in request.prompt
+            return {
+                "route": "tool_call",
+                "assistant_response": "",
+                "intent": "io",
+                "risk_level": "read_only",
+                "confidence": 0.97,
+                "capability_id": "filesystem.workspace.list",
+                "arguments": {"path": "", "max_files": 2},
+            }
+
+    class _Responder:
+        def generate_request(self, request):
+            raise AssertionError("chat response provider should not run for tool_call")
+
+    def _run_chat_direct_capability(*, db, chat_session_id, goal, capability_id, arguments, context_json, priority):
+        del db, chat_session_id, goal, arguments, context_json, priority
+        return chat_service.ChatDirectRunResult(
+            job=models.Job(
+                id="job-tool-call",
+                goal="List workspace files",
+                context_json={},
+                status=models.JobStatus.succeeded,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+                priority=0,
+                metadata={"workflow_source": "chat_direct"},
+            ),
+            capability_id=capability_id,
+            tool_name="filesystem.workspace.list",
+            output={"entries": [{"path": "/shared/workspace/README.md", "type": "file"}]},
+            assistant_response="Listed workspace files.",
+            error=None,
+        )
+
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    monkeypatch.setattr(main, "_run_chat_direct_capability", _run_chat_direct_capability)
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "List the workspace files", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "tool_call"
+    assert body["assistant_message"]["content"] == "Listed workspace files."
+    assert body["job"]["id"] == "job-tool-call"
 
 
 def test_chat_turn_executes_direct_capability_as_synchronous_one_step_run(monkeypatch) -> None:

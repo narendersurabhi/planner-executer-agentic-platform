@@ -156,6 +156,8 @@ POLICY_GATE_ENABLED = os.getenv("POLICY_GATE_ENABLED", "false").lower() == "true
 JOB_RECOVERY_ENABLED = os.getenv("JOB_RECOVERY_ENABLED", "true").lower() == "true"
 LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER", "").strip()
 LLM_MODEL_NAME = os.getenv("OPENAI_MODEL", "").strip()
+CHAT_ROUTER_MODEL = os.getenv("CHAT_ROUTER_MODEL", "").strip()
+CHAT_RESPONSE_MODEL = os.getenv("CHAT_RESPONSE_MODEL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").strip()
 OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "30"))
@@ -206,6 +208,9 @@ INTENT_MEMORY_RETRIEVAL_LIMIT = max(
 CHAT_DIRECT_EXECUTION_ENABLED = (
     os.getenv("CHAT_DIRECT_EXECUTION_ENABLED", "true").lower() == "true"
 )
+CHAT_ROUTING_MODE = os.getenv("CHAT_ROUTING_MODE", "response_first").strip().lower()
+if CHAT_ROUTING_MODE not in {"always_router", "response_first"}:
+    CHAT_ROUTING_MODE = "response_first"
 CHAT_DIRECT_CAPABILITIES = {
     entry.strip()
     for entry in os.getenv(
@@ -369,7 +374,7 @@ def _build_chat_router_provider() -> LLMProvider | None:
     provider_name = (LLM_PROVIDER_NAME or "").strip().lower()
     if not provider_name or provider_name == "mock":
         return None
-    model_name = (LLM_MODEL_NAME or "").strip()
+    model_name = (CHAT_ROUTER_MODEL or LLM_MODEL_NAME or "").strip()
     if not model_name:
         return None
     try:
@@ -390,6 +395,33 @@ def _build_chat_router_provider() -> LLMProvider | None:
 
 
 _chat_router_provider = _build_chat_router_provider()
+
+
+def _build_chat_response_provider() -> LLMProvider | None:
+    provider_name = (LLM_PROVIDER_NAME or "").strip().lower()
+    if not provider_name or provider_name == "mock":
+        return None
+    model_name = (CHAT_RESPONSE_MODEL or LLM_MODEL_NAME or "").strip()
+    if not model_name:
+        return None
+    try:
+        return resolve_provider(
+            provider_name,
+            api_key=OPENAI_API_KEY or None,
+            model=model_name,
+            base_url=OPENAI_BASE_URL or None,
+            timeout_s=max(1.0, OPENAI_TIMEOUT_S),
+            max_retries=max(0, OPENAI_MAX_RETRIES),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "chat_response_provider_init_failed",
+            extra={"provider": provider_name, "model": model_name},
+        )
+        return None
+
+
+_chat_response_provider = _build_chat_response_provider()
 
 
 def _rag_retriever_request_json(
@@ -1488,12 +1520,24 @@ def _route_chat_turn(
         session_metadata=session_metadata,
         merged_context=merged_context,
     )
-    if _chat_router_provider is None:
-        return fallback
     pending_clarification = bool(
         isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
     )
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
+    should_use_router = (
+        CHAT_ROUTING_MODE == "always_router"
+        or pending_clarification
+        or workflow_invocation is not None
+        or not _looks_like_conversational_turn(content)
+    )
+    if _chat_router_provider is None or not should_use_router:
+        return _finalize_chat_turn_plan(
+            fallback,
+            content=content,
+            candidate_goal=candidate_goal,
+            merged_context=merged_context,
+            messages=messages,
+        )
     try:
         prompt = _build_chat_router_prompt(
             content=content,
@@ -1521,16 +1565,28 @@ def _route_chat_turn(
                 },
             )
         )
-        return _normalize_chat_route(
-            parsed,
+        return _finalize_chat_turn_plan(
+            _normalize_chat_route(
+                parsed,
+                content=content,
+                candidate_goal=candidate_goal,
+                fallback=fallback,
+                workflow_invocation_available=workflow_invocation is not None,
+            ),
             content=content,
             candidate_goal=candidate_goal,
-            fallback=fallback,
-            workflow_invocation_available=workflow_invocation is not None,
+            merged_context=merged_context,
+            messages=messages,
         )
     except Exception:  # noqa: BLE001
         logger.exception("chat_router_failed")
-        return fallback
+        return _finalize_chat_turn_plan(
+            fallback,
+            content=content,
+            candidate_goal=candidate_goal,
+            merged_context=merged_context,
+            messages=messages,
+        )
 
 
 def _fallback_chat_turn_route(
@@ -1658,6 +1714,88 @@ def _build_chat_router_prompt(
         "- Return JSON only.\n\n"
         f"{json.dumps(payload, ensure_ascii=True)}"
     )
+
+
+def _build_chat_response_prompt(
+    *,
+    content: str,
+    candidate_goal: str,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> str:
+    recent_messages: list[dict[str, str]] = []
+    for message in list(messages or [])[-8:]:
+        recent_messages.append(
+            {
+                "role": str(message.role),
+                "content": str(message.content or "")[:800],
+            }
+        )
+    payload = {
+        "current_user_message": content,
+        "candidate_goal": candidate_goal,
+        "context_json": dict(merged_context or {}),
+        "recent_messages": recent_messages,
+    }
+    return json.dumps(payload, ensure_ascii=True)
+
+
+def _generate_chat_response(
+    *,
+    content: str,
+    candidate_goal: str,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+    fallback_response: str,
+) -> str:
+    if _chat_response_provider is None:
+        return fallback_response
+    try:
+        response = _chat_response_provider.generate_request(
+            LLMRequest(
+                prompt=_build_chat_response_prompt(
+                    content=content,
+                    candidate_goal=candidate_goal,
+                    merged_context=merged_context,
+                    messages=messages,
+                ),
+                system_prompt=(
+                    "You are the conversational assistant for an agent platform. "
+                    "Answer directly and stay in chat. "
+                    "Do not claim to have executed tools, created jobs, or run workflows unless the system already did so. "
+                    "Be concise, technically accurate, and grounded in the provided context."
+                ),
+                metadata={"component": "chat_response"},
+            )
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_response_generation_failed")
+        return fallback_response
+    generated = str(response.content or "").strip()
+    return generated or fallback_response
+
+
+def _finalize_chat_turn_plan(
+    turn_plan: Mapping[str, Any],
+    *,
+    content: str,
+    candidate_goal: str,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> dict[str, Any]:
+    finalized = dict(turn_plan)
+    route_type = str(finalized.get("type") or "").strip().lower()
+    if route_type != "respond":
+        return finalized
+    fallback_response = str(finalized.get("assistant_content") or "").strip()
+    finalized["assistant_content"] = _generate_chat_response(
+        content=content,
+        candidate_goal=candidate_goal,
+        merged_context=merged_context,
+        messages=messages,
+        fallback_response=fallback_response or _fallback_chat_response(content),
+    )
+    return finalized
 
 
 def _normalize_chat_route(
