@@ -205,6 +205,9 @@ def handle_turn(
         turn_plan.get("goal_intent_profile")
     ) or {}
     route_type = str(turn_plan.get("type") or "").strip().lower() or "respond"
+    resolved_goal = str(turn_plan.get("resolved_goal") or candidate_goal or "").strip()
+    if not resolved_goal:
+        resolved_goal = content
     assistant_content = str(turn_plan.get("assistant_content") or "").strip()
 
     assistant_action: chat_contracts.AssistantAction
@@ -222,12 +225,12 @@ def handle_turn(
             assistant_content = "\n".join(questions)
         assistant_action = chat_contracts.AssistantAction(
             type=chat_contracts.AssistantActionType.ask_clarification,
-            goal=candidate_goal,
+            goal=resolved_goal,
             clarification_questions=questions,
             goal_intent_profile=dict(assessment),
             context_json=merged_context,
         )
-        session_metadata["draft_goal"] = candidate_goal
+        session_metadata["draft_goal"] = resolved_goal
         session_metadata["pending_clarification"] = {
             "goal_intent_profile": dict(assessment),
             "questions": questions,
@@ -235,7 +238,7 @@ def handle_turn(
     elif route_type == "submit_job":
         created_job = runtime.create_job(
             models.JobCreate(
-                goal=candidate_goal,
+                goal=resolved_goal,
                 context_json=merged_context,
                 priority=request.priority,
             ),
@@ -248,7 +251,7 @@ def handle_turn(
             )
         assistant_action = chat_contracts.AssistantAction(
             type=chat_contracts.AssistantActionType.submit_job,
-            goal=candidate_goal,
+            goal=resolved_goal,
             job_id=created_job.id,
             goal_intent_profile=dict(assessment),
             context_json=merged_context,
@@ -267,12 +270,12 @@ def handle_turn(
                 assistant_content = question
             assistant_action = chat_contracts.AssistantAction(
                 type=chat_contracts.AssistantActionType.ask_clarification,
-                goal=candidate_goal,
+                goal=resolved_goal,
                 clarification_questions=[question],
                 goal_intent_profile=dict(assessment),
                 context_json=merged_context,
             )
-            session_metadata["draft_goal"] = candidate_goal
+            session_metadata["draft_goal"] = resolved_goal
             session_metadata["pending_clarification"] = {
                 "goal_intent_profile": dict(assessment),
                 "questions": [question],
@@ -294,12 +297,12 @@ def handle_turn(
                         assistant_content = question
                     assistant_action = chat_contracts.AssistantAction(
                         type=chat_contracts.AssistantActionType.ask_clarification,
-                        goal=candidate_goal,
+                        goal=resolved_goal,
                         clarification_questions=[question],
                         goal_intent_profile=dict(assessment),
                         context_json=merged_context,
                     )
-                    session_metadata["draft_goal"] = candidate_goal
+                    session_metadata["draft_goal"] = resolved_goal
                     session_metadata["pending_clarification"] = {
                         "goal_intent_profile": dict(assessment),
                         "questions": [question],
@@ -329,7 +332,7 @@ def handle_turn(
                         )
                     assistant_action = chat_contracts.AssistantAction(
                         type=chat_contracts.AssistantActionType.run_workflow,
-                        goal=candidate_goal,
+                        goal=resolved_goal,
                         job_id=created_job.id,
                         workflow_run_id=workflow_run.id,
                         workflow_definition_id=workflow_run.definition_id,
@@ -356,7 +359,7 @@ def handle_turn(
                 )
                 assistant_action = chat_contracts.AssistantAction(
                     type=chat_contracts.AssistantActionType.respond,
-                    goal=candidate_goal,
+                    goal=resolved_goal,
                     goal_intent_profile=dict(assessment),
                     context_json=merged_context,
                 )
@@ -372,7 +375,7 @@ def handle_turn(
             direct_result = runtime.run_direct_capability(
                 db=db,
                 chat_session_id=record.id,
-                goal=candidate_goal,
+                goal=resolved_goal,
                 capability_id=capability_id,
                 arguments=arguments,
                 context_json=merged_context,
@@ -386,7 +389,7 @@ def handle_turn(
                 )
                 assistant_action = chat_contracts.AssistantAction(
                     type=chat_contracts.AssistantActionType.respond,
-                    goal=candidate_goal,
+                    goal=resolved_goal,
                     job_id=created_job.id,
                     goal_intent_profile=dict(assessment),
                     context_json=merged_context,
@@ -402,7 +405,7 @@ def handle_turn(
                 ).strip()
                 assistant_action = chat_contracts.AssistantAction(
                     type=chat_contracts.AssistantActionType.tool_call,
-                    goal=candidate_goal,
+                    goal=resolved_goal,
                     job_id=created_job.id,
                     capability_id=direct_result.capability_id or capability_id or None,
                     tool_name=direct_result.tool_name,
@@ -419,14 +422,14 @@ def handle_turn(
             )
             assistant_action = chat_contracts.AssistantAction(
                 type=chat_contracts.AssistantActionType.respond,
-                goal=candidate_goal,
+                goal=resolved_goal,
                 goal_intent_profile=dict(assessment),
                 context_json=merged_context,
             )
     else:
         assistant_action = chat_contracts.AssistantAction(
             type=chat_contracts.AssistantActionType.respond,
-            goal=candidate_goal,
+            goal=resolved_goal,
             goal_intent_profile=dict(assessment),
             context_json=merged_context,
         )
@@ -441,7 +444,7 @@ def handle_turn(
     record.metadata_json = session_metadata
     record.updated_at = runtime.utcnow()
     if record.title == "New chat":
-        record.title = _default_session_title(candidate_goal)
+        record.title = _default_session_title(resolved_goal)
 
     assistant_message = ChatMessageRecord(
         id=runtime.make_id(),
@@ -476,9 +479,6 @@ def _candidate_goal(
 ) -> str:
     draft_goal = session_metadata.get("draft_goal")
     pending = session_metadata.get("pending_clarification")
-    correction_detector = is_chat_only_correction or looks_like_chat_only_correction
-    if isinstance(pending, Mapping) and correction_detector(content):
-        return content.strip()
     if isinstance(draft_goal, str) and draft_goal.strip() and isinstance(pending, Mapping):
         return f"{draft_goal.strip()}\n\nUser clarification: {content.strip()}"
     return content.strip()

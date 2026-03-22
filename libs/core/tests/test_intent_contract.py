@@ -48,6 +48,15 @@ def test_infer_task_intent_with_metadata_reports_source_and_confidence() -> None
     assert inference.confidence > 0
 
 
+def test_infer_task_intent_with_metadata_avoids_substring_false_positive() -> None:
+    inference = intent_contract.infer_task_intent_from_goal_with_metadata(
+        "Polish this document spec for release readiness"
+    )
+    assert inference.intent == "generate"
+    assert inference.source == "default"
+    assert inference.confidence == 0.4
+
+
 def test_decompose_goal_intent_produces_ordered_segments() -> None:
     graph = intent_contract.decompose_goal_intent(
         "Fetch GitHub repositories, then summarize findings, then render a PDF report."
@@ -654,6 +663,29 @@ def test_validate_intent_segment_contract_accepts_title_alias_from_topic() -> No
         task_intent="generate",
         tool_name="llm_generate_document_spec",
         payload={"topic": "active inference"},
+        capability_id="document.spec.generate",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
+def test_validate_intent_segment_contract_accepts_main_topic_alias_from_topic() -> None:
+    segment = {
+        "intent": "generate",
+        "objective": "Generate document spec",
+        "slots": {
+            "entity": "document",
+            "artifact_type": "document_spec",
+            "output_format": None,
+            "risk_level": "read_only",
+            "must_have_inputs": ["main_topic"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="generate",
+        tool_name="llm_generate_document_spec",
+        payload={"topic": "AI lifecycle cheatsheet"},
         capability_id="document.spec.generate",
         capability_risk_tier="read_only",
     )

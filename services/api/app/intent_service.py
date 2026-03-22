@@ -398,6 +398,9 @@ def _extract_goal_slot_signals(goal: str, intent: str, risk_level: str) -> dict[
     lowered = str(goal or "").lower()
     output_format = ""
     for token, normalized in (
+        ("word document", "docx"),
+        ("microsoft word", "docx"),
+        ("word doc", "docx"),
         ("pdf", "pdf"),
         ("docx", "docx"),
         ("markdown", "md"),

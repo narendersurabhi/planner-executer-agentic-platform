@@ -53,6 +53,28 @@ def test_assess_goal_intent_only_blocks_safety_constraints_for_high_risk_write()
     assert "safety_constraints" in profile.missing_slots
 
 
+def test_assess_goal_intent_infers_docx_for_word_document_request() -> None:
+    profile = intent_service.assess_goal_intent(
+        "Create a Word document about deploying ML workflows to Kubernetes.",
+        config=intent_service.GoalIntentConfig(
+            min_confidence=0.7,
+            min_confidence_by_intent={},
+            min_confidence_by_risk={},
+            clarification_blocking_slots={"output_format"},
+        ),
+        runtime=intent_service.GoalIntentRuntime(
+            infer_task_intent=lambda _goal: type(
+                "_Inference",
+                (),
+                {"intent": "generate", "source": "test", "confidence": 0.91},
+            )(),
+        ),
+    )
+
+    assert profile.slot_values["output_format"] == "docx"
+    assert profile.missing_slots == []
+
+
 def test_decompose_goal_intent_returns_llm_graph_with_summary_fields() -> None:
     failures: list[Exception] = []
     recorded: list[tuple[str, bool]] = []

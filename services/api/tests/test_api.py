@@ -723,6 +723,47 @@ def test_intent_clarify_endpoint_returns_assessment():
     assert envelope["clarification"]["missing_inputs"] == ["path"]
 
 
+def test_intent_clarify_endpoint_skips_vector_search_for_strong_heuristic(monkeypatch):
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del path, method, body, query, timeout_s
+        raise AssertionError("vector retriever should not run for strong heuristic intent matches")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "heuristic")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post("/intent/clarify", json={"goal": "Render a PDF status report"})
+
+    assert response.status_code == 200
+    assert response.json()["assessment"]["intent"] == "render"
+
+
+def test_intent_clarify_endpoint_skips_llm_for_strong_hybrid_inference(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            raise AssertionError(f"LLM assessment should be skipped for strong hybrid inference: {request}")
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del path, method, body, query, timeout_s
+        raise AssertionError("vector retriever should not run for strong heuristic intent matches")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "hybrid")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_intent_assess_provider", _Provider())
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post("/intent/clarify", json={"goal": "Render a PDF status report"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assessment"]["intent"] == "render"
+    assert body["assessment"]["source"] in {"goal_text", "task_text", "explicit"}
+
+
 def test_intent_clarify_endpoint_uses_llm_assessment_with_capability_catalog(monkeypatch):
     requests: list[LLMRequest] = []
 
@@ -808,6 +849,101 @@ def test_intent_clarify_endpoint_falls_back_when_llm_assessment_fails(monkeypatc
     assessment = body["assessment"]
     assert assessment["intent"] == "render"
     assert assessment["source"] in {"goal_text", "task_text", "explicit", "default"}
+
+
+def test_intent_clarify_endpoint_uses_vector_intent_for_fuzzy_goal(monkeypatch):
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 5, "chunk_ids": ["a", "b", "c"]}
+        if path == "/retrieve":
+            assert body is not None
+            assert body["query"] == "Polish this document spec for release readiness"
+            return {
+                "matches": [
+                    {
+                        "document_id": "transform",
+                        "score": 0.88,
+                        "metadata": {"intent_id": "transform"},
+                    },
+                    {
+                        "document_id": "generate",
+                        "score": 0.53,
+                        "metadata": {"intent_id": "generate"},
+                    },
+                ]
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "heuristic")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post(
+        "/intent/clarify",
+        json={"goal": "Polish this document spec for release readiness"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assessment = body["assessment"]
+    assert assessment["intent"] == "transform"
+    assert assessment["source"] == "vector"
+    assert assessment["needs_clarification"] is False
+
+
+def test_intent_clarify_endpoint_uses_vector_fallback_when_llm_assessment_fails(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            del request
+            return LLMResponse(content="not-json")
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 5, "chunk_ids": ["a", "b", "c"]}
+        if path == "/retrieve":
+            assert body is not None
+            assert body["query"] == "Polish this document spec for release readiness"
+            return {
+                "matches": [
+                    {
+                        "document_id": "transform",
+                        "score": 0.86,
+                        "metadata": {"intent_id": "transform"},
+                    },
+                    {
+                        "document_id": "generate",
+                        "score": 0.55,
+                        "metadata": {"intent_id": "generate"},
+                    },
+                ]
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "hybrid")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_intent_assess_provider", _Provider())
+    monkeypatch.setattr(main, "_intent_catalog_capability_entries", lambda: [])
+    monkeypatch.setattr(main, "_intent_catalog_capability_ids", lambda: set())
+    monkeypatch.setattr(main, "_semantic_goal_capability_hints", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post(
+        "/intent/clarify",
+        json={"goal": "Polish this document spec for release readiness"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assessment = body["assessment"]
+    assert assessment["intent"] == "transform"
+    assert assessment["source"] == "vector"
+    assert assessment["needs_clarification"] is False
 
 
 def test_intent_decompose_endpoint_returns_graph():
@@ -3187,6 +3323,65 @@ def test_preflight_plan_endpoint_accepts_intent_segment_tool_inputs_requirement(
                     },
                 }
             ]
+        },
+        "job_context": {},
+    }
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
+
+
+def test_preflight_plan_endpoint_accepts_document_segment_main_topic_alias() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "document generation",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "Generate DocumentSpec",
+                    "description": "Generate a DocumentSpec",
+                    "instruction": "Generate a 2-page DOCX cheatsheet for advanced AI engineers.",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "generate",
+                    "deps": [],
+                    "tool_requests": ["document.spec.generate"],
+                    "tool_inputs": {
+                        "document.spec.generate": {
+                            "instruction": "Generate a 2-page DOCX cheatsheet for advanced AI engineers.",
+                            "topic": "AI lifecycle using Kubernetes, Kubeflow, RAG retrieval, and RAG indexing",
+                            "audience": "Advanced AI engineers",
+                            "tone": "concise",
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "normalized_intent_envelope": {
+            "goal": "Create a word cheatsheet document",
+            "profile": {"intent": "generate", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "s1",
+                        "intent": "generate",
+                        "objective": "Generate a DocumentSpec for AI lifecycle cheat sheet",
+                        "required_inputs": ["main_topic", "length", "audience"],
+                        "suggested_capabilities": ["document.spec.generate"],
+                        "slots": {
+                            "entity": "document_spec",
+                            "artifact_type": "document_spec",
+                            "output_format": "docx",
+                            "risk_level": "read_only",
+                            "must_have_inputs": ["main_topic", "length", "audience"],
+                        },
+                    }
+                ]
+            },
         },
         "job_context": {},
     }

@@ -27,3 +27,4 @@ templates/
 ./artifacts
 ./templates
 ./workspace
+scripts/largest_paths_cleanup.sh

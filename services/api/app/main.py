@@ -158,6 +158,10 @@ LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER", "").strip()
 LLM_MODEL_NAME = os.getenv("OPENAI_MODEL", "").strip()
 CHAT_ROUTER_MODEL = os.getenv("CHAT_ROUTER_MODEL", "").strip()
 CHAT_RESPONSE_MODEL = os.getenv("CHAT_RESPONSE_MODEL", "").strip()
+CHAT_PENDING_CORRECTION_MODEL = os.getenv("CHAT_PENDING_CORRECTION_MODEL", "").strip()
+CHAT_RESPONSE_MODE = os.getenv("CHAT_RESPONSE_MODE", "answer_or_handoff").strip().lower()
+if CHAT_RESPONSE_MODE not in {"answer_only", "answer_or_handoff"}:
+    CHAT_RESPONSE_MODE = "answer_or_handoff"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").strip()
 OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "30"))
@@ -188,6 +192,14 @@ INTENT_CLARIFICATION_BLOCKING_SLOTS = {
     ).split(",")
     if entry.strip()
 }
+CHAT_PRE_SUBMIT_BLOCKING_SLOTS = {
+    entry.strip().lower()
+    for entry in os.getenv(
+        "CHAT_PRE_SUBMIT_BLOCKING_SLOTS",
+        "output_format,target_system,safety_constraints",
+    ).split(",")
+    if entry.strip()
+}
 INTENT_ASSESS_ENABLED = os.getenv("INTENT_ASSESS_ENABLED", "true").lower() == "true"
 INTENT_ASSESS_MODE = os.getenv("INTENT_ASSESS_MODE", "heuristic").strip().lower()
 if INTENT_ASSESS_MODE not in {"heuristic", "llm", "hybrid"}:
@@ -208,12 +220,123 @@ INTENT_MEMORY_RETRIEVAL_LIMIT = max(
 CHAT_DIRECT_EXECUTION_ENABLED = (
     os.getenv("CHAT_DIRECT_EXECUTION_ENABLED", "true").lower() == "true"
 )
+CHAT_INTENT_VECTOR_SEARCH_ENABLED = (
+    os.getenv("CHAT_INTENT_VECTOR_SEARCH_ENABLED", "true").lower() == "true"
+)
+CHAT_INTENT_VECTOR_COLLECTION = os.getenv("CHAT_INTENT_VECTOR_COLLECTION", "").strip() or None
+CHAT_INTENT_VECTOR_NAMESPACE_PREFIX = (
+    os.getenv("CHAT_INTENT_VECTOR_NAMESPACE_PREFIX", "chat_intent_catalog").strip()
+    or "chat_intent_catalog"
+)
+CHAT_INTENT_VECTOR_WORKSPACE_ID = (
+    os.getenv("CHAT_INTENT_VECTOR_WORKSPACE_ID", "chat-intent-catalog").strip()
+    or "chat-intent-catalog"
+)
+CHAT_INTENT_VECTOR_TOP_K = max(1, min(8, int(os.getenv("CHAT_INTENT_VECTOR_TOP_K", "3"))))
+CHAT_INTENT_VECTOR_TIMEOUT_S = max(
+    1.0, float(os.getenv("CHAT_INTENT_VECTOR_TIMEOUT_S", "4.0"))
+)
+_chat_intent_vector_min_score_raw = os.getenv("CHAT_INTENT_VECTOR_MIN_SCORE", "0.6").strip()
+try:
+    CHAT_INTENT_VECTOR_MIN_SCORE = float(_chat_intent_vector_min_score_raw or "0.6")
+except ValueError:
+    CHAT_INTENT_VECTOR_MIN_SCORE = 0.6
+try:
+    CHAT_INTENT_VECTOR_SCORE_MARGIN = max(
+        0.0, float(os.getenv("CHAT_INTENT_VECTOR_SCORE_MARGIN", "0.03"))
+    )
+except ValueError:
+    CHAT_INTENT_VECTOR_SCORE_MARGIN = 0.03
+CHAT_CAPABILITY_VECTOR_SEARCH_ENABLED = (
+    os.getenv("CHAT_CAPABILITY_VECTOR_SEARCH_ENABLED", "true").lower() == "true"
+)
+CHAT_CAPABILITY_VECTOR_COLLECTION = os.getenv("CHAT_CAPABILITY_VECTOR_COLLECTION", "").strip() or None
+CHAT_CAPABILITY_VECTOR_NAMESPACE_PREFIX = (
+    os.getenv("CHAT_CAPABILITY_VECTOR_NAMESPACE_PREFIX", "chat_capability_catalog").strip()
+    or "chat_capability_catalog"
+)
+CHAT_CAPABILITY_VECTOR_WORKSPACE_ID = (
+    os.getenv("CHAT_CAPABILITY_VECTOR_WORKSPACE_ID", "chat-capability-catalog").strip()
+    or "chat-capability-catalog"
+)
+CHAT_CAPABILITY_VECTOR_TOP_K = max(
+    1, min(50, int(os.getenv("CHAT_CAPABILITY_VECTOR_TOP_K", "12")))
+)
+CHAT_CAPABILITY_VECTOR_TIMEOUT_S = max(
+    1.0, float(os.getenv("CHAT_CAPABILITY_VECTOR_TIMEOUT_S", "5.0"))
+)
+_chat_capability_vector_min_score_raw = os.getenv("CHAT_CAPABILITY_VECTOR_MIN_SCORE", "").strip()
+try:
+    CHAT_CAPABILITY_VECTOR_MIN_SCORE = (
+        float(_chat_capability_vector_min_score_raw)
+        if _chat_capability_vector_min_score_raw
+        else None
+    )
+except ValueError:
+    CHAT_CAPABILITY_VECTOR_MIN_SCORE = None
 CHAT_ROUTING_MODE = os.getenv("CHAT_ROUTING_MODE", "response_first").strip().lower()
 if CHAT_ROUTING_MODE not in {"always_router", "response_first"}:
     CHAT_ROUTING_MODE = "response_first"
 CHAT_PENDING_CORRECTION_MODE = os.getenv("CHAT_PENDING_CORRECTION_MODE", "llm").strip().lower()
 if CHAT_PENDING_CORRECTION_MODE not in {"heuristic", "llm", "hybrid"}:
     CHAT_PENDING_CORRECTION_MODE = "llm"
+INTENT_VECTOR_SEARCH_ENABLED = (
+    os.getenv("INTENT_VECTOR_SEARCH_ENABLED", "true").lower() == "true"
+)
+INTENT_VECTOR_COLLECTION = os.getenv("INTENT_VECTOR_COLLECTION", "").strip() or None
+INTENT_VECTOR_NAMESPACE_PREFIX = (
+    os.getenv("INTENT_VECTOR_NAMESPACE_PREFIX", "intent_catalog").strip()
+    or "intent_catalog"
+)
+INTENT_VECTOR_WORKSPACE_ID = (
+    os.getenv("INTENT_VECTOR_WORKSPACE_ID", "intent-catalog").strip()
+    or "intent-catalog"
+)
+INTENT_VECTOR_TOP_K = max(1, min(5, int(os.getenv("INTENT_VECTOR_TOP_K", "3"))))
+INTENT_VECTOR_TIMEOUT_S = max(1.0, float(os.getenv("INTENT_VECTOR_TIMEOUT_S", "4.0")))
+_intent_vector_min_score_raw = os.getenv("INTENT_VECTOR_MIN_SCORE", "0.62").strip()
+try:
+    INTENT_VECTOR_MIN_SCORE = float(_intent_vector_min_score_raw or "0.62")
+except ValueError:
+    INTENT_VECTOR_MIN_SCORE = 0.62
+_intent_vector_score_margin_raw = os.getenv("INTENT_VECTOR_SCORE_MARGIN", "0.04").strip()
+try:
+    INTENT_VECTOR_SCORE_MARGIN = max(0.0, float(_intent_vector_score_margin_raw or "0.04"))
+except ValueError:
+    INTENT_VECTOR_SCORE_MARGIN = 0.04
+_intent_vector_override_confidence_raw = os.getenv(
+    "INTENT_VECTOR_OVERRIDE_MAX_HEURISTIC_CONFIDENCE",
+    "0.72",
+).strip()
+try:
+    INTENT_VECTOR_OVERRIDE_MAX_HEURISTIC_CONFIDENCE = max(
+        0.0,
+        min(1.0, float(_intent_vector_override_confidence_raw or "0.72")),
+    )
+except ValueError:
+    INTENT_VECTOR_OVERRIDE_MAX_HEURISTIC_CONFIDENCE = 0.72
+_intent_vector_trigger_confidence_raw = os.getenv(
+    "INTENT_VECTOR_TRIGGER_MAX_HEURISTIC_CONFIDENCE",
+    "0.55",
+).strip()
+try:
+    INTENT_VECTOR_TRIGGER_MAX_HEURISTIC_CONFIDENCE = max(
+        0.0,
+        min(1.0, float(_intent_vector_trigger_confidence_raw or "0.55")),
+    )
+except ValueError:
+    INTENT_VECTOR_TRIGGER_MAX_HEURISTIC_CONFIDENCE = 0.55
+_intent_assess_skip_llm_confidence_raw = os.getenv(
+    "INTENT_ASSESS_SKIP_LLM_MIN_CONFIDENCE",
+    "0.72",
+).strip()
+try:
+    INTENT_ASSESS_SKIP_LLM_MIN_CONFIDENCE = max(
+        0.0,
+        min(1.0, float(_intent_assess_skip_llm_confidence_raw or "0.72")),
+    )
+except ValueError:
+    INTENT_ASSESS_SKIP_LLM_MIN_CONFIDENCE = 0.72
 CHAT_DIRECT_CAPABILITIES = {
     entry.strip()
     for entry in os.getenv(
@@ -430,10 +553,134 @@ _chat_response_provider = _build_chat_response_provider()
 def _build_chat_pending_correction_provider() -> LLMProvider | None:
     if CHAT_PENDING_CORRECTION_MODE == "heuristic":
         return None
-    return _chat_response_provider
+    provider_name = (LLM_PROVIDER_NAME or "").strip().lower()
+    if not provider_name or provider_name == "mock":
+        return None
+    model_name = (
+        CHAT_PENDING_CORRECTION_MODEL
+        or CHAT_RESPONSE_MODEL
+        or LLM_MODEL_NAME
+        or ""
+    ).strip()
+    if not model_name:
+        return None
+    try:
+        return resolve_provider(
+            provider_name,
+            api_key=OPENAI_API_KEY or None,
+            model=model_name,
+            base_url=OPENAI_BASE_URL or None,
+            timeout_s=max(1.0, OPENAI_TIMEOUT_S),
+            max_retries=max(0, OPENAI_MAX_RETRIES),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "chat_pending_correction_provider_init_failed",
+            extra={"provider": provider_name, "model": model_name},
+        )
+        return None
 
 
 _chat_pending_correction_provider = _build_chat_pending_correction_provider()
+_CHAT_INTENT_VECTOR_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "id": "capability_discovery",
+        "label": "Capability discovery",
+        "text": (
+            "Chat intent: capability discovery.\n"
+            "Use when the user asks what the assistant can do, which capabilities or tools are "
+            "available, what work is supported, or which operations the assistant can handle.\n"
+            "Examples: what can you do; list your capabilities; what tools are available here; "
+            "show supported operations; what kinds of work can you handle here; what kinds of "
+            "GitHub work can you handle; what repo changes can you help with; what can this "
+            "assistant help with."
+        ),
+    },
+    {
+        "id": "general_chat",
+        "label": "General chat",
+        "text": (
+            "Chat intent: general chat.\n"
+            "Use when the user wants explanation, discussion, brainstorming, or help "
+            "understanding a topic rather than a list of available tools.\n"
+            "Examples: explain Kubernetes; help me understand RAG; walk me through Docker; "
+            "what is intent classification; how does the planner work."
+        ),
+    },
+    {
+        "id": "workflow_execution",
+        "label": "Workflow execution",
+        "text": (
+            "Chat intent: workflow execution.\n"
+            "Use when the user wants the assistant to perform work, create or update files, run "
+            "commands, generate an artifact, deploy something, or submit a workflow/job.\n"
+            "Examples: create a workflow; update the README; run the tests; deploy the API; "
+            "open a pull request; build a PDF report."
+        ),
+    },
+)
+_INTENT_VECTOR_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "id": "generate",
+        "label": "Generate",
+        "text": (
+            "Execution intent: generate.\n"
+            "Use when the user wants new content or a new artifact created from scratch.\n"
+            "Examples: draft release notes; create a workflow; write a new specification; "
+            "produce a report; generate documentation; compose a plan."
+        ),
+    },
+    {
+        "id": "transform",
+        "label": "Transform",
+        "text": (
+            "Execution intent: transform.\n"
+            "Use when the user wants existing content or data revised, polished, cleaned up, "
+            "normalized, reworked, reshaped, or refined.\n"
+            "Examples: polish this document spec; clean up this payload; normalize the data; "
+            "revise the draft; refactor the JSON structure."
+        ),
+    },
+    {
+        "id": "validate",
+        "label": "Validate",
+        "text": (
+            "Execution intent: validate.\n"
+            "Use when the user wants something checked, verified, linted, tested, reviewed, "
+            "or compared against a schema or contract.\n"
+            "Examples: validate this spec; sanity-check the payload; verify the schema; review "
+            "for errors; lint the configuration."
+        ),
+    },
+    {
+        "id": "render",
+        "label": "Render",
+        "text": (
+            "Execution intent: render.\n"
+            "Use when the user wants a final formatted artifact like PDF, DOCX, HTML, or another "
+            "presentation-ready output produced from structured content.\n"
+            "Examples: render a PDF report; generate a DOCX handout; turn the spec into a final "
+            "document; export the final artifact."
+        ),
+    },
+    {
+        "id": "io",
+        "label": "IO",
+        "text": (
+            "Execution intent: io.\n"
+            "Use when the user wants data read, listed, searched, fetched, uploaded, saved, "
+            "pushed, or synchronized with a system such as GitHub, Slack, Jira, memory, or the filesystem.\n"
+            "Examples: list repositories; fetch an issue; search memory; upload a file; save the "
+            "artifact; push changes to GitHub."
+        ),
+    },
+)
+_chat_intent_vector_sync_lock = threading.Lock()
+_chat_intent_vector_synced_namespace: str | None = None
+_intent_vector_sync_lock = threading.Lock()
+_intent_vector_synced_namespace: str | None = None
+_chat_capability_vector_sync_lock = threading.Lock()
+_chat_capability_vector_synced_namespace: str | None = None
 
 
 def _rag_retriever_request_json(
@@ -1207,14 +1454,6 @@ def _slot_question(slot: str, goal: str) -> str:
     return intent_service.slot_question(slot, goal)
 
 
-_CHAT_PRE_SUBMIT_BLOCKING_SLOTS: set[str] = {
-    "output_format",
-    "target_system",
-    "safety_constraints",
-    "intent_action",
-}
-
-
 def _chat_route_goal_intent_profile(
     profile: workflow_contracts.GoalIntentProfile,
     *,
@@ -1223,12 +1462,12 @@ def _chat_route_goal_intent_profile(
     chat_blocking_slots: list[str] = []
     for raw_slot in profile.blocking_slots:
         normalized = intent_contract.normalize_required_input_key(raw_slot)
-        if normalized in _CHAT_PRE_SUBMIT_BLOCKING_SLOTS and normalized not in chat_blocking_slots:
+        if normalized in CHAT_PRE_SUBMIT_BLOCKING_SLOTS and normalized not in chat_blocking_slots:
             chat_blocking_slots.append(normalized)
     chat_missing_slots: list[str] = []
     for raw_slot in profile.missing_slots:
         normalized = intent_contract.normalize_required_input_key(raw_slot)
-        if normalized in _CHAT_PRE_SUBMIT_BLOCKING_SLOTS and normalized not in chat_missing_slots:
+        if normalized in CHAT_PRE_SUBMIT_BLOCKING_SLOTS and normalized not in chat_missing_slots:
             chat_missing_slots.append(normalized)
     return profile.model_copy(
         update={
@@ -1244,8 +1483,6 @@ def _chat_route_goal_intent_profile(
 def _looks_like_conversational_turn(content: str) -> bool:
     lowered = str(content or "").strip().lower()
     if not lowered:
-        return True
-    if _looks_like_chat_only_correction(content):
         return True
     casual_phrases = (
         "hi",
@@ -1287,16 +1524,25 @@ def _looks_like_conversational_turn(content: str) -> bool:
         return False
     if lowered.endswith("?"):
         return True
+    conversational_patterns = (
+        r"\b(?:i want to|i'd like to|id like to|let'?s)\s+(?:discuss|talk about|chat about)\b",
+        r"\b(?:discuss|talk about|chat about)\b.{0,80}\b(?:with you|together)?\b",
+        r"\b(?:tell me about|walk me through|help me understand|teach me about|give me an overview of)\b",
+        r"\b(?:i am|i'm|im)\s+(?:curious about|interested in|trying to understand|learning about)\b",
+        r"\b(?:thoughts on|opinion on|overview of|basics of|intro to)\b",
+        r"\b(?:practice|mock|roleplay|coach me for|quiz me on)\b.{0,120}\b(?:interview|questions|answers)\b",
+        r"\b(?:ask me (?:a )?question|ask me questions one by one|i will type the answer)\b",
+        r"\b(?:interview practice|mock interview|practice interview questions)\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in conversational_patterns):
+        return True
     return any(lowered.startswith(phrase) or lowered == phrase for phrase in casual_phrases)
 
 
 def _looks_like_chat_only_correction(content: str) -> bool:
-    heuristic_result = chat_service.looks_like_chat_only_correction(content)
-    if CHAT_PENDING_CORRECTION_MODE == "heuristic":
-        return heuristic_result
     provider = _chat_pending_correction_provider
     if provider is None:
-        return heuristic_result
+        return False
     try:
         parsed = provider.generate_request_json_object(
             LLMRequest(
@@ -1325,15 +1571,312 @@ def _looks_like_chat_only_correction(content: str) -> bool:
         confidence_raw = parsed.get("confidence")
         confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else 0.0
         if CHAT_PENDING_CORRECTION_MODE == "hybrid" and confidence < 0.7:
-            return heuristic_result
+            return False
         return llm_result
     except Exception:  # noqa: BLE001
         logger.exception("chat_pending_correction_classification_failed")
-        return heuristic_result
+        return False
+
+
+def _chat_intent_vector_namespace() -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            list(_CHAT_INTENT_VECTOR_CATALOG),
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{CHAT_INTENT_VECTOR_NAMESPACE_PREFIX}:{digest}"
+
+
+def _intent_vector_namespace() -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            list(_INTENT_VECTOR_CATALOG),
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{INTENT_VECTOR_NAMESPACE_PREFIX}:{digest}"
+
+
+def _vector_intent_confidence(score: float) -> float:
+    bounded = max(0.0, min(1.0, float(score or 0.0)))
+    return round(min(0.93, max(0.68, 0.45 + (bounded * 0.5))), 3)
+
+
+def _ensure_chat_intent_vector_index() -> str | None:
+    global _chat_intent_vector_synced_namespace
+
+    if not CHAT_INTENT_VECTOR_SEARCH_ENABLED:
+        return None
+    namespace = _chat_intent_vector_namespace()
+    with _chat_intent_vector_sync_lock:
+        if _chat_intent_vector_synced_namespace == namespace:
+            return namespace
+        try:
+            upsert_entries = [
+                {
+                    "document_id": entry["id"],
+                    "text": entry["text"],
+                    "source_uri": f"chat-intent://{entry['id']}",
+                    "metadata": {
+                        "intent_id": entry["id"],
+                        "intent_label": entry["label"],
+                        "catalog_type": "chat_intent",
+                    },
+                }
+                for entry in _CHAT_INTENT_VECTOR_CATALOG
+            ]
+            _rag_retriever_request_json(
+                "/index/upsert_texts",
+                method="POST",
+                body={
+                    "collection_name": CHAT_INTENT_VECTOR_COLLECTION,
+                    "ensure_collection": True,
+                    "namespace": namespace,
+                    "workspace_id": CHAT_INTENT_VECTOR_WORKSPACE_ID,
+                    "entries": upsert_entries,
+                },
+                timeout_s=CHAT_INTENT_VECTOR_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("chat_intent_vector_index_sync_failed")
+            return None
+        _chat_intent_vector_synced_namespace = namespace
+        return namespace
+
+
+def _ensure_intent_vector_index() -> str | None:
+    global _intent_vector_synced_namespace
+
+    if not INTENT_VECTOR_SEARCH_ENABLED:
+        return None
+    namespace = _intent_vector_namespace()
+    with _intent_vector_sync_lock:
+        if _intent_vector_synced_namespace == namespace:
+            return namespace
+        try:
+            upsert_entries = [
+                {
+                    "document_id": entry["id"],
+                    "text": entry["text"],
+                    "source_uri": f"intent://{entry['id']}",
+                    "metadata": {
+                        "intent_id": entry["id"],
+                        "intent_label": entry["label"],
+                        "catalog_type": "goal_intent",
+                    },
+                }
+                for entry in _INTENT_VECTOR_CATALOG
+            ]
+            _rag_retriever_request_json(
+                "/index/upsert_texts",
+                method="POST",
+                body={
+                    "collection_name": INTENT_VECTOR_COLLECTION,
+                    "ensure_collection": True,
+                    "namespace": namespace,
+                    "workspace_id": INTENT_VECTOR_WORKSPACE_ID,
+                    "entries": upsert_entries,
+                },
+                timeout_s=INTENT_VECTOR_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("intent_vector_index_sync_failed")
+            return None
+        _intent_vector_synced_namespace = namespace
+        return namespace
+
+
+def _vector_chat_intent_matches(query: str) -> list[dict[str, Any]]:
+    namespace = _ensure_chat_intent_vector_index()
+    if not namespace or not str(query or "").strip():
+        return []
+    try:
+        result = _rag_retriever_request_json(
+            "/retrieve",
+            method="POST",
+            body={
+                "query": query,
+                "collection_name": CHAT_INTENT_VECTOR_COLLECTION,
+                "namespace": namespace,
+                "workspace_id": CHAT_INTENT_VECTOR_WORKSPACE_ID,
+                "top_k": CHAT_INTENT_VECTOR_TOP_K,
+                "min_score": CHAT_INTENT_VECTOR_MIN_SCORE,
+                "include_text": False,
+                "include_metadata": True,
+            },
+            timeout_s=CHAT_INTENT_VECTOR_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_intent_vector_search_failed")
+        return []
+
+    matches = result.get("matches") if isinstance(result, dict) else None
+    if not isinstance(matches, list):
+        return []
+    allowed_ids = {entry["id"] for entry in _CHAT_INTENT_VECTOR_CATALOG}
+    ranked: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+        intent_id = str(metadata.get("intent_id") or match.get("document_id") or "").strip()
+        if not intent_id or intent_id in seen_ids or intent_id not in allowed_ids:
+            continue
+        try:
+            score = float(match.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        ranked.append(
+            {
+                "id": intent_id,
+                "score": score,
+                "source": "vector_search",
+            }
+        )
+        seen_ids.add(intent_id)
+    ranked.sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+    return ranked
+
+
+def _vector_goal_intent_matches(goal: str) -> list[dict[str, Any]]:
+    namespace = _ensure_intent_vector_index()
+    if not namespace or not str(goal or "").strip():
+        return []
+    try:
+        result = _rag_retriever_request_json(
+            "/retrieve",
+            method="POST",
+            body={
+                "query": goal,
+                "collection_name": INTENT_VECTOR_COLLECTION,
+                "namespace": namespace,
+                "workspace_id": INTENT_VECTOR_WORKSPACE_ID,
+                "top_k": INTENT_VECTOR_TOP_K,
+                "min_score": INTENT_VECTOR_MIN_SCORE,
+                "include_text": False,
+                "include_metadata": True,
+            },
+            timeout_s=INTENT_VECTOR_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("intent_vector_search_failed")
+        return []
+
+    matches = result.get("matches") if isinstance(result, dict) else None
+    if not isinstance(matches, list):
+        return []
+    allowed_ids = {entry["id"] for entry in _INTENT_VECTOR_CATALOG}
+    ranked: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+        intent_id = str(metadata.get("intent_id") or match.get("document_id") or "").strip()
+        if not intent_id or intent_id in seen_ids or intent_id not in allowed_ids:
+            continue
+        try:
+            score = float(match.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        ranked.append(
+            {
+                "id": intent_id,
+                "score": score,
+                "source": "vector_search",
+            }
+        )
+        seen_ids.add(intent_id)
+    ranked.sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+    return ranked
+
+
+def _hybrid_goal_intent_inference(
+    goal: str,
+    heuristic: intent_contract.TaskIntentInference,
+) -> intent_contract.TaskIntentInference:
+    matches = _vector_goal_intent_matches(goal)
+    if not matches:
+        return heuristic
+    top_match = matches[0]
+    top_score = float(top_match.get("score") or 0.0)
+    second_score = float(matches[1].get("score") or 0.0) if len(matches) > 1 else 0.0
+    if top_score < INTENT_VECTOR_MIN_SCORE:
+        return heuristic
+    if second_score and (top_score - second_score) < INTENT_VECTOR_SCORE_MARGIN:
+        return heuristic
+    vector_intent = intent_contract.normalize_task_intent(top_match.get("id"))
+    if not vector_intent:
+        return heuristic
+    if vector_intent == str(heuristic.intent or "").strip().lower():
+        return heuristic
+    heuristic_confidence = float(getattr(heuristic, "confidence", 0.0) or 0.0)
+    heuristic_source = str(getattr(heuristic, "source", "") or "").strip().lower()
+    strong_vector_match = top_score >= max(0.8, INTENT_VECTOR_MIN_SCORE + 0.15)
+    if heuristic_source != "default":
+        if heuristic_confidence > INTENT_VECTOR_OVERRIDE_MAX_HEURISTIC_CONFIDENCE:
+            return heuristic
+        if not strong_vector_match:
+            return heuristic
+    return intent_contract.TaskIntentInference(
+        intent=vector_intent,
+        source="vector",
+        confidence=_vector_intent_confidence(top_score),
+    )
+
+
+def _should_run_goal_intent_vector_search(
+    heuristic: intent_contract.TaskIntentInference,
+) -> bool:
+    if not INTENT_VECTOR_SEARCH_ENABLED:
+        return False
+    heuristic_source = str(getattr(heuristic, "source", "") or "").strip().lower()
+    heuristic_confidence = float(getattr(heuristic, "confidence", 0.0) or 0.0)
+    if heuristic_source in {"", "default"}:
+        return True
+    return heuristic_confidence <= INTENT_VECTOR_TRIGGER_MAX_HEURISTIC_CONFIDENCE
+
+
+def _should_skip_llm_goal_intent_assessment(
+    inference: intent_contract.TaskIntentInference,
+    *,
+    assess_mode: str,
+) -> bool:
+    if assess_mode != "hybrid":
+        return False
+    source = str(getattr(inference, "source", "") or "").strip().lower()
+    if source in {"", "default"}:
+        return False
+    confidence = float(getattr(inference, "confidence", 0.0) or 0.0)
+    return confidence >= INTENT_ASSESS_SKIP_LLM_MIN_CONFIDENCE
+
+
+def _classify_chat_request_intent(content: str) -> str | None:
+    matches = _vector_chat_intent_matches(content)
+    if not matches:
+        return None
+    top_match = matches[0]
+    top_score = float(top_match.get("score") or 0.0)
+    second_score = float(matches[1].get("score") or 0.0) if len(matches) > 1 else 0.0
+    if top_score < CHAT_INTENT_VECTOR_MIN_SCORE:
+        return None
+    if second_score and (top_score - second_score) < CHAT_INTENT_VECTOR_SCORE_MARGIN:
+        return None
+    intent_id = str(top_match.get("id") or "").strip()
+    return intent_id or None
 
 
 def _fallback_chat_response(content: str) -> str:
     lowered = str(content or "").strip().lower()
+    capability_catalog_response = _capability_discovery_chat_response(content)
+    if capability_catalog_response:
+        return capability_catalog_response
     if lowered in {"hi", "hello", "hey"}:
         return "I can chat, answer questions, and create workflows when execution is needed."
     if lowered in {"thanks", "thank you"}:
@@ -1344,15 +1887,427 @@ def _fallback_chat_response(content: str) -> str:
     )
 
 
+def _is_capability_discovery_request(content: str) -> bool:
+    lowered = str(content or "").strip().lower()
+    if not lowered:
+        return False
+    patterns = (
+        r"\bwhat can you do\b",
+        r"\bwhat (?:tools|actions|operations) (?:do you have|are available|are supported)\b",
+        r"\bwhat can (?:this|the) (?:assistant|agent) do\b",
+        r"\bwhat capabilities(?: do you have| are available)?\b",
+        r"\bavailable capabilities\b",
+        r"\bavailable (?:tools|actions|operations)\b",
+        r"\blist (?:your |the )?capabilities\b",
+        r"\blist (?:your |the )?(?:tools|actions|operations)\b",
+        r"\bshow (?:your |the )?capabilities\b",
+        r"\bshow (?:your |the )?(?:tools|actions|operations)\b",
+        r"\bwhich capabilities\b",
+        r"\bwhich (?:tools|actions|operations)\b",
+        r"\bsupported (?:capabilities|tools|actions|operations)\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in patterns):
+        return True
+    return _classify_chat_request_intent(content) == "capability_discovery"
+
+
+def _chat_visible_capabilities() -> list[tuple[str, capability_registry.CapabilitySpec]]:
+    if capability_registry.resolve_capability_mode() == "disabled":
+        return []
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        return []
+
+    visible: list[tuple[str, capability_registry.CapabilitySpec]] = []
+    for capability_id, spec in sorted(registry.enabled_capabilities().items()):
+        allow_decision = capability_registry.evaluate_capability_allowlist(
+            capability_id,
+            "api",
+        )
+        if not allow_decision.allowed:
+            continue
+        visible.append((capability_id, spec))
+    return visible
+
+
+def _chat_capability_search_entries(
+    capabilities: list[tuple[str, capability_registry.CapabilitySpec]],
+) -> list[dict[str, Any]]:
+    capability_map = {capability_id: spec for capability_id, spec in capabilities}
+    return capability_search.build_capability_search_entries(capability_map)
+
+
+def _chat_capability_vector_namespace(
+    capabilities: list[tuple[str, capability_registry.CapabilitySpec]],
+) -> str:
+    payload: list[dict[str, Any]] = []
+    for capability_id, spec in capabilities:
+        payload.append(
+            {
+                "id": capability_id,
+                "description": str(spec.description or "").strip(),
+                "group": str(spec.group or "").strip(),
+                "subgroup": str(spec.subgroup or "").strip(),
+                "risk_tier": str(spec.risk_tier or "").strip(),
+                "tags": list(spec.tags),
+            }
+        )
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{CHAT_CAPABILITY_VECTOR_NAMESPACE_PREFIX}:{digest}"
+
+
+def _chat_capability_vector_document(
+    capability_id: str,
+    spec: capability_registry.CapabilitySpec,
+    entry: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    description = str(spec.description or "").strip()
+    group = str(spec.group or "").strip()
+    subgroup = str(spec.subgroup or "").strip()
+    tags = [str(tag).strip() for tag in spec.tags if str(tag).strip()]
+    required_inputs = [
+        str(item).strip()
+        for item in entry.get("required_inputs", [])
+        if str(item).strip()
+    ]
+    lines = [f"Capability ID: {capability_id}"]
+    if description:
+        lines.append(f"Description: {description}")
+    if group:
+        lines.append(f"Group: {group}")
+    if subgroup:
+        lines.append(f"Subgroup: {subgroup}")
+    if tags:
+        lines.append(f"Tags: {', '.join(tags)}")
+    if required_inputs:
+        lines.append(f"Required inputs: {', '.join(required_inputs)}")
+    if spec.risk_tier:
+        lines.append(f"Risk tier: {spec.risk_tier}")
+    return (
+        "\n".join(lines),
+        {
+            "capability_id": capability_id,
+            "group": group,
+            "subgroup": subgroup,
+            "risk_tier": str(spec.risk_tier or "").strip(),
+            "tags": tags,
+            "catalog_type": "assistant_capability",
+        },
+    )
+
+
+def _ensure_chat_capability_vector_index(
+    capabilities: list[tuple[str, capability_registry.CapabilitySpec]],
+    entries: list[dict[str, Any]],
+) -> str | None:
+    global _chat_capability_vector_synced_namespace
+
+    if not CHAT_CAPABILITY_VECTOR_SEARCH_ENABLED or not capabilities or not entries:
+        return None
+    namespace = _chat_capability_vector_namespace(capabilities)
+    with _chat_capability_vector_sync_lock:
+        if _chat_capability_vector_synced_namespace == namespace:
+            return namespace
+        try:
+            upsert_entries: list[dict[str, Any]] = []
+            entry_by_id = {
+                str(entry.get("id") or "").strip(): entry
+                for entry in entries
+                if str(entry.get("id") or "").strip()
+            }
+            for capability_id, spec in capabilities:
+                entry = entry_by_id.get(capability_id, {})
+                text, metadata = _chat_capability_vector_document(capability_id, spec, entry)
+                upsert_entries.append(
+                    {
+                        "document_id": capability_id,
+                        "text": text,
+                        "source_uri": f"capability://{capability_id}",
+                        "metadata": metadata,
+                    }
+                )
+            _rag_retriever_request_json(
+                "/index/upsert_texts",
+                method="POST",
+                body={
+                    "collection_name": CHAT_CAPABILITY_VECTOR_COLLECTION,
+                    "ensure_collection": True,
+                    "namespace": namespace,
+                    "workspace_id": CHAT_CAPABILITY_VECTOR_WORKSPACE_ID,
+                    "entries": upsert_entries,
+                },
+                timeout_s=CHAT_CAPABILITY_VECTOR_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("chat_capability_vector_index_sync_failed")
+            return None
+        _chat_capability_vector_synced_namespace = namespace
+        return namespace
+
+
+def _capability_discovery_scope_query(content: str) -> str:
+    lowered = str(content or "").strip().lower()
+    if not lowered:
+        return ""
+    normalized = re.sub(r"[^a-z0-9]+", " ", lowered)
+    generic_patterns = (
+        r"\bwhat can you do\b",
+        r"\bwhat can (?:this|the) (?:assistant|agent) do\b",
+        r"\bwhat capabilities(?: do you have| are available)?\b",
+        r"\bwhat (?:tools|actions|operations) (?:do you have|are available|are supported)\b",
+        r"\bavailable (?:capabilities|tools|actions|operations)\b",
+        r"\blist (?:your |the )?(?:capabilities|tools|actions|operations)\b",
+        r"\bshow (?:your |the )?(?:capabilities|tools|actions|operations)\b",
+        r"\bwhich (?:capabilities|tools|actions|operations)\b",
+        r"\bsupported (?:capabilities|tools|actions|operations)\b",
+        r"\bwhat (?:kind|kinds|type|types|sort|sorts) of\b",
+        r"\bwhat can you help with\b",
+        r"\bwhat (?:work|tasks|things|stuff) can you (?:handle|support|do)\b",
+    )
+    for pattern in generic_patterns:
+        normalized = re.sub(pattern, " ", normalized)
+    filler_pattern = (
+        r"\b(?:related to|about|for|here|assistant|agent|this|the|your|available|supported|"
+        r"kind|kinds|type|types|sort|sorts|work|tasks|things|stuff|handle|support|help|can|do)\b"
+    )
+    normalized = re.sub(filler_pattern, " ", normalized)
+    tokens = [
+        token
+        for token in re.sub(r"\s+", " ", normalized).strip().split()
+        if token
+        and token
+        not in {
+            "what",
+            "kinds",
+            "kind",
+            "types",
+            "type",
+            "sorts",
+            "sort",
+            "work",
+            "tasks",
+            "things",
+            "stuff",
+            "can",
+            "you",
+            "handle",
+            "support",
+            "help",
+            "do",
+            "with",
+        }
+    ]
+    return " ".join(tokens)
+
+
+def _scoped_chat_visible_capabilities(
+    content: str,
+    capabilities: list[tuple[str, capability_registry.CapabilitySpec]],
+) -> tuple[str, list[tuple[str, capability_registry.CapabilitySpec]]]:
+    scope_query = _capability_discovery_scope_query(content)
+    if not scope_query or not capabilities:
+        return "", capabilities
+
+    capability_map = {capability_id: spec for capability_id, spec in capabilities}
+    entries = _chat_capability_search_entries(capabilities)
+    lexical_matches = capability_search.search_capabilities(
+        query=scope_query,
+        capability_entries=entries,
+        limit=max(1, len(entries)),
+        rerank_feedback_rows=[],
+    )
+    hybrid_matches = _hybrid_chat_capability_matches(
+        query=scope_query,
+        capabilities=capabilities,
+        lexical_matches=lexical_matches,
+        entries=entries,
+    )
+    if not hybrid_matches:
+        return scope_query, []
+
+    matched_capabilities: list[tuple[str, capability_registry.CapabilitySpec]] = []
+    for match in hybrid_matches:
+        capability_id = str(match.get("id") or "").strip()
+        spec = capability_map.get(capability_id)
+        if spec is None:
+            continue
+        matched_capabilities.append((capability_id, spec))
+    return scope_query, matched_capabilities or capabilities
+
+
+def _vector_chat_capability_matches(
+    *,
+    query: str,
+    capabilities: list[tuple[str, capability_registry.CapabilitySpec]],
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    namespace = _ensure_chat_capability_vector_index(capabilities, entries)
+    if not namespace:
+        return []
+    try:
+        result = _rag_retriever_request_json(
+            "/retrieve",
+            method="POST",
+            body={
+                "query": query,
+                "collection_name": CHAT_CAPABILITY_VECTOR_COLLECTION,
+                "namespace": namespace,
+                "workspace_id": CHAT_CAPABILITY_VECTOR_WORKSPACE_ID,
+                "top_k": min(max(1, len(capabilities)), CHAT_CAPABILITY_VECTOR_TOP_K),
+                "min_score": CHAT_CAPABILITY_VECTOR_MIN_SCORE,
+                "include_text": False,
+                "include_metadata": True,
+            },
+            timeout_s=CHAT_CAPABILITY_VECTOR_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_capability_vector_search_failed")
+        return []
+
+    matches = result.get("matches") if isinstance(result, dict) else None
+    if not isinstance(matches, list):
+        return []
+    allowed_ids = {capability_id for capability_id, _spec in capabilities}
+    vector_matches: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+        capability_id = str(
+            metadata.get("capability_id")
+            or match.get("document_id")
+            or ""
+        ).strip()
+        if not capability_id or capability_id in seen_ids or capability_id not in allowed_ids:
+            continue
+        try:
+            score = float(match.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        vector_matches.append(
+            {
+                "id": capability_id,
+                "score": score,
+                "reason": "vector similarity",
+                "source": "vector_search",
+            }
+        )
+        seen_ids.add(capability_id)
+    return vector_matches
+
+
+def _hybrid_chat_capability_matches(
+    *,
+    query: str,
+    capabilities: list[tuple[str, capability_registry.CapabilitySpec]],
+    lexical_matches: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    vector_matches = _vector_chat_capability_matches(
+        query=query,
+        capabilities=capabilities,
+        entries=entries,
+    )
+    combined: dict[str, dict[str, Any]] = {}
+
+    for match in lexical_matches:
+        capability_id = str(match.get("id") or "").strip()
+        if not capability_id:
+            continue
+        combined[capability_id] = {
+            "id": capability_id,
+            "lexical_score": float(match.get("score") or 0.0),
+            "vector_score": 0.0,
+            "reason": str(match.get("reason") or "").strip(),
+        }
+
+    for match in vector_matches:
+        capability_id = str(match.get("id") or "").strip()
+        if not capability_id:
+            continue
+        current = combined.setdefault(
+            capability_id,
+            {
+                "id": capability_id,
+                "lexical_score": 0.0,
+                "vector_score": 0.0,
+                "reason": "",
+            },
+        )
+        current["vector_score"] = max(current["vector_score"], float(match.get("score") or 0.0))
+        if current["reason"]:
+            current["reason"] = f"{current['reason']}; vector similarity"
+        else:
+            current["reason"] = "vector similarity"
+
+    ranked: list[dict[str, Any]] = []
+    for item in combined.values():
+        lexical_score = float(item.get("lexical_score") or 0.0)
+        vector_score = float(item.get("vector_score") or 0.0)
+        fused_score = lexical_score + (vector_score * 25.0)
+        if lexical_score > 0 and vector_score > 0:
+            fused_score += 5.0
+        ranked.append(
+            {
+                "id": item["id"],
+                "score": round(fused_score, 6),
+                "reason": item["reason"] or "hybrid match",
+                "source": (
+                    "hybrid_search"
+                    if lexical_score > 0 and vector_score > 0
+                    else "lexical_search"
+                    if lexical_score > 0
+                    else "vector_search"
+                ),
+            }
+        )
+    ranked.sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+    return ranked
+
+
+def _capability_discovery_chat_response(content: str) -> str:
+    if not _is_capability_discovery_request(content):
+        return ""
+    capabilities = _chat_visible_capabilities()
+    scope_query, scoped_capabilities = _scoped_chat_visible_capabilities(content, capabilities)
+
+    if scoped_capabilities:
+        header = f"Available capabilities for this assistant ({len(scoped_capabilities)}):"
+        if scope_query:
+            header = (
+                f"Available capabilities related to '{scope_query}' for this assistant "
+                f"({len(scoped_capabilities)}):"
+            )
+        lines = [
+            header,
+        ]
+        for capability_id, spec in scoped_capabilities:
+            description = str(spec.description or "").strip()
+            if description:
+                lines.append(f"- {capability_id}: {description}")
+            else:
+                lines.append(f"- {capability_id}")
+        return "\n".join(lines)
+
+    if scope_query:
+        return f"No capabilities related to '{scope_query}' are currently available for this assistant."
+    return "No capabilities are currently available for this assistant."
+
+
 def _conversational_chat_fast_path_envelope(
     *,
     goal: str,
+    source: str = "chat_conversational_fast_path",
 ) -> workflow_contracts.NormalizedIntentEnvelope:
     return workflow_contracts.NormalizedIntentEnvelope(
         goal=str(goal or "").strip(),
         profile=workflow_contracts.GoalIntentProfile(
             intent="other",
-            source="chat_conversational_fast_path",
+            source=source,
             confidence=1.0,
             risk_level="read_only",
             threshold=0.0,
@@ -1363,11 +2318,11 @@ def _conversational_chat_fast_path_envelope(
             blocking_slots=[],
             missing_slots=[],
             slot_values={"intent_action": "other", "risk_level": "read_only"},
-            clarification_mode="chat_fast_path",
+            clarification_mode=source,
         ),
         graph=workflow_contracts.IntentGraph(
             segments=[],
-            source="chat_conversational_fast_path",
+            source=source,
             overall_confidence=1.0,
         ),
         candidate_capabilities={},
@@ -1378,16 +2333,90 @@ def _conversational_chat_fast_path_envelope(
             questions=[],
             blocking_slots=[],
             slot_values={"intent_action": "other", "risk_level": "read_only"},
-            clarification_mode="chat_fast_path",
+            clarification_mode=source,
         ),
         trace=workflow_contracts.NormalizationTrace(
-            assessment_source="chat_conversational_fast_path",
+            assessment_source=source,
             assessment_mode="fast_path",
             assessment_fallback_used=False,
             decomposition_source="disabled",
             decomposition_mode="disabled",
             decomposition_fallback_used=False,
         ),
+    )
+
+
+def _chat_response_turn_plan(
+    *,
+    goal: str,
+    assistant_content: str,
+    clear_pending_clarification: bool = False,
+    source: str = "chat_boundary_decision",
+) -> dict[str, Any]:
+    resolved_goal = str(goal or "").strip()
+    normalized = _conversational_chat_fast_path_envelope(goal=goal, source=source)
+    resolved_assistant_content = (
+        _capability_discovery_chat_response(resolved_goal)
+        or str(assistant_content or "").strip()
+        or _fallback_chat_response(resolved_goal)
+    )
+    return {
+        "type": "respond",
+        "assistant_content": resolved_assistant_content,
+        "clarification_questions": [],
+        "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(normalized.profile)
+        or {},
+        "normalized_intent_envelope": (
+            workflow_contracts.dump_normalized_intent_envelope(normalized) or {}
+        ),
+        "resolved_goal": resolved_goal,
+        "clear_pending_clarification": clear_pending_clarification,
+        "response_generated": True,
+    }
+
+
+def _chat_boundary_failure_response(
+    *,
+    content: str,
+    pending_clarification: bool,
+) -> dict[str, Any]:
+    if pending_clarification:
+        return _chat_response_turn_plan(
+            goal=content.strip(),
+            assistant_content=(
+                "I can either continue the current workflow request or answer here in chat. "
+                "Tell me which one you want."
+            ),
+            source="chat_boundary_failure",
+        )
+    return _chat_response_turn_plan(
+        goal=content.strip(),
+        assistant_content=_fallback_chat_response(content),
+        source="chat_boundary_failure",
+    )
+
+
+def _chat_router_failure_response(
+    *,
+    content: str,
+    pending_clarification: bool,
+) -> dict[str, Any]:
+    if pending_clarification:
+        return _chat_response_turn_plan(
+            goal=content.strip(),
+            assistant_content=(
+                "I could not determine how to continue the current workflow request. "
+                "Reply with the missing detail, or say you want the answer here in chat."
+            ),
+            source="chat_router_failure",
+        )
+    return _chat_response_turn_plan(
+        goal=content.strip(),
+        assistant_content=(
+            "I could not determine a safe execution route for that request. "
+            "Rephrase the task, or ask me to answer here in chat instead."
+        ),
+        source="chat_router_failure",
     )
 
 
@@ -1617,6 +2646,86 @@ def _route_chat_turn(
     merged_context: Mapping[str, Any] | None,
     messages: Sequence[chat_contracts.ChatMessage] | None,
 ) -> dict[str, Any]:
+    pending_clarification = bool(
+        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
+    )
+    if CHAT_RESPONSE_MODE != "answer_or_handoff":
+        return _route_chat_turn_legacy(
+            content=content,
+            candidate_goal=candidate_goal,
+            session_metadata=session_metadata,
+            merged_context=merged_context,
+            messages=messages,
+        )
+    if CHAT_ROUTING_MODE == "always_router":
+        return _route_chat_turn_with_router(
+            content=content,
+            candidate_goal=candidate_goal,
+            session_metadata=session_metadata,
+            merged_context=merged_context,
+            messages=messages,
+        )
+    boundary = _generate_chat_boundary_decision(
+        content=content,
+        candidate_goal=candidate_goal,
+        session_metadata=session_metadata,
+        merged_context=merged_context,
+        messages=messages,
+    )
+    if boundary is None:
+        return _chat_boundary_failure_response(
+            content=content,
+            pending_clarification=pending_clarification,
+        )
+    decision = boundary.decision
+    if pending_clarification and decision == chat_contracts.ChatBoundaryDecisionType.chat_reply:
+        decision = chat_contracts.ChatBoundaryDecisionType.exit_pending_to_chat
+    if decision == chat_contracts.ChatBoundaryDecisionType.chat_reply:
+        return _chat_response_turn_plan(
+            goal=content.strip(),
+            assistant_content=boundary.assistant_response or _fallback_chat_response(content),
+        )
+    if decision == chat_contracts.ChatBoundaryDecisionType.exit_pending_to_chat:
+        return _chat_response_turn_plan(
+            goal=content.strip(),
+            assistant_content=boundary.assistant_response or _fallback_chat_response(content),
+            clear_pending_clarification=True,
+        )
+    if decision == chat_contracts.ChatBoundaryDecisionType.meta_clarification:
+        return _chat_response_turn_plan(
+            goal=content.strip(),
+            assistant_content=boundary.assistant_response
+            or (
+                "Do you want to continue the current workflow request, or should I answer "
+                "here in chat instead?"
+            ),
+            source="chat_boundary_meta_clarification",
+        )
+    if decision in {
+        chat_contracts.ChatBoundaryDecisionType.execution_request,
+        chat_contracts.ChatBoundaryDecisionType.continue_pending,
+    }:
+        return _route_chat_turn_with_router(
+            content=content,
+            candidate_goal=candidate_goal,
+            session_metadata=session_metadata,
+            merged_context=merged_context,
+            messages=messages,
+        )
+    return _chat_boundary_failure_response(
+        content=content,
+        pending_clarification=pending_clarification,
+    )
+
+
+def _route_chat_turn_legacy(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> dict[str, Any]:
     fallback = _fallback_chat_turn_route(
         content=content,
         candidate_goal=candidate_goal,
@@ -1638,7 +2747,15 @@ def _route_chat_turn(
         or workflow_invocation is not None
         or not _looks_like_conversational_turn(content)
     )
-    if _chat_router_provider is None or not should_use_router:
+    if not should_use_router:
+        return _finalize_chat_turn_plan(
+            fallback,
+            content=content,
+            candidate_goal=candidate_goal,
+            merged_context=merged_context,
+            messages=messages,
+        )
+    if _chat_router_provider is None:
         return _finalize_chat_turn_plan(
             fallback,
             content=content,
@@ -1678,7 +2795,6 @@ def _route_chat_turn(
                 parsed,
                 content=content,
                 candidate_goal=candidate_goal,
-                fallback=fallback,
                 workflow_invocation_available=workflow_invocation is not None,
             ),
             content=content,
@@ -1694,6 +2810,70 @@ def _route_chat_turn(
             candidate_goal=candidate_goal,
             merged_context=merged_context,
             messages=messages,
+        )
+
+
+def _route_chat_turn_with_router(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> dict[str, Any]:
+    pending_clarification = bool(
+        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
+    )
+    workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
+    if _chat_router_provider is None:
+        return _chat_router_failure_response(
+            content=content,
+            pending_clarification=pending_clarification,
+        )
+    try:
+        prompt = _build_chat_router_prompt(
+            content=content,
+            candidate_goal=candidate_goal,
+            pending_clarification=pending_clarification,
+            merged_context=merged_context,
+            messages=messages,
+        )
+        parsed = _chat_router_provider.generate_request_json_object(
+            LLMRequest(
+                prompt=prompt,
+                system_prompt=(
+                    "You route chat turns for an agent platform. "
+                    "Return JSON only. "
+                    "Use route='respond' for normal conversation or explanation when no tools/workflow are needed. "
+                    "Use route='tool_call' only for a single safe read-only capability from the allowed catalog as a synchronous one-step run. "
+                    "Use route='run_workflow' only when the user wants to invoke a published Studio workflow and the provided context already includes workflow_trigger_id, workflow_version_id, or workflow_definition_id. "
+                    "Use route='submit_job' only when the user wants the system to perform work, create artifacts, inspect systems, or run automation. "
+                    "Use route='ask_clarification' only when workflow execution is needed but essential details are missing. "
+                    "Never choose tool_call for writes, multi-step work, or anything outside the allowed direct catalog."
+                ),
+                metadata={
+                    "component": "chat_router",
+                    "pending_clarification": str(pending_clarification).lower(),
+                },
+            )
+        )
+        return _finalize_chat_turn_plan(
+            _normalize_chat_route(
+                parsed,
+                content=content,
+                candidate_goal=candidate_goal,
+                workflow_invocation_available=workflow_invocation is not None,
+            ),
+            content=content,
+            candidate_goal=candidate_goal,
+            merged_context=merged_context,
+            messages=messages,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_router_failed")
+        return _chat_router_failure_response(
+            content=content,
+            pending_clarification=pending_clarification,
         )
 
 
@@ -1879,6 +3059,66 @@ def _build_chat_response_prompt(
     return json.dumps(payload, ensure_ascii=True)
 
 
+def _build_chat_boundary_decision_prompt(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> str:
+    recent_messages: list[dict[str, str]] = []
+    for message in list(messages or [])[-8:]:
+        recent_messages.append(
+            {
+                "role": str(message.role),
+                "content": str(message.content or "")[:800],
+            }
+        )
+    pending = (
+        dict(session_metadata.get("pending_clarification"))
+        if isinstance(session_metadata, Mapping)
+        and isinstance(session_metadata.get("pending_clarification"), Mapping)
+        else {}
+    )
+    workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
+    payload = {
+        "current_user_message": content,
+        "candidate_goal": candidate_goal,
+        "pending_clarification": bool(pending),
+        "draft_goal": (
+            str(session_metadata.get("draft_goal") or "").strip()
+            if isinstance(session_metadata, Mapping)
+            else ""
+        ),
+        "pending_questions": [
+            str(question).strip()
+            for question in pending.get("questions", [])
+            if isinstance(question, str) and question.strip()
+        ],
+        "context_json": dict(merged_context or {}),
+        "recent_messages": recent_messages,
+        "workflow_context": {
+            "target_available": workflow_invocation is not None,
+            "trigger_id": workflow_invocation.trigger_id if workflow_invocation is not None else None,
+            "version_id": workflow_invocation.version_id if workflow_invocation is not None else None,
+            "definition_id": workflow_invocation.definition_id
+            if workflow_invocation is not None
+            else None,
+        },
+        "response_schema": {
+            "decision": (
+                "chat_reply | execution_request | continue_pending | "
+                "exit_pending_to_chat | meta_clarification"
+            ),
+            "assistant_response": "string",
+            "confidence": "0..1",
+            "reason_code": "string",
+        },
+    }
+    return json.dumps(payload, ensure_ascii=True)
+
+
 def _generate_chat_response(
     *,
     content: str,
@@ -1914,6 +3154,63 @@ def _generate_chat_response(
     return generated or fallback_response
 
 
+def _generate_chat_boundary_decision(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+    fallback_response: str | None = None,
+) -> chat_contracts.ChatBoundaryDecision | None:
+    if CHAT_RESPONSE_MODE != "answer_or_handoff" or _chat_response_provider is None:
+        return None
+    try:
+        parsed = _chat_response_provider.generate_request_json_object(
+            LLMRequest(
+                prompt=_build_chat_boundary_decision_prompt(
+                    content=content,
+                    candidate_goal=candidate_goal,
+                    session_metadata=session_metadata,
+                    merged_context=merged_context,
+                    messages=messages,
+                ),
+                system_prompt=(
+                    "You are the front-door boundary decision model for an agent platform. "
+                    "Choose exactly one bounded decision and return JSON only. "
+                    "When pending_clarification is false: "
+                    "use decision='chat_reply' for normal conversation, explanation, discussion, advice, tutoring, coaching, quizzes, interview practice, roleplay, brainstorming, or any other back-and-forth chat experience. "
+                    "Use decision='execution_request' only when the user wants tools, system actions, file changes, workflow execution, job submission, artifact creation, repository or environment inspection, or automation. "
+                    "When pending_clarification is true: "
+                    "use decision='continue_pending' if the user is answering the existing workflow clarification or wants to continue that request; "
+                    "use decision='exit_pending_to_chat' if the user wants to stop the workflow path and just get a normal chat answer; "
+                    "use decision='meta_clarification' if it is ambiguous whether they want to continue the pending workflow or return to normal chat. "
+                    "For chat_reply, exit_pending_to_chat, and meta_clarification, include assistant_response. "
+                    "Do not choose execution_request just because the user wants a structured conversation or repeated turns."
+                ),
+                metadata={"component": "chat_boundary_decision"},
+            )
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_boundary_decision_failed")
+        return None
+    try:
+        decision = chat_contracts.ChatBoundaryDecision.model_validate(
+            {
+                "decision": parsed.get("decision") or parsed.get("type"),
+                "confidence": parsed.get("confidence"),
+                "assistant_response": (
+                    str(parsed.get("assistant_response") or "").strip()
+                    or str(fallback_response or "").strip()
+                ),
+                "reason_code": parsed.get("reason_code"),
+            }
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return decision
+
+
 def _finalize_chat_turn_plan(
     turn_plan: Mapping[str, Any],
     *,
@@ -1925,6 +3222,13 @@ def _finalize_chat_turn_plan(
     finalized = dict(turn_plan)
     route_type = str(finalized.get("type") or "").strip().lower()
     if route_type != "respond":
+        return finalized
+    capability_catalog_response = _capability_discovery_chat_response(content)
+    if capability_catalog_response:
+        finalized["assistant_content"] = capability_catalog_response
+        finalized["response_generated"] = True
+        return finalized
+    if bool(finalized.get("response_generated")):
         return finalized
     fallback_response = str(finalized.get("assistant_content") or "").strip()
     finalized["assistant_content"] = _generate_chat_response(
@@ -1942,26 +3246,19 @@ def _normalize_chat_route(
     *,
     content: str,
     candidate_goal: str,
-    fallback: Mapping[str, Any],
     workflow_invocation_available: bool,
 ) -> dict[str, Any]:
-    heuristic = workflow_contracts.parse_goal_intent_profile(
-        fallback.get("goal_intent_profile")
-    )
-    if heuristic is None:
-        heuristic = _normalize_goal_intent(candidate_goal).profile
+    heuristic = _normalize_goal_intent(candidate_goal).profile
     heuristic = _chat_route_goal_intent_profile(heuristic, goal=candidate_goal)
     route = str(parsed.get("route") or parsed.get("type") or "").strip().lower()
     if route not in {"respond", "tool_call", "ask_clarification", "submit_job", "run_workflow"}:
-        route = str(fallback.get("type") or "respond")
-    if route == "respond" and not _looks_like_conversational_turn(content):
-        route = str(fallback.get("type") or "respond")
+        route = "respond"
     capability_id = str(parsed.get("capability_id") or "").strip()
     if route == "tool_call" and capability_id not in CHAT_DIRECT_CAPABILITIES:
-        route = str(fallback.get("type") or "respond")
+        route = "respond"
         capability_id = ""
     if route == "run_workflow" and not workflow_invocation_available:
-        route = str(fallback.get("type") or "respond")
+        route = "respond"
     arguments = dict(parsed.get("arguments")) if isinstance(parsed.get("arguments"), Mapping) else {}
 
     intent = str(parsed.get("intent") or heuristic.intent or "").strip().lower()
@@ -2015,7 +3312,7 @@ def _normalize_chat_route(
     if route != "respond" and low_confidence and "intent_action" in blocking_slots and "intent_action" not in missing_slots:
         missing_slots.append("intent_action")
     if route == "tool_call" and (missing_slots or risk_level != "read_only"):
-        route = str(fallback.get("type") or "respond")
+        route = "respond"
     if route == "submit_job" and missing_slots:
         route = "ask_clarification"
     clarification_questions = [
@@ -2062,6 +3359,7 @@ def _normalize_chat_route(
         "arguments": arguments,
         "clarification_questions": clarification_questions,
         "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(assessment) or {},
+        "resolved_goal": candidate_goal,
     }
 
 
@@ -4093,14 +5391,21 @@ def _infer_goal_intent_with_metadata(
     mode_override: str | None = None,
 ) -> intent_contract.TaskIntentInference:
     heuristic = intent_contract.infer_task_intent_from_goal_with_metadata(goal)
+    semantic_inference = (
+        _hybrid_goal_intent_inference(goal, heuristic)
+        if _should_run_goal_intent_vector_search(heuristic)
+        else heuristic
+    )
     assess_mode = str(mode_override or INTENT_ASSESS_MODE).strip().lower()
     if assess_mode not in {"heuristic", "llm", "hybrid"}:
         assess_mode = "heuristic"
     if not INTENT_ASSESS_ENABLED or assess_mode == "heuristic":
-        return heuristic
+        return semantic_inference
+    if _should_skip_llm_goal_intent_assessment(semantic_inference, assess_mode=assess_mode):
+        return semantic_inference
     provider = _intent_assess_provider
     if provider is None:
-        return heuristic
+        return semantic_inference
     allowed_capability_catalog = _intent_catalog_capability_entries()
     allowed_capability_ids = {
         str(entry.get("id") or "").strip()
@@ -4117,7 +5422,7 @@ def _infer_goal_intent_with_metadata(
         return _llm_infer_goal_intent_with_capabilities(
             goal=goal,
             provider=provider,
-            fallback_inference=heuristic,
+            fallback_inference=semantic_inference,
             allowed_capability_ids=allowed_capability_ids,
             allowed_capability_catalog=allowed_capability_catalog,
             capability_top_k=INTENT_CAPABILITY_TOP_K,
@@ -4128,7 +5433,7 @@ def _infer_goal_intent_with_metadata(
             "intent_assess_llm_failed",
             extra={"goal": goal[:160], "mode": assess_mode},
         )
-        return heuristic
+        return semantic_inference
 
 
 def _filter_catalog_capability_ids(

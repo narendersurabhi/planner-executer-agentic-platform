@@ -10,6 +10,7 @@ os.environ["POLICY_GATE_ENABLED"] = "false"
 os.environ["CAPABILITY_MODE"] = "enabled"
 
 from libs.core import models  # noqa: E402
+from libs.core import capability_registry as cap_registry  # noqa: E402
 from services.api.app import chat_service, main  # noqa: E402
 from services.api.app.database import Base, engine  # noqa: E402
 
@@ -17,6 +18,11 @@ from services.api.app.database import Base, engine  # noqa: E402
 Base.metadata.create_all(bind=engine)
 
 client = TestClient(main.app)
+main.CHAT_RESPONSE_MODE = "answer_only"
+main.CHAT_ROUTING_MODE = "response_first"
+main._chat_router_provider = None
+main._chat_response_provider = None
+main._chat_pending_correction_provider = None
 
 
 def test_create_chat_session() -> None:
@@ -43,6 +49,363 @@ def test_chat_turn_can_respond_without_creating_job() -> None:
     assert body["assistant_message"]["action"]["type"] == "respond"
     assert "workflow" in body["assistant_message"]["content"].lower()
     assert "pending_clarification" not in body["session"]["metadata"]
+
+
+def test_chat_turn_lists_available_capabilities_when_asked(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="github.repo.list",
+        description="List repositories for a user or organization.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="github",
+        subgroup="repositories",
+        enabled=True,
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"github.repo.list": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "What capabilities do you have?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert "Available capabilities for this assistant (1):" in body["assistant_message"]["content"]
+    assert "github.repo.list" in body["assistant_message"]["content"]
+    assert "List repositories for a user or organization." in body["assistant_message"]["content"]
+
+
+def test_chat_turn_lists_only_allowlisted_capabilities_for_assistant(monkeypatch) -> None:
+    allowed = cap_registry.CapabilitySpec(
+        capability_id="github.repo.list",
+        description="List repositories for a user or organization.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="github",
+        subgroup="repositories",
+        enabled=True,
+    )
+    blocked = cap_registry.CapabilitySpec(
+        capability_id="github.branch.create",
+        description="Create a branch in a repository.",
+        risk_tier="bounded_write",
+        idempotency="write",
+        group="github",
+        subgroup="branches",
+        enabled=True,
+    )
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "github.repo.list": allowed,
+            "github.branch.create": blocked,
+        }
+    )
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(
+        main.capability_registry,
+        "evaluate_capability_allowlist",
+        lambda capability_id, service_name=None: cap_registry.CapabilityAllowDecision(
+            allowed=capability_id != "github.branch.create",
+            reason="allowed" if capability_id != "github.branch.create" else "service_disabled",
+        ),
+    )
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "What tools are available here?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "github.repo.list" in body["assistant_message"]["content"]
+    assert "github.branch.create" not in body["assistant_message"]["content"]
+
+
+def test_chat_turn_lists_only_scoped_capabilities_when_query_mentions_github(monkeypatch) -> None:
+    github_capability = cap_registry.CapabilitySpec(
+        capability_id="github.repo.list",
+        description="List repositories for a user or organization.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="github",
+        subgroup="repositories",
+        enabled=True,
+    )
+    filesystem_capability = cap_registry.CapabilitySpec(
+        capability_id="filesystem.workspace.list",
+        description="List files under workspace storage.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="filesystem",
+        subgroup="workspace",
+        enabled=True,
+    )
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "github.repo.list": github_capability,
+            "filesystem.workspace.list": filesystem_capability,
+        }
+    )
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "What can you do related to GitHub?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "Available capabilities related to 'github'" in body["assistant_message"]["content"]
+    assert "github.repo.list" in body["assistant_message"]["content"]
+    assert "filesystem.workspace.list" not in body["assistant_message"]["content"]
+
+
+def test_chat_turn_uses_vector_capability_search_for_fuzzy_scope_queries(monkeypatch) -> None:
+    github_capability = cap_registry.CapabilitySpec(
+        capability_id="github.file.create_or_update",
+        description="Create or update a single file in a repository.",
+        risk_tier="bounded_write",
+        idempotency="safe_write",
+        group="github",
+        subgroup="files",
+        enabled=True,
+    )
+    filesystem_capability = cap_registry.CapabilitySpec(
+        capability_id="filesystem.workspace.list",
+        description="List files under workspace storage.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="filesystem",
+        subgroup="workspace",
+        enabled=True,
+    )
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "github.file.create_or_update": github_capability,
+            "filesystem.workspace.list": filesystem_capability,
+        }
+    )
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 2, "chunk_ids": ["a", "b"]}
+        if path == "/retrieve":
+            assert body is not None
+            assert body["query"] == "repo changes"
+            return {
+                "matches": [
+                    {
+                        "document_id": "github.file.create_or_update",
+                        "score": 0.82,
+                        "metadata": {"capability_id": "github.file.create_or_update"},
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(main.capability_search, "search_capabilities", lambda **kwargs: [])
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_chat_capability_vector_synced_namespace", None)
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "What can you do related to repo changes?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "Available capabilities related to 'repo changes'" in body["assistant_message"]["content"]
+    assert "github.file.create_or_update" in body["assistant_message"]["content"]
+    assert "filesystem.workspace.list" not in body["assistant_message"]["content"]
+
+
+def test_chat_turn_uses_vector_intent_detection_for_fuzzy_capability_question(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="github.repo.list",
+        description="List repositories for a user or organization.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="github",
+        subgroup="repositories",
+        enabled=True,
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"github.repo.list": capability})
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 3, "chunk_ids": ["a", "b", "c"]}
+        if path == "/retrieve":
+            assert body is not None
+            assert body["query"] == "What kinds of work can you handle here?"
+            return {
+                "matches": [
+                    {
+                        "document_id": "capability_discovery",
+                        "score": 0.84,
+                        "metadata": {"intent_id": "capability_discovery"},
+                    },
+                    {
+                        "document_id": "general_chat",
+                        "score": 0.51,
+                        "metadata": {"intent_id": "general_chat"},
+                    },
+                ]
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_chat_intent_vector_synced_namespace", None)
+    monkeypatch.setattr(main, "CHAT_CAPABILITY_VECTOR_SEARCH_ENABLED", False)
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "What kinds of work can you handle here?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "Available capabilities for this assistant (1):" in body["assistant_message"]["content"]
+    assert "github.repo.list" in body["assistant_message"]["content"]
+
+
+def test_chat_turn_uses_vector_intent_detection_for_fuzzy_github_scope(monkeypatch) -> None:
+    github_capability = cap_registry.CapabilitySpec(
+        capability_id="github.repo.list",
+        description="List repositories for a user or organization.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="github",
+        subgroup="repositories",
+        enabled=True,
+    )
+    filesystem_capability = cap_registry.CapabilitySpec(
+        capability_id="filesystem.workspace.list",
+        description="List files under workspace storage.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="filesystem",
+        subgroup="workspace",
+        enabled=True,
+    )
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "github.repo.list": github_capability,
+            "filesystem.workspace.list": filesystem_capability,
+        }
+    )
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 3, "chunk_ids": ["a", "b", "c"]}
+        if path == "/retrieve":
+            assert body is not None
+            assert body["query"] == "What kinds of GitHub work can you handle here?"
+            return {
+                "matches": [
+                    {
+                        "document_id": "capability_discovery",
+                        "score": 0.86,
+                        "metadata": {"intent_id": "capability_discovery"},
+                    },
+                    {
+                        "document_id": "workflow_execution",
+                        "score": 0.47,
+                        "metadata": {"intent_id": "workflow_execution"},
+                    },
+                ]
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_chat_intent_vector_synced_namespace", None)
+    monkeypatch.setattr(main, "CHAT_CAPABILITY_VECTOR_SEARCH_ENABLED", False)
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "What kinds of GitHub work can you handle here?",
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "Available capabilities related to 'github'" in body["assistant_message"]["content"]
+    assert "github.repo.list" in body["assistant_message"]["content"]
+    assert "filesystem.workspace.list" not in body["assistant_message"]["content"]
+
+
+def test_chat_turn_capability_discovery_overrides_llm_chat_reply(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="github.repo.list",
+        description="List repositories for a user or organization.",
+        risk_tier="read_only",
+        idempotency="read",
+        group="github",
+        subgroup="repositories",
+        enabled=True,
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"github.repo.list": capability})
+
+    class _BoundaryResponder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            return {"decision": "chat_reply", "assistant_response": "Generic chat reply."}
+
+        def generate_request(self, request):
+            raise AssertionError("chat generation should not run for deterministic capability discovery")
+
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_response_provider", _BoundaryResponder())
+    monkeypatch.setattr(
+        main,
+        "_chat_router_provider",
+        type(
+            "_Router",
+            (),
+            {
+                "generate_request_json_object": lambda self, request: (_ for _ in ()).throw(
+                    AssertionError("router should not run for chat replies")
+                )
+            },
+        )(),
+    )
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "What capabilities do you have?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert "Available capabilities for this assistant (1):" in body["assistant_message"]["content"]
+    assert "Generic chat reply." not in body["assistant_message"]["content"]
 
 
 def test_chat_turn_can_request_clarification_for_ambiguous_workflow() -> None:
@@ -509,6 +872,7 @@ def test_chat_turn_uses_separate_response_provider_for_conversational_reply(monk
             return type("_Response", (), {"content": "Response model answer."})()
 
     monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_only")
     monkeypatch.setattr(main, "_chat_router_provider", _Router())
     monkeypatch.setattr(main, "_chat_response_provider", _Responder())
     session = client.post("/chat/sessions", json={}).json()
@@ -530,17 +894,103 @@ def test_chat_turn_response_first_skips_router_for_conversational_turn(monkeypat
         def generate_request_json_object(self, request):
             raise AssertionError("router should not run for conversational turns in response_first mode")
 
+    class _PendingCorrectionProvider:
+        def generate_request_json_object(self, request):
+            raise AssertionError("pending correction classifier should not run for normal conversational turns")
+
     class _Responder:
         def generate_request(self, request):
             assert request.metadata == {"component": "chat_response"}
             return type("_Response", (), {"content": "Direct response model answer."})()
 
     monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_only")
     monkeypatch.setattr(
         main,
         "_normalize_goal_intent",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("intent normalization should not run for conversational fast path")
+        ),
+    )
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_pending_correction_provider", _PendingCorrectionProvider())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Can you explain the architecture?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert body["assistant_message"]["content"] == "Direct response model answer."
+
+
+def test_chat_turn_response_first_treats_discussion_request_as_conversational(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            raise AssertionError("router should not run for discussion-style conversational turns")
+
+    class _PendingCorrectionProvider:
+        def generate_request_json_object(self, request):
+            raise AssertionError("pending correction classifier should not run for normal discussion turns")
+
+    class _Responder:
+        def generate_request(self, request):
+            assert request.metadata == {"component": "chat_response"}
+            assert "discuss about kubernetes" in request.prompt.lower()
+            return type("_Response", (), {"content": "Let's discuss Kubernetes."})()
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_only")
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("intent normalization should not run for discussion-style conversational turns")
+        ),
+    )
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_pending_correction_provider", _PendingCorrectionProvider())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "I want to discuss about Kubernetes with you.", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert body["assistant_message"]["content"] == "Let's discuss Kubernetes."
+
+
+def test_chat_turn_response_first_answer_or_handoff_answers_without_router(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            raise AssertionError("router should not run when response model answers directly")
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            assert "current_user_message" in request.prompt
+            return {
+                "decision": "chat_reply",
+                "assistant_response": "Direct answer-or-handoff response.",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("intent normalization should not run for answer-or-handoff direct responses")
         ),
     )
     monkeypatch.setattr(main, "_chat_router_provider", _Router())
@@ -556,7 +1006,123 @@ def test_chat_turn_response_first_skips_router_for_conversational_turn(monkeypat
     body = response.json()
     assert body["job"] is None
     assert body["assistant_message"]["action"]["type"] == "respond"
-    assert body["assistant_message"]["content"] == "Direct response model answer."
+    assert body["assistant_message"]["content"] == "Direct answer-or-handoff response."
+
+
+def test_chat_turn_response_first_answer_or_handoff_keeps_interview_practice_in_chat(
+    monkeypatch,
+) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            raise AssertionError("router should not run for interview-practice chat turns")
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            assert "practice interview questions and answers" in request.prompt.lower()
+            return {
+                "decision": "chat_reply",
+                "assistant_response": "Great — let's practice Applied AI Engineer interview questions.",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("intent normalization should not run for interview-practice chat turns")
+        ),
+    )
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": (
+                "I want to practice interview questions and answers with you. "
+                "You ask me a question, I will type the answer. Lets do it for applied AI engineer."
+            ),
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert (
+        body["assistant_message"]["content"]
+        == "Great — let's practice Applied AI Engineer interview questions."
+    )
+
+
+def test_chat_turn_response_first_answer_or_handoff_can_escalate_to_router(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "render",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+                "output_format": "pdf",
+            }
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            return {"decision": "execution_request", "assistant_response": ""}
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Can you prepare a deployment report?", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is not None
+    assert body["assistant_message"]["action"]["type"] == "submit_job"
+
+
+def test_chat_route_goal_intent_profile_uses_minimal_pre_submit_slots(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "CHAT_PRE_SUBMIT_BLOCKING_SLOTS",
+        {"output_format", "target_system", "safety_constraints"},
+    )
+    profile = main.workflow_contracts.GoalIntentProfile(
+        intent="generate",
+        source="test",
+        confidence=0.42,
+        risk_level="bounded_write",
+        threshold=0.7,
+        low_confidence=True,
+        needs_clarification=True,
+        requires_blocking_clarification=True,
+        questions=["What format?", "What should the system do first?"],
+        blocking_slots=["output_format", "intent_action"],
+        missing_slots=["output_format", "intent_action"],
+        slot_values={"output_format": "", "intent_action": "generate"},
+    )
+
+    narrowed = main._chat_route_goal_intent_profile(profile, goal="Create a document")
+
+    assert narrowed.blocking_slots == ["output_format"]
+    assert narrowed.missing_slots == ["output_format"]
+    assert narrowed.questions == [
+        "What output format do you need (for example PDF, DOCX, JSON, or Markdown)?"
+    ]
 
 
 def test_chat_turn_exits_pending_clarification_when_user_requests_chat_only_response(
@@ -577,21 +1143,18 @@ def test_chat_turn_exits_pending_clarification_when_user_requests_chat_only_resp
         def generate_request_json_object(self, request):
             raise AssertionError("router should not run when user exits pending clarification to stay in chat")
 
-    class _PendingCorrectionProvider:
-        def generate_request_json_object(self, request):
-            assert request.metadata == {"component": "chat_pending_correction"}
-            return {"chat_only_correction": True, "confidence": 0.98}
-
     class _Responder:
-        def generate_request(self, request):
-            assert request.metadata == {"component": "chat_response"}
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
             assert "don't need a document" in request.prompt.lower()
-            return type("_Response", (), {"content": "Here are my thoughts on Kubernetes."})()
+            return {
+                "decision": "exit_pending_to_chat",
+                "assistant_response": "Here are my thoughts on Kubernetes.",
+            }
 
     monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
-    monkeypatch.setattr(main, "CHAT_PENDING_CORRECTION_MODE", "llm")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
     monkeypatch.setattr(main, "_chat_router_provider", _Router())
-    monkeypatch.setattr(main, "_chat_pending_correction_provider", _PendingCorrectionProvider())
     monkeypatch.setattr(main, "_chat_response_provider", _Responder())
     monkeypatch.setattr(
         main,
@@ -634,21 +1197,18 @@ def test_chat_turn_exits_pending_clarification_for_semantic_chat_only_correction
         def generate_request_json_object(self, request):
             raise AssertionError("router should not run when user semantically redirects back to chat")
 
-    class _PendingCorrectionProvider:
-        def generate_request_json_object(self, request):
-            assert request.metadata == {"component": "chat_pending_correction"}
-            return {"chat_only_correction": True, "confidence": 0.95}
-
     class _Responder:
-        def generate_request(self, request):
-            assert request.metadata == {"component": "chat_response"}
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
             assert "skip the workflow and answer here" in request.prompt.lower()
-            return type("_Response", (), {"content": "Here is the direct chat answer."})()
+            return {
+                "decision": "exit_pending_to_chat",
+                "assistant_response": "Here is the direct chat answer.",
+            }
 
     monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
-    monkeypatch.setattr(main, "CHAT_PENDING_CORRECTION_MODE", "llm")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
     monkeypatch.setattr(main, "_chat_router_provider", _Router())
-    monkeypatch.setattr(main, "_chat_pending_correction_provider", _PendingCorrectionProvider())
     monkeypatch.setattr(main, "_chat_response_provider", _Responder())
     monkeypatch.setattr(
         main,
@@ -675,28 +1235,118 @@ def test_chat_turn_exits_pending_clarification_for_semantic_chat_only_correction
     assert "pending_clarification" not in body["session"]["metadata"]
 
 
-def test_chat_pending_correction_llm_falls_back_to_heuristic_on_failure(monkeypatch) -> None:
-    monkeypatch.setattr(main, "CHAT_PENDING_CORRECTION_MODE", "llm")
+def test_chat_turn_answer_or_handoff_classifier_failure_does_not_fallback_to_execution(
+    monkeypatch,
+) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            raise AssertionError("router should not run when the boundary decision fails")
+
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
     monkeypatch.setattr(
         main,
-        "_chat_pending_correction_provider",
+        "_chat_response_provider",
         type(
-            "_FailingProvider",
+            "_FailingBoundaryProvider",
             (),
             {
                 "generate_request_json_object": lambda self, request: (_ for _ in ()).throw(
-                    RuntimeError("classification failed")
+                    RuntimeError("boundary failed")
                 )
             },
         )(),
     )
-
-    assert (
-        main._looks_like_chat_only_correction(
-            "Don't create a workflow. Just answer here in chat."
-        )
-        is True
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("intent normalization should not run when boundary decision fails")
+        ),
     )
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Generate a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert "workflow" in body["assistant_message"]["content"].lower()
+
+
+def test_chat_turn_pending_boundary_failure_returns_meta_clarification(monkeypatch) -> None:
+    session = client.post("/chat/sessions", json={}).json()
+    first_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Generate a deployment report", "context_json": {}, "priority": 0},
+    )
+    assert first_response.status_code == 200
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            raise AssertionError("router should not run when pending boundary decision fails")
+
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(
+        main,
+        "_chat_response_provider",
+        type(
+            "_FailingBoundaryProvider",
+            (),
+            {
+                "generate_request_json_object": lambda self, request: (_ for _ in ()).throw(
+                    RuntimeError("boundary failed")
+                )
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "intent normalization should not run when pending boundary decision fails"
+            )
+        ),
+    )
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "PDF for leadership", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert "continue the current workflow request" in body["assistant_message"]["content"].lower()
+    assert body["session"]["metadata"]["pending_clarification"]["questions"]
+
+
+def test_build_chat_pending_correction_provider_prefers_dedicated_model(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def _resolve_provider(provider_name, **kwargs):
+        captured["provider_name"] = provider_name
+        captured["model"] = kwargs.get("model") or ""
+        return object()
+
+    monkeypatch.setattr(main, "CHAT_PENDING_CORRECTION_MODE", "llm")
+    monkeypatch.setattr(main, "LLM_PROVIDER_NAME", "openai")
+    monkeypatch.setattr(main, "CHAT_PENDING_CORRECTION_MODEL", "gpt-5-nano")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODEL", "gpt-4.1-mini")
+    monkeypatch.setattr(main, "LLM_MODEL_NAME", "gpt-5-mini")
+    monkeypatch.setattr(main, "resolve_provider", _resolve_provider)
+
+    provider = main._build_chat_pending_correction_provider()
+
+    assert provider is not None
+    assert captured == {"provider_name": "openai", "model": "gpt-5-nano"}
 
 
 def test_chat_turn_response_first_still_uses_router_for_execution_turn(monkeypatch) -> None:
@@ -714,8 +1364,9 @@ def test_chat_turn_response_first_still_uses_router_for_execution_turn(monkeypat
             }
 
     class _Responder:
-        def generate_request(self, request):
-            raise AssertionError("response provider should not run for execution turns")
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            return {"decision": "execution_request", "assistant_response": ""}
 
     normalize_calls = {"count": 0}
 
@@ -741,6 +1392,7 @@ def test_chat_turn_response_first_still_uses_router_for_execution_turn(monkeypat
         )
 
     monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
     monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
     monkeypatch.setattr(main, "_chat_router_provider", _Router())
     monkeypatch.setattr(main, "_chat_response_provider", _Responder())

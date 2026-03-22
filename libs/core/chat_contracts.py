@@ -15,6 +15,14 @@ class ChatRole(str, Enum):
     system = "system"
 
 
+class ChatBoundaryDecisionType(str, Enum):
+    chat_reply = "chat_reply"
+    execution_request = "execution_request"
+    continue_pending = "continue_pending"
+    exit_pending_to_chat = "exit_pending_to_chat"
+    meta_clarification = "meta_clarification"
+
+
 class AssistantActionType(str, Enum):
     respond = "respond"
     tool_call = "tool_call"
@@ -40,6 +48,13 @@ class AssistantAction(BaseModel):
         default_factory=workflow_contracts.GoalIntentProfile
     )
     context_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatBoundaryDecision(BaseModel):
+    decision: ChatBoundaryDecisionType
+    confidence: float | None = None
+    assistant_response: str = ""
+    reason_code: str | None = None
 
 
 class ChatMessage(BaseModel):

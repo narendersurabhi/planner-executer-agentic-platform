@@ -97,6 +97,9 @@ _SLOT_OUTPUT_FORMAT_MAP: dict[str, str] = {
     ".pdf": "pdf",
     "docx": "docx",
     ".docx": "docx",
+    "word": "docx",
+    "word_document": "docx",
+    "microsoft_word": "docx",
     "md": "md",
     ".md": "md",
     "markdown": "md",
@@ -188,7 +191,14 @@ _CLAUSE_SPLIT_ACTION_HINTS: tuple[str, ...] = (
 
 def _contains_any(text: str, tokens: Iterable[str]) -> bool:
     lowered = text.lower()
-    return any(token in lowered for token in tokens)
+    for raw_token in tokens:
+        token = str(raw_token or "").strip().lower()
+        if not token:
+            continue
+        pattern = r"(?<![a-z0-9])" + re.escape(token).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+        if re.search(pattern, lowered):
+            return True
+    return False
 
 
 def _prepend_unique(items: list[str], *candidates: str) -> list[str]:
@@ -759,12 +769,15 @@ def _payload_has_required_input(
         "title": (
             "document_title",
             "topic",
+            "main_topic",
             "subject",
             "target_role_name",
             "role_name",
             "job_title",
             "role",
         ),
+        "topic": ("main_topic", "title", "subject", "document_title"),
+        "main_topic": ("topic", "title", "subject", "document_title"),
         "job_posting_text": ("job_description",),
         "company_logo_image": ("company_logo", "company_logo_url", "logo_url"),
     }
@@ -904,7 +917,7 @@ def _infer_intent_from_text_with_source(
         confidence = 0.86 if source == _INTENT_SOURCE_TASK_TEXT else 0.78
         return TaskIntentInference(intent="generate", source=source, confidence=confidence)
     for intent, keywords in _KEYWORD_MAP:
-        if any(keyword in normalized for keyword in keywords):
+        if _contains_any(normalized, keywords):
             confidence = 0.82 if source == _INTENT_SOURCE_TASK_TEXT else 0.72
             return TaskIntentInference(intent=intent, source=source, confidence=confidence)
     return TaskIntentInference(
@@ -939,7 +952,7 @@ def infer_task_intent_from_text(
         parts.extend([item for item in acceptance_criteria if isinstance(item, str)])
     text = " ".join(parts).lower()
     for intent, keywords in _KEYWORD_MAP:
-        if any(keyword in text for keyword in keywords):
+        if _contains_any(text, keywords):
             return intent
     return "generate"
 

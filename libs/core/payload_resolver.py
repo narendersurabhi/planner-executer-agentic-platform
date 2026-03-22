@@ -181,6 +181,7 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
             "instruction",
             "markdown_text",
             "topic",
+            "main_topic",
             "audience",
             "tone",
             "today",
@@ -203,6 +204,8 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
             value = job_context.get(key)
             if isinstance(value, str) and value.strip():
                 filled[key] = value
+    if "topic" not in filled and isinstance(filled.get("main_topic"), str) and filled["main_topic"].strip():
+        filled["topic"] = filled["main_topic"].strip()
     if "document_spec" not in filled:
         doc = _extract_document_spec_from_context(context)
         if isinstance(doc, dict):
@@ -246,6 +249,7 @@ def _promote_document_job_fields(
     for key in (
         "instruction",
         "topic",
+        "main_topic",
         "audience",
         "tone",
         "today",
@@ -256,6 +260,10 @@ def _promote_document_job_fields(
         value = job.get(key)
         if isinstance(value, str) and value.strip():
             promoted[key] = value
+    if "topic" not in promoted and isinstance(promoted.get("main_topic"), str):
+        main_topic = str(promoted.get("main_topic") or "").strip()
+        if main_topic:
+            promoted["topic"] = main_topic
     return promoted
 
 
