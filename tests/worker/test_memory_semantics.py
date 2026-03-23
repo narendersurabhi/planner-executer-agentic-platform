@@ -23,7 +23,7 @@ def test_apply_memory_defaults_prefers_latest_document_spec() -> None:
     assert updated["document_spec"]["doc_type"] == "latest"
 
 
-def test_docx_generate_from_spec_prefers_document_path_alias() -> None:
+def test_docx_render_from_spec_prefers_document_path_alias() -> None:
     payload = {
         "document_spec": {"doc_type": "generic_document"},
         "memory": {
@@ -33,7 +33,7 @@ def test_docx_generate_from_spec_prefers_document_path_alias() -> None:
             ]
         },
     }
-    updated = memory_semantics.apply_memory_defaults("docx_generate_from_spec", payload)
+    updated = memory_semantics.apply_memory_defaults("docx_render_from_spec", payload)
     assert updated["path"] == "documents/preferred.docx"
 
 

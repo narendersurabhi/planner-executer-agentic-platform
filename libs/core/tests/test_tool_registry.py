@@ -142,6 +142,57 @@ def test_output_size_cap() -> None:
     assert "output exceeded max size" in call.output_or_error["error"]
 
 
+def test_tool_registry_resolves_aliases_to_canonical_tool_names() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            spec=ToolSpec(
+                name="canonical_tool",
+                aliases=["legacy_tool"],
+                description="test",
+                input_schema={"type": "object"},
+                output_schema={
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                },
+                timeout_s=1,
+                risk_level=RiskLevel.low,
+            ),
+            handler=lambda payload: {"ok": True},
+        )
+    )
+
+    assert registry.get("legacy_tool").spec.name == "canonical_tool"
+    call = registry.execute("legacy_tool", {}, "idempotency", "trace")
+    assert call.status == "completed"
+    assert call.tool_name == "canonical_tool"
+
+
+def test_evaluate_tool_allowlist_canonicalizes_aliases(monkeypatch) -> None:
+    monkeypatch.delenv("ENABLED_TOOLS", raising=False)
+    monkeypatch.delenv("DISABLED_TOOLS", raising=False)
+    monkeypatch.setenv("WORKER_ENABLED_TOOLS", "docx_render_from_spec")
+    monkeypatch.delenv("WORKER_DISABLED_TOOLS", raising=False)
+    spec = ToolSpec(
+        name="docx_render_from_spec",
+        aliases=["docx_generate_from_spec"],
+        description="render",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        timeout_s=1,
+        risk_level=RiskLevel.low,
+    )
+
+    decision = evaluate_tool_allowlist(
+        "docx_generate_from_spec",
+        "worker",
+        tool_spec=spec,
+    )
+
+    assert decision.allowed is True
+
+
 def test_docx_render_tool_registered() -> None:
     registry = default_registry()
     tool = registry.get("docx_render")
@@ -156,7 +207,7 @@ def test_docx_render_tool_registered() -> None:
 
 def test_pdf_generate_tool_registered() -> None:
     registry = default_registry()
-    tool = registry.get("pdf_generate_from_spec")
+    tool = registry.get("pdf_render_from_spec")
     schema = tool.spec.input_schema
     assert "document_spec" in schema["properties"]
     assert "path" in schema["properties"]
@@ -883,13 +934,13 @@ def test_llm_iterative_improve_runbook_spec_generates_document_spec() -> None:
     assert out["validation_report"]["valid"] is True
 
 
-def test_docx_generate_from_spec_requires_explicit_path(
+def test_docx_render_from_spec_requires_explicit_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("ARTIFACTS_DIR", str(tmp_path))
     registry = default_registry()
     call = registry.execute(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {
             "document_spec": {"blocks": [{"type": "paragraph", "text": "Hello"}]},
         },

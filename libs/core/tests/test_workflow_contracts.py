@@ -115,6 +115,31 @@ def test_parse_normalized_intent_envelope_accepts_mapping() -> None:
     assert envelope.trace.assessment_mode == "hybrid"
 
 
+def test_parse_normalized_intent_envelope_canonicalizes_legacy_render_capabilities() -> None:
+    envelope = workflow_contracts.parse_normalized_intent_envelope(
+        {
+            "goal": "Render the document spec as PDF",
+            "profile": {"intent": "render", "source": "heuristic"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "s1",
+                        "intent": "render",
+                        "suggested_capabilities": ["document.pdf.generate"],
+                        "suggested_capability_rankings": [{"id": "document.pdf.generate"}],
+                    }
+                ]
+            },
+            "candidate_capabilities": {"s1": ["document.pdf.generate"]},
+        }
+    )
+
+    assert envelope is not None
+    assert envelope.graph.segments[0].suggested_capabilities == ["document.pdf.render"]
+    assert envelope.graph.segments[0].suggested_capability_rankings[0]["id"] == "document.pdf.render"
+    assert envelope.candidate_capabilities["s1"] == ["document.pdf.render"]
+
+
 def test_dump_normalized_intent_envelope_returns_json_mapping() -> None:
     dumped = workflow_contracts.dump_normalized_intent_envelope(
         workflow_contracts.NormalizedIntentEnvelope(

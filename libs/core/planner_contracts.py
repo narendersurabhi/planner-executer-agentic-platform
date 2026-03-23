@@ -27,6 +27,7 @@ class PlanRequestCapability(BaseModel):
     subgroup: str | None = None
     input_schema_ref: str | None = None
     output_schema_ref: str | None = None
+    aliases: list[str] = Field(default_factory=list)
     planner_hints: dict[str, Any] = Field(default_factory=dict)
     adapters: list[PlanRequestCapabilityAdapter] = Field(default_factory=list)
 
@@ -137,6 +138,7 @@ def build_plan_request(
                 subgroup=spec.subgroup,
                 input_schema_ref=spec.input_schema_ref,
                 output_schema_ref=spec.output_schema_ref,
+                aliases=list(spec.aliases),
                 planner_hints=(
                     dict(spec.planner_hints) if isinstance(spec.planner_hints, dict) else {}
                 ),
@@ -162,7 +164,14 @@ def build_plan_request(
 
 
 def capability_map(request: PlanRequest) -> dict[str, PlanRequestCapability]:
-    return {capability.capability_id: capability for capability in request.capabilities}
+    mapped: dict[str, PlanRequestCapability] = {}
+    for capability in request.capabilities:
+        mapped[capability.capability_id] = capability
+        for alias in capability.aliases:
+            normalized = str(alias or "").strip()
+            if normalized:
+                mapped[normalized] = capability
+    return mapped
 
 
 def normalized_intent_envelope(

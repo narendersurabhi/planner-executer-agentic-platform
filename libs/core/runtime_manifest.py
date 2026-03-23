@@ -120,7 +120,8 @@ def explain_capability_unavailability(
     manifest: RuntimeManifest,
     capability_id: str,
 ) -> str | None:
-    status = manifest.capabilities.get(capability_id)
+    canonical = capability_registry.canonicalize_capability_id(capability_id)
+    status = manifest.capabilities.get(canonical or capability_id)
     if status is None:
         if manifest.build_errors:
             return "; ".join(manifest.build_errors)

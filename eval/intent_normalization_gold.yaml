@@ -18,9 +18,9 @@ cases:
     goal: Render the approved document spec to /shared/artifacts/q1-plan.pdf.
     expected_intents: [render]
     expected_capabilities:
-      - document.pdf.generate
+      - document.pdf.render
     expected_capabilities_by_segment:
-      - [document.pdf.generate]
+      - [document.pdf.render]
 
   - id: repo_branch_release_summary
     goal: List GitHub branches and summarize release readiness.

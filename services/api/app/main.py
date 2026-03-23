@@ -265,6 +265,12 @@ CHAT_CAPABILITY_VECTOR_TOP_K = max(
 CHAT_CAPABILITY_VECTOR_TIMEOUT_S = max(
     1.0, float(os.getenv("CHAT_CAPABILITY_VECTOR_TIMEOUT_S", "5.0"))
 )
+CHAT_CAPABILITY_VECTOR_CLEANUP_ENABLED = (
+    os.getenv("CHAT_CAPABILITY_VECTOR_CLEANUP_ENABLED", "true").lower() == "true"
+)
+CHAT_CAPABILITY_VECTOR_CLEANUP_LIMIT = max(
+    1, min(500, int(os.getenv("CHAT_CAPABILITY_VECTOR_CLEANUP_LIMIT", "500")))
+)
 _chat_capability_vector_min_score_raw = os.getenv("CHAT_CAPABILITY_VECTOR_MIN_SCORE", "").strip()
 try:
     CHAT_CAPABILITY_VECTOR_MIN_SCORE = (
@@ -1539,6 +1545,52 @@ def _looks_like_conversational_turn(content: str) -> bool:
     return any(lowered.startswith(phrase) or lowered == phrase for phrase in casual_phrases)
 
 
+def _looks_like_execution_confirmation(content: str) -> bool:
+    lowered = str(content or "").strip().lower()
+    if not lowered:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+    if not normalized:
+        return False
+    exact_matches = {
+        "yes",
+        "yes go ahead",
+        "go ahead",
+        "proceed",
+        "continue",
+        "continue please",
+        "please continue",
+        "yes proceed",
+        "yes continue",
+        "sounds good",
+        "ok go ahead",
+        "okay go ahead",
+    }
+    return normalized in exact_matches
+
+
+def _active_job_confirmation_turn_plan(
+    *,
+    content: str,
+    session_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(session_metadata, Mapping):
+        return None
+    if session_metadata.get("pending_clarification"):
+        return None
+    active_job_id = str(session_metadata.get("active_job_id") or "").strip()
+    if not active_job_id or not _looks_like_execution_confirmation(content):
+        return None
+    return _chat_response_turn_plan(
+        goal=content.strip(),
+        assistant_content=(
+            f"Job {active_job_id} is already submitted. "
+            "Ask for status, results, or tell me what you want changed."
+        ),
+        source="chat_active_job_confirmation",
+    )
+
+
 def _looks_like_chat_only_correction(content: str) -> bool:
     provider = _chat_pending_correction_provider
     if provider is None:
@@ -1951,6 +2003,7 @@ def _chat_capability_vector_namespace(
                 "subgroup": str(spec.subgroup or "").strip(),
                 "risk_tier": str(spec.risk_tier or "").strip(),
                 "tags": list(spec.tags),
+                "aliases": list(spec.aliases),
             }
         )
     digest = hashlib.sha256(
@@ -1968,6 +2021,7 @@ def _chat_capability_vector_document(
     group = str(spec.group or "").strip()
     subgroup = str(spec.subgroup or "").strip()
     tags = [str(tag).strip() for tag in spec.tags if str(tag).strip()]
+    aliases = [str(alias).strip() for alias in spec.aliases if str(alias).strip()]
     required_inputs = [
         str(item).strip()
         for item in entry.get("required_inputs", [])
@@ -1982,6 +2036,8 @@ def _chat_capability_vector_document(
         lines.append(f"Subgroup: {subgroup}")
     if tags:
         lines.append(f"Tags: {', '.join(tags)}")
+    if aliases:
+        lines.append(f"Aliases: {', '.join(aliases)}")
     if required_inputs:
         lines.append(f"Required inputs: {', '.join(required_inputs)}")
     if spec.risk_tier:
@@ -1994,9 +2050,74 @@ def _chat_capability_vector_document(
             "subgroup": subgroup,
             "risk_tier": str(spec.risk_tier or "").strip(),
             "tags": tags,
+            "aliases": aliases,
             "catalog_type": "assistant_capability",
         },
     )
+
+
+def _cleanup_stale_chat_capability_vector_namespaces(current_namespace: str) -> None:
+    if not CHAT_CAPABILITY_VECTOR_CLEANUP_ENABLED:
+        return
+    prefix = f"{CHAT_CAPABILITY_VECTOR_NAMESPACE_PREFIX}:"
+    if not current_namespace.startswith(prefix):
+        return
+    try:
+        result = _rag_retriever_request_json(
+            "/documents/list",
+            method="POST",
+            body={
+                "collection_name": CHAT_CAPABILITY_VECTOR_COLLECTION,
+                "workspace_id": CHAT_CAPABILITY_VECTOR_WORKSPACE_ID,
+                "limit": CHAT_CAPABILITY_VECTOR_CLEANUP_LIMIT,
+            },
+            timeout_s=CHAT_CAPABILITY_VECTOR_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_capability_vector_cleanup_list_failed")
+        return
+    if not isinstance(result, Mapping):
+        return
+    if bool(result.get("truncated")):
+        logger.warning(
+            "chat_capability_vector_cleanup_skipped_truncated",
+            extra={"limit": CHAT_CAPABILITY_VECTOR_CLEANUP_LIMIT},
+        )
+        return
+    stale_documents_by_namespace: dict[str, set[str]] = {}
+    for document in result.get("documents", []) or []:
+        if not isinstance(document, Mapping):
+            continue
+        namespace = str(document.get("namespace") or "").strip()
+        if not namespace.startswith(prefix) or namespace == current_namespace:
+            continue
+        metadata = document.get("metadata")
+        if isinstance(metadata, Mapping):
+            catalog_type = str(metadata.get("catalog_type") or "").strip()
+            if catalog_type and catalog_type != "assistant_capability":
+                continue
+        document_id = str(document.get("document_id") or "").strip()
+        if document_id:
+            stale_documents_by_namespace.setdefault(namespace, set()).add(document_id)
+    for namespace, document_ids in stale_documents_by_namespace.items():
+        for document_id in sorted(document_ids):
+            try:
+                _rag_retriever_request_json(
+                    "/documents/delete",
+                    method="POST",
+                    body={
+                        "collection_name": CHAT_CAPABILITY_VECTOR_COLLECTION,
+                        "namespace": namespace,
+                        "workspace_id": CHAT_CAPABILITY_VECTOR_WORKSPACE_ID,
+                        "document_id": document_id,
+                    },
+                    timeout_s=CHAT_CAPABILITY_VECTOR_TIMEOUT_S,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "chat_capability_vector_cleanup_delete_failed",
+                    extra={"namespace": namespace, "document_id": document_id},
+                )
 
 
 def _ensure_chat_capability_vector_index(
@@ -2044,6 +2165,7 @@ def _ensure_chat_capability_vector_index(
         except Exception:  # noqa: BLE001
             logger.exception("chat_capability_vector_index_sync_failed")
             return None
+        _cleanup_stale_chat_capability_vector_namespaces(namespace)
         _chat_capability_vector_synced_namespace = namespace
         return namespace
 
@@ -2646,6 +2768,12 @@ def _route_chat_turn(
     merged_context: Mapping[str, Any] | None,
     messages: Sequence[chat_contracts.ChatMessage] | None,
 ) -> dict[str, Any]:
+    active_job_confirmation = _active_job_confirmation_turn_plan(
+        content=content,
+        session_metadata=session_metadata,
+    )
+    if active_job_confirmation is not None:
+        return active_job_confirmation
     pending_clarification = bool(
         isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
     )
@@ -5108,7 +5236,7 @@ def _canonical_capability_id(
     capability_id: str,
     allowed_capability_ids: set[str],
 ) -> str | None:
-    candidate = str(capability_id or "").strip()
+    candidate = capability_registry.canonicalize_capability_id(capability_id)
     if not candidate:
         return None
     if not allowed_capability_ids:
@@ -5117,6 +5245,46 @@ def _canonical_capability_id(
         return candidate
     lookup = {entry.lower(): entry for entry in allowed_capability_ids}
     return lookup.get(candidate.lower())
+
+
+def _capability_task_intent_hint(capability_id: str) -> str | None:
+    normalized_capability_id = capability_registry.canonicalize_capability_id(capability_id)
+    if not normalized_capability_id:
+        return None
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        return None
+    spec = registry.get(normalized_capability_id)
+    if spec is None:
+        return None
+    planner_hints = spec.planner_hints if isinstance(spec.planner_hints, Mapping) else {}
+    raw_task_intents = planner_hints.get("task_intents")
+    if isinstance(raw_task_intents, list):
+        normalized = [
+            intent_contract.normalize_task_intent(item)
+            for item in raw_task_intents
+            if intent_contract.normalize_task_intent(item)
+        ]
+        if len(set(normalized)) == 1:
+            return normalized[0]
+    subgroup = str(spec.subgroup or "").strip().lower()
+    tags = {str(tag).strip().lower() for tag in spec.tags if str(tag).strip()}
+    if subgroup == "rendering" or "render" in tags:
+        return "render"
+    return None
+
+
+def _reconcile_intent_with_capabilities(intent: str, capability_ids: Sequence[str]) -> str:
+    hinted = {
+        hint
+        for capability_id in capability_ids
+        for hint in [_capability_task_intent_hint(capability_id)]
+        if hint
+    }
+    if len(hinted) == 1:
+        return next(iter(hinted))
+    return intent
 
 
 def _normalize_catalog_capability_ids(
@@ -5368,6 +5536,7 @@ def _llm_infer_goal_intent_with_capabilities(
         allowed_capability_ids,
         limit=capability_top_k,
     )
+    intent = _reconcile_intent_with_capabilities(intent, suggested_capabilities)
     confidence_default = max(0.4, min(0.95, float(fallback_inference.confidence or 0.6)))
     confidence = _coerce_confidence(parsed.get("confidence"), confidence_default)
     if semantic_goal_capabilities and suggested_capabilities:
@@ -5528,6 +5697,7 @@ def _normalize_llm_intent_graph(
             for item in ranked_capabilities
             if isinstance(item, Mapping) and str(item.get("id") or "").strip()
         ]
+        intent = _reconcile_intent_with_capabilities(intent, suggested_capabilities)
         slots = intent_contract.normalize_intent_segment_slots(
             raw_slots=raw_segment.get("slots"),
             fallback_slots=(
@@ -5638,6 +5808,8 @@ def _llm_decompose_goal_intent(
         "- objective_facts must be grounded claims only (no speculation)\n"
         "- use depends_on only for prior segment IDs\n"
         "- confidence must be between 0 and 1\n"
+        "- keep intent consistent with suggested_capabilities and capability subgroup semantics\n"
+        "- document.docx.render and document.pdf.render MUST use intent=render\n"
         "- slots.output_format must be one of: pdf, docx, md, txt, html, json, csv, xlsx when known\n"
         "- slots.risk_level must be one of: read_only, bounded_write, high_risk_write\n"
         "- slots.must_have_inputs should contain concrete input keys (not prose)\n"
@@ -9214,9 +9386,11 @@ def _select_goal_intent_segment_for_task(
             if expanded_ids & task_requests:
                 matching.append(segment)
         if matching:
-            for segment in matching:
-                if intent_contract.normalize_task_intent(segment.get("intent")) == task_intent:
-                    return segment
+            if task_intent:
+                for segment in matching:
+                    if intent_contract.normalize_task_intent(segment.get("intent")) == task_intent:
+                        return segment
+                return None
             return matching[0]
     if has_suggested_capabilities:
         if len(goal_intent_segments) == 1:

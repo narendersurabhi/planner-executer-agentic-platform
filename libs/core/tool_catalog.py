@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, Optional
 
 from libs.framework.tool_runtime import Tool, ToolRegistry
 from libs.tools.core_ops import CoreOpsHandlers, register_core_ops_tools
-from libs.tools.docx_generate_from_spec import register_docx_tools
+from libs.tools.docx_render_from_spec import register_docx_tools
 from libs.tools.document_spec_iterative import register_document_spec_iterative_tools
 from libs.tools.document_spec_llm import register_document_spec_llm_tools
 from libs.tools.document_spec_validate import register_document_spec_tools
@@ -16,7 +16,7 @@ from libs.tools.llm_tool_groups import (
     register_llm_text_tool,
 )
 from libs.tools.openapi_iterative import register_openapi_iterative_tools
-from libs.tools.pdf_generate_from_spec import register_pdf_tools
+from libs.tools.pdf_render_from_spec import register_pdf_tools
 
 from .llm_provider import LLMProvider
 from .models import RiskLevel, ToolIntent, ToolSpec

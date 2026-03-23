@@ -16,8 +16,8 @@ tool_governance:
         - llm_iterative_improve_runbook_spec
         - llm_iterative_improve_openapi_spec
         - document_spec_validate
-        - docx_generate_from_spec
-        - pdf_generate_from_spec
+        - docx_render_from_spec
+        - pdf_render_from_spec
         - docx_render
         - derive_output_filename
         - file_read_text
@@ -53,8 +53,8 @@ tool_governance:
         - llm_iterative_improve_runbook_spec
         - llm_iterative_improve_openapi_spec
         - document_spec_validate
-        - docx_generate_from_spec
-        - pdf_generate_from_spec
+        - docx_render_from_spec
+        - pdf_render_from_spec
         - docx_render
         - derive_output_filename
         - file_read_text
@@ -106,8 +106,8 @@ tool_governance:
         - llm_iterative_improve_runbook_spec
         - llm_iterative_improve_openapi_spec
         - document_spec_validate
-        - docx_generate_from_spec
-        - pdf_generate_from_spec
+        - docx_render_from_spec
+        - pdf_render_from_spec
         - docx_render
         - derive_output_filename
         - file_read_text

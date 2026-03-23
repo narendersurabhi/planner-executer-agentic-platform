@@ -996,8 +996,8 @@ capabilities:
         tool_name: document_spec_validate
         arg_map: {}
         enabled: true
-  - id: document.docx.generate
-    description: Generate a DOCX artifact directly from a DocumentSpec.
+  - id: document.docx.render
+    description: Render a DOCX artifact directly from a DocumentSpec.
     risk_tier: bounded_write
     idempotency: safe_write
     group: documents
@@ -1008,13 +1008,16 @@ capabilities:
       - documents
       - docx
       - render
+    aliases:
+      - document.docx.generate
     planner_hints:
+      task_intents: [render]
       required_output_extension: docx
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
-        tool_name: docx_generate_from_spec
+        tool_name: docx_render_from_spec
         arg_map: {}
         enabled: true
   - id: document.docx.render_template
@@ -1037,8 +1040,8 @@ capabilities:
         tool_name: docx_render
         arg_map: {}
         enabled: true
-  - id: document.pdf.generate
-    description: Generate a PDF artifact directly from a DocumentSpec.
+  - id: document.pdf.render
+    description: Render a PDF artifact directly from a DocumentSpec.
     risk_tier: bounded_write
     idempotency: safe_write
     group: documents
@@ -1049,13 +1052,16 @@ capabilities:
       - documents
       - pdf
       - render
+    aliases:
+      - document.pdf.generate
     planner_hints:
+      task_intents: [render]
       required_output_extension: pdf
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
-        tool_name: pdf_generate_from_spec
+        tool_name: pdf_render_from_spec
         arg_map: {}
         enabled: true
   - id: openapi.spec.generate_iterative

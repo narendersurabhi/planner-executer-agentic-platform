@@ -81,7 +81,7 @@ _SUGGESTED_CAPABILITIES_BY_INTENT: dict[str, tuple[str, ...]] = {
     "generate": ("llm.text.generate", "document.spec.generate"),
     "transform": ("utility.json.transform", "document.spec.improve"),
     "validate": ("document.spec.validate",),
-    "render": ("document.docx.generate", "document.pdf.generate"),
+    "render": ("document.docx.render", "document.pdf.render"),
 }
 
 _REQUIRED_INPUTS_BY_INTENT: dict[str, tuple[str, ...]] = {
@@ -449,6 +449,7 @@ def normalize_intent_segment_slots(
             for key in must_have_inputs
             if key
             not in {
+                "goal",
                 "filename",
                 "path",
                 "output_path",
@@ -1088,9 +1089,9 @@ def _suggested_capabilities_for_clause(
             suggestions = _prepend_unique(suggestions, "github.pull_request.create")
     if intent == "render":
         if "pdf" in lowered:
-            suggestions = ["document.pdf.generate"]
+            suggestions = ["document.pdf.render"]
         elif "docx" in lowered:
-            suggestions = ["document.docx.generate"]
+            suggestions = ["document.docx.render"]
     if intent == "generate":
         if "openapi" in context_lowered:
             suggestions = _prepend_unique(suggestions, "openapi.spec.generate_iterative")

@@ -142,8 +142,8 @@ def test_invoke_capability_raises_when_all_adapters_fail() -> None:
 def test_invoke_capability_with_native_tool_adapter() -> None:
     cap_registry = capability_registry.CapabilityRegistry(
         capabilities={
-            "document.docx.generate": capability_registry.CapabilitySpec(
-                capability_id="document.docx.generate",
+            "document.docx.render": capability_registry.CapabilitySpec(
+                capability_id="document.docx.render",
                 description="Generate DOCX from document spec",
                 risk_tier="read_only",
                 idempotency="read",
@@ -151,7 +151,7 @@ def test_invoke_capability_with_native_tool_adapter() -> None:
                     capability_registry.CapabilityAdapterSpec(
                         type="tool",
                         server_id="local_worker",
-                        tool_name="docx_generate_from_spec",
+                        tool_name="docx_render_from_spec",
                         arg_map={"path": "output_path", "document_spec": "document_spec"},
                     ),
                 ),
@@ -161,13 +161,13 @@ def test_invoke_capability_with_native_tool_adapter() -> None:
     )
 
     def _execute_tool(tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        assert tool_name == "docx_generate_from_spec"
+        assert tool_name == "docx_render_from_spec"
         assert payload["path"] == "documents/out.docx"
         assert payload["document_spec"] == {"blocks": []}
         return {"path": "/shared/artifacts/documents/out.docx", "bytes_written": 123}
 
     result = mcp_gateway.invoke_capability(
-        "document.docx.generate",
+        "document.docx.render",
         {"output_path": "documents/out.docx", "document_spec": {"blocks": []}},
         capability_registry=cap_registry,
         execute_tool=_execute_tool,

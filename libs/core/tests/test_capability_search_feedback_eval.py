@@ -5,12 +5,12 @@ def test_evaluate_feedback_rows_reports_core_rates() -> None:
     report = capability_search_feedback_eval.evaluate_feedback_rows(
         [
             {
-                "selected_capabilities": ["document.pdf.generate"],
-                "retrieved_selected": ["document.pdf.generate"],
-                "executed_capabilities": [{"id": "document.pdf.generate", "status": "completed"}],
+                "selected_capabilities": ["document.pdf.render"],
+                "retrieved_selected": ["document.pdf.render"],
+                "executed_capabilities": [{"id": "document.pdf.render", "status": "completed"}],
                 "execution_succeeded": True,
                 "planner_override": [],
-                "retrieved_capabilities": ["document.pdf.generate", "llm.text.generate"],
+                "retrieved_capabilities": ["document.pdf.render", "llm.text.generate"],
                 "hard_negative_ids": ["llm.text.generate"],
             },
             {

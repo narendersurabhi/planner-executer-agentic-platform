@@ -66,7 +66,7 @@ def test_decompose_goal_intent_produces_ordered_segments() -> None:
     assert segments[0]["intent"] == "io"
     assert segments[1]["depends_on"] == ["s1"]
     assert segments[-1]["intent"] == "render"
-    assert "document.pdf.generate" in segments[-1]["suggested_capabilities"]
+    assert "document.pdf.render" in segments[-1]["suggested_capabilities"]
     assert isinstance(segments[-1]["slots"], dict)
     assert segments[-1]["slots"]["output_format"] == "pdf"
     assert "must_have_inputs" in segments[-1]["slots"]
@@ -85,7 +85,7 @@ def test_decompose_goal_intent_render_segment_suggests_renderer_only() -> None:
     segments = graph["segments"]
     assert len(segments) == 1
     assert segments[0]["intent"] == "render"
-    assert segments[0]["suggested_capabilities"] == ["document.pdf.generate"]
+    assert segments[0]["suggested_capabilities"] == ["document.pdf.render"]
 
 
 def test_decompose_goal_intent_splits_comma_separated_action_clauses() -> None:
@@ -96,7 +96,7 @@ def test_decompose_goal_intent_splits_comma_separated_action_clauses() -> None:
     assert [segment["intent"] for segment in segments[:3]] == ["generate", "validate", "render"]
     assert "document.spec.generate" in segments[0]["suggested_capabilities"]
     assert segments[1]["suggested_capabilities"] == ["document.spec.validate"]
-    assert segments[2]["suggested_capabilities"] == ["document.docx.generate"]
+    assert segments[2]["suggested_capabilities"] == ["document.docx.render"]
 
 
 def test_decompose_goal_intent_prefers_openapi_iterative_capabilities() -> None:
@@ -138,9 +138,9 @@ def test_validate_intent_segment_contract_requires_renderer_explicit_path() -> N
     mismatch = intent_contract.validate_intent_segment_contract(
         segment=segment,
         task_intent="render",
-        tool_name="document.pdf.generate",
+        tool_name="document.pdf.render",
         payload={"document_spec": {"blocks": []}},
-        capability_id="document.pdf.generate",
+        capability_id="document.pdf.render",
         capability_risk_tier="bounded_write",
     )
     assert mismatch == "must_have_inputs_missing:path"
@@ -162,9 +162,9 @@ def test_validate_intent_segment_contract_accepts_path_for_path_requirement() ->
     mismatch = intent_contract.validate_intent_segment_contract(
         segment=segment,
         task_intent="render",
-        tool_name="docx_generate_from_spec",
+        tool_name="docx_render_from_spec",
         payload={"document_spec": {"blocks": []}, "path": "artifacts/output.docx"},
-        capability_id="document.docx.generate",
+        capability_id="document.docx.render",
         capability_risk_tier="bounded_write",
     )
     assert mismatch is None
@@ -185,12 +185,12 @@ def test_validate_intent_segment_contract_checks_output_format_hint() -> None:
     mismatch = intent_contract.validate_intent_segment_contract(
         segment=segment,
         task_intent="render",
-        tool_name="document.docx.generate",
+        tool_name="document.docx.render",
         payload={"path": "artifacts/output.docx"},
-        capability_id="document.docx.generate",
+        capability_id="document.docx.render",
         capability_risk_tier="bounded_write",
     )
-    assert mismatch == "output_format_mismatch:document.docx.generate:expected=pdf:got=docx"
+    assert mismatch == "output_format_mismatch:document.docx.render:expected=pdf:got=docx"
 
 
 def test_validate_intent_segment_contract_treats_renderer_hint_as_output_format_input() -> None:
@@ -209,9 +209,9 @@ def test_validate_intent_segment_contract_treats_renderer_hint_as_output_format_
     mismatch = intent_contract.validate_intent_segment_contract(
         segment=segment,
         task_intent="render",
-        tool_name="docx_generate_from_spec",
+        tool_name="docx_render_from_spec",
         payload={"document_spec": {"blocks": []}},
-        capability_id="document.docx.generate",
+        capability_id="document.docx.render",
         capability_risk_tier="bounded_write",
     )
     assert mismatch is None
@@ -692,6 +692,31 @@ def test_validate_intent_segment_contract_accepts_main_topic_alias_from_topic() 
     assert mismatch is None
 
 
+def test_validate_intent_segment_contract_ignores_goal_for_document_spec_generation() -> None:
+    segment = {
+        "intent": "generate",
+        "objective": "Generate initial DocumentSpec from goal",
+        "required_inputs": ["goal"],
+        "suggested_capabilities": ["document.spec.generate"],
+        "slots": {
+            "entity": "document_spec",
+            "artifact_type": "document_spec",
+            "output_format": "json",
+            "risk_level": "bounded_write",
+            "must_have_inputs": ["goal"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="generate",
+        tool_name="llm_generate_document_spec",
+        payload={"instruction": "Generate the requested document specification."},
+        capability_id="document.spec.generate",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
 def test_validate_intent_segment_contract_accepts_length_with_instruction() -> None:
     segment = {
         "intent": "generate",
@@ -732,7 +757,7 @@ def test_derive_envelope_clarification_requires_path_for_render_without_explicit
                     "intent": "render",
                     "objective": "Render final artifact",
                     "required_inputs": ["input_data", "path_or_format"],
-                    "suggested_capabilities": ["document.pdf.generate"],
+                    "suggested_capabilities": ["document.pdf.render"],
                     "slots": {
                         "output_format": "pdf",
                         "risk_level": "bounded_write",

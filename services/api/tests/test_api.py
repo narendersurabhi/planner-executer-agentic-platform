@@ -773,7 +773,7 @@ def test_intent_clarify_endpoint_uses_llm_assessment_with_capability_catalog(mon
             return LLMResponse(
                 content=(
                     '{"intent":"render","confidence":0.94,'
-                    '"suggested_capabilities":["document.pdf.generate"],'
+                    '"suggested_capabilities":["document.pdf.render"],'
                     '"reason":"PDF rendering capability best matches the goal"}'
                 )
             )
@@ -787,7 +787,7 @@ def test_intent_clarify_endpoint_uses_llm_assessment_with_capability_catalog(mon
         "_intent_catalog_capability_entries",
         lambda: [
             {
-                "id": "document.pdf.generate",
+                "id": "document.pdf.render",
                 "group": "document",
                 "subgroup": "render",
                 "description": "Render a PDF from a document spec",
@@ -803,14 +803,14 @@ def test_intent_clarify_endpoint_uses_llm_assessment_with_capability_catalog(mon
     monkeypatch.setattr(
         main,
         "_intent_catalog_capability_ids",
-        lambda: {"document.pdf.generate", "llm.text.generate"},
+        lambda: {"document.pdf.render", "llm.text.generate"},
     )
     monkeypatch.setattr(
         main,
         "_semantic_goal_capability_hints",
         lambda **_kwargs: [
             {
-                "id": "document.pdf.generate",
+                "id": "document.pdf.render",
                 "score": 0.99,
                 "reason": "semantic match",
                 "source": "semantic_search",
@@ -827,7 +827,7 @@ def test_intent_clarify_endpoint_uses_llm_assessment_with_capability_catalog(mon
     assert requests
     assert requests[0].metadata is not None
     assert requests[0].metadata["operation"] == "intent_assess"
-    assert "document.pdf.generate" in requests[0].prompt
+    assert "document.pdf.render" in requests[0].prompt
 
 
 def test_intent_clarify_endpoint_falls_back_when_llm_assessment_fails(monkeypatch):
@@ -1008,7 +1008,7 @@ def test_capabilities_search_returns_ranked_matches() -> None:
     assert body["intent"] == "render"
     assert len(body["items"]) >= 1
     ids = [item["id"] for item in body["items"]]
-    assert "document.pdf.generate" in ids
+    assert "document.pdf.render" in ids
     first = body["items"][0]
     assert isinstance(first["score"], float)
     assert isinstance(first["reason"], str) and first["reason"]
@@ -1041,7 +1041,7 @@ def test_capabilities_search_emits_capability_search_event(monkeypatch) -> None:
     assert payload["correlation_id"] == "corr-search-1"
     assert payload["job_id"] == "job-search-1"
     assert payload["result_count"] >= 1
-    assert any(item["id"] == "document.pdf.generate" for item in payload["results"])
+    assert any(item["id"] == "document.pdf.render" for item in payload["results"])
 
 
 def test_capabilities_search_requires_query() -> None:
@@ -1138,6 +1138,35 @@ def test_intent_decompose_endpoint_filters_unknown_llm_capabilities(monkeypatch)
     assert all(capability_id in catalog_ids for capability_id in suggested)
 
 
+def test_intent_decompose_endpoint_reconciles_legacy_render_capability_intent(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate(self, prompt: str):  # noqa: ARG002
+            return LLMResponse(
+                content=(
+                    '{"segments":[{"id":"s1","intent":"generate","objective":"Render PDF",'
+                    '"confidence":0.9,"depends_on":[],"required_inputs":["document_spec","path"],'
+                    '"suggested_capabilities":["document.pdf.generate"],'
+                    '"slots":{"entity":"artifact","artifact_type":"document","output_format":"pdf",'
+                    '"risk_level":"bounded_write","must_have_inputs":["document_spec","path"]}}]}'
+                )
+            )
+
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_MODE", "llm")
+    monkeypatch.setattr(main, "_intent_decompose_provider", _Provider())
+
+    response = client.post("/intent/decompose", json={"goal": "Render a PDF report"})
+
+    assert response.status_code == 200
+    graph = response.json()["intent_graph"]
+    segment = graph["segments"][0]
+    assert segment["intent"] == "render"
+    assert segment["suggested_capabilities"] == ["document.pdf.render"]
+    rankings = segment.get("suggested_capability_rankings")
+    assert isinstance(rankings, list)
+    assert rankings[0]["id"] == "document.pdf.render"
+
+
 def test_intent_decompose_endpoint_normalizes_capability_id_casing(monkeypatch):
     class _Provider(LLMProvider):
         def generate(self, prompt: str):  # noqa: ARG002
@@ -1174,7 +1203,7 @@ def test_intent_decompose_endpoint_limits_capability_rankings_to_top_k(monkeypat
                     '{"segments":[{"id":"s1","intent":"generate","objective":"Create summary",'
                     '"confidence":0.9,"depends_on":[],"required_inputs":["instruction"],'
                     '"suggested_capabilities":["llm.text.generate","document.spec.generate",'
-                    '"document.spec.validate","document.pdf.generate"]}]}'
+                    '"document.spec.validate","document.pdf.render"]}]}'
                 )
             )
 
@@ -1500,7 +1529,7 @@ def test_intent_decompose_uses_semantic_workflow_hints_in_llm_prompt(monkeypatch
             "goal": "Render monthly pdf report",
             "outcome": "succeeded",
             "intent_order": ["generate", "render"],
-            "capabilities": ["document.spec.generate", "document.pdf.generate"],
+            "capabilities": ["document.spec.generate", "document.pdf.render"],
             "confidence": 0.9,
             "threshold": 0.7,
         }
@@ -1556,7 +1585,7 @@ def test_intent_decompose_uses_semantic_capability_hints_in_llm_prompt(monkeypat
                 content=(
                     '{"segments":[{"id":"s1","intent":"render","objective":"Render pdf report",'
                     '"confidence":0.9,"depends_on":[],"required_inputs":["document_spec","path"],'
-                    '"suggested_capabilities":["document.pdf.generate"]}]}'
+                    '"suggested_capabilities":["document.pdf.render"]}]}'
                 )
             )
 
@@ -1573,7 +1602,7 @@ def test_intent_decompose_uses_semantic_capability_hints_in_llm_prompt(monkeypat
     assert graph["summary"]["semantic_capability_hints_used"] >= 1
     assert prompts
     assert "Most relevant capabilities for this goal from local semantic search" in prompts[0]
-    assert "document.pdf.generate" in prompts[0]
+    assert "document.pdf.render" in prompts[0]
 
 
 def test_intent_decompose_emits_capability_search_event_for_semantic_hints(monkeypatch):
@@ -2031,11 +2060,11 @@ def test_job_details():
                                     "id": "s1",
                                     "intent": "render",
                                     "objective": "Render the final PDF",
-                                    "suggested_capabilities": ["document.pdf.generate"],
+                                    "suggested_capabilities": ["document.pdf.render"],
                                 }
                             ]
                         },
-                        "candidate_capabilities": {"s1": ["document.pdf.generate"]},
+                        "candidate_capabilities": {"s1": ["document.pdf.render"]},
                         "clarification": {
                             "needs_clarification": True,
                             "requires_blocking_clarification": True,
@@ -2106,7 +2135,7 @@ def test_job_details():
     assert data["goal_intent_graph"]["segments"][0]["id"] == "s1"
     assert data["normalization_trace"]["assessment_source"] == "llm"
     assert data["normalization_clarification"]["missing_inputs"] == ["path"]
-    assert data["normalization_candidate_capabilities"] == {"s1": ["document.pdf.generate"]}
+    assert data["normalization_candidate_capabilities"] == {"s1": ["document.pdf.render"]}
 
 
 def test_job_debugger_returns_timeline_and_error_classification():
@@ -2860,7 +2889,7 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
         enabled=True,
     )
     spec_render = cap_registry.CapabilitySpec(
-        capability_id="document.pdf.generate",
+        capability_id="document.pdf.render",
         description="Render a PDF",
         risk_tier="bounded_write",
         idempotency="read",
@@ -2872,7 +2901,7 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
     registry = cap_registry.CapabilityRegistry(
         capabilities={
             "document.spec.generate": spec_generate,
-            "document.pdf.generate": spec_render,
+            "document.pdf.render": spec_render,
         }
     )
     monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
@@ -2911,7 +2940,7 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
     assert body["source"] == "heuristic"
     assert isinstance(body["recommendations"], list)
     assert len(body["recommendations"]) >= 1
-    assert body["recommendations"][0]["id"] == "document.pdf.generate"
+    assert body["recommendations"][0]["id"] == "document.pdf.render"
 
 
 def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
@@ -2926,7 +2955,7 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
         enabled=True,
     )
     spec_render = cap_registry.CapabilitySpec(
-        capability_id="document.pdf.generate",
+        capability_id="document.pdf.render",
         description="Render a PDF",
         risk_tier="bounded_write",
         idempotency="read",
@@ -2938,7 +2967,7 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
     registry = cap_registry.CapabilityRegistry(
         capabilities={
             "document.spec.generate": spec_generate,
-            "document.pdf.generate": spec_render,
+            "document.pdf.render": spec_render,
         }
     )
     monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
@@ -2950,7 +2979,7 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
         def generate_request(self, request: LLMRequest):
             requests.append(request)
             return LLMResponse(
-                content='{"recommendations":[{"id":"document.pdf.generate","reason":"next step","confidence":0.91}]}'
+                content='{"recommendations":[{"id":"document.pdf.render","reason":"next step","confidence":0.91}]}'
             )
 
     monkeypatch.setattr(main, "_composer_recommender_provider", _Provider())
@@ -2968,7 +2997,7 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["source"] == "llm"
-    assert body["recommendations"][0]["id"] == "document.pdf.generate"
+    assert body["recommendations"][0]["id"] == "document.pdf.render"
     assert requests
     assert requests[0].metadata is not None
     assert requests[0].metadata["operation"] == "capability_recommendations"
@@ -4314,9 +4343,9 @@ def test_task_payload_from_record_flags_unresolved_reference_inputs() -> None:
         max_reworks=0,
         assigned_to=None,
         intent="render",
-        tool_requests=["docx_generate_from_spec"],
+        tool_requests=["docx_render_from_spec"],
         tool_inputs={
-            "docx_generate_from_spec": {
+            "docx_render_from_spec": {
                 "path": "documents/out.docx",
                 "document_spec": {
                     "$from": "dependencies_by_name.GenerateDocumentSpec.llm_generate_document_spec.document_spec"
@@ -4329,8 +4358,8 @@ def test_task_payload_from_record_flags_unresolved_reference_inputs() -> None:
     )
     payload = main._task_payload_from_record(record, correlation_id="corr", context={})
     validation = payload.get("tool_inputs_validation", {})
-    assert "docx_generate_from_spec" in validation
-    assert "input reference resolution failed" in validation["docx_generate_from_spec"]
+    assert "docx_render_from_spec" in validation
+    assert "input reference resolution failed" in validation["docx_render_from_spec"]
 
 
 def test_task_payload_from_record_resolves_validation_report_alias_reference() -> None:
@@ -4461,9 +4490,9 @@ def test_task_payload_from_record_resolves_output_path_alias_reference() -> None
         max_reworks=0,
         assigned_to=None,
         intent="render",
-        tool_requests=["docx_generate_from_spec"],
+        tool_requests=["docx_render_from_spec"],
         tool_inputs={
-            "docx_generate_from_spec": {
+            "docx_render_from_spec": {
                 "document_spec": {"blocks": []},
                 "output_path": {
                     "$from": "dependencies_by_name.Derive Output Filename.derive_output_filename.output_path"
@@ -4485,7 +4514,7 @@ def test_task_payload_from_record_resolves_output_path_alias_reference() -> None
 
     payload = main._task_payload_from_record(record, correlation_id="corr", context=context)
     assert "tool_inputs_validation" not in payload
-    resolved = payload["tool_inputs"]["docx_generate_from_spec"]
+    resolved = payload["tool_inputs"]["docx_render_from_spec"]
     assert resolved["output_path"] == "artifacts/output.docx"
 
 
@@ -4508,9 +4537,9 @@ def test_task_payload_from_record_resolves_task_level_path_reference() -> None:
         max_reworks=0,
         assigned_to=None,
         intent="render",
-        tool_requests=["docx_generate_from_spec"],
+        tool_requests=["docx_render_from_spec"],
         tool_inputs={
-            "docx_generate_from_spec": {
+            "docx_render_from_spec": {
                 "document_spec": {"blocks": []},
                 "output_path": {
                     "$from": "dependencies_by_name.DeriveResumeOutputPath.path"
@@ -4532,7 +4561,7 @@ def test_task_payload_from_record_resolves_task_level_path_reference() -> None:
 
     payload = main._task_payload_from_record(record, correlation_id="corr", context=context)
     assert "tool_inputs_validation" not in payload
-    resolved = payload["tool_inputs"]["docx_generate_from_spec"]
+    resolved = payload["tool_inputs"]["docx_render_from_spec"]
     assert resolved["output_path"] == "artifacts/output.docx"
 
 
@@ -4555,8 +4584,8 @@ def test_task_payload_from_record_includes_intent_segment_profile() -> None:
         max_reworks=0,
         assigned_to=None,
         intent=None,
-        tool_requests=["document.pdf.generate"],
-        tool_inputs={"document.pdf.generate": {"path": "artifacts/report.pdf"}},
+        tool_requests=["document.pdf.render"],
+        tool_inputs={"document.pdf.render": {"path": "artifacts/report.pdf"}},
         created_at=now,
         updated_at=now,
         critic_required=0,
@@ -4570,7 +4599,7 @@ def test_task_payload_from_record_includes_intent_segment_profile() -> None:
             "intent": "render",
             "objective": "Render final PDF report",
             "required_inputs": ["document_spec", "path"],
-            "suggested_capabilities": ["document.pdf.generate"],
+            "suggested_capabilities": ["document.pdf.render"],
             "slots": {
                 "entity": "report",
                 "artifact_type": "document",
@@ -4808,7 +4837,7 @@ def test_plan_preflight_ignores_non_matching_intent_segments_when_suggested_capa
                 "intent": "render",
                 "objective": "Render docx",
                 "required_inputs": ["document_spec", "output_path"],
-                "suggested_capabilities": ["document.docx.generate"],
+                "suggested_capabilities": ["document.docx.render"],
             }
         ]
     }

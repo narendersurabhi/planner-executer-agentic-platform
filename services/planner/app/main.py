@@ -893,9 +893,13 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
     task_by_name = {task.name: task for task in tasks}
     changed = False
     renderer_requests = {
+        "docx_render_from_spec",
         "docx_generate_from_spec",
+        "pdf_render_from_spec",
         "pdf_generate_from_spec",
+        "document.docx.render",
         "document.docx.generate",
+        "document.pdf.render",
         "document.pdf.generate",
     }
     document_spec_consumer_requests = {

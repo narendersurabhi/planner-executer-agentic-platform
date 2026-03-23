@@ -76,6 +76,7 @@ class ToolSpec(BaseModel):
     description: str
     input_schema: Dict[str, Any]
     output_schema: Dict[str, Any]
+    aliases: List[str] = Field(default_factory=list)
     usage_guidance: Optional[str] = None
     examples: List[Dict[str, Any]] = Field(default_factory=list)
     auth_required: bool = False

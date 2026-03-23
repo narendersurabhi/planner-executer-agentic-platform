@@ -219,6 +219,44 @@ def test_validate_plan_request_prefers_normalized_goal_segment_for_ambiguous_tas
     assert valid, reason
 
 
+def test_select_goal_intent_segment_for_task_skips_capability_match_with_mismatched_intent() -> None:
+    task = models.TaskCreate(
+        name="RenderPdf",
+        description="Render the final PDF",
+        instruction="Render the validated document spec as PDF.",
+        acceptance_criteria=["PDF rendered"],
+        expected_output_schema_ref="schemas/test",
+        intent=models.ToolIntent.render,
+        deps=[],
+        tool_requests=["document.pdf.render"],
+        tool_inputs={"document.pdf.render": {"path": "artifacts/report.pdf"}},
+        critic_required=False,
+    )
+
+    selected = planner_service.select_goal_intent_segment_for_task(
+        task=task,
+        task_index=0,
+        task_intent="render",
+        goal_intent_segments=[
+            {
+                "id": "s1",
+                "intent": "generate",
+                "objective": "Render the final PDF",
+                "suggested_capabilities": ["document.pdf.render"],
+            }
+        ],
+        total_tasks=1,
+        capabilities={
+            "document.pdf.render": planner_contracts.PlanRequestCapability(
+                capability_id="document.pdf.render",
+                planner_hints={"task_intents": ["render"]},
+            )
+        },
+    )
+
+    assert selected is None
+
+
 def test_build_validation_payload_projects_explicit_document_generation_fields() -> None:
     request = planner_contracts.PlanRequest(
         job_id="job-1",

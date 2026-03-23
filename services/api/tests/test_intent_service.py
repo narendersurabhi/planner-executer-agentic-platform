@@ -242,7 +242,7 @@ def test_normalize_goal_intent_uses_capability_required_inputs_for_clarification
                         intent="render",
                         objective="Render final artifact",
                         required_inputs=["input_data", "path_or_format"],
-                        suggested_capabilities=["document.pdf.generate"],
+                        suggested_capabilities=["document.pdf.render"],
                         slots=workflow_contracts.IntentGraphSlots(
                             output_format="pdf",
                             risk_level="bounded_write",
@@ -253,7 +253,7 @@ def test_normalize_goal_intent_uses_capability_required_inputs_for_clarification
                 source="llm",
             ),
             capability_required_inputs=lambda capability_id: (
-                ["document_spec", "path"] if capability_id == "document.pdf.generate" else []
+                ["document_spec", "path"] if capability_id == "document.pdf.render" else []
             ),
         ),
     )

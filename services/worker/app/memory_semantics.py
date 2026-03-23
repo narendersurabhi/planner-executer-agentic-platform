@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 
+_DOCX_RENDER_TOOL_NAMES = ("docx_render_from_spec", "docx_generate_from_spec")
+
 MEMORY_OUTPUT_KEYS = {
     "llm_generate_document_spec": ["document_spec"],
     "llm_generate_document_spec_from_markdown": ["document_spec"],
@@ -30,6 +32,7 @@ MEMORY_OUTPUT_KEYS = {
 
 MEMORY_INPUT_KEYS = {
     "document_spec_validate": ["document_spec"],
+    "docx_render_from_spec": ["document_spec", "path"],
     "docx_generate_from_spec": ["document_spec", "path"],
     "llm_improve_document_spec": ["document_spec"],
     "llm_iterative_improve_document_spec": ["document_spec"],
@@ -39,6 +42,7 @@ MEMORY_INPUT_KEYS = {
 
 MEMORY_ONLY_INPUTS = {tool_name: list(keys) for tool_name, keys in MEMORY_INPUT_KEYS.items()}
 MEMORY_ONLY_INPUTS.pop("document_spec_validate", None)
+MEMORY_ONLY_INPUTS.pop("docx_render_from_spec", None)
 MEMORY_ONLY_INPUTS.pop("docx_generate_from_spec", None)
 # Iterative generators support either seed spec (from memory/dependency) OR job input.
 # Do not enforce memory-only for these tools.
@@ -114,7 +118,7 @@ def apply_memory_defaults(tool_name: str, payload: Mapping[str, Any]) -> dict:
             continue
         if key in output and not isinstance(existing, str) and existing is not None:
             continue
-        if key == "path" and tool_name == "docx_generate_from_spec":
+        if key == "path" and tool_name in _DOCX_RENDER_TOOL_NAMES:
             value = _extract_docx_path_for_document(task_outputs, output.get("document_spec"))
         else:
             value = extract_memory_value(task_outputs, key)

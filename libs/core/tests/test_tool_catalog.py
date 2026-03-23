@@ -18,7 +18,7 @@ def test_register_default_tools_adds_builtin_specs() -> None:
     specs = {spec.name for spec in registry.list_specs()}
     assert "json_transform" in specs
     assert "math_eval" in specs
-    assert "docx_generate_from_spec" in specs
+    assert "docx_render_from_spec" in specs
 
 
 def test_register_default_tools_adds_llm_contextual_tool_when_enabled() -> None:

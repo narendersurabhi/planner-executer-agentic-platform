@@ -17,10 +17,10 @@ def test_load_intent_eval_cases_parses_yaml(tmp_path: Path) -> None:
             "  - id: c1\n"
             "    goal: Generate a PDF report\n"
             "    expected_intents: [generate, render]\n"
-            "    expected_capabilities: [document.spec.generate, document.pdf.generate]\n"
+            "    expected_capabilities: [document.spec.generate, document.pdf.render]\n"
             "    expected_capabilities_by_segment:\n"
             "      - [document.spec.generate]\n"
-            "      - [document.pdf.generate]\n"
+            "      - [document.pdf.render]\n"
         ),
         encoding="utf-8",
     )
@@ -35,23 +35,23 @@ def test_evaluate_intent_case_scores_expected_matches() -> None:
         case_id="c1",
         goal="Generate and render.",
         expected_intents=("generate", "render"),
-        expected_capabilities=("document.spec.generate", "document.pdf.generate"),
+        expected_capabilities=("document.spec.generate", "document.pdf.render"),
         expected_capabilities_by_segment=(
             ("document.spec.generate",),
-            ("document.pdf.generate",),
+            ("document.pdf.render",),
         ),
     )
     graph = {
         "segments": [
             {"intent": "generate", "suggested_capabilities": ["document.spec.generate"]},
-            {"intent": "render", "suggested_capabilities": ["document.pdf.generate"]},
+            {"intent": "render", "suggested_capabilities": ["document.pdf.render"]},
         ]
     }
     result = evaluate_intent_case(
         case,
         graph,
         top_k=2,
-        allowed_capability_ids={"document.spec.generate", "document.pdf.generate"},
+        allowed_capability_ids={"document.spec.generate", "document.pdf.render"},
     )
     assert result["intent"]["f1"] == 1.0
     assert result["capabilities"]["f1"] == 1.0
@@ -65,10 +65,10 @@ def test_evaluate_intent_cases_aggregates_metrics() -> None:
             case_id="c1",
             goal="Generate and render.",
             expected_intents=("generate", "render"),
-            expected_capabilities=("document.spec.generate", "document.pdf.generate"),
+            expected_capabilities=("document.spec.generate", "document.pdf.render"),
             expected_capabilities_by_segment=(
                 ("document.spec.generate",),
-                ("document.pdf.generate",),
+                ("document.pdf.render",),
             ),
         ),
         IntentEvalCase(
@@ -85,7 +85,7 @@ def test_evaluate_intent_cases_aggregates_metrics() -> None:
             return {
                 "segments": [
                     {"intent": "generate", "suggested_capabilities": ["document.spec.generate"]},
-                    {"intent": "render", "suggested_capabilities": ["document.pdf.generate"]},
+                    {"intent": "render", "suggested_capabilities": ["document.pdf.render"]},
                 ]
             }
         return {
@@ -101,7 +101,7 @@ def test_evaluate_intent_cases_aggregates_metrics() -> None:
         top_k=2,
         allowed_capability_ids={
             "document.spec.generate",
-            "document.pdf.generate",
+            "document.pdf.render",
             "memory.read",
             "utility.json.transform",
         },

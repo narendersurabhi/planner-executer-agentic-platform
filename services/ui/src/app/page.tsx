@@ -1642,7 +1642,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Use llm_generate_document_spec to create a DocumentSpec about '{{topic}}' for '{{audience}}' in a '{{tone}}' tone. " +
       "Provide allowed_block_types as [text, paragraph, heading, bullets, spacer, optional_paragraph, repeat]. " +
       "Validate with document_spec_validate (strict). " +
-      "Render a DOCX with docx_generate_from_spec using explicit path '{{path}}'.",
+      "Render a DOCX with docx_render_from_spec using explicit path '{{path}}'.",
     contextJson:
       '{\n  "topic": "{{topic}}",\n  "audience": "{{audience}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "path": "{{path}}"\n}',
     priority: 2,
@@ -1693,7 +1693,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Do not invent sections beyond the markdown structure. " +
       "Set allowed_block_types to [\"text\",\"paragraph\",\"heading\",\"bullets\",\"spacer\",\"optional_paragraph\",\"repeat\"], strict=true, and document_type=\"document\". " +
       "Validate the result with document_spec_validate strict=true. " +
-      "Finally, call document.docx.generate with document_spec from document.spec.generate_from_markdown and explicit path '{{path}}'.",
+      "Finally, call document.docx.render with document_spec from document.spec.generate_from_markdown and explicit path '{{path}}'.",
     contextJson:
       '{\n  "markdown_text": "{{markdown_text}}",\n  "topic": "{{topic}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "path": "{{path}}"\n}',
     priority: 2,
@@ -1737,7 +1737,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Demonstrate capability chaining by passing outputs to downstream inputs with $from references.",
     goal:
       "Create a 3-task plan with these exact task names: GenerateSpec, ValidateSpec, RenderDocx. " +
-      "Use capability IDs document.spec.generate, document.spec.validate, and document.docx.generate. " +
+      "Use capability IDs document.spec.generate, document.spec.validate, and document.docx.render. " +
       "You MUST use explicit tool_inputs reference objects for chaining. " +
       "For ValidateSpec.document_spec use {\"$from\":[\"dependencies_by_name\",\"GenerateSpec\",\"document.spec.generate\",\"document_spec\"]}. " +
       "For RenderDocx.document_spec use the same GenerateSpec reference. " +
@@ -2135,7 +2135,7 @@ function HomeContent() {
   const [chainSourceCapabilityId, setChainSourceCapabilityId] = useState("document.spec.generate");
   const [chainSourceOutputPath, setChainSourceOutputPath] = useState("document_spec");
   const [chainTargetTaskName, setChainTargetTaskName] = useState("RenderDocx");
-  const [chainTargetCapabilityId, setChainTargetCapabilityId] = useState("document.docx.generate");
+  const [chainTargetCapabilityId, setChainTargetCapabilityId] = useState("document.docx.render");
   const [chainTargetInputField, setChainTargetInputField] = useState("document_spec");
   const [chainDefaultValue, setChainDefaultValue] = useState("");
   const [chainCapabilityQuery, setChainCapabilityQuery] = useState("");
@@ -3440,7 +3440,7 @@ function HomeContent() {
           : "document.spec.generate";
     const starterSequence = [
       generatorCapability,
-      guidedStarterFormat === "pdf" ? "document.pdf.generate" : "document.docx.generate"
+      guidedStarterFormat === "pdf" ? "document.pdf.render" : "document.docx.render"
     ];
 
     const missing = starterSequence.filter((capabilityId) => !capabilityById.has(capabilityId));
@@ -3476,7 +3476,7 @@ function HomeContent() {
         const requiredInputs = getCapabilityRequiredInputs(capabilityById.get(capabilityId));
 
         if (
-          (capabilityId === "document.docx.generate" || capabilityId === "document.pdf.generate") &&
+          (capabilityId === "document.docx.render" || capabilityId === "document.pdf.render") &&
           typeof context.path === "string" &&
           context.path.trim().length > 0
         ) {

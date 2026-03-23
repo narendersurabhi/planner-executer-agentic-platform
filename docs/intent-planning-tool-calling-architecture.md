@@ -130,7 +130,7 @@ Good planner tools:
 
 Bad planner tools:
 
-- `document.pdf.generate`
+- `document.pdf.render`
 - `github.repo.list`
 - `workspace.write`
 - any tool that performs real side effects during planning

@@ -471,8 +471,8 @@ def test_llm_prompt_includes_semantic_capability_hints(monkeypatch: pytest.Monke
     monkeypatch.setattr(
         "services.planner.app.main._planner_capabilities",
         lambda: {
-            "document.pdf.generate": capability_registry.CapabilitySpec(
-                capability_id="document.pdf.generate",
+            "document.pdf.render": capability_registry.CapabilitySpec(
+                capability_id="document.pdf.render",
                 description="Generate a PDF artifact directly from a DocumentSpec.",
                 risk_tier="bounded_write",
                 idempotency="read",
@@ -483,14 +483,14 @@ def test_llm_prompt_includes_semantic_capability_hints(monkeypatch: pytest.Monke
         job,
         [
             _tool(
-                "document.pdf.generate",
+                "document.pdf.render",
                 {"type": "object", "properties": {"document_spec": {"type": "object"}}},
                 tool_intent=models.ToolIntent.render,
             )
         ],
     )
     assert "Most relevant capabilities for this goal from local semantic search" in prompt
-    assert "document.pdf.generate" in prompt
+    assert "document.pdf.render" in prompt
 
 
 def test_planner_semantic_capability_hints_emit_plan_event(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -502,8 +502,8 @@ def test_planner_semantic_capability_hints_emit_plan_event(monkeypatch: pytest.M
     job = _job()
     job.goal = "Generate a PDF report from a document spec"
     capabilities = {
-        "document.pdf.generate": capability_registry.CapabilitySpec(
-            capability_id="document.pdf.generate",
+        "document.pdf.render": capability_registry.CapabilitySpec(
+            capability_id="document.pdf.render",
             description="Generate a PDF artifact directly from a DocumentSpec.",
             risk_tier="bounded_write",
             idempotency="read",
@@ -557,7 +557,7 @@ def test_emit_planner_capability_selection_event_reports_selected_capabilities(
                 expected_output_schema_ref="schemas/file",
                 intent=models.ToolIntent.render,
                 deps=["generate_spec"],
-                tool_requests=["document.pdf.generate"],
+                tool_requests=["document.pdf.render"],
                 tool_inputs={},
                 critic_required=False,
             ),
@@ -571,7 +571,7 @@ def test_emit_planner_capability_selection_event_reports_selected_capabilities(
     assert event_type == "plan.capability_selection"
     payload = kwargs["payload"]
     assert payload["planner_version"] == "planner_v1"
-    assert payload["selected_capabilities"] == ["document.spec.generate", "document.pdf.generate"]
+    assert payload["selected_capabilities"] == ["document.spec.generate", "document.pdf.render"]
 
 
 def test_validate_plan_rejects_missing_root_required_with_anyof() -> None:
@@ -628,7 +628,7 @@ def test_validate_plan_allows_dependency_filled_inputs() -> None:
 
 def test_validate_plan_allows_reference_object_inputs() -> None:
     plan = _plan_with_task(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {
             "path": "documents/out.docx",
             "document_spec": {
@@ -638,7 +638,7 @@ def test_validate_plan_allows_reference_object_inputs() -> None:
         deps=["generate_spec"],
     )
     tool = _tool(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {
             "type": "object",
             "properties": {
@@ -1213,7 +1213,7 @@ def test_ensure_renderer_required_inputs_autowires_document_spec_only() -> None:
                 expected_output_schema_ref="schemas/docx_output",
                 intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["docx_generate_from_spec"],
+                tool_requests=["docx_render_from_spec"],
                 tool_inputs={},
                 critic_required=False,
             ),
@@ -1221,11 +1221,52 @@ def test_ensure_renderer_required_inputs_autowires_document_spec_only() -> None:
     )
     updated = _ensure_renderer_required_inputs(plan)
     render_task = next(item for item in updated.tasks if item.name == "RenderResumeDocx")
-    payload = dict(render_task.tool_inputs["docx_generate_from_spec"])
+    payload = dict(render_task.tool_inputs["docx_render_from_spec"])
     assert payload["document_spec"] == {
         "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
     }
     assert "path" not in payload
+
+
+def test_ensure_renderer_required_inputs_autowires_legacy_renderer_aliases() -> None:
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.transform,
+                deps=[],
+                tool_requests=["document.spec.generate"],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderResumeDocx",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.transform,
+                deps=[],
+                tool_requests=["docx_generate_from_spec"],
+                tool_inputs={},
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_renderer_required_inputs(plan)
+    render_task = next(item for item in updated.tasks if item.name == "RenderResumeDocx")
+    payload = dict(render_task.tool_inputs["docx_generate_from_spec"])
+    assert payload["document_spec"] == {
+        "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
+    }
 
 
 def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() -> None:
@@ -1266,9 +1307,9 @@ def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() 
                 expected_output_schema_ref="schemas/docx_output",
                 intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["docx_generate_from_spec"],
+                tool_requests=["docx_render_from_spec"],
                 tool_inputs={
-                    "docx_generate_from_spec": {
+                    "docx_render_from_spec": {
                         "document_spec": {
                             "$from": "dependencies_by_name.Generate DocumentSpec Legacy.document.spec.generate.document_spec"
                         },
@@ -1283,7 +1324,7 @@ def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() 
     )
     updated = _ensure_renderer_required_inputs(plan)
     render_task = next(item for item in updated.tasks if item.name == "RenderResumeDocx")
-    payload = dict(render_task.tool_inputs["docx_generate_from_spec"])
+    payload = dict(render_task.tool_inputs["docx_render_from_spec"])
     assert payload["document_spec"] == {
         "$from": "dependencies_by_name.Generate DocumentSpec.document.spec.generate.document_spec"
     }

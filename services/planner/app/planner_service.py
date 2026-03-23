@@ -296,7 +296,7 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
         "6) Prefer the generic validation + rendering pipeline:\n"
         "   - Generate a DocumentSpec JSON.\n"
         "   - Validate with document_spec_validate.\n"
-        "   - Render with docx_generate_from_spec or pdf_generate_from_spec.\n"
+        "   - Render with docx_render_from_spec or pdf_render_from_spec.\n"
         "   - Do not add a separate output-path derivation task unless the path itself is needed downstream.\n"
         "   Use specialized tools only if explicitly requested.\n"
         "7) If unsure, use llm_generate.\n"
@@ -405,6 +405,7 @@ def select_goal_intent_segment_for_task(
         str(name).strip().lower() for name in (task.tool_requests or []) if str(name).strip()
     }
     if task_requests:
+        matching: list[dict[str, Any]] = []
         for segment in goal_intent_segments:
             suggested = segment.get("suggested_capabilities")
             if not isinstance(suggested, list):
@@ -423,7 +424,14 @@ def select_goal_intent_segment_for_task(
                     if tool_name:
                         suggested_ids.add(tool_name)
             if suggested_ids & task_requests:
-                return segment
+                matching.append(segment)
+        if matching:
+            if task_intent:
+                for segment in matching:
+                    if intent_contract.normalize_task_intent(segment.get("intent")) == task_intent:
+                        return segment
+                return None
+            return matching[0]
     if has_suggested_capabilities:
         if len(goal_intent_segments) == 1:
             only_segment = goal_intent_segments[0]

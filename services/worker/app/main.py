@@ -1326,9 +1326,13 @@ def _is_render_request(request_id: Any) -> bool:
         return False
     normalized = request_id.strip().lower()
     return normalized in {
+        "docx_render_from_spec",
         "docx_generate_from_spec",
+        "pdf_render_from_spec",
         "pdf_generate_from_spec",
+        "document.docx.render",
         "document.docx.generate",
+        "document.pdf.render",
         "document.pdf.generate",
     }
 

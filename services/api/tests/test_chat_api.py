@@ -232,6 +232,72 @@ def test_chat_turn_uses_vector_capability_search_for_fuzzy_scope_queries(monkeyp
     assert "filesystem.workspace.list" not in body["assistant_message"]["content"]
 
 
+def test_chat_capability_vector_sync_cleans_stale_namespaces(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="github.file.create_or_update",
+        description="Create or update a single file in a repository.",
+        risk_tier="bounded_write",
+        idempotency="safe_write",
+        group="github",
+        subgroup="files",
+        enabled=True,
+    )
+    capabilities = [(capability.capability_id, capability)]
+    entries = main._chat_capability_search_entries(capabilities)
+    current_namespace = main._chat_capability_vector_namespace(capabilities)
+    stale_namespace = f"{main.CHAT_CAPABILITY_VECTOR_NAMESPACE_PREFIX}:legacy"
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        calls.append((path, dict(body or {})))
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 1, "chunk_ids": ["c1"]}
+        if path == "/documents/list":
+            return {
+                "collection_name": "test",
+                "truncated": False,
+                "scanned_point_count": 2,
+                "documents": [
+                    {
+                        "document_id": "github.file.create_or_update",
+                        "namespace": current_namespace,
+                        "metadata": {"catalog_type": "assistant_capability"},
+                    },
+                    {
+                        "document_id": "document.docx.generate",
+                        "namespace": stale_namespace,
+                        "metadata": {"catalog_type": "assistant_capability"},
+                    },
+                ],
+            }
+        if path == "/documents/delete":
+            return {
+                "collection_name": "test",
+                "document_id": body["document_id"],
+                "deleted_chunk_count": 1,
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_chat_capability_vector_synced_namespace", None)
+
+    namespace = main._ensure_chat_capability_vector_index(capabilities, entries)
+
+    assert namespace == current_namespace
+    assert [path for path, _body in calls] == [
+        "/index/upsert_texts",
+        "/documents/list",
+        "/documents/delete",
+    ]
+    assert calls[-1][1] == {
+        "collection_name": main.CHAT_CAPABILITY_VECTOR_COLLECTION,
+        "namespace": stale_namespace,
+        "workspace_id": main.CHAT_CAPABILITY_VECTOR_WORKSPACE_ID,
+        "document_id": "document.docx.generate",
+    }
+
+
 def test_chat_turn_uses_vector_intent_detection_for_fuzzy_capability_question(monkeypatch) -> None:
     capability = cap_registry.CapabilitySpec(
         capability_id="github.repo.list",
@@ -354,6 +420,7 @@ def test_chat_turn_uses_vector_intent_detection_for_fuzzy_github_scope(monkeypat
     body = response.json()
     assert "Available capabilities related to 'github'" in body["assistant_message"]["content"]
     assert "github.repo.list" in body["assistant_message"]["content"]
+
     assert "filesystem.workspace.list" not in body["assistant_message"]["content"]
 
 
@@ -443,6 +510,34 @@ def test_chat_turn_can_submit_job() -> None:
     assert body["assistant_message"]["action"]["job_id"] == body["job"]["id"]
     assert body["session"]["active_job_id"] == body["job"]["id"]
     assert len(body["session"]["messages"]) == 2
+
+
+def test_chat_turn_does_not_spawn_new_job_for_active_job_confirmation() -> None:
+    session = client.post("/chat/sessions", json={}).json()
+
+    first_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Render a PDF deployment report",
+            "context_json": {"topic": "Deployment report"},
+            "priority": 1,
+        },
+    )
+    assert first_response.status_code == 200
+    first_body = first_response.json()
+    active_job_id = first_body["job"]["id"]
+
+    follow_up = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "yes. go ahead", "context_json": {}, "priority": 1},
+    )
+
+    assert follow_up.status_code == 200
+    body = follow_up.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert active_job_id in body["assistant_message"]["content"]
+    assert body["session"]["active_job_id"] == active_job_id
 
 
 def test_chat_turn_can_run_published_workflow_by_version_reference() -> None:

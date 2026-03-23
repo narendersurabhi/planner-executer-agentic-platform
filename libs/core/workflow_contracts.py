@@ -3,7 +3,29 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from . import capability_registry
+
+
+def _canonicalize_capability_id(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    return capability_registry.canonicalize_capability_id(candidate)
+
+
+def _canonicalize_capability_id_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        canonical = _canonicalize_capability_id(item)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            normalized.append(canonical)
+    return normalized
 
 
 class IntentGraphSlots(BaseModel):
@@ -31,6 +53,36 @@ class IntentGraphSegment(BaseModel):
     suggested_capability_rankings: list[dict[str, Any]] = Field(default_factory=list)
     unsupported_facts: list[str] = Field(default_factory=list)
     slots: IntentGraphSlots = Field(default_factory=IntentGraphSlots)
+
+    @field_validator("suggested_capabilities", mode="before")
+    @classmethod
+    def _normalize_suggested_capabilities(cls, value: Any) -> list[str] | Any:
+        if not isinstance(value, list):
+            return value
+        return _canonicalize_capability_id_list(value)
+
+    @field_validator("suggested_capability_rankings", mode="before")
+    @classmethod
+    def _normalize_suggested_capability_rankings(cls, value: Any) -> list[dict[str, Any]] | Any:
+        if not isinstance(value, list):
+            return value
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            entry = dict(item)
+            raw_id = entry.get("id")
+            if raw_id is None:
+                normalized.append(entry)
+                continue
+            canonical = _canonicalize_capability_id(raw_id)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            entry["id"] = canonical
+            normalized.append(entry)
+        return normalized
 
 
 class IntentGraphSummary(BaseModel):
@@ -118,6 +170,21 @@ class NormalizedIntentEnvelope(BaseModel):
     candidate_capabilities: dict[str, list[str]] = Field(default_factory=dict)
     clarification: ClarificationState = Field(default_factory=ClarificationState)
     trace: NormalizationTrace = Field(default_factory=NormalizationTrace)
+
+    @field_validator("candidate_capabilities", mode="before")
+    @classmethod
+    def _normalize_candidate_capabilities(
+        cls,
+        value: Any,
+    ) -> dict[str, list[str]] | Any:
+        if not isinstance(value, Mapping):
+            return value
+        normalized: dict[str, list[str]] = {}
+        for segment_id, capability_ids in value.items():
+            normalized_ids = _canonicalize_capability_id_list(capability_ids)
+            if normalized_ids:
+                normalized[str(segment_id)] = normalized_ids
+        return normalized
 
 
 def parse_intent_graph(value: Any) -> IntentGraph | None:

@@ -31,7 +31,7 @@ def _job() -> models.Job:
 
 def test_build_plan_request_extracts_intent_graph_and_capabilities() -> None:
     tool = models.ToolSpec(
-        name="docx_generate_from_spec",
+        name="docx_render_from_spec",
         description="Render a DOCX",
         input_schema={},
         output_schema={},
@@ -96,7 +96,7 @@ def test_build_plan_request_prefers_normalized_envelope_graph_when_present() -> 
                         "id": "env-seg",
                         "intent": "render",
                         "objective": "Render the document",
-                        "suggested_capabilities": ["document.docx.generate"],
+                        "suggested_capabilities": ["document.docx.render"],
                     }
                 ]
             },
