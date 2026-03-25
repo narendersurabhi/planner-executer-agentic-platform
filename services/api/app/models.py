@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -52,6 +52,28 @@ class ChatMessageRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
     session: Mapped[ChatSessionRecord] = relationship("ChatSessionRecord", back_populates="messages")
+
+
+class FeedbackRecord(Base):
+    __tablename__ = "feedback"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    target_type: Mapped[str] = mapped_column(String, index=True)
+    target_id: Mapped[str] = mapped_column(String, index=True)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    job_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    plan_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    message_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    actor_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    sentiment: Mapped[str] = mapped_column(String, index=True)
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason_codes_json: Mapped[List[str]] = mapped_column("reason_codes", JSON, default=list)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snapshot_json: Mapped[Dict[str, Any]] = mapped_column("snapshot", JSON, default=dict)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
 class WorkflowDefinitionRecord(Base):

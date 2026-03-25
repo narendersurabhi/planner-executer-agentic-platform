@@ -56,6 +56,18 @@ class MemoryScope(str, Enum):
     global_ = "global"
 
 
+class MemoryCandidateType(str, Enum):
+    user_profile_update = "user_profile_update"
+    semantic_fact = "semantic_fact"
+    interaction_summary = "interaction_summary"
+    task_pattern = "task_pattern"
+
+
+class MemorySensitivity(str, Enum):
+    low = "low"
+    restricted = "restricted"
+
+
 class WorkflowTriggerType(str, Enum):
     manual = "manual"
     api = "api"
@@ -69,6 +81,20 @@ class RunKind(str, Enum):
     chat_direct = "chat_direct"
     trigger = "trigger"
     api = "api"
+
+
+class FeedbackTargetType(str, Enum):
+    chat_message = "chat_message"
+    intent_assessment = "intent_assessment"
+    plan = "plan"
+    job_outcome = "job_outcome"
+
+
+class FeedbackSentiment(str, Enum):
+    positive = "positive"
+    negative = "negative"
+    neutral = "neutral"
+    partial = "partial"
 
 
 class ToolSpec(BaseModel):
@@ -136,6 +162,25 @@ class MemoryQuery(BaseModel):
     project_id: Optional[str] = None
     limit: int = 50
     include_expired: bool = False
+
+
+class UserProfilePreferences(BaseModel):
+    preferred_output_format: Optional[str] = None
+    response_verbosity: Optional[str] = None
+
+
+class UserProfilePayload(BaseModel):
+    preferences: UserProfilePreferences = Field(default_factory=UserProfilePreferences)
+    updated_at: Optional[str] = None
+
+
+class MemoryPromotionDecision(BaseModel):
+    candidate_type: MemoryCandidateType
+    accepted: bool
+    reason: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    sensitivity: MemorySensitivity = MemorySensitivity.low
+    indexable: bool = True
 
 
 class TaskDlqEntry(BaseModel):
@@ -370,6 +415,49 @@ class RunEvent(BaseModel):
     event_type: str
     payload: Dict[str, Any] = Field(default_factory=dict)
     occurred_at: datetime
+
+
+class FeedbackCreate(BaseModel):
+    target_type: FeedbackTargetType
+    target_id: str
+    sentiment: FeedbackSentiment
+    score: Optional[int] = Field(default=None, ge=0, le=5)
+    reason_codes: List[str] = Field(default_factory=list)
+    comment: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class Feedback(BaseModel):
+    id: str
+    target_type: FeedbackTargetType
+    target_id: str
+    session_id: Optional[str] = None
+    job_id: Optional[str] = None
+    plan_id: Optional[str] = None
+    message_id: Optional[str] = None
+    user_id: Optional[str] = None
+    actor_key: Optional[str] = None
+    sentiment: FeedbackSentiment
+    score: Optional[int] = None
+    reason_codes: List[str] = Field(default_factory=list)
+    comment: Optional[str] = None
+    snapshot: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class FeedbackSummary(BaseModel):
+    total: int = 0
+    positive: int = 0
+    negative: int = 0
+    neutral: int = 0
+    partial: int = 0
+
+
+class FeedbackListResponse(BaseModel):
+    items: List[Feedback] = Field(default_factory=list)
+    summary: FeedbackSummary = Field(default_factory=FeedbackSummary)
 
 
 class JobCreate(BaseModel):

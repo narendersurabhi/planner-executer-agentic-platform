@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
 import re
 from typing import Any, Callable
 
@@ -10,7 +11,11 @@ from sqlalchemy.orm import Session
 
 from libs.core import chat_contracts, models, workflow_contracts
 
+from . import memory_profile_service
 from .models import ChatMessageRecord, ChatSessionRecord
+
+logger = logging.getLogger("api.chat_service")
+_INTERNAL_CHAT_USER_ID_KEY = "_chat_user_id"
 
 
 @dataclass(frozen=True)
@@ -123,24 +128,40 @@ def create_session(
     request: chat_contracts.ChatSessionCreate,
     *,
     runtime: ChatServiceRuntime,
+    user_id: str | None = None,
 ) -> chat_contracts.ChatSession:
     now = runtime.utcnow()
     title = str(request.title or "").strip() or "New chat"
+    metadata = _coerce_context_json(request.metadata)
+    metadata.pop(_INTERNAL_CHAT_USER_ID_KEY, None)
+    metadata.pop("user_id", None)
+    metadata.pop("semantic_user_id", None)
+    if isinstance(metadata.get("context_json"), Mapping):
+        metadata["context_json"] = _sanitize_chat_context(metadata.get("context_json"))
+    if _normalized_user_id(user_id):
+        metadata[_INTERNAL_CHAT_USER_ID_KEY] = _normalized_user_id(user_id)
     record = ChatSessionRecord(
         id=runtime.make_id(),
         title=title,
-        metadata_json=dict(request.metadata) if isinstance(request.metadata, dict) else {},
+        metadata_json=metadata,
         created_at=now,
         updated_at=now,
     )
     db.add(record)
     db.commit()
-    return get_session(db, record.id)
+    return get_session(db, record.id, user_id=user_id)
 
 
-def get_session(db: Session, session_id: str) -> chat_contracts.ChatSession | None:
+def get_session(
+    db: Session,
+    session_id: str,
+    *,
+    user_id: str | None = None,
+) -> chat_contracts.ChatSession | None:
     record = db.query(ChatSessionRecord).filter(ChatSessionRecord.id == session_id).first()
     if record is None:
+        return None
+    if not _chat_session_access_allowed(record, user_id):
         return None
     messages = (
         db.query(ChatMessageRecord)
@@ -157,9 +178,12 @@ def handle_turn(
     request: chat_contracts.ChatTurnRequest,
     *,
     runtime: ChatServiceRuntime,
+    user_id: str | None = None,
 ) -> chat_contracts.ChatTurnResponse:
     record = db.query(ChatSessionRecord).filter(ChatSessionRecord.id == session_id).first()
     if record is None:
+        raise KeyError(session_id)
+    if not _chat_session_access_allowed(record, user_id):
         raise KeyError(session_id)
 
     content = str(request.content or "").strip()
@@ -168,13 +192,20 @@ def handle_turn(
 
     now = runtime.utcnow()
     session_metadata = dict(record.metadata_json or {})
-    session_context = _coerce_context_json(session_metadata.get("context_json"))
+    bound_user_id = _normalized_user_id(user_id) or _chat_session_user_id(session_metadata)
+    if bound_user_id and not _chat_session_user_id(session_metadata):
+        session_metadata[_INTERNAL_CHAT_USER_ID_KEY] = bound_user_id
+    session_context = _sanitize_chat_context(_coerce_context_json(session_metadata.get("context_json")))
     turn_context = _prepare_turn_context(
         request.context_json,
         session_metadata=session_metadata,
         content=content,
     )
+    turn_context = _sanitize_chat_context(turn_context)
     merged_context = _merge_chat_context(session_context, turn_context)
+    if bound_user_id:
+        merged_context["user_id"] = bound_user_id
+        merged_context["semantic_user_id"] = bound_user_id
 
     user_message = ChatMessageRecord(
         id=runtime.make_id(),
@@ -458,8 +489,20 @@ def handle_turn(
     )
     db.add(assistant_message)
     db.commit()
+    if bound_user_id:
+        try:
+            memory_profile_service.apply_user_profile_updates_from_text(
+                db,
+                user_id=bound_user_id,
+                content=content,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "chat_profile_memory_persist_failed",
+                extra={"session_id": record.id},
+            )
 
-    session = get_session(db, record.id)
+    session = get_session(db, record.id, user_id=bound_user_id or user_id)
     if session is None:
         raise KeyError(record.id)
     return chat_contracts.ChatTurnResponse(
@@ -658,7 +701,7 @@ def _session_from_record(
     record: ChatSessionRecord,
     messages: list[ChatMessageRecord],
 ) -> chat_contracts.ChatSession:
-    metadata = dict(record.metadata_json or {})
+    metadata = _public_session_metadata(record.metadata_json)
     return chat_contracts.ChatSession(
         id=record.id,
         title=record.title,
@@ -673,14 +716,17 @@ def _session_from_record(
 def _message_from_record(record: ChatMessageRecord) -> chat_contracts.ChatMessage:
     action = None
     if isinstance(record.action_json, dict):
-        action = chat_contracts.AssistantAction.model_validate(record.action_json)
+        action_payload = dict(record.action_json)
+        if isinstance(action_payload.get("context_json"), Mapping):
+            action_payload["context_json"] = _sanitize_chat_context(action_payload.get("context_json"))
+        action = chat_contracts.AssistantAction.model_validate(action_payload)
     return chat_contracts.ChatMessage(
         id=record.id,
         session_id=record.session_id,
         role=record.role,
         content=record.content,
         created_at=record.created_at,
-        metadata=dict(record.metadata_json or {}),
+        metadata=_public_session_metadata(record.metadata_json),
         action=action,
         job_id=record.job_id,
     )
@@ -706,6 +752,37 @@ def _assistant_metadata(
     if isinstance(workflow_run, models.WorkflowRun):
         metadata["workflow_run"] = workflow_run.model_dump(mode="json", exclude_none=True)
     return metadata
+
+
+def _sanitize_chat_context(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    context = dict(value) if isinstance(value, Mapping) else {}
+    context.pop("user_id", None)
+    context.pop("semantic_user_id", None)
+    return context
+
+
+def _public_session_metadata(value: Any) -> dict[str, Any]:
+    metadata = dict(value) if isinstance(value, Mapping) else {}
+    metadata.pop(_INTERNAL_CHAT_USER_ID_KEY, None)
+    if isinstance(metadata.get("context_json"), Mapping):
+        metadata["context_json"] = _sanitize_chat_context(metadata.get("context_json"))
+    return metadata
+
+
+def _chat_session_user_id(metadata: Mapping[str, Any]) -> str:
+    return _normalized_user_id(metadata.get(_INTERNAL_CHAT_USER_ID_KEY))
+
+
+def _normalized_user_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _chat_session_access_allowed(record: ChatSessionRecord, user_id: str | None) -> bool:
+    bound_user_id = _chat_session_user_id(record.metadata_json or {})
+    normalized_user_id = _normalized_user_id(user_id)
+    if not bound_user_id or not normalized_user_id:
+        return True
+    return bound_user_id == normalized_user_id
 
 
 def _workflow_input_question(definition: Mapping[str, Any]) -> str:

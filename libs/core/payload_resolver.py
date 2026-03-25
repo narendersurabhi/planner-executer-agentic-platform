@@ -6,6 +6,8 @@ from typing import Any, Dict
 
 from jsonschema import Draft202012Validator
 
+from libs.core import planner_contracts
+
 
 class ToolInputReferenceError(ValueError):
     """Raised when a tool input reference cannot be resolved."""
@@ -94,6 +96,7 @@ def resolve_tool_payload(
     payload = _merge_payload_from_task(payload, task_payload, instruction)
     payload = _fill_payload_from_context(payload, context)
     payload = _promote_document_job_fields(payload, tool_name=tool_name)
+    payload = _canonicalize_render_path_aliases(payload, tool_name=tool_name)
     if tool_name == "llm_generate_with_context":
         base_prompt = payload.get("prompt") or payload.get("text") or instruction
         normalized: dict[str, Any] = {"prompt": str(base_prompt or "")}
@@ -198,6 +201,11 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
             "job_description",
             "output_dir",
             "document_type",
+            "path",
+            "output_path",
+            "filename",
+            "file_name",
+            "output_filename",
         ):
             if key in filled:
                 continue
@@ -272,6 +280,7 @@ def normalize_reference_payload_for_validation(
     *,
     dependency_defaults: dict[str, Any] | None = None,
     unknown_default: Any = "__dependency__",
+    tool_name: str | None = None,
 ) -> dict[str, Any]:
     defaults = dependency_defaults or {}
 
@@ -291,7 +300,27 @@ def normalize_reference_payload_for_validation(
     normalized = _normalize(dict(payload))
     if isinstance(normalized, dict):
         normalized = _promote_document_job_fields(normalized)
+        normalized = _canonicalize_render_path_aliases(normalized, tool_name=tool_name)
     return normalized
+
+
+def _canonicalize_render_path_aliases(
+    payload: dict[str, Any],
+    *,
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    if not planner_contracts.is_render_request_id(tool_name):
+        return dict(payload)
+    canonical = dict(payload)
+    path_value = canonical.get("path")
+    if isinstance(path_value, str) and path_value.strip():
+        return canonical
+    for key in ("output_path", "filename", "file_name", "output_filename"):
+        value = canonical.get(key)
+        if isinstance(value, str) and value.strip():
+            canonical["path"] = value.strip()
+            break
+    return canonical
 
 
 def _resolve_payload_references(value: Any, context: dict[str, Any], *, strict: bool) -> Any:

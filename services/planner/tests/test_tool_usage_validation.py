@@ -1331,6 +1331,159 @@ def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() 
     assert "path" not in payload
 
 
+def test_validate_plan_rejects_dependency_derived_render_path_for_raw_jobs() -> None:
+    job = _job()
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="render chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="DeriveOutputPath",
+                description="derive",
+                instruction="derive",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/path",
+                intent=models.ToolIntent.io,
+                deps=[],
+                tool_requests=["derive_output_filename"],
+                tool_inputs={
+                    "derive_output_filename": {
+                        "document_type": "document",
+                        "output_extension": "docx",
+                        "target_role_name": "deployment_report",
+                    }
+                },
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderResumeDocx",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["DeriveOutputPath"],
+                tool_requests=["docx_render_from_spec"],
+                tool_inputs={
+                    "docx_render_from_spec": {
+                        "document_spec": {"blocks": []},
+                        "path": {
+                            "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
+                        },
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+    tools = [
+        _tool(
+            "derive_output_filename",
+            {
+                "type": "object",
+                "properties": {"document_type": {"type": "string"}},
+                "required": ["document_type"],
+            },
+            tool_intent=models.ToolIntent.io,
+        ),
+        _tool(
+            "docx_render_from_spec",
+            {
+                "type": "object",
+                "properties": {
+                    "document_spec": {"type": "object"},
+                    "path": {"type": "string"},
+                },
+                "required": ["document_spec", "path"],
+            },
+            tool_intent=models.ToolIntent.render,
+        ),
+    ]
+
+    valid, reason = _validate_plan(plan, tools, job)
+
+    assert valid is False
+    assert reason == "render_path_derived_not_allowed:docx_render_from_spec:task=RenderResumeDocx"
+
+
+def test_validate_plan_allows_dependency_derived_render_path_for_auto_mode_jobs() -> None:
+    job = _job()
+    job.metadata = {"render_path_mode": "auto"}
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="render chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="DeriveOutputPath",
+                description="derive",
+                instruction="derive",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/path",
+                intent=models.ToolIntent.io,
+                deps=[],
+                tool_requests=["derive_output_filename"],
+                tool_inputs={
+                    "derive_output_filename": {
+                        "document_type": "document",
+                        "output_extension": "docx",
+                        "target_role_name": "deployment_report",
+                    }
+                },
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderResumeDocx",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["DeriveOutputPath"],
+                tool_requests=["docx_render_from_spec"],
+                tool_inputs={
+                    "docx_render_from_spec": {
+                        "document_spec": {"blocks": []},
+                        "path": {
+                            "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
+                        },
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+    tools = [
+        _tool(
+            "derive_output_filename",
+            {
+                "type": "object",
+                "properties": {"document_type": {"type": "string"}},
+                "required": ["document_type"],
+            },
+            tool_intent=models.ToolIntent.io,
+        ),
+        _tool(
+            "docx_render_from_spec",
+            {
+                "type": "object",
+                "properties": {
+                    "document_spec": {"type": "object"},
+                    "path": {"type": "string"},
+                },
+                "required": ["document_spec", "path"],
+            },
+            tool_intent=models.ToolIntent.render,
+        ),
+    ]
+
+    valid, reason = _validate_plan(plan, tools, job)
+
+    assert valid is True
+    assert reason == "ok"
+
+
 def test_ensure_renderer_required_inputs_autowires_document_spec_for_validate_task() -> None:
     plan = models.PlanCreate(
         planner_version="1",

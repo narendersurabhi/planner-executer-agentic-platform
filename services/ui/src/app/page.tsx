@@ -10,6 +10,18 @@ import ScreenHeader, {
 } from "./components/ScreenHeader";
 import ComposerStepInspector from "./components/composer/ComposerStepInspector";
 import ComposerValidationPanel from "./components/composer/ComposerValidationPanel";
+import FeedbackControl from "./components/feedback/FeedbackControl";
+import {
+  CHAT_FEEDBACK_REASONS,
+  INTENT_FEEDBACK_REASONS,
+  OUTCOME_FEEDBACK_REASONS,
+  PLAN_FEEDBACK_REASONS,
+  feedbackTargetKey,
+  getFeedbackActorId,
+  type FeedbackEntry,
+  type FeedbackListResponse,
+  type FeedbackTargetType
+} from "./lib/feedback";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
 const jaegerUiUrl = (process.env.NEXT_PUBLIC_JAEGER_URL || "http://localhost:16686").replace(
@@ -740,6 +752,15 @@ type JobDetailsPayload = {
   tasks?: Task[];
   task_results?: Record<string, TaskResult>;
 };
+
+const mapViewerFeedback = (items: FeedbackEntry[], actorId: string) =>
+  items.reduce<Record<string, FeedbackEntry>>((acc, item) => {
+    if (!item || item.actor_key !== actorId) {
+      return acc;
+    }
+    acc[feedbackTargetKey(item.target_type, item.target_id)] = item;
+    return acc;
+  }, {});
 
 type ContextBuilderFieldEditor = {
   originalKey: string;
@@ -2057,6 +2078,9 @@ function HomeContent() {
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatUseComposeContext, setChatUseComposeContext] = useState(true);
+  const [feedbackByTarget, setFeedbackByTarget] = useState<Record<string, FeedbackEntry>>({});
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState<Record<string, boolean>>({});
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
   const [showTaskInputs, setShowTaskInputs] = useState(false);
   const [showRecentEvents, setShowRecentEvents] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
@@ -2210,6 +2234,7 @@ function HomeContent() {
     null
   );
   const [composerCompileLoading, setComposerCompileLoading] = useState(false);
+  const feedbackActorId = useMemo(() => getFeedbackActorId(workspaceUserId), [workspaceUserId]);
   const [isDesktop, setIsDesktop] = useState(false);
   const [hasSetInitialSidebar, setHasSetInitialSidebar] = useState(false);
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
@@ -5922,6 +5947,73 @@ const openTemplateModal = (template: Template) => {
     }
   };
 
+  const mergeViewerFeedback = (items: FeedbackEntry[]) => {
+    const viewerFeedback = mapViewerFeedback(items, feedbackActorId);
+    setFeedbackByTarget((previous) => ({ ...previous, ...viewerFeedback }));
+  };
+
+  const loadChatFeedback = async (sessionId: string) => {
+    const result = await fetchJson(`${apiUrl}/chat/sessions/${encodeURIComponent(sessionId)}/feedback`);
+    if (result.ok && result.data && typeof result.data === "object") {
+      const payload = result.data as FeedbackListResponse;
+      mergeViewerFeedback(Array.isArray(payload.items) ? payload.items : []);
+    }
+  };
+
+  const loadJobFeedback = async (jobId: string) => {
+    const result = await fetchJson(`${apiUrl}/jobs/${encodeURIComponent(jobId)}/feedback`);
+    if (result.ok && result.data && typeof result.data === "object") {
+      const payload = result.data as FeedbackListResponse;
+      mergeViewerFeedback(Array.isArray(payload.items) ? payload.items : []);
+    }
+  };
+
+  const submitFeedback = async (
+    targetType: FeedbackTargetType,
+    targetId: string,
+    payload: {
+      sentiment: "positive" | "negative" | "neutral" | "partial";
+      reason_codes: string[];
+      comment?: string;
+      score?: number;
+    }
+  ) => {
+    const key = feedbackTargetKey(targetType, targetId);
+    setFeedbackSubmitting((previous) => ({ ...previous, [key]: true }));
+    setFeedbackError(null);
+    try {
+      const response = await fetch(`${apiUrl}/feedback`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Feedback-Actor-Id": feedbackActorId
+        },
+        body: JSON.stringify({
+          target_type: targetType,
+          target_id: targetId,
+          sentiment: payload.sentiment,
+          reason_codes: payload.reason_codes,
+          comment: payload.comment,
+          score: payload.score
+        })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Failed to submit feedback (${response.status}).`);
+      }
+      const body = (await response.json()) as FeedbackEntry;
+      setFeedbackByTarget((previous) => ({
+        ...previous,
+        [feedbackTargetKey(body.target_type, body.target_id)]: body
+      }));
+    } catch (error) {
+      setFeedbackError(error instanceof Error ? error.message : "Failed to submit feedback.");
+      throw error;
+    } finally {
+      setFeedbackSubmitting((previous) => ({ ...previous, [key]: false }));
+    }
+  };
+
   const createChatSession = async () => {
     const response = await fetch(`${apiUrl}/chat/sessions`, {
       method: "POST",
@@ -5946,6 +6038,7 @@ const openTemplateModal = (template: Template) => {
     setChatInput("");
     setChatError(null);
     setChatNotice(null);
+    setFeedbackError(null);
   };
 
   const loadChatSession = async (sessionId: string) => {
@@ -5955,6 +6048,7 @@ const openTemplateModal = (template: Template) => {
     }
     const session = (await response.json()) as ChatSession;
     setChatSession(session);
+    void loadChatFeedback(session.id);
   };
 
   const refreshChatJobViews = async (jobId: string) => {
@@ -6031,6 +6125,7 @@ const openTemplateModal = (template: Template) => {
       }
       const body = (await response.json()) as ChatTurnResponse;
       setChatSession(body.session);
+      void loadChatFeedback(body.session.id);
       if (body.job?.id) {
         setChatLoading(false);
         void refreshChatJobViews(body.job.id);
@@ -6091,7 +6186,12 @@ const openTemplateModal = (template: Template) => {
       }
     }
 
-    await Promise.all([loadMemoryEntries(jobId), loadDlqEntries(jobId), loadJobDebugger(jobId)]);
+    await Promise.all([
+      loadMemoryEntries(jobId),
+      loadDlqEntries(jobId),
+      loadJobDebugger(jobId),
+      loadJobFeedback(jobId)
+    ]);
 
     const currentChatSession = chatSessionRef.current;
     if (
@@ -8975,6 +9075,27 @@ const openTemplateModal = (template: Template) => {
                                 </button>
                               </div>
                             ) : null}
+                            {message.role === "assistant" && !isPending ? (
+                              <FeedbackControl
+                                title="Was this response helpful?"
+                                reasonOptions={CHAT_FEEDBACK_REASONS}
+                                sentimentOptions={[
+                                  { value: "positive", label: "Helpful" },
+                                  { value: "negative", label: "Not helpful" }
+                                ]}
+                                existing={
+                                  feedbackByTarget[feedbackTargetKey("chat_message", message.id)] || null
+                                }
+                                submitting={
+                                  Boolean(
+                                    feedbackSubmitting[feedbackTargetKey("chat_message", message.id)]
+                                  )
+                                }
+                                onSubmit={(payload) =>
+                                  submitFeedback("chat_message", message.id, payload)
+                                }
+                              />
+                            ) : null}
                           </div>
                         );
                       })}
@@ -9012,6 +9133,11 @@ const openTemplateModal = (template: Template) => {
                 {chatNotice ? (
                   <div className="mt-3 rounded-xl border border-sky-300/20 bg-sky-300/10 px-3 py-2 text-sm text-sky-100">
                     {chatNotice}
+                  </div>
+                ) : null}
+                {feedbackError && showChatScreen ? (
+                  <div className="mt-3 rounded-xl border border-amber-300/20 bg-amber-300/10 px-3 py-2 text-sm text-amber-100">
+                    Feedback error: {feedbackError}
                   </div>
                 ) : null}
                 <div className="mt-4 space-y-3">
@@ -9219,6 +9345,19 @@ const openTemplateModal = (template: Template) => {
               ) : (
                 <div className="text-xs text-slate-600">Plan not created yet.</div>
               )}
+              {selectedPlan ? (
+                <FeedbackControl
+                  title="Does this plan make sense?"
+                  reasonOptions={PLAN_FEEDBACK_REASONS}
+                  sentimentOptions={[
+                    { value: "positive", label: "Yes" },
+                    { value: "negative", label: "No" }
+                  ]}
+                  existing={feedbackByTarget[feedbackTargetKey("plan", selectedPlan.id)] || null}
+                  submitting={Boolean(feedbackSubmitting[feedbackTargetKey("plan", selectedPlan.id)])}
+                  onSubmit={(payload) => submitFeedback("plan", selectedPlan.id, payload)}
+                />
+              ) : null}
               <div className="mt-3 flex items-center justify-between gap-2">
                 <div className="font-medium">Intent Graph</div>
                 <button
@@ -9323,6 +9462,25 @@ const openTemplateModal = (template: Template) => {
                   No intent graph stored for this job.
                 </div>
               )}
+              {selectedJobId ? (
+                <FeedbackControl
+                  title="Did we understand your request correctly?"
+                  reasonOptions={INTENT_FEEDBACK_REASONS}
+                  sentimentOptions={[
+                    { value: "positive", label: "Yes" },
+                    { value: "negative", label: "No" }
+                  ]}
+                  existing={
+                    feedbackByTarget[feedbackTargetKey("intent_assessment", selectedJobId)] || null
+                  }
+                  submitting={
+                    Boolean(
+                      feedbackSubmitting[feedbackTargetKey("intent_assessment", selectedJobId)]
+                    )
+                  }
+                  onSubmit={(payload) => submitFeedback("intent_assessment", selectedJobId, payload)}
+                />
+              ) : null}
               <div className="mt-3 font-medium">Downloads</div>
               {jobDownloadPaths.length > 0 ? (
                 <div className="mt-2 flex flex-wrap gap-2">
@@ -9341,6 +9499,27 @@ const openTemplateModal = (template: Template) => {
               ) : (
                 <div className="text-xs text-slate-600">No downloadable artifacts yet.</div>
               )}
+              {selectedJobId &&
+              ((selectedJobStatus || selectedJob?.status) === "succeeded" ||
+                (selectedJobStatus || selectedJob?.status) === "failed" ||
+                (selectedJobStatus || selectedJob?.status) === "canceled") ? (
+                <FeedbackControl
+                  title="Did the system accomplish your goal?"
+                  reasonOptions={OUTCOME_FEEDBACK_REASONS}
+                  sentimentOptions={[
+                    { value: "positive", label: "Success" },
+                    { value: "partial", label: "Partial" },
+                    { value: "negative", label: "Failed" }
+                  ]}
+                  existing={feedbackByTarget[feedbackTargetKey("job_outcome", selectedJobId)] || null}
+                  submitting={Boolean(feedbackSubmitting[feedbackTargetKey("job_outcome", selectedJobId)])}
+                  autoSubmitSentiments={["positive"]}
+                  onSubmit={(payload) => submitFeedback("job_outcome", selectedJobId, payload)}
+                />
+              ) : null}
+              {feedbackError ? (
+                <div className="mt-3 text-xs text-amber-700">Feedback error: {feedbackError}</div>
+              ) : null}
             </div>
 
             <div className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">

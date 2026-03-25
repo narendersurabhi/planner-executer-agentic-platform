@@ -574,6 +574,11 @@ def _fill_payload_context_defaults(
         "job_description",
         "output_dir",
         "document_type",
+        "path",
+        "output_path",
+        "filename",
+        "file_name",
+        "output_filename",
     ):
         if key in payload:
             continue
@@ -583,6 +588,12 @@ def _fill_payload_context_defaults(
             continue
         if isinstance(value, (int, float, bool)):
             payload[key] = value
+    if "path" not in payload:
+        for alias in ("output_path", "filename", "file_name", "output_filename"):
+            value = payload.get(alias)
+            if isinstance(value, str) and value.strip():
+                payload["path"] = value.strip()
+                break
 
 
 def build_validation_payload(
@@ -594,6 +605,7 @@ def build_validation_payload(
     payload = payload_resolver.normalize_reference_payload_for_validation(
         dict(raw_tool_inputs),
         dependency_defaults=dependency_fill_defaults(),
+        tool_name=tool.name,
     )
     projected_inputs = job_projection.project_explicit_inputs_for_tool(
         tool.name,
@@ -633,18 +645,20 @@ def build_validation_payload(
 
 def build_capability_validation_payload(
     task: models.TaskCreate,
+    request_id: str,
     raw_tool_inputs: dict[str, Any],
     request: planner_contracts.PlanRequest,
 ) -> dict[str, Any]:
     payload = payload_resolver.normalize_reference_payload_for_validation(
         dict(raw_tool_inputs),
         dependency_defaults=dependency_fill_defaults(),
+        tool_name=request_id,
     )
     projected_inputs = {}
     if task.tool_requests:
-        for request_id in task.tool_requests:
+        for candidate_id in task.tool_requests:
             projected_inputs = job_projection.project_explicit_inputs_for_tool(
-                request_id,
+                candidate_id,
                 request.job_payload,
                 default_goal=request.goal,
             )
@@ -689,7 +703,12 @@ def validate_capability_inputs(
     )
     if schema is None:
         return f"capability_schema_not_found:{capability.input_schema_ref}"
-    payload = build_capability_validation_payload(task, raw_tool_inputs, request)
+    payload = build_capability_validation_payload(
+        task,
+        capability.capability_id,
+        raw_tool_inputs,
+        request,
+    )
     if capability.capability_id == "github.repo.list":
         job_context = request.job_context if isinstance(request.job_context, dict) else {}
         github_query = synthesize_github_repo_query(
@@ -759,9 +778,19 @@ def validate_plan_request(
             elif capability is not None:
                 segment_payload = build_capability_validation_payload(
                     task,
+                    tool_name,
                     raw_tool_inputs,
                     request,
                 )
+            render_path_error = planner_contracts.validate_render_path_requirement(
+                request_id=tool_name,
+                raw_payload=raw_tool_inputs,
+                resolved_payload=segment_payload,
+                job_context=request.job_context if isinstance(request.job_context, dict) else {},
+                render_path_mode=planner_contracts.render_path_mode(request),
+            )
+            if render_path_error:
+                return False, f"{render_path_error}:task={task.name}"
             segment_contract_error = intent_contract.validate_intent_segment_contract(
                 segment=goal_intent_segment,
                 task_intent=task_intent,

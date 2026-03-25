@@ -11,8 +11,8 @@ os.environ["CAPABILITY_MODE"] = "enabled"
 
 from libs.core import models  # noqa: E402
 from libs.core import capability_registry as cap_registry  # noqa: E402
-from services.api.app import chat_service, main  # noqa: E402
-from services.api.app.database import Base, engine  # noqa: E402
+from services.api.app import chat_service, main, memory_profile_service  # noqa: E402
+from services.api.app.database import Base, SessionLocal, engine  # noqa: E402
 
 
 Base.metadata.create_all(bind=engine)
@@ -506,6 +506,8 @@ def test_chat_turn_can_submit_job() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["job"]["goal"] == "Render a PDF deployment report"
+    assert body["job"]["metadata"]["workflow_source"] == "chat"
+    assert body["job"]["metadata"]["render_path_mode"] == "auto"
     assert body["assistant_message"]["action"]["type"] == "submit_job"
     assert body["assistant_message"]["action"]["job_id"] == body["job"]["id"]
     assert body["session"]["active_job_id"] == body["job"]["id"]
@@ -1678,3 +1680,51 @@ def test_chat_memory_arguments_inherit_user_id_from_context() -> None:
         "user_id": "narendersurabhi",
         "scope": "user",
     }
+
+
+def test_chat_turn_profile_update_uses_authenticated_user_id_not_context_user_id() -> None:
+    headers = {"X-Authenticated-User-Id": "alice"}
+    session = client.post("/chat/sessions", json={}, headers=headers).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "I prefer markdown and concise responses.",
+            "context_json": {"user_id": "mallory"},
+            "priority": 0,
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session"]["metadata"].get("_chat_user_id") is None
+    if isinstance(body["session"]["metadata"].get("context_json"), dict):
+        assert "user_id" not in body["session"]["metadata"]["context_json"]
+
+    db = SessionLocal()
+    try:
+        alice_profile = memory_profile_service.load_user_profile(db, "alice")
+        mallory_profile = memory_profile_service.load_user_profile(db, "mallory")
+    finally:
+        db.close()
+
+    assert alice_profile.preferences.preferred_output_format == "markdown"
+    assert alice_profile.preferences.response_verbosity == "concise"
+    assert mallory_profile.preferences.preferred_output_format is None
+
+
+def test_chat_session_rejects_authenticated_user_mismatch() -> None:
+    alice_headers = {"X-Authenticated-User-Id": "alice"}
+    bob_headers = {"X-Authenticated-User-Id": "bob"}
+    session = client.post("/chat/sessions", json={}, headers=alice_headers).json()
+
+    get_response = client.get(f"/chat/sessions/{session['id']}", headers=bob_headers)
+    message_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "hello", "context_json": {}, "priority": 0},
+        headers=bob_headers,
+    )
+
+    assert get_response.status_code == 404
+    assert message_response.status_code == 404

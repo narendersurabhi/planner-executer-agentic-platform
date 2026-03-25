@@ -146,3 +146,37 @@ def test_governance_context_uses_request_metadata() -> None:
     assert context["job_id"] == "job-1"
     assert context["job_type"] == "document"
     assert context["job_context"]["output_dir"] == "artifacts"
+
+
+def test_build_plan_request_defaults_render_path_mode_to_explicit() -> None:
+    request = planner_contracts.build_plan_request(_job(), tools=[], capabilities={})
+
+    assert request.render_path_mode == planner_contracts.RENDER_PATH_MODE_EXPLICIT
+
+
+def test_validate_render_path_requirement_accepts_job_context_reference() -> None:
+    error = planner_contracts.validate_render_path_requirement(
+        request_id="docx_render_from_spec",
+        raw_payload={"path": {"$from": "job_context.path"}},
+        resolved_payload={"path": "documents/report.docx"},
+        job_context={"path": "documents/report.docx"},
+        render_path_mode="explicit",
+    )
+
+    assert error is None
+
+
+def test_validate_render_path_requirement_rejects_dependency_reference() -> None:
+    error = planner_contracts.validate_render_path_requirement(
+        request_id="docx_render_from_spec",
+        raw_payload={
+            "path": {
+                "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
+            }
+        },
+        resolved_payload={"path": "documents/report.docx"},
+        job_context={},
+        render_path_mode="explicit",
+    )
+
+    assert error == "render_path_derived_not_allowed:docx_render_from_spec"

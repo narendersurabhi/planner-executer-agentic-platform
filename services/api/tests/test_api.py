@@ -43,6 +43,67 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _document_render_registry() -> cap_registry.CapabilityRegistry:
+    return cap_registry.CapabilityRegistry(
+        capabilities={
+            "document.spec.generate": cap_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a document spec.",
+                enabled=True,
+                risk_tier="read_only",
+                idempotency="read",
+                group="document",
+                subgroup="spec",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="llm_generate_document_spec",
+                    ),
+                ),
+                planner_hints={"task_intents": ["generate"]},
+            ),
+            "derive_output_filename": cap_registry.CapabilitySpec(
+                capability_id="derive_output_filename",
+                description="Derive a safe output path.",
+                enabled=True,
+                risk_tier="read_only",
+                idempotency="read",
+                group="document",
+                subgroup="paths",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="derive_output_filename",
+                    ),
+                ),
+                planner_hints={"task_intents": ["transform"]},
+            ),
+            "document.docx.render": cap_registry.CapabilitySpec(
+                capability_id="document.docx.render",
+                description="Render a DOCX document.",
+                enabled=True,
+                risk_tier="bounded_write",
+                idempotency="safe_write",
+                group="document",
+                subgroup="render",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="docx_render_from_spec",
+                    ),
+                ),
+                planner_hints={
+                    "task_intents": ["render"],
+                    "required_output_extension": "docx",
+                },
+            ),
+        }
+    )
+
+
 def test_create_job():
     response = client.post(
         "/jobs",
@@ -52,6 +113,7 @@ def test_create_job():
     data = response.json()
     assert data["goal"] == "demo"
     assert data["metadata"]["normalized_intent_envelope"]["goal"] == "demo"
+    assert data["metadata"]["render_path_mode"] == "explicit"
 
 
 def test_intent_assessment_fallback_used_respects_mode(monkeypatch) -> None:
@@ -127,6 +189,7 @@ def test_workflow_definition_publish_and_run_bypasses_planner_job_event() -> Non
     assert run_body["workflow_run"]["version_id"] == version["id"]
     assert run_body["workflow_run"]["job_id"] == job_id
     assert run_body["job"]["metadata"]["workflow_source"] == "studio"
+    assert run_body["job"]["metadata"]["render_path_mode"] == "auto"
     assert run_body["job"]["metadata"]["workflow_definition_id"] == definition["id"]
     assert run_body["job"]["metadata"]["workflow_version_id"] == version["id"]
     assert run_body["job"]["metadata"]["workflow_run_id"] == run_body["workflow_run"]["id"]
@@ -214,6 +277,92 @@ def test_workflow_run_uses_postgres_scheduler_when_flag_enabled(monkeypatch) -> 
     event_types = {row.event_type for row in matching_events}
     assert "task.ready" in event_types
     assert "plan.created" not in event_types
+
+
+def test_workflow_version_run_allows_derived_render_paths_in_studio_mode(monkeypatch) -> None:
+    registry = _document_render_registry()
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(main, "RUNTIME_CONFORMANCE_ENABLED", False)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", False)
+
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Render DOCX workflow",
+            "goal": "Render a DOCX deployment report",
+            "context_json": {},
+            "draft": {
+                "summary": "Render DOCX workflow",
+                "nodes": [
+                    {
+                        "id": "spec",
+                        "taskName": "GenerateDocumentSpec",
+                        "capabilityId": "document.spec.generate",
+                        "bindings": {
+                            "instruction": {
+                                "kind": "literal",
+                                "value": "Create a deployment report document.",
+                            },
+                            "topic": {"kind": "literal", "value": "Deployment report"},
+                            "audience": {"kind": "literal", "value": "Engineers"},
+                        },
+                    },
+                    {
+                        "id": "path",
+                        "taskName": "DeriveOutputPath",
+                        "capabilityId": "derive_output_filename",
+                        "bindings": {
+                            "document_type": {"kind": "literal", "value": "document"},
+                            "output_extension": {"kind": "literal", "value": "docx"},
+                            "target_role_name": {
+                                "kind": "literal",
+                                "value": "deployment_report",
+                            },
+                        },
+                    },
+                    {
+                        "id": "render",
+                        "taskName": "RenderDocument",
+                        "capabilityId": "document.docx.render",
+                        "bindings": {
+                            "document_spec": {
+                                "kind": "step_output",
+                                "sourceNodeId": "spec",
+                                "sourcePath": "document_spec",
+                            },
+                            "path": {
+                                "kind": "step_output",
+                                "sourceNodeId": "path",
+                                "sourcePath": "path",
+                            },
+                        },
+                    },
+                ],
+                "edges": [
+                    {"fromNodeId": "spec", "toNodeId": "render"},
+                    {"fromNodeId": "path", "toNodeId": "render"},
+                ],
+            },
+        },
+    )
+
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={},
+    )
+
+    assert run_response.status_code == 200
+    body = run_response.json()
+    assert body["job"]["metadata"]["workflow_source"] == "studio"
+    assert body["job"]["metadata"]["render_path_mode"] == "auto"
 
 
 def test_studio_scheduler_advances_dependency_from_durable_step_state(monkeypatch) -> None:
@@ -3032,6 +3181,175 @@ def test_preflight_plan_endpoint_returns_valid_true_for_simple_plan():
     assert body["errors"] == {}
 
 
+def test_preflight_plan_endpoint_rejects_render_task_without_explicit_path() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": [],
+                    "tool_requests": ["docx_render_from_spec"],
+                    "tool_inputs": {"docx_render_from_spec": {"document_spec": {"blocks": []}}},
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["RenderDocx"] == "render_path_explicit_required:docx_render_from_spec"
+    assert body["diagnostics"][0]["code"] == "render_path_explicit_required"
+
+
+def test_preflight_plan_endpoint_rejects_dependency_derived_render_path() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [["DeriveOutputPath", "RenderDocx"]],
+            "tasks": [
+                {
+                    "name": "DeriveOutputPath",
+                    "description": "Derive output path",
+                    "instruction": "derive",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "transform",
+                    "deps": [],
+                    "tool_requests": ["derive_output_filename"],
+                    "tool_inputs": {
+                        "derive_output_filename": {
+                            "document_type": "document",
+                            "output_extension": "docx",
+                            "target_role_name": "deployment_report",
+                        }
+                    },
+                    "critic_required": False,
+                },
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": ["DeriveOutputPath"],
+                    "tool_requests": ["docx_render_from_spec"],
+                    "tool_inputs": {
+                        "docx_render_from_spec": {
+                            "document_spec": {"blocks": []},
+                            "path": {
+                                "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
+                            },
+                        }
+                    },
+                    "critic_required": False,
+                },
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["RenderDocx"] == "render_path_derived_not_allowed:docx_render_from_spec"
+    assert any(
+        diagnostic["code"] == "render_path_derived_not_allowed"
+        and diagnostic["field"] == "RenderDocx"
+        for diagnostic in body["diagnostics"]
+    )
+
+
+def test_preflight_plan_endpoint_accepts_render_output_path_alias_literal() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": [],
+                    "tool_requests": ["docx_render_from_spec"],
+                    "tool_inputs": {
+                        "docx_render_from_spec": {
+                            "document_spec": {"blocks": []},
+                            "output_path": "documents/report.docx",
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
+
+
+def test_preflight_plan_endpoint_accepts_render_path_from_job_context_reference() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": [],
+                    "tool_requests": ["docx_render_from_spec"],
+                    "tool_inputs": {
+                        "docx_render_from_spec": {
+                            "document_spec": {"blocks": []},
+                            "path": {"$from": "job_context.path"},
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {"path": "documents/report.docx"},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
+
+
 def test_preflight_plan_endpoint_returns_reference_error_for_broken_dependency_tool():
     payload = {
         "plan": {
@@ -3545,6 +3863,75 @@ def test_composer_compile_emits_run_spec(monkeypatch) -> None:
             body["run_spec"]["steps"][1]["step_id"],
         ]
     ]
+
+
+def test_composer_compile_allows_derived_render_paths_in_studio_mode(monkeypatch) -> None:
+    registry = _document_render_registry()
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+
+    response = client.post(
+        "/composer/compile",
+        json={
+            "draft": {
+                "summary": "Render a DOCX from a generated spec",
+                "nodes": [
+                    {
+                        "id": "spec",
+                        "taskName": "GenerateDocumentSpec",
+                        "capabilityId": "document.spec.generate",
+                        "bindings": {
+                            "instruction": {
+                                "kind": "literal",
+                                "value": "Create a deployment report document.",
+                            },
+                            "topic": {"kind": "literal", "value": "Deployment report"},
+                            "audience": {"kind": "literal", "value": "Engineers"},
+                        },
+                    },
+                    {
+                        "id": "path",
+                        "taskName": "DeriveOutputPath",
+                        "capabilityId": "derive_output_filename",
+                        "bindings": {
+                            "document_type": {"kind": "literal", "value": "document"},
+                            "output_extension": {"kind": "literal", "value": "docx"},
+                            "target_role_name": {
+                                "kind": "literal",
+                                "value": "deployment_report",
+                            },
+                        },
+                    },
+                    {
+                        "id": "render",
+                        "taskName": "RenderDocument",
+                        "capabilityId": "document.docx.render",
+                        "bindings": {
+                            "document_spec": {
+                                "kind": "step_output",
+                                "sourceNodeId": "spec",
+                                "sourcePath": "document_spec",
+                            },
+                            "path": {
+                                "kind": "step_output",
+                                "sourceNodeId": "path",
+                                "sourcePath": "path",
+                            },
+                        },
+                    },
+                ],
+                "edges": [
+                    {"fromNodeId": "spec", "toNodeId": "render"},
+                    {"fromNodeId": "path", "toNodeId": "render"},
+                ],
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["preflight_errors"] == {}
 
 
 def test_build_plan_from_composer_draft_flags_control_flow_nodes() -> None:

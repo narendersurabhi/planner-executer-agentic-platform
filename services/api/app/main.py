@@ -36,6 +36,7 @@ from libs.core import (
     mcp_gateway,
     models,
     payload_resolver,
+    planner_contracts,
     run_specs,
     runtime_manifest,
     state_machine,
@@ -66,7 +67,15 @@ from .models import (
     WorkflowTriggerRecord,
     WorkflowVersionRecord,
 )
-from . import chat_execution_service, chat_service, dispatch_service, intent_service, memory_store
+from . import (
+    chat_execution_service,
+    chat_service,
+    dispatch_service,
+    feedback_service,
+    intent_service,
+    memory_promotion_service,
+    memory_store,
+)
 
 core_logging.configure_logging("api")
 logger = logging.getLogger("api.orchestrator")
@@ -3531,7 +3540,14 @@ def _chat_runtime() -> chat_service.ChatServiceRuntime:
     return chat_service.ChatServiceRuntime(
         route_turn=_route_chat_turn,
         run_direct_capability=_run_chat_direct_capability,
-        create_job=_create_job_internal,
+        create_job=lambda job, db: _create_job_internal(
+            job,
+            db,
+            metadata_overrides={
+                "workflow_source": "chat",
+                "render_path_mode": planner_contracts.RENDER_PATH_MODE_AUTO,
+            },
+        ),
         run_workflow=_run_chat_workflow,
         inspect_workflow=_inspect_chat_workflow,
         utcnow=_utcnow,
@@ -3704,6 +3720,7 @@ def _run_chat_direct_capability(
             normalized_context_json,
             goal_text=str(goal or capability_spec.description or capability_spec.capability_id),
             goal_intent_graph=None,
+            render_path_mode=planner_contracts.RENDER_PATH_MODE_AUTO,
         ),
         _compile_plan_runtime_conformance_errors(plan),
     )
@@ -3724,6 +3741,7 @@ def _run_chat_direct_capability(
         metadata_overrides={
             "goal_intent_graph": None,
             "workflow_source": "chat_direct",
+            "render_path_mode": planner_contracts.RENDER_PATH_MODE_AUTO,
             "scheduler_mode": POSTGRES_RUN_SPEC_SCHEDULER_MODE,
             "run_kind": models.RunKind.chat_direct.value,
             "run_spec": run_spec.model_dump(mode="json"),
@@ -4321,6 +4339,26 @@ def _semantic_user_id_from_context(context: Mapping[str, Any] | None) -> str:
     return _semantic_default_user_id()
 
 
+def _chat_authenticated_user_id(request: Request) -> str | None:
+    state = getattr(request, "state", None)
+    for attr in ("authenticated_user_id", "user_id"):
+        candidate = _semantic_normalize_text(getattr(state, attr, None), max_len=120)
+        if candidate:
+            return candidate
+    for header_name in ("X-Authenticated-User-Id", "X-User-Id"):
+        candidate = _semantic_normalize_text(request.headers.get(header_name), max_len=120)
+        if candidate:
+            return candidate
+    return None
+
+
+def _feedback_actor_key(request: Request) -> str | None:
+    authenticated = _chat_authenticated_user_id(request)
+    if authenticated:
+        return authenticated
+    return _semantic_normalize_text(request.headers.get("X-Feedback-Actor-Id"), max_len=120)
+
+
 def _retrieve_intent_workflow_hints(
     db: Session | None,
     *,
@@ -4520,27 +4558,30 @@ def _persist_intent_workflow_memory(
     }
     memory_key = f"intent_workflow:{job.id}"
     try:
-        memory_store.write_memory(
-            db,
-            models.MemoryWrite(
-                name="semantic_memory",
-                scope=models.MemoryScope.user,
-                user_id=user_id,
-                key=memory_key,
-                payload=semantic_record,
-                metadata={
-                    "semantic": True,
-                    "semantic_namespace": "intent_workflows",
-                    "semantic_subject": semantic_record["subject"],
-                    "job_id_source": job.id,
-                    "outcome": outcome,
-                },
-            ),
+        write_request = memory_promotion_service.build_semantic_memory_write(
+            user_id=user_id,
+            key=memory_key,
+            payload=semantic_record,
+            metadata={
+                "semantic": True,
+                "semantic_namespace": "intent_workflows",
+                "semantic_subject": semantic_record["subject"],
+                "job_id_source": job.id,
+                "outcome": outcome,
+                "promotion_source": "intent_workflow_outcome",
+            },
         )
+        if isinstance(write_request.payload, Mapping):
+            write_request.metadata["semantic_subject"] = str(
+                write_request.payload.get("subject") or write_request.metadata.get("semantic_subject") or ""
+            )
+        memory_store.write_memory(db, write_request)
         metadata["intent_memory_persisted"] = True
         metadata["intent_memory_persisted_at"] = _utcnow().isoformat()
         metadata["intent_memory_key"] = memory_key
         metadata["intent_memory_user_id"] = user_id
+        metadata["intent_memory_indexable"] = bool(write_request.metadata.get("indexable"))
+        metadata["intent_memory_sensitive"] = bool(write_request.metadata.get("sensitive"))
         job.metadata_json = metadata
     except Exception:  # noqa: BLE001
         logger.exception("intent_memory_persist_failed", extra={"job_id": job.id})
@@ -7688,6 +7729,8 @@ def _stream_for_event(event_type: str) -> str:
         return events.TASK_STREAM
     if event_type.startswith("policy"):
         return events.POLICY_STREAM
+    if event_type.startswith("feedback"):
+        return events.FEEDBACK_STREAM
     return events.TASK_STREAM
 
 
@@ -7861,6 +7904,9 @@ def _handle_plan_created(envelope: dict) -> None:
             goal_intent_graph=job.metadata_json.get("goal_intent_graph")
             if job and isinstance(job.metadata_json, dict)
             else None,
+            render_path_mode=planner_contracts.render_path_mode_from_metadata(
+                job.metadata_json if job and isinstance(job.metadata_json, dict) else None
+            ),
         )
         preflight_errors = _merge_preflight_errors(
             preflight_errors,
@@ -8950,6 +8996,7 @@ def _compile_plan_preflight(
     | Mapping[str, Any]
     | None = None,
     goal_intent_graph: Mapping[str, Any] | None = None,
+    render_path_mode: str = planner_contracts.RENDER_PATH_MODE_EXPLICIT,
 ) -> dict[str, str]:
     errors: dict[str, str] = {}
     capabilities: dict[str, capability_registry.CapabilitySpec] = {}
@@ -9108,6 +9155,31 @@ def _compile_plan_preflight(
             errors[task.name] = f"{first_tool}:{message}"
             continue
 
+        request_payload_error: str | None = None
+        for request_id in task.tool_requests or []:
+            resolved_payload_raw = resolved_inputs.get(request_id, {})
+            resolved_payload = (
+                resolved_payload_raw
+                if isinstance(resolved_payload_raw, Mapping)
+                else {}
+            )
+            request_payload_error = _preflight_request_payload_semantics(
+                request_id=request_id,
+                payload=resolved_payload,
+                raw_payload=(
+                    normalized_tool_inputs.get(request_id, {})
+                    if isinstance(normalized_tool_inputs.get(request_id), Mapping)
+                    else {}
+                ),
+                job_context=context.get("job_context"),
+                render_path_mode=render_path_mode,
+            )
+            if request_payload_error:
+                errors[task.name] = request_payload_error
+                break
+        if request_payload_error:
+            continue
+
         validation_errors = payload_resolver.validate_tool_inputs(
             resolved_inputs, TOOL_INPUT_SCHEMAS
         )
@@ -9123,13 +9195,6 @@ def _compile_plan_preflight(
                 if isinstance(resolved_payload_raw, Mapping)
                 else {}
             )
-            request_payload_error = _preflight_request_payload_semantics(
-                request_id=request_id,
-                payload=resolved_payload,
-            )
-            if request_payload_error:
-                errors[task.name] = request_payload_error
-                break
             segment_payload = dict(resolved_payload)
             segment_payload.setdefault("tool_inputs", task_payload.get("tool_inputs", {}))
             if (
@@ -9238,7 +9303,19 @@ def _preflight_request_payload_semantics(
     *,
     request_id: str,
     payload: Mapping[str, Any],
+    raw_payload: Mapping[str, Any] | None = None,
+    job_context: Mapping[str, Any] | None = None,
+    render_path_mode: str = planner_contracts.RENDER_PATH_MODE_EXPLICIT,
 ) -> str | None:
+    render_path_error = planner_contracts.validate_render_path_requirement(
+        request_id=request_id,
+        raw_payload=raw_payload,
+        resolved_payload=payload,
+        job_context=job_context,
+        render_path_mode=render_path_mode,
+    )
+    if render_path_error:
+        return render_path_error
     if request_id in {"memory.read", "memory.write"}:
         return _preflight_memory_request_payload(request_id=request_id, payload=payload)
     return None
@@ -9467,6 +9544,18 @@ def _preflight_error_diagnostic(task_name: str, message: str) -> dict[str, Any]:
         return diagnostic
     if normalized.startswith("task_intent_mismatch:"):
         diagnostic["code"] = "task_intent_mismatch"
+        return diagnostic
+    if normalized.startswith("render_path_explicit_required:"):
+        diagnostic["code"] = "render_path_explicit_required"
+        diagnostic["message"] = (
+            "Render tasks in raw API and automation flows require a caller-provided path."
+        )
+        return diagnostic
+    if normalized.startswith("render_path_derived_not_allowed:"):
+        diagnostic["code"] = "render_path_derived_not_allowed"
+        diagnostic["message"] = (
+            "Render tasks in raw API and automation flows cannot derive paths from prior task output."
+        )
         return diagnostic
     if normalized.startswith("runtime conformance failed for capability"):
         diagnostic["code"] = "runtime_conformance_failed"
@@ -11010,17 +11099,28 @@ def _debugger_timeline_for_job(job_id: str, *, limit: int, db: Session) -> list[
 @app.post("/chat/sessions", response_model=chat_contracts.ChatSession)
 def create_chat_session(
     request: chat_contracts.ChatSessionCreate,
+    raw_request: Request,
     db: Session = Depends(get_db),
 ) -> chat_contracts.ChatSession:
-    return chat_service.create_session(db, request, runtime=_chat_runtime())
+    return chat_service.create_session(
+        db,
+        request,
+        runtime=_chat_runtime(),
+        user_id=_chat_authenticated_user_id(raw_request),
+    )
 
 
 @app.get("/chat/sessions/{session_id}", response_model=chat_contracts.ChatSession)
 def get_chat_session(
     session_id: str,
+    raw_request: Request,
     db: Session = Depends(get_db),
 ) -> chat_contracts.ChatSession:
-    session = chat_service.get_session(db, session_id)
+    session = chat_service.get_session(
+        db,
+        session_id,
+        user_id=_chat_authenticated_user_id(raw_request),
+    )
     if session is None:
         raise HTTPException(status_code=404, detail="chat_session_not_found")
     return session
@@ -11033,6 +11133,7 @@ def get_chat_session(
 def create_chat_message(
     session_id: str,
     request: chat_contracts.ChatTurnRequest,
+    raw_request: Request,
     db: Session = Depends(get_db),
 ) -> chat_contracts.ChatTurnResponse:
     try:
@@ -11041,11 +11142,91 @@ def create_chat_message(
             session_id,
             request,
             runtime=_chat_runtime(),
+            user_id=_chat_authenticated_user_id(raw_request),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="chat_session_not_found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _raise_feedback_http_error(exc: ValueError) -> None:
+    detail = str(exc)
+    status_code = 404 if detail == "feedback_target_not_found" else 400
+    raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/feedback", response_model=models.Feedback)
+def submit_feedback(
+    request: models.FeedbackCreate,
+    raw_request: Request,
+    db: Session = Depends(get_db),
+) -> models.Feedback:
+    try:
+        feedback = feedback_service.submit_feedback(
+            db,
+            request,
+            actor_key=_feedback_actor_key(raw_request),
+            user_id=_chat_authenticated_user_id(raw_request),
+        )
+    except ValueError as exc:
+        _raise_feedback_http_error(exc)
+    _emit_event("feedback.submitted", feedback.model_dump(mode="json"))
+    return feedback
+
+
+@app.get("/feedback", response_model=models.FeedbackListResponse)
+def get_feedback(
+    target_type: models.FeedbackTargetType | None = Query(default=None),
+    target_id: str | None = Query(default=None),
+    session_id: str | None = Query(default=None),
+    job_id: str | None = Query(default=None),
+    plan_id: str | None = Query(default=None),
+    message_id: str | None = Query(default=None),
+    actor_key: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.FeedbackListResponse:
+    return feedback_service.list_feedback_response(
+        db,
+        target_type=target_type,
+        target_id=target_id,
+        session_id=session_id,
+        job_id=job_id,
+        plan_id=plan_id,
+        message_id=message_id,
+        actor_key=actor_key,
+        limit=limit,
+    )
+
+
+@app.get("/jobs/{job_id}/feedback", response_model=models.FeedbackListResponse)
+def get_job_feedback(
+    job_id: str,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.FeedbackListResponse:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return feedback_service.list_feedback_response(db, job_id=job_id, limit=limit)
+
+
+@app.get("/chat/sessions/{session_id}/feedback", response_model=models.FeedbackListResponse)
+def get_chat_session_feedback(
+    session_id: str,
+    raw_request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.FeedbackListResponse:
+    session = chat_service.get_session(
+        db,
+        session_id,
+        user_id=_chat_authenticated_user_id(raw_request),
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="chat_session_not_found")
+    return feedback_service.list_feedback_response(db, session_id=session_id, limit=limit)
 
 
 def _create_job_internal(
@@ -11088,6 +11269,7 @@ def _create_job_internal(
     metadata: Dict[str, Any] = {}
     if job.idempotency_key:
         metadata["idempotency_key"] = job.idempotency_key
+    metadata["render_path_mode"] = planner_contracts.RENDER_PATH_MODE_EXPLICIT
     if LLM_PROVIDER_NAME:
         metadata["llm_provider"] = LLM_PROVIDER_NAME
     if LLM_MODEL_NAME:
@@ -11777,6 +11959,7 @@ def stream_events(request: Request, once: bool = False):
             events.TASK_STREAM: "0-0",
             events.CRITIC_STREAM: "0-0",
             events.POLICY_STREAM: "0-0",
+            events.FEEDBACK_STREAM: "0-0",
         }
         while True:
             if request.client is None:
@@ -11933,20 +12116,22 @@ def write_semantic_memory(
         ),
         "captured_at": _utcnow().isoformat(),
     }
-    write_request = models.MemoryWrite(
-        name="semantic_memory",
-        scope=models.MemoryScope.user,
-        key=key,
+    write_request = memory_promotion_service.build_semantic_memory_write(
         user_id=user_id,
+        key=key,
         payload=semantic_record,
         metadata=metadata,
         ttl_seconds=ttl_seconds,
     )
+    if isinstance(write_request.payload, Mapping):
+        write_request.metadata["semantic_subject"] = str(
+            write_request.payload.get("subject") or write_request.metadata.get("semantic_subject") or ""
+        )
     try:
         entry = memory_store.write_memory(db, write_request)
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"entry": entry.model_dump(), "semantic_record": semantic_record}
+    return {"entry": entry.model_dump(), "semantic_record": write_request.payload}
 
 
 @app.post("/memory/semantic/search")
@@ -12344,6 +12529,7 @@ def preflight_plan(
         goal_text=goal_text,
         normalized_intent_envelope=provided_envelope,
         goal_intent_graph=provided_graph if isinstance(provided_graph, Mapping) else None,
+        render_path_mode=planner_contracts.RENDER_PATH_MODE_EXPLICIT,
     )
     diagnostics = _preflight_error_diagnostics(preflight_errors)
     return {
@@ -12466,6 +12652,7 @@ def _compile_workflow_definition_version(
         preview_job_context,
         goal_text=goal_text,
         goal_intent_graph=None,
+        render_path_mode=planner_contracts.RENDER_PATH_MODE_AUTO,
     )
     preflight_errors = _merge_preflight_errors(
         preflight_errors,
@@ -12901,6 +13088,7 @@ def _run_workflow_version_internal(
             context_json,
             goal_text=version.goal or definition.goal or definition.title,
             goal_intent_graph=None,
+            render_path_mode=planner_contracts.RENDER_PATH_MODE_AUTO,
         ),
         _compile_plan_runtime_conformance_errors(compiled_plan),
     )
@@ -12928,6 +13116,7 @@ def _run_workflow_version_internal(
     )
     metadata_overrides = {
         "workflow_source": "studio",
+        "render_path_mode": planner_contracts.RENDER_PATH_MODE_AUTO,
         "workflow_definition_id": definition.id,
         "workflow_version_id": version.id,
         "goal_intent_graph": None,
@@ -13161,6 +13350,7 @@ def compile_composer_draft(
             goal_text=goal_text,
             normalized_intent_envelope=provided_envelope,
             goal_intent_graph=provided_graph if isinstance(provided_graph, Mapping) else None,
+            render_path_mode=planner_contracts.RENDER_PATH_MODE_AUTO,
         )
         for diagnostic in _preflight_error_diagnostics(preflight_errors):
             diagnostics_errors.append(
@@ -13284,6 +13474,9 @@ def _create_plan_internal(
         goal_intent_graph=job.metadata_json.get("goal_intent_graph")
         if job and isinstance(job.metadata_json, dict)
         else None,
+        render_path_mode=planner_contracts.render_path_mode_from_metadata(
+            job.metadata_json if job and isinstance(job.metadata_json, dict) else None
+        ),
     )
     if preflight_errors:
         raise HTTPException(

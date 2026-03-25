@@ -1260,8 +1260,10 @@ def _build_capability_validation_payload_for_request(
     raw_tool_inputs: dict[str, Any],
     request: planner_contracts.PlanRequest,
 ) -> dict[str, Any]:
+    request_id = next((str(item).strip() for item in task.tool_requests or [] if str(item).strip()), "")
     return planner_service.build_capability_validation_payload(
         task,
+        request_id,
         raw_tool_inputs,
         request,
     )

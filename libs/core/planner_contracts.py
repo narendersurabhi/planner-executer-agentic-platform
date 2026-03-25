@@ -8,6 +8,24 @@ from pydantic import BaseModel, ConfigDict, Field
 from libs.core import capability_registry, intent_contract, models, workflow_contracts
 
 
+RENDER_PATH_MODE_AUTO = "auto"
+RENDER_PATH_MODE_EXPLICIT = "explicit"
+
+_RENDER_REQUEST_IDS = frozenset(
+    {
+        "docx_render_from_spec",
+        "docx_generate_from_spec",
+        "pdf_render_from_spec",
+        "pdf_generate_from_spec",
+        "document.docx.render",
+        "document.docx.generate",
+        "document.pdf.render",
+        "document.pdf.generate",
+    }
+)
+_RENDER_PATH_KEYS = ("path", "output_path", "filename", "file_name", "output_filename")
+
+
 class PlanRequestCapabilityAdapter(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -46,6 +64,143 @@ class PlanRequest(BaseModel):
     goal_intent_graph: workflow_contracts.IntentGraph | None = None
     semantic_capability_hints: list[dict[str, Any]] = Field(default_factory=list)
     max_dependency_depth: int | None = None
+    render_path_mode: str = RENDER_PATH_MODE_EXPLICIT
+
+
+def normalize_render_path_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == RENDER_PATH_MODE_AUTO:
+        return RENDER_PATH_MODE_AUTO
+    return RENDER_PATH_MODE_EXPLICIT
+
+
+def render_path_mode_from_metadata(metadata: Mapping[str, Any] | None) -> str:
+    if not isinstance(metadata, Mapping):
+        return RENDER_PATH_MODE_EXPLICIT
+    return normalize_render_path_mode(metadata.get("render_path_mode"))
+
+
+def render_path_mode(request: PlanRequest) -> str:
+    return normalize_render_path_mode(getattr(request, "render_path_mode", None))
+
+
+def is_render_request_id(request_id: str | None) -> bool:
+    normalized = str(request_id or "").strip()
+    return normalized in _RENDER_REQUEST_IDS
+
+
+def _non_empty_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _mapping_has_explicit_render_path(payload: Mapping[str, Any] | None) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    return any(_non_empty_string(payload.get(key)) for key in _RENDER_PATH_KEYS)
+
+
+def _job_context_has_explicit_render_path(job_context: Mapping[str, Any] | None) -> bool:
+    if not isinstance(job_context, Mapping):
+        return False
+    return any(_non_empty_string(job_context.get(key)) for key in _RENDER_PATH_KEYS)
+
+
+def _job_context_has_explicit_render_path_key(
+    job_context: Mapping[str, Any] | None,
+    key: str,
+) -> bool:
+    if not isinstance(job_context, Mapping):
+        return False
+    normalized = str(key or "").strip()
+    if normalized == "path":
+        return bool(
+            _non_empty_string(job_context.get("path"))
+            or _non_empty_string(job_context.get("output_path"))
+        )
+    if normalized == "output_path":
+        return bool(
+            _non_empty_string(job_context.get("output_path"))
+            or _non_empty_string(job_context.get("path"))
+        )
+    return _non_empty_string(job_context.get(normalized)) is not None
+
+
+def _reference_segments(path_spec: Any) -> list[str] | None:
+    segments: list[str] = []
+    if isinstance(path_spec, (list, tuple)):
+        for item in path_spec:
+            normalized = _non_empty_string(item)
+            if normalized:
+                segments.append(normalized)
+    elif isinstance(path_spec, str):
+        raw = path_spec.strip()
+        if not raw:
+            return None
+        if raw.startswith("$."):
+            raw = raw[2:]
+        if raw.startswith("/"):
+            segments = [
+                item.replace("~1", "/").replace("~0", "~")
+                for item in raw.split("/")[1:]
+                if item
+            ]
+        else:
+            segments = [item for item in raw.split(".") if item]
+    else:
+        return None
+    return segments or None
+
+
+def _reference_has_default_path(value: Mapping[str, Any] | None) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return _non_empty_string(value.get("$default")) is not None
+
+
+def validate_render_path_requirement(
+    *,
+    request_id: str,
+    raw_payload: Mapping[str, Any] | None,
+    resolved_payload: Mapping[str, Any] | None = None,
+    job_context: Mapping[str, Any] | None = None,
+    render_path_mode: str | None = None,
+) -> str | None:
+    if not is_render_request_id(request_id):
+        return None
+    if normalize_render_path_mode(render_path_mode) != RENDER_PATH_MODE_EXPLICIT:
+        return None
+
+    if _mapping_has_explicit_render_path(raw_payload):
+        return None
+
+    if isinstance(raw_payload, Mapping):
+        for key in _RENDER_PATH_KEYS:
+            raw_value = raw_payload.get(key)
+            if not isinstance(raw_value, Mapping):
+                continue
+            segments = _reference_segments(raw_value.get("$from"))
+            if not segments:
+                continue
+            if segments[0] == "job_context":
+                if len(segments) >= 2 and segments[1] in _RENDER_PATH_KEYS:
+                    if _job_context_has_explicit_render_path_key(
+                        job_context,
+                        segments[1],
+                    ) or _reference_has_default_path(raw_value):
+                        return None
+                return f"render_path_explicit_required:{request_id}"
+            return f"render_path_derived_not_allowed:{request_id}"
+
+    if _job_context_has_explicit_render_path(job_context):
+        return None
+
+    if _mapping_has_explicit_render_path(resolved_payload):
+        return f"render_path_explicit_required:{request_id}"
+
+    return f"render_path_explicit_required:{request_id}"
 
 
 def _candidate_capabilities_from_graph(
@@ -160,6 +315,7 @@ def build_plan_request(
             dict(item) for item in semantic_capability_hints or [] if isinstance(item, Mapping)
         ],
         max_dependency_depth=max_dependency_depth,
+        render_path_mode=render_path_mode_from_metadata(job_metadata),
     )
 
 
