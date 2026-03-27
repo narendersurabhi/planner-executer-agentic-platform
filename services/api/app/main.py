@@ -8952,7 +8952,7 @@ def _canonicalize_preflight_reference_path(
         normalized = [dep_name]
         return [root, *normalized] if root else normalized
 
-    tool_requests = [str(item).strip() for item in (dep_task.tool_requests or []) if str(item).strip()]
+    tool_requests = _task_request_ids_for_preflight(dep_task)
     tool_name: str | None = None
     tool_consumed = 0
     for end in range(len(tail), 0, -1):
@@ -8971,13 +8971,17 @@ def _canonicalize_preflight_reference_path(
     return [root, *normalized] if root else normalized
 
 
+def _task_request_ids_for_preflight(task: models.TaskCreate) -> list[str]:
+    return planner_contracts.planner_task_request_ids(task)
+
+
 def _build_preflight_dependency_output(task: models.TaskCreate) -> dict[str, Any]:
     output: dict[str, Any] = {
         "document_spec": {},
         "validation_report": {"valid": True, "errors": [], "warnings": []},
         "path": "documents/preflight.pdf",
     }
-    for tool_name in task.tool_requests:
+    for tool_name in _task_request_ids_for_preflight(task):
         output[tool_name] = {
             "document_spec": {},
             "validation_report": {"valid": True, "errors": [], "warnings": []},
@@ -9018,10 +9022,11 @@ def _compile_plan_preflight(
     render_path_mode: str = planner_contracts.RENDER_PATH_MODE_EXPLICIT,
 ) -> dict[str, str]:
     errors: dict[str, str] = {}
+    full_capability_registry: capability_registry.CapabilityRegistry | None = None
     capabilities: dict[str, capability_registry.CapabilitySpec] = {}
     try:
-        if capability_registry.resolve_capability_mode() != "disabled":
-            capabilities = capability_registry.load_capability_registry().enabled_capabilities()
+        full_capability_registry = capability_registry.load_capability_registry()
+        capabilities = full_capability_registry.enabled_capabilities()
     except Exception:  # noqa: BLE001
         capabilities = {}
     tasks_by_name: dict[str, models.TaskCreate] = {}
@@ -9048,6 +9053,19 @@ def _compile_plan_preflight(
         goal_intent_graph=goal_intent_graph,
     )
     for task_index, task in enumerate(plan.tasks):
+        task_request_ids = _task_request_ids_for_preflight(task)
+        for request_id in task_request_ids:
+            language_error = planner_contracts.validate_planner_request_language(
+                request_id,
+                capabilities=capabilities,
+                full_capabilities=full_capability_registry,
+                runtime_tool_names=sorted(set(TOOL_INPUT_SCHEMAS) | set(TOOL_INTENTS_BY_NAME)),
+            )
+            if language_error:
+                errors[task.name] = language_error
+                break
+        if task.name in errors:
+            continue
         dependency_names = _collect_ancestor_task_names(task, tasks_by_name)
         task_intent = _preflight_task_intent(task, goal_text=goal_text)
         goal_intent_segment = _select_goal_intent_segment_for_task(
@@ -9057,7 +9075,7 @@ def _compile_plan_preflight(
             goal_intent_segments=goal_intent_segments,
             total_tasks=len(plan.tasks),
         )
-        for request_id in task.tool_requests or []:
+        for request_id in task_request_ids:
             tool_intent = TOOL_INTENTS_BY_NAME.get(request_id)
             if tool_intent is not None:
                 mismatch = intent_contract.validate_tool_intent_compatibility(
@@ -9096,7 +9114,7 @@ def _compile_plan_preflight(
         task_payload = {
             "name": task.name,
             "instruction": task.instruction,
-            "tool_requests": list(task.tool_requests or []),
+            "tool_requests": list(task_request_ids),
             "tool_inputs": normalized_tool_inputs,
         }
 
@@ -9127,7 +9145,7 @@ def _compile_plan_preflight(
                     dep_task = tasks_by_name.get(dep_name)
                     if dep_name in dependency_names and dep_task:
                         referenced_tool = path[2]
-                        if referenced_tool not in set(dep_task.tool_requests or []):
+                        if referenced_tool not in set(_task_request_ids_for_preflight(dep_task)):
                             reference_error = (
                                 "input reference resolution failed: "
                                 f"path '{'.'.join(path)}' references unknown dependency tool "
@@ -9143,7 +9161,7 @@ def _compile_plan_preflight(
                     dep_task = tasks_by_name.get(dep_name)
                     if dep_name in dependency_names and dep_task:
                         referenced_tool = path[1]
-                        if referenced_tool not in set(dep_task.tool_requests or []):
+                        if referenced_tool not in set(_task_request_ids_for_preflight(dep_task)):
                             reference_error = (
                                 "input reference resolution failed: "
                                 f"path '{'.'.join(path)}' references unknown dependency tool "
@@ -9175,7 +9193,7 @@ def _compile_plan_preflight(
             continue
 
         request_payload_error: str | None = None
-        for request_id in task.tool_requests or []:
+        for request_id in task_request_ids:
             resolved_payload_raw = resolved_inputs.get(request_id, {})
             resolved_payload = (
                 resolved_payload_raw
@@ -9207,7 +9225,7 @@ def _compile_plan_preflight(
             errors[task.name] = f"{first_tool}:{message}"
             continue
 
-        for request_id in task.tool_requests or []:
+        for request_id in task_request_ids:
             resolved_payload_raw = resolved_inputs.get(request_id, {})
             resolved_payload = (
                 resolved_payload_raw
@@ -9275,6 +9293,11 @@ def _task_capability_requests_for_runtime_conformance(
 ) -> list[str]:
     capability_ids: list[str] = []
     seen: set[str] = set()
+    for request_id in getattr(task, "capability_requests", None) or []:
+        normalized = str(request_id or "").strip()
+        if normalized and normalized in known_capabilities and normalized not in seen:
+            seen.add(normalized)
+            capability_ids.append(normalized)
     for request_id in task.tool_requests or []:
         normalized = str(request_id or "").strip()
         if normalized and normalized in known_capabilities and normalized not in seen:
@@ -9396,7 +9419,7 @@ def _task_intent_inference_for_task(
     if inferred == models.ToolIntent.generate.value and not task.intent:
         unique_tool_intents = {
             TOOL_INTENTS_BY_NAME[request_id]
-            for request_id in (task.tool_requests or [])
+            for request_id in _task_request_ids_for_preflight(task)
             if request_id in TOOL_INTENTS_BY_NAME
         }
         if len(unique_tool_intents) == 1:
@@ -9460,7 +9483,7 @@ def _select_goal_intent_segment_for_task(
     )
     task_requests = {
         str(name).strip().lower()
-        for name in (task.tool_requests or [])
+        for name in _task_request_ids_for_preflight(task)
         if str(name).strip()
     }
     if task_requests:
@@ -9563,6 +9586,51 @@ def _preflight_error_diagnostic(task_name: str, message: str) -> dict[str, Any]:
         return diagnostic
     if normalized.startswith("task_intent_mismatch:"):
         diagnostic["code"] = "task_intent_mismatch"
+        return diagnostic
+    if normalized.startswith("planner_request_language_invalid:"):
+        parts = normalized.split(":")
+        requested_id = parts[1] if len(parts) > 1 else ""
+        canonical_id = parts[3] if len(parts) > 3 else ""
+        diagnostic["code"] = "planner_request_language_invalid"
+        diagnostic["message"] = (
+            f"Planner tasks must use canonical capability IDs. Use "
+            f"'{canonical_id or 'a canonical capability ID'}' instead of "
+            f"'{requested_id or 'the raw request ID'}'."
+        )
+        if requested_id:
+            diagnostic["request_id"] = requested_id
+        if canonical_id:
+            diagnostic["canonical_request_id"] = canonical_id
+        return diagnostic
+    if normalized.startswith("planner_request_capability_disabled:"):
+        capability_id = normalized.split(":", 1)[1].strip()
+        diagnostic["code"] = "planner_request_capability_disabled"
+        diagnostic["message"] = f"Capability '{capability_id}' is disabled."
+        if capability_id:
+            diagnostic["capability_id"] = capability_id
+        return diagnostic
+    if normalized.startswith("planner_request_capability_not_allowed:"):
+        capability_id = normalized.split(":", 1)[1].strip()
+        diagnostic["code"] = "planner_request_capability_not_allowed"
+        diagnostic["message"] = f"Capability '{capability_id}' is not allowed for planning."
+        if capability_id:
+            diagnostic["capability_id"] = capability_id
+        return diagnostic
+    if normalized.startswith("planner_request_runtime_tool_not_allowed:"):
+        request_id = normalized.split(":", 1)[1].strip()
+        diagnostic["code"] = "planner_request_runtime_tool_not_allowed"
+        diagnostic["message"] = (
+            f"Runtime tool '{request_id}' cannot appear in planner-visible requests."
+        )
+        if request_id:
+            diagnostic["request_id"] = request_id
+        return diagnostic
+    if normalized.startswith("planner_request_unknown_capability:"):
+        request_id = normalized.split(":", 1)[1].strip()
+        diagnostic["code"] = "planner_request_unknown_capability"
+        diagnostic["message"] = f"Unknown capability '{request_id}'."
+        if request_id:
+            diagnostic["request_id"] = request_id
         return diagnostic
     if normalized.startswith("render_path_explicit_required:"):
         diagnostic["code"] = "render_path_explicit_required"

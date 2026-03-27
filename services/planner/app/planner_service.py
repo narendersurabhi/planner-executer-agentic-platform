@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import BaseModel
 
 from libs.core import (
+    capability_registry,
     intent_contract,
     job_projection,
     llm_provider,
@@ -94,6 +95,7 @@ def build_plan_request(
     job: models.Job,
     tools: list[models.ToolSpec],
     *,
+    planner_tools: list[models.ToolSpec] | None = None,
     config: PlannerServiceConfig,
     runtime: PlannerServiceRuntime,
     include_semantic_hints: bool | None = None,
@@ -110,6 +112,7 @@ def build_plan_request(
     return planner_contracts.build_plan_request(
         job,
         tools=tools,
+        planner_tools=planner_tools or [],
         capabilities=capabilities,
         semantic_capability_hints=semantic_hints,
         max_dependency_depth=config.max_dependency_depth,
@@ -163,11 +166,15 @@ def rule_based_plan(_: planner_contracts.PlanRequest) -> models.PlanCreate:
 
 def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
     capabilities = planner_contracts.capability_map(request)
-    allowed_names = sorted({tool.name for tool in request.tools} | set(capabilities.keys()))
-    tool_names = ", ".join(allowed_names)
-    tool_catalog = [
+    canonical_capability_ids = sorted(
         {
-            "type": "tool",
+            str(capability.capability_id).strip()
+            for capability in request.capabilities
+            if str(capability.capability_id).strip()
+        }
+    )
+    planner_tool_catalog = [
+        {
             "name": tool.name,
             "description": tool.description,
             "input_schema": tool.input_schema,
@@ -179,12 +186,11 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
             if isinstance(tool.tool_intent, Enum)
             else tool.tool_intent,
         }
-        for tool in request.tools
+        for tool in request.planner_tools
     ]
     capability_catalog = [
         {
-            "type": "capability",
-            "name": capability.capability_id,
+            "capability_id": capability.capability_id,
             "description": capability.description,
             "risk_tier": capability.risk_tier,
             "idempotency": capability.idempotency,
@@ -192,19 +198,27 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
             "subgroup": capability.subgroup,
             "input_schema_ref": capability.input_schema_ref,
             "output_schema_ref": capability.output_schema_ref,
+            "aliases": list(capability.aliases),
+            "planner_hints": dict(capability.planner_hints),
             "adapters": [
                 {
                     "type": adapter.type,
                     "server_id": adapter.server_id,
-                    "tool_name": adapter.tool_name,
                 }
                 for adapter in capability.adapters
             ],
         }
         for capability in capabilities.values()
+        if capability.capability_id in canonical_capability_ids
     ]
-    tool_catalog_json = json.dumps(
-        tool_catalog + capability_catalog,
+    capability_catalog_json = json.dumps(
+        capability_catalog,
+        ensure_ascii=False,
+        indent=2,
+        default=_json_fallback,
+    )
+    planner_tool_catalog_json = json.dumps(
+        planner_tool_catalog,
         ensure_ascii=False,
         indent=2,
         default=_json_fallback,
@@ -258,7 +272,8 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
         '- dag_edges must be an array of 2-element string arrays, e.g. [["A","B"],["B","C"]].\n'
         "- acceptance_criteria must be an array of strings, not a single string.\n"
         "Each task must include: name, description, instruction, acceptance_criteria, "
-        "expected_output_schema_ref, intent, deps, tool_requests, tool_inputs, critic_required.\n"
+        "expected_output_schema_ref, intent, deps, capability_requests, tool_inputs, critic_required.\n"
+        "tool_requests is optional compatibility output and may be omitted or left empty.\n"
         "Example:\n"
         "{\n"
         '  "planner_version": "1.0.0",\n'
@@ -273,49 +288,56 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
         '      "expected_output_schema_ref": "schemas/example",\n'
         '      "intent": "generate",\n'
         '      "deps": [],\n'
-        '      "tool_requests": ["llm_generate"],\n'
-        '      "tool_inputs": {"llm_generate": {"text": "..."}},\n'
+        '      "capability_requests": ["llm.text.generate"],\n'
+        '      "tool_inputs": {"llm.text.generate": {"text": "..."}},\n'
         '      "critic_required": false\n'
         "    }\n"
         "  ]\n"
         "}\n"
         "\n"
         "Rules:\n"
-        "1) Use only tool names from the allowed list.\n"
+        "1) Use canonical capability IDs in task.capability_requests whenever a matching capability exists.\n"
         "1a) Every task must set intent to one of: transform, generate, validate, render, io.\n"
+        "1b) Raw runtime tool names are executor details. Do not emit adapter tool names when a "
+        "capability ID exists.\n"
+        "1c) You may omit tool_requests entirely; runtime compatibility fields will be derived later.\n"
         "2) deps must reference task names that appear in this plan.\n"
         "3) If a tool requires structured JSON, add a prior task to generate that JSON and set "
         "expected_output_schema_ref to that schema.\n"
-        "4) If a tool requires specific inputs, put them in task.tool_inputs "
-        "(a dict keyed by tool name). Do NOT embed JSON in instruction text.\n"
+        "4) If a tool or capability requires specific inputs, put them in task.tool_inputs "
+        "(a dict keyed by the same request ID used in capability_requests). Do NOT embed JSON in instruction text.\n"
         "5) Do NOT use placeholder strings like ${Task.output} in tool_inputs. "
         "When a later task needs dependency output, either omit the field and rely on deps context "
         "injection OR use explicit reference objects like "
         '{"$from":"dependencies_by_name.TaskA.tool_name.field"} (or add "$default"). '
         "You may still include other inputs like strict, allowed_block_types, or path.\n"
-        "6) Prefer the generic validation + rendering pipeline:\n"
-        "   - Generate a DocumentSpec JSON.\n"
-        "   - Validate with document_spec_validate.\n"
-        "   - Render with docx_render_from_spec or pdf_render_from_spec.\n"
+        "6) Planner support tools are metadata-only helpers. Never emit planner support "
+        "tool names in tasks, capability_requests, or tool_requests.\n"
+        "7) Prefer the generic validation + rendering pipeline:\n"
+        "   - Generate a DocumentSpec JSON with document.spec.generate.\n"
+        "   - Validate with document.spec.validate.\n"
+        "   - Render with document.docx.render or document.pdf.render.\n"
         "   - Do not add a separate output-path derivation task unless the path itself is needed downstream.\n"
-        "   Use specialized tools only if explicitly requested.\n"
-        "7) If unsure, use llm_generate.\n"
-        "8) Keep output compact. Do NOT copy or embed large raw text from Job JSON "
+        "8) If unsure, use llm.text.generate.\n"
+        "9) Keep output compact. Do NOT copy or embed large raw text from Job JSON "
         "(especially long context fields like job_description) into tasks, instructions, "
         "acceptance criteria, or tool_inputs.\n"
-        "9) For tool_inputs include only minimal scalar params. Omit large/context fields "
+        "10) For tool_inputs include only minimal scalar params. Omit large/context fields "
         "(e.g., job, memory, document_spec) "
         "and rely on runtime dependency/context injection.\n"
-        "10) Keep each task instruction concise (one short paragraph) and keep acceptance "
+        "11) Keep each task instruction concise (one short paragraph) and keep acceptance "
         "criteria short bullets.\n"
         "\n"
         f"{depth_hint}"
         f"{normalized_intent_block}"
         f"{intent_graph_block}"
         f"{intent_repair_block}"
-        f"Allowed tool names: {tool_names}\n"
         f"{semantic_capability_block}"
-        f"Tool catalog (JSON): {tool_catalog_json}\n"
+        f"Preferred capability IDs: {', '.join(canonical_capability_ids) or 'none'}\n"
+        f"Capability catalog (JSON): {capability_catalog_json}\n"
+        f"Planner support tools (metadata-only): "
+        f"{', '.join(tool.name for tool in request.planner_tools) or 'none'}\n"
+        f"Planner support tool catalog (JSON): {planner_tool_catalog_json}\n"
         f"Goal: {request.goal}\n"
         f"Job (JSON): {job_json}\n"
     )
@@ -326,23 +348,34 @@ def build_llm_repair_prompt(
     raw_output: str,
     request: planner_contracts.PlanRequest,
 ) -> str:
-    capabilities = planner_contracts.capability_map(request)
-    allowed_names = sorted({tool.name for tool in request.tools} | set(capabilities.keys()))
-    tool_names = ", ".join(allowed_names)
+    canonical_capability_ids = sorted(
+        {
+            str(capability.capability_id).strip()
+            for capability in request.capabilities
+            if str(capability.capability_id).strip()
+        }
+    )
+    planner_tool_names = sorted(tool.name for tool in request.planner_tools)
     return (
         "You are fixing a malformed planner response.\n"
         "Return ONLY one valid JSON object for PlanCreate.\n"
         "Do not include markdown, comments, or prose.\n"
         "Required top-level fields: planner_version, tasks_summary, dag_edges, tasks.\n"
         "Each task must include: name, description, instruction, acceptance_criteria, "
-        "expected_output_schema_ref, intent, deps, tool_requests, tool_inputs, critic_required.\n"
+        "expected_output_schema_ref, intent, deps, capability_requests, tool_inputs, critic_required.\n"
+        "tool_requests is optional compatibility output and may be omitted or left empty.\n"
         "Rules:\n"
         "- acceptance_criteria must be string array.\n"
         "- dag_edges must be array of 2-string arrays.\n"
         "- each task must include intent in {transform, generate, validate, render, io}.\n"
-        "- Use only allowed tool names.\n"
+        "- Use canonical capability IDs in capability_requests whenever a capability exists.\n"
+        "- Rewrite raw runtime tool names to their capability IDs.\n"
+        "- Never emit planner support tool names in tasks.\n"
+        "- If capability_requests is present and tool_requests is missing, leave tool_requests empty.\n"
         "- If a field is missing, add a safe default value.\n"
-        f"Allowed tool names: {tool_names}\n\n"
+        f"Preferred capability IDs: {', '.join(canonical_capability_ids) or 'none'}\n"
+        f"Planner support tools (metadata-only, never emit in tasks): "
+        f"{', '.join(planner_tool_names) or 'none'}\n\n"
         f"Original planner prompt (for context):\n{original_prompt}\n\n"
         f"Malformed planner output to repair:\n{raw_output}\n"
     )
@@ -376,7 +409,7 @@ def resolve_task_intent_for_validation(
     if inferred == models.ToolIntent.generate.value and not task.intent:
         unique_tool_intents = {
             tool_map[tool_name].tool_intent
-            for tool_name in (task.tool_requests or [])
+            for tool_name in planner_contracts.planner_task_request_ids(task)
             if tool_name in tool_map
         }
         if len(unique_tool_intents) == 1:
@@ -402,7 +435,9 @@ def select_goal_intent_segment_for_task(
         for segment in goal_intent_segments
     )
     task_requests = {
-        str(name).strip().lower() for name in (task.tool_requests or []) if str(name).strip()
+        str(name).strip().lower()
+        for name in planner_contracts.planner_task_request_ids(task)
+        if str(name).strip()
     }
     if task_requests:
         matching: list[dict[str, Any]] = []
@@ -448,6 +483,50 @@ def select_goal_intent_segment_for_task(
     ):
         return goal_intent_segments[task_index]
     return None
+
+
+def canonicalize_task_request_ids(
+    task: models.TaskCreate,
+    *,
+    capabilities: Mapping[str, Any] | Sequence[Any] | planner_contracts.PlanRequest | None = None,
+) -> models.TaskCreate:
+    raw_capability_requests = [
+        str(request_id).strip()
+        for request_id in (getattr(task, "capability_requests", None) or [])
+        if str(request_id).strip()
+    ]
+    raw_tool_requests = [
+        str(request_id).strip()
+        for request_id in (task.tool_requests or [])
+        if str(request_id).strip()
+    ]
+    source_request_ids = raw_capability_requests or raw_tool_requests
+    canonical_request_ids, rewrites = planner_contracts.canonicalize_planner_request_ids(
+        source_request_ids,
+        capabilities=capabilities,
+    )
+    if (
+        canonical_request_ids == raw_capability_requests
+        and canonical_request_ids == raw_tool_requests
+        and not rewrites
+    ):
+        return task
+
+    tool_inputs = dict(task.tool_inputs) if isinstance(task.tool_inputs, dict) else {}
+    for raw_request_id, canonical_request_id in rewrites.items():
+        if raw_request_id == canonical_request_id or raw_request_id not in tool_inputs:
+            continue
+        if canonical_request_id not in tool_inputs:
+            tool_inputs[canonical_request_id] = tool_inputs[raw_request_id]
+        tool_inputs.pop(raw_request_id, None)
+
+    return task.model_copy(
+        update={
+            "capability_requests": canonical_request_ids,
+            "tool_requests": canonical_request_ids,
+            "tool_inputs": tool_inputs,
+        }
+    )
 
 
 def capability_intent_mismatch(
@@ -669,6 +748,14 @@ def build_capability_validation_payload(
         for key, value in projected_inputs.items():
             payload.setdefault(key, value)
     payload.setdefault("tool_inputs", dict(raw_tool_inputs))
+    if "instruction" not in payload and isinstance(task.instruction, str) and task.instruction.strip():
+        payload["instruction"] = task.instruction.strip()
+    if request_id == "llm.text.generate":
+        has_text = isinstance(payload.get("text"), str) and bool(payload.get("text").strip())
+        has_prompt = isinstance(payload.get("prompt"), str) and bool(payload.get("prompt").strip())
+        instruction = payload.get("instruction")
+        if not has_text and not has_prompt and isinstance(instruction, str) and instruction.strip():
+            payload["prompt"] = instruction.strip()
     if task.deps:
         for key, default_value in dependency_fill_defaults().items():
             payload.setdefault(key, default_value)
@@ -734,12 +821,26 @@ def validate_plan_request(
     tool_map = {tool.name: tool for tool in request.tools}
     tool_schemas = {tool.name: tool.input_schema or {} for tool in request.tools}
     capabilities = planner_contracts.capability_map(request)
+    try:
+        full_capabilities = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        full_capabilities = None
     goal_intent_segments = planner_contracts.goal_intent_segments(request)
     for task_index, task in enumerate(plan.tasks):
-        if not task.tool_requests:
+        for request_id in planner_contracts.planner_task_request_ids(task):
+            language_error = planner_contracts.validate_planner_request_language(
+                request_id,
+                capabilities=request.capabilities,
+                full_capabilities=full_capabilities,
+                runtime_tool_names=list(tool_map.keys()),
+            )
+            if language_error:
+                return False, f"{language_error}:task={task.name}"
+        normalized_task = canonicalize_task_request_ids(task, capabilities=request.capabilities)
+        if not normalized_task.tool_requests:
             continue
         goal_intent_segment = select_goal_intent_segment_for_task(
-            task=task,
+            task=normalized_task,
             task_index=task_index,
             task_intent="",
             goal_intent_segments=goal_intent_segments,
@@ -747,37 +848,44 @@ def validate_plan_request(
             capabilities=capabilities,
         )
         task_intent = resolve_task_intent_for_validation(
-            task,
+            normalized_task,
             tool_map,
             goal_text=request.goal,
             goal_intent_segment=goal_intent_segment,
         )
         if not task_intent:
-            return False, f"missing_task_intent:{task.name}"
+            return False, f"missing_task_intent:{normalized_task.name}"
         if goal_intent_segment is None:
             goal_intent_segment = select_goal_intent_segment_for_task(
-                task=task,
+                task=normalized_task,
                 task_index=task_index,
                 task_intent=task_intent,
                 goal_intent_segments=goal_intent_segments,
                 total_tasks=len(plan.tasks),
                 capabilities=capabilities,
             )
-        for tool_name in task.tool_requests:
+        for tool_name in normalized_task.tool_requests:
             tool = tool_map.get(tool_name)
             capability = capabilities.get(tool_name)
             raw_tool_inputs: dict[str, Any] = {}
-            if isinstance(task.tool_inputs, dict) and tool_name in task.tool_inputs:
-                entry = task.tool_inputs.get(tool_name)
+            if isinstance(normalized_task.tool_inputs, dict) and tool_name in normalized_task.tool_inputs:
+                entry = normalized_task.tool_inputs.get(tool_name)
                 if not isinstance(entry, dict):
-                    return False, f"tool_inputs_invalid:{tool_name}:{task.name}:payload_not_object"
+                    return False, (
+                        f"tool_inputs_invalid:{tool_name}:{normalized_task.name}:payload_not_object"
+                    )
                 raw_tool_inputs = dict(entry)
             segment_payload: dict[str, Any] = raw_tool_inputs
             if tool is not None:
-                segment_payload = build_validation_payload(task, tool, request, raw_tool_inputs)
+                segment_payload = build_validation_payload(
+                    normalized_task,
+                    tool,
+                    request,
+                    raw_tool_inputs,
+                )
             elif capability is not None:
                 segment_payload = build_capability_validation_payload(
-                    task,
+                    normalized_task,
                     tool_name,
                     raw_tool_inputs,
                     request,
@@ -790,7 +898,7 @@ def validate_plan_request(
                 render_path_mode=planner_contracts.render_path_mode(request),
             )
             if render_path_error:
-                return False, f"{render_path_error}:task={task.name}"
+                return False, f"{render_path_error}:task={normalized_task.name}"
             segment_contract_error = intent_contract.validate_intent_segment_contract(
                 segment=goal_intent_segment,
                 task_intent=task_intent,
@@ -803,24 +911,26 @@ def validate_plan_request(
                 core_logging.get_logger("planner").warning(
                     "intent_segment_rejected",
                     tool_name=tool_name,
-                    task_name=task.name,
+                    task_name=normalized_task.name,
                     job_id=request.job_id,
                     reason=_intent_segment_contract_reason(segment_contract_error),
                     detail=segment_contract_error,
                 )
                 return (
                     False,
-                    f"intent_segment_invalid:{tool_name}:{task.name}:{segment_contract_error}",
+                    f"intent_segment_invalid:{tool_name}:{normalized_task.name}:{segment_contract_error}",
                 )
             if tool is None and capability is None:
                 return False, f"unknown_tool_or_capability:{tool_name}"
             if tool is None and capability is not None:
                 mismatch = capability_intent_mismatch(task_intent, capability, tool_name)
                 if mismatch:
-                    return False, f"capability_intent_invalid:{tool_name}:{task.name}:{mismatch}"
+                    return False, (
+                        f"capability_intent_invalid:{tool_name}:{normalized_task.name}:{mismatch}"
+                    )
                 validation_error = validate_capability_inputs(
                     capability,
-                    task,
+                    normalized_task,
                     raw_tool_inputs,
                     request,
                     schema_registry_path=schema_registry_path,
@@ -828,7 +938,7 @@ def validate_plan_request(
                 if validation_error:
                     return (
                         False,
-                        f"capability_inputs_invalid:{tool_name}:{task.name}:{validation_error}",
+                        f"capability_inputs_invalid:{tool_name}:{normalized_task.name}:{validation_error}",
                     )
                 continue
             allow_decision = tool_registry.evaluate_tool_allowlist(
@@ -845,7 +955,7 @@ def validate_plan_request(
                     tool_name=tool_name,
                     mode=allow_decision.mode,
                     reason=allow_decision.reason,
-                    task_name=task.name,
+                    task_name=normalized_task.name,
                     job_id=request.job_id,
                 )
             mismatch = intent_contract.validate_tool_intent_compatibility(
@@ -854,9 +964,9 @@ def validate_plan_request(
                 tool_name,
             )
             if mismatch:
-                return False, f"{mismatch}:task={task.name}"
+                return False, f"{mismatch}:task={normalized_task.name}"
             validation_payload = build_validation_payload(
-                task,
+                normalized_task,
                 tool,
                 request,
                 raw_tool_inputs,
@@ -867,7 +977,7 @@ def validate_plan_request(
             )
             message = validation_errors.get(tool_name)
             if message:
-                return False, f"tool_inputs_invalid:{tool_name}:{task.name}:{message}"
+                return False, f"tool_inputs_invalid:{tool_name}:{normalized_task.name}:{message}"
     return True, "ok"
 
 
@@ -905,7 +1015,7 @@ def llm_plan(
                 "operation": "plan_generation",
                 "job_id": request.job_id,
                 "goal_len": len(request.goal or ""),
-                "tool_count": len(request.tools),
+                "tool_count": len(request.planner_tools),
             },
         )
     )
@@ -921,7 +1031,7 @@ def llm_plan(
                     "operation": "plan_generation_repair",
                     "job_id": request.job_id,
                     "goal_len": len(request.goal or ""),
-                    "tool_count": len(request.tools),
+                    "tool_count": len(request.planner_tools),
                 },
             )
         )
@@ -945,6 +1055,7 @@ def plan_job(
     job: models.Job,
     tools: list[models.ToolSpec],
     *,
+    planner_tools: list[models.ToolSpec] | None = None,
     provider: llm_provider.LLMProvider | None,
     config: PlannerServiceConfig,
     runtime: PlannerServiceRuntime,
@@ -952,6 +1063,7 @@ def plan_job(
     request = build_plan_request(
         job,
         tools,
+        planner_tools=planner_tools,
         config=config,
         runtime=runtime,
     )

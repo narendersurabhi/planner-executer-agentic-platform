@@ -31,6 +31,7 @@ class PlannerRuntimeConfig:
 class PlannerExecutionContext:
     provider: llm_provider.LLMProvider | None
     tool_specs: list[models.ToolSpec]
+    planner_tool_specs: list[models.ToolSpec]
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,11 @@ def resolve_execution_context(config: PlannerRuntimeConfig) -> PlannerExecutionC
             http_fetch_enabled=False,
             service_name="planner",
         )
+    planner_tool_specs = tool_bootstrap.build_planner_support_tool_specs()
     return PlannerExecutionContext(
         provider=provider,
         tool_specs=registry.list_specs(),
+        planner_tool_specs=planner_tool_specs,
     )
 
 

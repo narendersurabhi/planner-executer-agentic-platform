@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class JobStatus(str, Enum):
@@ -323,7 +323,8 @@ class TaskCreate(BaseModel):
     expected_output_schema_ref: str
     intent: Optional[ToolIntent] = None
     deps: List[str]
-    tool_requests: List[str]
+    capability_requests: List[str] = Field(default_factory=list)
+    tool_requests: List[str] = Field(default_factory=list)
     tool_inputs: Dict[str, Any] = Field(default_factory=dict)
     capability_bindings: Dict[str, Any] = Field(default_factory=dict)
     critic_required: bool = True
@@ -337,8 +338,39 @@ class PlanCreate(BaseModel):
 
 
 class CapabilityRequestSpec(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     request_id: str
     capability_id: str
+    execution_request_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _normalize_request_ids(self) -> "CapabilityRequestSpec":
+        request_id = str(self.request_id or "").strip()
+        capability_id = str(self.capability_id or "").strip()
+        execution_request_id = str(self.execution_request_id or "").strip()
+
+        if not capability_id:
+            capability_id = request_id or execution_request_id
+        if not request_id:
+            request_id = capability_id or execution_request_id
+
+        if not execution_request_id:
+            if capability_id and request_id and capability_id != request_id:
+                execution_request_id = request_id
+                request_id = capability_id
+            else:
+                execution_request_id = request_id or capability_id
+
+        if not capability_id:
+            capability_id = request_id or execution_request_id
+        if not request_id:
+            request_id = capability_id or execution_request_id
+
+        self.request_id = request_id
+        self.capability_id = capability_id
+        self.execution_request_id = execution_request_id or None
+        return self
 
 
 class StepRetryPolicy(BaseModel):

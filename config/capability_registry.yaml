@@ -989,11 +989,35 @@ capabilities:
       - documents
       - spec
       - validation
+    planner_hints:
+      task_intents: [validate]
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
         tool_name: document_spec_validate
+        arg_map: {}
+        enabled: true
+  - id: derive_output_filename
+    description: Derive a safe output path for a rendered document artifact.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: paths
+    input_schema_ref: document_derive_output_path_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - path
+      - filename
+      - transform
+    planner_hints:
+      task_intents: [io, transform]
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: derive_output_filename
         arg_map: {}
         enabled: true
   - id: document.docx.render
@@ -1116,6 +1140,8 @@ capabilities:
       - utility
       - json
       - transform
+    planner_hints:
+      task_intents: [transform]
     enabled: true
     adapters:
       - type: tool
@@ -1136,6 +1162,8 @@ capabilities:
       - text
       - generation
       - high_cost
+    planner_hints:
+      task_intents: [generate]
     enabled: true
     adapters:
       - type: tool

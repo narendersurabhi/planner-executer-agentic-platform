@@ -125,12 +125,16 @@ def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.Pla
 
 @_log_entry_exit("llm_plan")
 def llm_plan(
-    job: models.Job, tools: List[models.ToolSpec], provider: llm_provider.LLMProvider
+    job: models.Job,
+    tools: List[models.ToolSpec],
+    planner_tools: List[models.ToolSpec],
+    provider: llm_provider.LLMProvider,
 ) -> models.PlanCreate:
     config = _planner_service_config()
     request = planner_service.build_plan_request(
         job,
         tools,
+        planner_tools=planner_tools,
         config=config,
         runtime=_planner_service_runtime(),
         include_semantic_hints=True,
@@ -149,6 +153,7 @@ def plan_job(job: models.Job) -> models.PlanCreate:
     return planner_service.plan_job(
         job,
         execution.tool_specs,
+        planner_tools=execution.planner_tool_specs,
         provider=execution.provider,
         config=_planner_service_config(),
         runtime=_planner_service_runtime(),
@@ -250,9 +255,11 @@ def _parse_datetime(value: object, fallback: datetime) -> datetime:
 
 
 def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
+    execution = runtime_service.resolve_execution_context(_planner_runtime_config())
     request = planner_service.build_plan_request(
         job,
         tools,
+        planner_tools=execution.planner_tool_specs,
         config=_planner_service_config(),
         runtime=_planner_service_runtime(),
         include_semantic_hints=True,
@@ -324,10 +331,44 @@ def _parse_llm_plan(content: str) -> models.PlanCreate | None:
 def _ensure_llm_tool(plan: models.PlanCreate) -> models.PlanCreate:
     updated_tasks = []
     for task in plan.tasks:
-        if not task.tool_requests:
-            updated_tasks.append(task.model_copy(update={"tool_requests": ["llm_generate"]}))
+        capability_requests = [
+            str(request_id).strip()
+            for request_id in (getattr(task, "capability_requests", None) or [])
+            if str(request_id).strip()
+        ]
+        tool_requests = [
+            str(request_id).strip()
+            for request_id in (task.tool_requests or [])
+            if str(request_id).strip()
+        ]
+        if capability_requests:
+            if tool_requests != capability_requests:
+                updated_tasks.append(
+                    task.model_copy(
+                        update={
+                            "capability_requests": capability_requests,
+                            "tool_requests": capability_requests,
+                        }
+                    )
+                )
+                continue
+        elif tool_requests:
+            updated_tasks.append(
+                task.model_copy(update={"capability_requests": tool_requests})
+            )
+            continue
         else:
-            updated_tasks.append(task)
+            default_request = "llm.text.generate"
+            updated_tasks.append(
+                task.model_copy(
+                    update={
+                        "capability_requests": [default_request],
+                        "tool_requests": [default_request],
+                    }
+                )
+            )
+            continue
+        updated_tasks.append(task)
     return plan.model_copy(update={"tasks": updated_tasks})
 
 
@@ -740,18 +781,26 @@ def _ensure_execution_bindings(plan: models.PlanCreate) -> models.PlanCreate:
     updated_tasks: list[models.TaskCreate] = []
     changed = False
     for task in plan.tasks:
-        normalized_bindings = execution_contracts.normalize_capability_bindings(
-            task.capability_bindings,
-            request_ids=task.tool_requests,
+        normalized_task = planner_service.canonicalize_task_request_ids(
+            task,
             capabilities=capabilities,
         )
-        if normalized_bindings != (task.capability_bindings or {}):
+        normalized_bindings = execution_contracts.normalize_capability_bindings(
+            normalized_task.capability_bindings,
+            request_ids=normalized_task.tool_requests,
+            capabilities=capabilities,
+        )
+        if (
+            normalized_task.tool_requests != list(task.tool_requests or [])
+            or normalized_task.tool_inputs != (task.tool_inputs or {})
+            or normalized_bindings != (normalized_task.capability_bindings or {})
+        ):
             updated_tasks.append(
-                task.model_copy(update={"capability_bindings": normalized_bindings})
+                normalized_task.model_copy(update={"capability_bindings": normalized_bindings})
             )
             changed = True
         else:
-            updated_tasks.append(task)
+            updated_tasks.append(normalized_task)
     if not changed:
         return plan
     return plan.model_copy(update={"tasks": updated_tasks})

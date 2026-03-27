@@ -18,6 +18,7 @@ from libs.tools.llm_tool_groups import (
 from libs.tools.openapi_iterative import register_openapi_iterative_tools
 from libs.tools.pdf_render_from_spec import register_pdf_tools
 
+from . import planner_support_tools
 from .llm_provider import LLMProvider
 from .models import RiskLevel, ToolIntent, ToolSpec
 
@@ -131,3 +132,7 @@ def register_default_tools(
         llm_provider,
         timeout_s=llm_iterative_timeout_s,
     )
+
+
+def build_planner_support_tool_specs() -> list[ToolSpec]:
+    return planner_support_tools.build_planner_support_tool_specs()

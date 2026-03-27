@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import os
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -10,6 +12,8 @@ from libs.core import capability_registry, intent_contract, models, workflow_con
 
 RENDER_PATH_MODE_AUTO = "auto"
 RENDER_PATH_MODE_EXPLICIT = "explicit"
+PLANNER_CAPABILITY_LANGUAGE_MODE_ENFORCE = "enforce"
+PLANNER_CAPABILITY_LANGUAGE_MODE_COMPAT = "compat"
 
 _RENDER_REQUEST_IDS = frozenset(
     {
@@ -59,12 +63,39 @@ class PlanRequest(BaseModel):
     job_metadata: dict[str, Any] = Field(default_factory=dict)
     job_payload: dict[str, Any] = Field(default_factory=dict)
     tools: list[models.ToolSpec] = Field(default_factory=list)
+    planner_tools: list[models.ToolSpec] = Field(default_factory=list)
     capabilities: list[PlanRequestCapability] = Field(default_factory=list)
     normalized_intent_envelope: workflow_contracts.NormalizedIntentEnvelope | None = None
     goal_intent_graph: workflow_contracts.IntentGraph | None = None
     semantic_capability_hints: list[dict[str, Any]] = Field(default_factory=list)
     max_dependency_depth: int | None = None
     render_path_mode: str = RENDER_PATH_MODE_EXPLICIT
+
+
+@dataclass(frozen=True)
+class CompiledTaskRequests:
+    request_ids: list[str]
+    request_id_rewrites: dict[str, str]
+    tool_inputs: dict[str, Any]
+    capability_bindings: dict[str, dict[str, Any]]
+
+
+def resolve_planner_capability_language_mode() -> str:
+    raw = (
+        os.getenv(
+            "PLANNER_CAPABILITY_LANGUAGE_MODE",
+            PLANNER_CAPABILITY_LANGUAGE_MODE_ENFORCE,
+        )
+        .strip()
+        .lower()
+    )
+    if raw == PLANNER_CAPABILITY_LANGUAGE_MODE_COMPAT:
+        return PLANNER_CAPABILITY_LANGUAGE_MODE_COMPAT
+    return PLANNER_CAPABILITY_LANGUAGE_MODE_ENFORCE
+
+
+def planner_capability_language_enforced() -> bool:
+    return resolve_planner_capability_language_mode() == PLANNER_CAPABILITY_LANGUAGE_MODE_ENFORCE
 
 
 def normalize_render_path_mode(value: Any) -> str:
@@ -256,6 +287,7 @@ def build_plan_request(
     job: models.Job,
     *,
     tools: Sequence[models.ToolSpec],
+    planner_tools: Sequence[models.ToolSpec] | None = None,
     capabilities: Mapping[str, capability_registry.CapabilitySpec]
     | Sequence[capability_registry.CapabilitySpec]
     | None = None,
@@ -283,6 +315,7 @@ def build_plan_request(
         job_metadata=dict(job_metadata),
         job_payload=job.model_dump(mode="json"),
         tools=list(tools),
+        planner_tools=list(planner_tools or []),
         capabilities=[
             PlanRequestCapability(
                 capability_id=spec.capability_id,
@@ -328,6 +361,342 @@ def capability_map(request: PlanRequest) -> dict[str, PlanRequestCapability]:
             if normalized:
                 mapped[normalized] = capability
     return mapped
+
+
+def _capability_values(
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None,
+) -> list[Any]:
+    if isinstance(capabilities, PlanRequest):
+        return list(capabilities.capabilities)
+    if isinstance(capabilities, Mapping):
+        return list(capabilities.values())
+    if isinstance(capabilities, Sequence) and not isinstance(capabilities, (str, bytes, bytearray)):
+        return list(capabilities)
+    return []
+
+
+def _full_capability_values(
+    full_capabilities: capability_registry.CapabilityRegistry
+    | Mapping[str, Any]
+    | Sequence[Any]
+    | PlanRequest
+    | None,
+) -> list[Any]:
+    if isinstance(full_capabilities, capability_registry.CapabilityRegistry):
+        return list(full_capabilities.capabilities.values())
+    if full_capabilities is None:
+        try:
+            return list(capability_registry.load_capability_registry().capabilities.values())
+        except Exception:  # noqa: BLE001
+            return []
+    return _capability_values(full_capabilities)
+
+
+def _register_unique_mapping(
+    index: dict[str, str],
+    ambiguous: set[str],
+    key: str,
+    capability_id: str,
+) -> None:
+    if not key:
+        return
+    existing = index.get(key)
+    if existing and existing != capability_id:
+        ambiguous.add(key)
+        index.pop(key, None)
+        return
+    if key not in ambiguous:
+        index[key] = capability_id
+
+
+def _capability_index(
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None,
+) -> dict[str, Any]:
+    indexed: dict[str, Any] = {}
+    for capability in _capability_values(capabilities):
+        capability_id = str(getattr(capability, "capability_id", "") or "").strip()
+        if capability_id and capability_id not in indexed:
+            indexed[capability_id] = capability
+    return indexed
+
+
+def canonicalize_planner_request_id(
+    request_id: str,
+    *,
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None = None,
+) -> str:
+    candidate = str(request_id or "").strip()
+    if not candidate:
+        return ""
+    capability_values = _capability_values(capabilities)
+    if not capability_values:
+        return candidate
+
+    exact_lookup: dict[str, str] = {}
+    lower_lookup: dict[str, str] = {}
+    adapter_lookup: dict[str, str] = {}
+    adapter_lower_lookup: dict[str, str] = {}
+    ambiguous_adapter_keys: set[str] = set()
+    ambiguous_adapter_lower_keys: set[str] = set()
+
+    for capability in capability_values:
+        capability_id = str(getattr(capability, "capability_id", "") or "").strip()
+        if not capability_id:
+            continue
+        exact_lookup.setdefault(capability_id, capability_id)
+        lower_lookup.setdefault(capability_id.lower(), capability_id)
+        for alias in getattr(capability, "aliases", ()) or ():
+            normalized_alias = str(alias or "").strip()
+            if not normalized_alias:
+                continue
+            exact_lookup.setdefault(normalized_alias, capability_id)
+            lower_lookup.setdefault(normalized_alias.lower(), capability_id)
+        for adapter in getattr(capability, "adapters", ()) or ():
+            if getattr(adapter, "enabled", True) is False:
+                continue
+            tool_name = str(getattr(adapter, "tool_name", "") or "").strip()
+            if not tool_name:
+                continue
+            _register_unique_mapping(
+                adapter_lookup,
+                ambiguous_adapter_keys,
+                tool_name,
+                capability_id,
+            )
+            _register_unique_mapping(
+                adapter_lower_lookup,
+                ambiguous_adapter_lower_keys,
+                tool_name.lower(),
+                capability_id,
+            )
+
+    return (
+        exact_lookup.get(candidate)
+        or lower_lookup.get(candidate.lower())
+        or adapter_lookup.get(candidate)
+        or adapter_lower_lookup.get(candidate.lower())
+        or candidate
+    )
+
+
+def canonicalize_planner_request_ids(
+    request_ids: Sequence[str] | None,
+    *,
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    canonicalized: list[str] = []
+    rewrites: dict[str, str] = {}
+    seen: set[str] = set()
+    for request_id in request_ids or []:
+        raw = str(request_id or "").strip()
+        if not raw:
+            continue
+        canonical = canonicalize_planner_request_id(raw, capabilities=capabilities)
+        if canonical and canonical not in seen:
+            canonicalized.append(canonical)
+            seen.add(canonical)
+        if canonical and canonical != raw:
+            rewrites[raw] = canonical
+    return canonicalized, rewrites
+
+
+def planner_task_request_ids(task: Any) -> list[str]:
+    request_ids = getattr(task, "capability_requests", None) or getattr(task, "tool_requests", None) or []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for request_id in request_ids:
+        raw = str(request_id or "").strip()
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        normalized.append(raw)
+    return normalized
+
+
+def validate_planner_request_language(
+    request_id: str,
+    *,
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None = None,
+    full_capabilities: capability_registry.CapabilityRegistry
+    | Mapping[str, Any]
+    | Sequence[Any]
+    | PlanRequest
+    | None = None,
+    runtime_tool_names: Sequence[str] | None = None,
+    mode: str | None = None,
+) -> str | None:
+    normalized_request_id = str(request_id or "").strip()
+    if not normalized_request_id:
+        return None
+    resolved_mode = str(mode or resolve_planner_capability_language_mode()).strip().lower()
+    if resolved_mode == PLANNER_CAPABILITY_LANGUAGE_MODE_COMPAT:
+        return None
+
+    allowed_capabilities = _capability_index(capabilities)
+    full_capability_values = _full_capability_values(
+        full_capabilities if full_capabilities is not None else capabilities
+    )
+    resolved_capability = resolve_planner_capability(
+        normalized_request_id,
+        capabilities=full_capability_values,
+    )
+    if resolved_capability is not None:
+        canonical_id = str(getattr(resolved_capability, "capability_id", "") or "").strip()
+        if not canonical_id:
+            return None
+        if getattr(resolved_capability, "enabled", True) is False:
+            return f"planner_request_capability_disabled:{canonical_id}"
+        if allowed_capabilities and canonical_id not in allowed_capabilities:
+            return f"planner_request_capability_not_allowed:{canonical_id}"
+        if normalized_request_id != canonical_id:
+            return (
+                f"planner_request_language_invalid:{normalized_request_id}:"
+                f"use_capability_id:{canonical_id}"
+            )
+        return None
+
+    runtime_tool_set = {
+        str(tool_name or "").strip()
+        for tool_name in (runtime_tool_names or [])
+        if str(tool_name or "").strip()
+    }
+    if normalized_request_id in runtime_tool_set:
+        return None
+    return f"planner_request_unknown_capability:{normalized_request_id}"
+
+
+def resolve_planner_capability(
+    capability_id: str,
+    *,
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None = None,
+) -> Any | None:
+    canonical = canonicalize_planner_request_id(capability_id, capabilities=capabilities)
+    if not canonical:
+        return None
+    return _capability_index(capabilities).get(canonical)
+
+
+def resolve_primary_adapter(capability: Any) -> Any | None:
+    adapters = getattr(capability, "adapters", ()) if capability is not None else ()
+    if not isinstance(adapters, Sequence):
+        return None
+    for adapter in adapters:
+        if getattr(adapter, "enabled", True) is False:
+            continue
+        tool_name = str(getattr(adapter, "tool_name", "") or "").strip()
+        if tool_name:
+            return adapter
+    return None
+
+
+def compile_capability_request(
+    request_id: str,
+    *,
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None = None,
+) -> dict[str, Any]:
+    canonical_request_id = canonicalize_planner_request_id(request_id, capabilities=capabilities)
+    capability = resolve_planner_capability(canonical_request_id, capabilities=capabilities)
+    if capability is None:
+        return {
+            "request_id": canonical_request_id or str(request_id or "").strip(),
+            "capability_id": None,
+            "tool_name": canonical_request_id or str(request_id or "").strip(),
+            "adapter_type": None,
+            "server_id": None,
+        }
+    adapter = resolve_primary_adapter(capability)
+    if adapter is None:
+        return {
+            "request_id": capability.capability_id,
+            "capability_id": capability.capability_id,
+            "tool_name": None,
+            "adapter_type": None,
+            "server_id": None,
+        }
+    tool_name = str(getattr(adapter, "tool_name", "") or "").strip() or capability.capability_id
+    return {
+        "request_id": tool_name,
+        "capability_id": capability.capability_id,
+        "tool_name": tool_name,
+        "adapter_type": str(getattr(adapter, "type", "") or "").strip() or None,
+        "server_id": str(getattr(adapter, "server_id", "") or "").strip() or None,
+    }
+
+
+def rewrite_request_keyed_mapping(
+    value: Mapping[str, Any] | None,
+    rewrites: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    rewritten: dict[str, Any] = {}
+    rewrite_map = dict(rewrites or {})
+    for request_id, payload in (value or {}).items():
+        raw_request_id = str(request_id or "").strip()
+        if not raw_request_id:
+            continue
+        target_request_id = rewrite_map.get(raw_request_id, raw_request_id)
+        if target_request_id in rewritten:
+            continue
+        rewritten[target_request_id] = payload
+    return rewritten
+
+
+def compile_task_request_payloads(
+    *,
+    capability_requests: Sequence[str] | None = None,
+    tool_requests: Sequence[str] | None = None,
+    tool_inputs: Mapping[str, Any] | None = None,
+    capability_bindings: Mapping[str, Any] | None = None,
+    capabilities: Mapping[str, Any] | Sequence[Any] | PlanRequest | None = None,
+) -> CompiledTaskRequests:
+    source_request_ids = [
+        str(request_id).strip()
+        for request_id in (capability_requests or tool_requests or [])
+        if str(request_id).strip()
+    ]
+    compiled_request_ids: list[str] = []
+    compiled_bindings: dict[str, dict[str, Any]] = {}
+    request_id_rewrites: dict[str, str] = {}
+    seen: set[str] = set()
+    for request_id in source_request_ids:
+        compiled = compile_capability_request(request_id, capabilities=capabilities)
+        compiled_request_id = str(compiled.get("request_id") or "").strip()
+        if not compiled_request_id:
+            continue
+        if compiled_request_id not in seen:
+            compiled_request_ids.append(compiled_request_id)
+            seen.add(compiled_request_id)
+        if compiled_request_id != request_id:
+            request_id_rewrites[request_id] = compiled_request_id
+        capability_id = str(compiled.get("capability_id") or "").strip()
+        if capability_id:
+            compiled_bindings[compiled_request_id] = {
+                key: value
+                for key, value in {
+                    "request_id": compiled_request_id,
+                    "capability_id": capability_id,
+                    "tool_name": compiled.get("tool_name"),
+                    "adapter_type": compiled.get("adapter_type"),
+                    "server_id": compiled.get("server_id"),
+                }.items()
+                if value is not None and value != ""
+            }
+
+    rewritten_inputs = rewrite_request_keyed_mapping(tool_inputs, request_id_rewrites)
+    rewritten_bindings = rewrite_request_keyed_mapping(capability_bindings, request_id_rewrites)
+    rewritten_bindings.update(compiled_bindings)
+    if compiled_request_ids:
+        rewritten_bindings = {
+            request_id: binding
+            for request_id in compiled_request_ids
+            if isinstance((binding := rewritten_bindings.get(request_id)), Mapping)
+        }
+
+    return CompiledTaskRequests(
+        request_ids=compiled_request_ids or source_request_ids,
+        request_id_rewrites=request_id_rewrites,
+        tool_inputs=rewritten_inputs,
+        capability_bindings={key: dict(value) for key, value in rewritten_bindings.items()},
+    )
 
 
 def normalized_intent_envelope(

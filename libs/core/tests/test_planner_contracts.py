@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from libs.core import capability_registry, models, planner_contracts
 
 
@@ -180,3 +182,141 @@ def test_validate_render_path_requirement_rejects_dependency_reference() -> None
     )
 
     assert error == "render_path_derived_not_allowed:docx_render_from_spec"
+
+
+def test_canonicalize_planner_request_ids_rewrites_aliases_and_adapter_tools() -> None:
+    capability = capability_registry.CapabilitySpec(
+        capability_id="document.docx.render",
+        description="Render a DOCX",
+        group="documents",
+        subgroup="rendering",
+        risk_tier="read_only",
+        idempotency="read",
+        aliases=("document.docx.generate",),
+        adapters=(
+            capability_registry.CapabilityAdapterSpec(
+                type="tool",
+                server_id="local_worker",
+                tool_name="docx_render_from_spec",
+                enabled=True,
+            ),
+        ),
+    )
+
+    canonicalized, rewrites = planner_contracts.canonicalize_planner_request_ids(
+        [
+            "document.docx.generate",
+            "docx_render_from_spec",
+            "document.docx.render",
+        ],
+        capabilities={"document.docx.render": capability},
+    )
+
+    assert canonicalized == ["document.docx.render"]
+    assert rewrites == {
+        "document.docx.generate": "document.docx.render",
+        "docx_render_from_spec": "document.docx.render",
+    }
+
+
+def test_compile_task_request_payloads_compiles_capability_requests_to_runtime_tools() -> None:
+    capability = capability_registry.CapabilitySpec(
+        capability_id="document.spec.generate",
+        description="Generate a document spec",
+        group="documents",
+        subgroup="generation",
+        risk_tier="read_only",
+        idempotency="read",
+        adapters=(
+            capability_registry.CapabilityAdapterSpec(
+                type="tool",
+                server_id="local_worker",
+                tool_name="llm_generate_document_spec",
+                enabled=True,
+            ),
+        ),
+    )
+
+    compiled = planner_contracts.compile_task_request_payloads(
+        capability_requests=["document.spec.generate"],
+        tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+        capabilities={"document.spec.generate": capability},
+    )
+
+    assert compiled.request_ids == ["llm_generate_document_spec"]
+    assert compiled.request_id_rewrites == {
+        "document.spec.generate": "llm_generate_document_spec"
+    }
+    assert compiled.tool_inputs == {
+        "llm_generate_document_spec": {"instruction": "Generate a document"}
+    }
+    assert compiled.capability_bindings["llm_generate_document_spec"]["capability_id"] == (
+        "document.spec.generate"
+    )
+
+
+def test_validate_planner_request_language_rejects_raw_adapter_tool_name() -> None:
+    capability = capability_registry.CapabilitySpec(
+        capability_id="document.spec.generate",
+        description="Generate a document spec",
+        group="documents",
+        subgroup="generation",
+        risk_tier="read_only",
+        idempotency="read",
+        enabled=True,
+        adapters=(
+            capability_registry.CapabilityAdapterSpec(
+                type="tool",
+                server_id="local_worker",
+                tool_name="llm_generate_document_spec",
+                enabled=True,
+            ),
+        ),
+    )
+
+    error = planner_contracts.validate_planner_request_language(
+        "llm_generate_document_spec",
+        capabilities={"document.spec.generate": capability},
+        full_capabilities={"document.spec.generate": capability},
+        runtime_tool_names=["llm_generate_document_spec"],
+    )
+
+    assert error == (
+        "planner_request_language_invalid:llm_generate_document_spec:"
+        "use_capability_id:document.spec.generate"
+    )
+
+
+def test_validate_planner_request_language_supports_compat_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = capability_registry.CapabilitySpec(
+        capability_id="document.spec.generate",
+        description="Generate a document spec",
+        group="documents",
+        subgroup="generation",
+        risk_tier="read_only",
+        idempotency="read",
+        enabled=True,
+        adapters=(
+            capability_registry.CapabilityAdapterSpec(
+                type="tool",
+                server_id="local_worker",
+                tool_name="llm_generate_document_spec",
+                enabled=True,
+            ),
+        ),
+    )
+    monkeypatch.setenv(
+        "PLANNER_CAPABILITY_LANGUAGE_MODE",
+        planner_contracts.PLANNER_CAPABILITY_LANGUAGE_MODE_COMPAT,
+    )
+
+    error = planner_contracts.validate_planner_request_language(
+        "llm_generate_document_spec",
+        capabilities={"document.spec.generate": capability},
+        full_capabilities={"document.spec.generate": capability},
+        runtime_tool_names=["llm_generate_document_spec"],
+    )
+
+    assert error is None

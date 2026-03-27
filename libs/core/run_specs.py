@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from libs.core import execution_contracts, models
+from libs.core import capability_registry, execution_contracts, models, planner_contracts
 
 
 def parse_run_spec(value: Any) -> models.RunSpec | None:
@@ -26,6 +26,7 @@ def plan_to_run_spec(
     kind: models.RunKind = models.RunKind.studio,
     metadata: Mapping[str, Any] | None = None,
 ) -> models.RunSpec:
+    enabled_capabilities = _enabled_capabilities()
     used_step_ids: set[str] = set()
     step_id_by_task_name = {
         task.name: _step_id_for_name(task.name, index=index, used_ids=used_step_ids)
@@ -34,11 +35,29 @@ def plan_to_run_spec(
     steps: list[models.StepSpec] = []
     capability_requests: list[models.CapabilityRequestSpec] = []
     for task in plan.tasks:
-        request_id, capability_id, routing_hints = _task_request(task)
+        source_request_ids = list(task.capability_requests or task.tool_requests or [])
+        planner_request_field = (
+            "capability_requests" if task.capability_requests else "tool_requests"
+        )
+        compiled = planner_contracts.compile_task_request_payloads(
+            capability_requests=getattr(task, "capability_requests", None),
+            tool_requests=task.tool_requests,
+            tool_inputs=task.tool_inputs,
+            capability_bindings=task.capability_bindings,
+            capabilities=enabled_capabilities,
+        )
+        execution_request_id, capability_id, routing_hints = _task_request(task, compiled=compiled)
+        planner_request_id = source_request_ids[0] if source_request_ids else capability_id
+        if planner_request_id:
+            routing_hints["planner_request_field"] = planner_request_field
         execution_gate = execution_contracts.normalize_execution_gates(
             {"tool_inputs": task.tool_inputs},
-            request_ids=[request_id],
-        ).get(request_id)
+            request_ids=source_request_ids,
+        )
+        execution_gate = planner_contracts.rewrite_request_keyed_mapping(
+            execution_gate,
+            compiled.request_id_rewrites,
+        ).get(execution_request_id)
         step = models.StepSpec(
             step_id=step_id_by_task_name[task.name],
             name=task.name,
@@ -46,10 +65,11 @@ def plan_to_run_spec(
             instruction=task.instruction,
             intent=task.intent,
             capability_request=models.CapabilityRequestSpec(
-                request_id=request_id,
+                request_id=planner_request_id,
                 capability_id=capability_id,
+                execution_request_id=execution_request_id,
             ),
-            input_bindings=_request_inputs(task.tool_inputs, request_id),
+            input_bindings=_request_inputs(compiled.tool_inputs, execution_request_id),
             execution_gate=dict(execution_gate) if isinstance(execution_gate, Mapping) else None,
             expected_output_schema_ref=task.expected_output_schema_ref,
             retry_policy=models.StepRetryPolicy(),
@@ -101,19 +121,27 @@ def run_spec_to_plan(run_spec: models.RunSpec) -> models.PlanCreate:
     for step in run_spec.steps:
         request_id = str(step.capability_request.request_id or "").strip()
         capability_id = str(step.capability_request.capability_id or "").strip() or request_id
-        if not request_id or not capability_id:
+        execution_request_id = (
+            str(step.capability_request.execution_request_id or "").strip() or request_id
+        )
+        if not request_id or not capability_id or not execution_request_id:
             raise ValueError(
                 f"RunSpec step '{step.step_id}' is missing capability request identifiers."
             )
+        restored_request_id, restored_request_field = _restored_planner_request(step)
         tool_inputs = execution_contracts.embed_execution_gate(
-            {request_id: dict(step.input_bindings or {})},
+            {restored_request_id: dict(step.input_bindings or {})},
             dict(step.execution_gate) if isinstance(step.execution_gate, Mapping) else None,
-            request_ids=[request_id],
+            request_ids=[restored_request_id],
         )
-        capability_bindings = _step_capability_bindings(
-            step,
-            request_id=request_id,
-            capability_id=capability_id,
+        capability_bindings = (
+            _step_capability_bindings(
+                step,
+                request_id=restored_request_id,
+                capability_id=capability_id,
+            )
+            if restored_request_field == "capability_requests"
+            else {}
         )
         tasks.append(
             models.TaskCreate(
@@ -128,7 +156,14 @@ def run_spec_to_plan(run_spec: models.RunSpec) -> models.PlanCreate:
                     for dependency_id in step.depends_on
                     if dependency_id in step_by_id
                 ],
-                tool_requests=[request_id],
+                capability_requests=(
+                    [restored_request_id]
+                    if restored_request_field == "capability_requests"
+                    else []
+                ),
+                tool_requests=(
+                    [restored_request_id] if restored_request_field == "tool_requests" else []
+                ),
                 tool_inputs=tool_inputs,
                 capability_bindings=capability_bindings,
                 critic_required=bool(step.acceptance_policy.critic_required),
@@ -151,16 +186,18 @@ def run_spec_to_plan(run_spec: models.RunSpec) -> models.PlanCreate:
 
 def _task_request(
     task: models.TaskCreate,
+    *,
+    compiled: planner_contracts.CompiledTaskRequests,
 ) -> tuple[str, str, dict[str, Any]]:
-    request_ids = [str(request_id).strip() for request_id in task.tool_requests if str(request_id).strip()]
+    request_ids = list(compiled.request_ids)
     if len(request_ids) != 1:
         raise ValueError(
             f"Task '{task.name}' must have exactly one capability request to convert into StepSpec."
         )
     request_id = request_ids[0]
     raw_binding = (
-        task.capability_bindings.get(request_id)
-        if isinstance(task.capability_bindings, Mapping)
+        compiled.capability_bindings.get(request_id)
+        if isinstance(compiled.capability_bindings, Mapping)
         else None
     )
     capability_id = request_id
@@ -172,7 +209,7 @@ def _task_request(
         routing_hints = {
             key: value
             for key, value in dict(raw_binding).items()
-            if key != "capability_id" and value is not None
+            if key not in {"request_id", "capability_id"} and value is not None
         }
     return request_id, capability_id, routing_hints
 
@@ -192,12 +229,32 @@ def _step_capability_bindings(
     binding = {
         key: value
         for key, value in dict(step.routing_hints or {}).items()
-        if value is not None
+        if key not in {"planner_request_id", "planner_request_field"} and value is not None
     }
     if capability_id != request_id or binding:
         binding["capability_id"] = capability_id
         return {request_id: binding}
     return {}
+
+
+def _restored_planner_request(step: models.StepSpec) -> tuple[str, str]:
+    request_id = str(step.capability_request.request_id or "").strip()
+    routing_hints = dict(step.routing_hints or {})
+    planner_request_field = str(routing_hints.get("planner_request_field") or "").strip()
+    restored_request_id = request_id
+    if planner_request_field in {"capability_requests", "tool_requests"}:
+        return restored_request_id, planner_request_field
+    if str(step.capability_request.execution_request_id or "").strip() != request_id:
+        return restored_request_id, "capability_requests"
+    return restored_request_id, "tool_requests"
+
+
+def _enabled_capabilities() -> Mapping[str, Any]:
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        return {}
+    return registry.enabled_capabilities()
 
 
 def _run_spec_edges(run_spec: models.RunSpec) -> list[tuple[str, str]]:

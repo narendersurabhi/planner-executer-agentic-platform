@@ -18,6 +18,7 @@ from libs.core import (
     models,
     orchestrator,
     payload_resolver,
+    planner_contracts,
 )
 from .models import EventOutboxRecord, JobRecord, TaskRecord
 
@@ -239,14 +240,28 @@ def task_payload_from_record(
     callbacks: ApiDispatchCallbacks,
 ) -> dict[str, Any]:
     raw_tool_inputs = record.tool_inputs if isinstance(record.tool_inputs, dict) else {}
-    capability_bindings = execution_contracts.normalize_capability_bindings(
+    enabled_capabilities = _enabled_capabilities()
+    source_request_ids = list(record.tool_requests or [])
+    normalized_bindings = execution_contracts.normalize_capability_bindings(
         {"tool_inputs": raw_tool_inputs},
-        request_ids=record.tool_requests or [],
-        capabilities=_enabled_capabilities(),
+        request_ids=source_request_ids,
+        capabilities=enabled_capabilities,
+    )
+    compiled = planner_contracts.compile_task_request_payloads(
+        tool_requests=source_request_ids,
+        tool_inputs=execution_contracts.strip_execution_metadata_from_tool_inputs(
+            raw_tool_inputs
+        ),
+        capability_bindings=normalized_bindings,
+        capabilities=enabled_capabilities,
     )
     execution_gates = execution_contracts.normalize_execution_gates(
         {"tool_inputs": raw_tool_inputs},
-        request_ids=record.tool_requests or [],
+        request_ids=source_request_ids,
+    )
+    execution_gates = planner_contracts.rewrite_request_keyed_mapping(
+        execution_gates,
+        compiled.request_id_rewrites,
     )
     payload: dict[str, Any] = {
         "task_id": record.id,
@@ -265,11 +280,9 @@ def task_payload_from_record(
         "rework_count": record.rework_count or 0,
         "max_reworks": record.max_reworks or 0,
         "assigned_to": record.assigned_to,
-        "tool_requests": record.tool_requests or [],
-        "tool_inputs": execution_contracts.strip_execution_metadata_from_tool_inputs(
-            raw_tool_inputs
-        ),
-        "capability_bindings": capability_bindings,
+        "tool_requests": compiled.request_ids or source_request_ids,
+        "tool_inputs": compiled.tool_inputs,
+        "capability_bindings": compiled.capability_bindings,
         "execution_gates": execution_gates,
         "critic_required": bool(record.critic_required),
         "intent": record.intent,

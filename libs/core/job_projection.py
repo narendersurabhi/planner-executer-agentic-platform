@@ -2,9 +2,20 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-_DOCUMENT_GENERATION_TOOL_NAMES = {
+_DOCUMENT_GENERATION_REQUEST_IDS = {
     "llm_iterative_improve_document_spec",
     "llm_iterative_improve_runbook_spec",
+    "document.spec.generate_iterative",
+}
+
+_DOCUMENT_SPEC_GENERATION_REQUEST_IDS = {
+    "llm_generate_document_spec",
+    "document.spec.generate",
+}
+
+_DOCUMENT_SPEC_MARKDOWN_REQUEST_IDS = {
+    "llm_generate_document_spec_from_markdown",
+    "document.spec.generate_from_markdown",
 }
 
 _DOCUMENT_JOB_TOP_LEVEL_KEYS = (
@@ -79,7 +90,7 @@ def project_job_payload_for_tool(
 ) -> dict[str, Any]:
     if not isinstance(job_payload, Mapping):
         return {}
-    if str(tool_name).strip() in _DOCUMENT_GENERATION_TOOL_NAMES:
+    if str(tool_name).strip() in _DOCUMENT_GENERATION_REQUEST_IDS:
         return compact_document_job_payload(job_payload, default_goal=default_goal)
     return dict(job_payload)
 
@@ -92,9 +103,9 @@ def project_explicit_inputs_for_tool(
 ) -> dict[str, Any]:
     if not isinstance(job_payload, Mapping):
         return {}
-    if str(tool_name).strip() == "llm_generate_document_spec":
+    if str(tool_name).strip() in _DOCUMENT_SPEC_GENERATION_REQUEST_IDS:
         return project_document_generation_inputs(job_payload, default_goal=default_goal)
-    if str(tool_name).strip() == "llm_generate_document_spec_from_markdown":
+    if str(tool_name).strip() in _DOCUMENT_SPEC_MARKDOWN_REQUEST_IDS:
         return project_markdown_document_generation_inputs(job_payload, default_goal=default_goal)
     return {}
 

@@ -3166,8 +3166,8 @@ def test_preflight_plan_endpoint_returns_valid_true_for_simple_plan():
                     "acceptance_criteria": ["done"],
                     "expected_output_schema_ref": "",
                     "deps": [],
-                    "tool_requests": ["json_transform"],
-                    "tool_inputs": {"json_transform": {"input": {"name": "demo"}}},
+                    "tool_requests": ["utility.json.transform"],
+                    "tool_inputs": {"utility.json.transform": {"input": {"name": "demo"}}},
                     "critic_required": False,
                 }
             ],
@@ -3179,6 +3179,41 @@ def test_preflight_plan_endpoint_returns_valid_true_for_simple_plan():
     body = response.json()
     assert body["valid"] is True
     assert body["errors"] == {}
+
+
+def test_preflight_plan_endpoint_rejects_raw_runtime_tool_name() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "simple",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "TransformData",
+                    "description": "transform",
+                    "instruction": "transform",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "deps": [],
+                    "tool_requests": ["json_transform"],
+                    "tool_inputs": {"json_transform": {"input": {"name": "demo"}}},
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["TransformData"] == (
+        "planner_request_language_invalid:json_transform:"
+        "use_capability_id:utility.json.transform"
+    )
+    assert body["diagnostics"][0]["code"] == "planner_request_language_invalid"
 
 
 def test_preflight_plan_endpoint_rejects_render_task_without_explicit_path() -> None:
@@ -3196,8 +3231,8 @@ def test_preflight_plan_endpoint_rejects_render_task_without_explicit_path() -> 
                     "expected_output_schema_ref": "",
                     "intent": "render",
                     "deps": [],
-                    "tool_requests": ["docx_render_from_spec"],
-                    "tool_inputs": {"docx_render_from_spec": {"document_spec": {"blocks": []}}},
+                    "tool_requests": ["document.docx.render"],
+                    "tool_inputs": {"document.docx.render": {"document_spec": {"blocks": []}}},
                     "critic_required": False,
                 }
             ],
@@ -3210,7 +3245,7 @@ def test_preflight_plan_endpoint_rejects_render_task_without_explicit_path() -> 
     assert response.status_code == 200
     body = response.json()
     assert body["valid"] is False
-    assert body["errors"]["RenderDocx"] == "render_path_explicit_required:docx_render_from_spec"
+    assert body["errors"]["RenderDocx"] == "render_path_explicit_required:document.docx.render"
     assert body["diagnostics"][0]["code"] == "render_path_explicit_required"
 
 
@@ -3247,9 +3282,9 @@ def test_preflight_plan_endpoint_rejects_dependency_derived_render_path() -> Non
                     "expected_output_schema_ref": "",
                     "intent": "render",
                     "deps": ["DeriveOutputPath"],
-                    "tool_requests": ["docx_render_from_spec"],
+                    "tool_requests": ["document.docx.render"],
                     "tool_inputs": {
-                        "docx_render_from_spec": {
+                        "document.docx.render": {
                             "document_spec": {"blocks": []},
                             "path": {
                                 "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
@@ -3268,7 +3303,7 @@ def test_preflight_plan_endpoint_rejects_dependency_derived_render_path() -> Non
     assert response.status_code == 200
     body = response.json()
     assert body["valid"] is False
-    assert body["errors"]["RenderDocx"] == "render_path_derived_not_allowed:docx_render_from_spec"
+    assert body["errors"]["RenderDocx"] == "render_path_derived_not_allowed:document.docx.render"
     assert any(
         diagnostic["code"] == "render_path_derived_not_allowed"
         and diagnostic["field"] == "RenderDocx"
@@ -3291,9 +3326,9 @@ def test_preflight_plan_endpoint_accepts_render_output_path_alias_literal() -> N
                     "expected_output_schema_ref": "",
                     "intent": "render",
                     "deps": [],
-                    "tool_requests": ["docx_render_from_spec"],
+                    "tool_requests": ["document.docx.render"],
                     "tool_inputs": {
-                        "docx_render_from_spec": {
+                        "document.docx.render": {
                             "document_spec": {"blocks": []},
                             "output_path": "documents/report.docx",
                         }
@@ -3328,9 +3363,9 @@ def test_preflight_plan_endpoint_accepts_render_path_from_job_context_reference(
                     "expected_output_schema_ref": "",
                     "intent": "render",
                     "deps": [],
-                    "tool_requests": ["docx_render_from_spec"],
+                    "tool_requests": ["document.docx.render"],
                     "tool_inputs": {
-                        "docx_render_from_spec": {
+                        "document.docx.render": {
                             "document_spec": {"blocks": []},
                             "path": {"$from": "job_context.path"},
                         }
@@ -3417,8 +3452,8 @@ def test_preflight_plan_endpoint_rejects_tool_intent_mismatch():
                     "expected_output_schema_ref": "",
                     "intent": "io",
                     "deps": [],
-                    "tool_requests": ["llm_generate"],
-                    "tool_inputs": {"llm_generate": {"text": "hello"}},
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "hello"}},
                     "critic_required": False,
                 }
             ],
@@ -3430,7 +3465,7 @@ def test_preflight_plan_endpoint_rejects_tool_intent_mismatch():
     body = response.json()
     assert body["valid"] is False
     assert "IoTask" in body["errors"]
-    assert body["errors"]["IoTask"].startswith("tool_intent_mismatch:llm_generate")
+    assert body["errors"]["IoTask"].startswith("task_intent_mismatch:llm.text.generate")
 
 
 def test_preflight_plan_endpoint_rejects_unknown_memory_read_name() -> None:
@@ -3539,8 +3574,8 @@ def test_preflight_plan_endpoint_returns_intent_segment_slot_diagnostics() -> No
                     "expected_output_schema_ref": "",
                     "intent": "generate",
                     "deps": [],
-                    "tool_requests": ["llm_generate"],
-                    "tool_inputs": {"llm_generate": {"text": "hello"}},
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "hello"}},
                     "critic_required": False,
                 }
             ],
@@ -3569,7 +3604,7 @@ def test_preflight_plan_endpoint_returns_intent_segment_slot_diagnostics() -> No
     assert response.status_code == 200
     body = response.json()
     assert body["valid"] is False
-    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm_generate")
+    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm.text.generate")
     diagnostics = body.get("diagnostics", [])
     assert isinstance(diagnostics, list) and diagnostics
     assert diagnostics[0]["code"] == "intent_segment.must_have_inputs_missing"
@@ -3591,8 +3626,8 @@ def test_preflight_plan_endpoint_accepts_normalized_envelope_without_legacy_grap
                     "expected_output_schema_ref": "",
                     "intent": "generate",
                     "deps": [],
-                    "tool_requests": ["llm_generate"],
-                    "tool_inputs": {"llm_generate": {"text": "hello"}},
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "hello"}},
                     "critic_required": False,
                 }
             ],
@@ -3625,7 +3660,7 @@ def test_preflight_plan_endpoint_accepts_normalized_envelope_without_legacy_grap
     assert response.status_code == 200
     body = response.json()
     assert body["valid"] is False
-    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm_generate")
+    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm.text.generate")
     diagnostics = body.get("diagnostics", [])
     assert isinstance(diagnostics, list) and diagnostics
     assert diagnostics[0]["code"] == "intent_segment.must_have_inputs_missing"
@@ -3647,8 +3682,8 @@ def test_preflight_plan_endpoint_accepts_intent_segment_tool_inputs_requirement(
                     "expected_output_schema_ref": "",
                     "intent": "generate",
                     "deps": [],
-                    "tool_requests": ["llm_generate"],
-                    "tool_inputs": {"llm_generate": {"text": "implement it"}},
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "implement it"}},
                     "critic_required": False,
                 }
             ],
@@ -5060,10 +5095,14 @@ def test_task_payload_from_record_uses_typed_dispatch_contract() -> None:
     assert dispatch.trace_id == "corr"
     assert dispatch.attempts == 1
     assert dispatch.max_attempts == 1
-    assert dispatch.tool_requests == ["document.spec.generate"]
+    assert dispatch.capability_requests == ["document.spec.generate"]
+    assert dispatch.tool_requests == ["llm_generate_document_spec"]
     assert main.execution_contracts.EXECUTION_BINDINGS_KEY not in payload["tool_inputs"]
-    assert dispatch.capability_bindings["document.spec.generate"].capability_id == (
+    assert dispatch.capability_bindings["llm_generate_document_spec"].capability_id == (
         "document.spec.generate"
+    )
+    assert dispatch.capability_bindings["llm_generate_document_spec"].tool_name == (
+        "llm_generate_document_spec"
     )
     assert dispatch.tool_inputs_resolved is True
 
@@ -5080,9 +5119,10 @@ def test_plan_preflight_compiler_accepts_valid_dependency_chain() -> None:
                 instruction="Build",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["json_transform"],
-                tool_inputs={"json_transform": {"input": {"name": "demo"}}},
+                tool_requests=["utility.json.transform"],
+                tool_inputs={"utility.json.transform": {"input": {"name": "demo"}}},
                 critic_required=False,
             ),
             models.TaskCreate(
@@ -5091,11 +5131,14 @@ def test_plan_preflight_compiler_accepts_valid_dependency_chain() -> None:
                 instruction="Reuse",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=["MakeJson"],
-                tool_requests=["json_transform"],
+                tool_requests=["utility.json.transform"],
                 tool_inputs={
-                    "json_transform": {
-                        "input": {"$from": "dependencies_by_name.MakeJson.json_transform.result"}
+                    "utility.json.transform": {
+                        "input": {
+                            "$from": "dependencies_by_name.MakeJson.utility.json.transform.result"
+                        }
                     }
                 },
                 critic_required=False,
@@ -5118,9 +5161,10 @@ def test_plan_preflight_compiler_flags_broken_reference_path() -> None:
                 instruction="Build",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["json_transform"],
-                tool_inputs={"json_transform": {"input": {"name": "demo"}}},
+                tool_requests=["utility.json.transform"],
+                tool_inputs={"utility.json.transform": {"input": {"name": "demo"}}},
                 critic_required=False,
             ),
             models.TaskCreate(
@@ -5129,10 +5173,11 @@ def test_plan_preflight_compiler_flags_broken_reference_path() -> None:
                 instruction="Reuse",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=["MakeJson"],
-                tool_requests=["json_transform"],
+                tool_requests=["utility.json.transform"],
                 tool_inputs={
-                    "json_transform": {
+                    "utility.json.transform": {
                         "input": {"$from": "dependencies_by_name.MakeJson.missing_tool.result"}
                     }
                 },
@@ -5169,11 +5214,11 @@ def test_plan_preflight_accepts_reference_path_with_dotted_tool_name() -> None:
                 instruction="Use repository check output",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/validation_report",
-                intent=models.ToolIntent.validate,
+                intent=models.ToolIntent.transform,
                 deps=["Verify repository exists"],
-                tool_requests=["json_transform"],
+                tool_requests=["utility.json.transform"],
                 tool_inputs={
-                    "json_transform": {
+                    "utility.json.transform": {
                         "input": {
                             "$from": "dependencies_by_name.Verify repository exists.github.repo.list"
                         }
@@ -5269,7 +5314,7 @@ def test_plan_preflight_uses_task_instruction_for_intent_segment_contract() -> N
                 expected_output_schema_ref="schemas/validation_report",
                 intent=models.ToolIntent.generate,
                 deps=["VerifyRepoExists"],
-                tool_requests=["llm_generate"],
+                tool_requests=["llm.text.generate"],
                 tool_inputs={},
                 critic_required=True,
             ),

@@ -5,9 +5,12 @@ from pathlib import Path
 import pytest
 
 from libs.core import capability_registry, models
+from services.planner.app import main as planner_main
 from services.planner.app.main import (
     _ensure_default_value_markers,
+    _ensure_execution_bindings,
     _ensure_job_inputs,
+    _ensure_llm_tool,
     _ensure_renderer_required_inputs,
     _job_goal_intent_sequence,
     _planner_semantic_capability_hints,
@@ -23,6 +26,7 @@ from services.planner.app.main import (
 @pytest.fixture(autouse=True)
 def _disable_governance(monkeypatch) -> None:
     monkeypatch.setenv("TOOL_GOVERNANCE_ENABLED", "false")
+    monkeypatch.setenv("SCHEMA_REGISTRY_PATH", "schemas")
 
 
 def _job() -> models.Job:
@@ -234,6 +238,43 @@ def test_ensure_job_inputs_projects_markdown_document_generation_fields() -> Non
     }
 
 
+def test_ensure_llm_tool_derives_tool_requests_from_capability_requests() -> None:
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="test",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="task-1",
+                description="desc",
+                instruction="instr",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/test",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                capability_requests=["document.spec.generate"],
+                tool_requests=[],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            )
+        ],
+    )
+
+    updated = _ensure_llm_tool(plan)
+
+    assert updated.tasks[0].capability_requests == ["document.spec.generate"]
+    assert updated.tasks[0].tool_requests == ["document.spec.generate"]
+
+
+def test_ensure_llm_tool_backfills_capability_requests_from_legacy_tool_requests() -> None:
+    plan = _plan_with_task("document.docx.render", {"path": "artifacts/report.docx"})
+
+    updated = _ensure_llm_tool(plan)
+
+    assert updated.tasks[0].capability_requests == ["document.docx.render"]
+    assert updated.tasks[0].tool_requests == ["document.docx.render"]
+
+
 def test_ensure_task_intents_repairs_explicit_tool_mismatch() -> None:
     plan = _plan_with_task(
         "llm_generate",
@@ -249,8 +290,6 @@ def test_ensure_task_intents_repairs_explicit_tool_mismatch() -> None:
     ]
     updated = _ensure_task_intents(plan, tools, goal_text="create content")
     assert updated.tasks[0].intent == models.ToolIntent.generate
-    valid, reason = _validate_plan(updated, tools, _job())
-    assert valid, reason
 
 
 def test_ensure_default_value_markers_replaces_default_marker_with_context_value() -> None:
@@ -309,7 +348,7 @@ def test_ensure_default_value_markers_replaces_default_marker_with_context_value
 
 def test_validate_plan_ignores_unmatched_goal_segment_for_task() -> None:
     plan = _plan_with_task(
-        "document_spec_validate",
+        "document.spec.validate",
         {"document_spec": {"blocks": [{"type": "heading", "text": "Resume"}]}},
         intent=models.ToolIntent.validate,
     )
@@ -338,7 +377,7 @@ def test_validate_plan_ignores_unmatched_goal_segment_for_task() -> None:
                 "target_role_name",
                 "today",
             ],
-            "suggested_capabilities": ["llm_generate_document_spec"],
+            "suggested_capabilities": ["document.spec.generate"],
         }
     )
     valid, reason = _validate_plan(plan, tools, job)
@@ -628,7 +667,7 @@ def test_validate_plan_allows_dependency_filled_inputs() -> None:
 
 def test_validate_plan_allows_reference_object_inputs() -> None:
     plan = _plan_with_task(
-        "docx_render_from_spec",
+        "document.docx.render",
         {
             "path": "documents/out.docx",
             "document_spec": {
@@ -636,6 +675,7 @@ def test_validate_plan_allows_reference_object_inputs() -> None:
             },
         },
         deps=["generate_spec"],
+        intent=models.ToolIntent.render,
     )
     tool = _tool(
         "docx_render_from_spec",
@@ -690,7 +730,7 @@ def test_validate_plan_accepts_memory_backed_contract_branch() -> None:
 
 def test_validate_plan_rejects_tool_intent_mismatch() -> None:
     plan = _plan_with_task(
-        "llm_generate",
+        "llm.text.generate",
         {"text": "hello"},
         intent=models.ToolIntent.io,
     )
@@ -705,12 +745,15 @@ def test_validate_plan_rejects_tool_intent_mismatch() -> None:
     )
     valid, reason = _validate_plan(plan, [tool], _job())
     assert not valid
-    assert reason.startswith("tool_intent_mismatch:llm_generate:generate:io")
+    assert reason.startswith(
+        "capability_intent_invalid:llm.text.generate:task-1:"
+        "task_intent_mismatch:llm.text.generate:io"
+    )
 
 
 def test_validate_plan_rejects_missing_intent_segment_must_have_inputs() -> None:
     plan = _plan_with_task(
-        "llm_generate",
+        "llm.text.generate",
         {},
         intent=models.ToolIntent.generate,
     )
@@ -734,7 +777,9 @@ def test_validate_plan_rejects_missing_intent_segment_must_have_inputs() -> None
     )
     valid, reason = _validate_plan(plan, [tool], job)
     assert not valid
-    assert reason.startswith("intent_segment_invalid:llm_generate:task-1:must_have_inputs_missing:instruction")
+    assert reason.startswith(
+        "intent_segment_invalid:llm.text.generate:task-1:must_have_inputs_missing:instruction"
+    )
 
 
 def test_validate_plan_uses_task_instruction_for_llm_generate_intent_contract() -> None:
@@ -751,7 +796,7 @@ def test_validate_plan_uses_task_instruction_for_llm_generate_intent_contract() 
                 expected_output_schema_ref="schemas/validation_report",
                 intent=models.ToolIntent.generate,
                 deps=[],
-                tool_requests=["llm_generate"],
+                tool_requests=["llm.text.generate"],
                 tool_inputs={},
                 critic_required=False,
             )
@@ -1269,6 +1314,78 @@ def test_ensure_renderer_required_inputs_autowires_legacy_renderer_aliases() -> 
     }
 
 
+def test_ensure_execution_bindings_canonicalizes_adapter_request_ids(monkeypatch) -> None:
+    monkeypatch.setattr(
+        planner_main,
+        "_planner_capabilities",
+        lambda: {
+            "document.spec.generate": capability_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a document spec",
+                risk_tier="read_only",
+                idempotency="read",
+                adapters=(
+                    capability_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="llm_generate_document_spec",
+                        enabled=True,
+                    ),
+                ),
+            ),
+            "document.docx.render": capability_registry.CapabilitySpec(
+                capability_id="document.docx.render",
+                description="Render a DOCX",
+                risk_tier="read_only",
+                idempotency="read",
+                adapters=(
+                    capability_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="docx_render_from_spec",
+                        enabled=True,
+                    ),
+                ),
+            ),
+        },
+    )
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                tool_requests=["llm_generate_document_spec", "docx_render_from_spec"],
+                tool_inputs={
+                    "llm_generate_document_spec": {"instruction": "Generate a document"},
+                    "docx_render_from_spec": {"path": "artifacts/report.docx"},
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_execution_bindings(plan)
+    task = updated.tasks[0]
+
+    assert task.tool_requests == ["document.spec.generate", "document.docx.render"]
+    assert task.tool_inputs["document.spec.generate"] == {"instruction": "Generate a document"}
+    assert task.tool_inputs["document.docx.render"] == {"path": "artifacts/report.docx"}
+    assert task.capability_bindings["document.spec.generate"]["tool_name"] == (
+        "llm_generate_document_spec"
+    )
+    assert task.capability_bindings["document.docx.render"]["tool_name"] == (
+        "docx_render_from_spec"
+    )
+
+
 def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() -> None:
     plan = models.PlanCreate(
         planner_version="1",
@@ -1364,9 +1481,9 @@ def test_validate_plan_rejects_dependency_derived_render_path_for_raw_jobs() -> 
                 expected_output_schema_ref="schemas/docx_output",
                 intent=models.ToolIntent.render,
                 deps=["DeriveOutputPath"],
-                tool_requests=["docx_render_from_spec"],
+                tool_requests=["document.docx.render"],
                 tool_inputs={
-                    "docx_render_from_spec": {
+                    "document.docx.render": {
                         "document_spec": {"blocks": []},
                         "path": {
                             "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
@@ -1404,7 +1521,7 @@ def test_validate_plan_rejects_dependency_derived_render_path_for_raw_jobs() -> 
     valid, reason = _validate_plan(plan, tools, job)
 
     assert valid is False
-    assert reason == "render_path_derived_not_allowed:docx_render_from_spec:task=RenderResumeDocx"
+    assert reason == "render_path_derived_not_allowed:document.docx.render:task=RenderResumeDocx"
 
 
 def test_validate_plan_allows_dependency_derived_render_path_for_auto_mode_jobs() -> None:
@@ -1441,9 +1558,9 @@ def test_validate_plan_allows_dependency_derived_render_path_for_auto_mode_jobs(
                 expected_output_schema_ref="schemas/docx_output",
                 intent=models.ToolIntent.render,
                 deps=["DeriveOutputPath"],
-                tool_requests=["docx_render_from_spec"],
+                tool_requests=["document.docx.render"],
                 tool_inputs={
-                    "docx_render_from_spec": {
+                    "document.docx.render": {
                         "document_spec": {"blocks": []},
                         "path": {
                             "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"

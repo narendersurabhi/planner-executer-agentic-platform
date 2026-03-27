@@ -144,8 +144,13 @@ def execute_task_request(
             native_execution_name = (
                 binding.tool_name if binding and binding.tool_name else request_id
             )
+            prefer_native_tool = bool(
+                binding
+                and str(binding.adapter_type or "").strip().lower() == "tool"
+                and str(binding.tool_name or "").strip()
+            )
             capability_spec = None
-            if bound_capability_id:
+            if bound_capability_id and not prefer_native_tool:
                 capability_spec = context.capability_runtime.resolve_enabled_capability(
                     bound_capability_id
                 )
