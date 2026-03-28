@@ -152,6 +152,41 @@ def _attach_chat_session_to_job(
     return session_id
 
 
+def _create_chat_message_with_boundary_decision(
+    *,
+    content: str = "I can help with that.",
+    action_type: str = "respond",
+    boundary_decision: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    session_id = str(uuid.uuid4())
+    message_id = str(uuid.uuid4())
+    now = _utcnow()
+    with SessionLocal() as db:
+        db.add(
+            ChatSessionRecord(
+                id=session_id,
+                title="Boundary feedback session",
+                metadata_json={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.add(
+            ChatMessageRecord(
+                id=message_id,
+                session_id=session_id,
+                role="assistant",
+                content=content,
+                metadata_json={"boundary_decision": dict(boundary_decision or {})},
+                action_json={"type": action_type},
+                job_id=None,
+                created_at=now,
+            )
+        )
+        db.commit()
+    return session_id, message_id
+
+
 def _metric_value(metrics_text: str, metric_name: str, labels: dict[str, str] | None = None) -> float:
     for line in metrics_text.splitlines():
         if not line or line.startswith("#"):
@@ -204,6 +239,172 @@ def test_submit_chat_message_feedback_and_list_for_session() -> None:
     list_body = list_response.json()
     assert list_body["summary"]["total"] >= 1
     assert any(item["id"] == body["id"] for item in list_body["items"])
+
+
+def test_chat_message_feedback_carries_boundary_dimensions_into_summary_export_and_metrics() -> None:
+    before_metrics = client.get("/metrics")
+    assert before_metrics.status_code == 200
+    boundary_feedback_before = _metric_value(
+        before_metrics.text,
+        "chat_boundary_feedback_total",
+        {"decision": "chat_reply", "sentiment": "negative"},
+    )
+
+    session_id, message_id = _create_chat_message_with_boundary_decision(
+        boundary_decision={
+            "decision": "chat_reply",
+            "reason_code": "conversation_first",
+            "evidence": {
+                "conversation_mode_hint": "execution_oriented",
+                "top_families": [
+                    {"family": "documents", "score": 1.7, "capability_ids": ["document.spec.generate"]}
+                ],
+            },
+        }
+    )
+
+    feedback_response = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": "tester-boundary"},
+        json={
+            "target_type": "chat_message",
+            "target_id": message_id,
+            "sentiment": "negative",
+            "reason_codes": ["missed_request"],
+            "comment": "This should have started a job.",
+        },
+    )
+
+    assert feedback_response.status_code == 200
+    body = feedback_response.json()
+    assert body["metadata"]["dimensions"]["boundary_decision"] == "chat_reply"
+    assert body["metadata"]["dimensions"]["boundary_reason_code"] == "conversation_first"
+    assert body["metadata"]["dimensions"]["boundary_conversation_mode_hint"] == "execution_oriented"
+    assert body["metadata"]["dimensions"]["boundary_top_family"] == "documents"
+
+    summary_response = client.get(
+        "/feedback/summary",
+        params={"target_type": "chat_message"},
+    )
+    assert summary_response.status_code == 200
+    summary = summary_response.json()
+    assert any(
+        bucket["key"] == "chat_reply" and bucket["total"] >= 1
+        for bucket in summary["boundary_decisions"]
+    )
+    assert any(
+        bucket["key"] == "conversation_first" and bucket["total"] >= 1
+        for bucket in summary["boundary_reason_codes"]
+    )
+    assert any(
+        bucket["key"] == "documents" and bucket["total"] >= 1
+        for bucket in summary["boundary_top_families"]
+    )
+
+    export_response = client.get(
+        "/feedback/examples",
+        params=[("target_type", "chat_message"), ("sentiment", "negative")],
+    )
+    assert export_response.status_code == 200
+    export = export_response.json()
+    exported = next(item for item in export["items"] if item["feedback"]["id"] == body["id"])
+    assert exported["dimensions"]["boundary_decision"] == "chat_reply"
+    assert exported["dimensions"]["boundary_top_family"] == "documents"
+    assert exported["snapshot"]["metadata"]["boundary_decision"]["reason_code"] == "conversation_first"
+
+    after_metrics = client.get("/metrics")
+    assert after_metrics.status_code == 200
+    assert (
+        _metric_value(
+            after_metrics.text,
+            "chat_boundary_feedback_total",
+            {"decision": "chat_reply", "sentiment": "negative"},
+        )
+        >= boundary_feedback_before + 1
+    )
+
+    list_response = client.get(f"/chat/sessions/{session_id}/feedback")
+    assert list_response.status_code == 200
+    assert any(item["id"] == body["id"] for item in list_response.json()["items"])
+
+
+def test_chat_boundary_review_queue_orders_likely_misroutes() -> None:
+    _session_a, message_a = _create_chat_message_with_boundary_decision(
+        content="I can explain that in chat.",
+        action_type="respond",
+        boundary_decision={
+            "decision": "chat_reply",
+            "reason_code": "conversation_first",
+            "evidence": {
+                "conversation_mode_hint": "execution_oriented",
+                "top_families": [{"family": "documents", "score": 1.7}],
+            },
+        },
+    )
+    _session_b, message_b = _create_chat_message_with_boundary_decision(
+        content="I started a job for that request.",
+        action_type="submit_job",
+        boundary_decision={
+            "decision": "execution_request",
+            "reason_code": "semantic_capability_evidence",
+            "evidence": {
+                "conversation_mode_hint": "execution_oriented",
+                "top_families": [{"family": "github", "score": 1.2}],
+            },
+        },
+    )
+
+    first = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": "review-chat-reply"},
+        json={
+            "target_type": "chat_message",
+            "target_id": message_a,
+            "sentiment": "negative",
+            "reason_codes": ["missed_request"],
+            "comment": "This should have become a job.",
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": "review-exec"},
+        json={
+            "target_type": "chat_message",
+            "target_id": message_b,
+            "sentiment": "partial",
+            "reason_codes": ["incorrect"],
+            "comment": "This should probably have stayed in chat.",
+        },
+    )
+    assert second.status_code == 200
+
+    response = client.get("/feedback/chat-boundary/review")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] >= 2
+    labels = [item["review_label"] for item in body["items"]]
+    assert "likely_false_chat_reply" in labels
+    assert "likely_false_execution_request" in labels
+    filtered_chat_reply = client.get(
+        "/feedback/chat-boundary/review",
+        params={"review_label": "likely_false_chat_reply", "boundary_decision": "chat_reply"},
+    )
+    assert filtered_chat_reply.status_code == 200
+    filtered_chat_reply_body = filtered_chat_reply.json()
+    assert filtered_chat_reply_body["total"] >= 1
+    assert filtered_chat_reply_body["items"][0]["review_label"] == "likely_false_chat_reply"
+
+    filtered = client.get(
+        "/feedback/chat-boundary/review",
+        params={"boundary_decision": "chat_reply", "review_label": "likely_false_chat_reply"},
+    )
+    assert filtered.status_code == 200
+    filtered_body = filtered.json()
+    assert filtered_body["total"] >= 1
+    assert all(item["dimensions"]["boundary_decision"] == "chat_reply" for item in filtered_body["items"])
+    assert all(item["review_label"] == "likely_false_chat_reply" for item in filtered_body["items"])
 
 
 def test_submit_intent_and_plan_feedback_updates_same_actor_record() -> None:

@@ -14,7 +14,16 @@ def test_feedback_eval_builds_rows_and_jsonl() -> None:
                 "reason_codes": ["missing_step"],
                 "comment": "Missing review step.",
             },
-            "snapshot": {"plan_id": "plan-1", "task_count": 2},
+            "snapshot": {
+                "plan_id": "plan-1",
+                "task_count": 2,
+                "metadata": {
+                    "boundary_decision": {
+                        "decision": "execution_request",
+                        "evidence": {"top_families": [{"family": "documents"}]},
+                    }
+                },
+            },
             "dimensions": {"planner_version": "planner_v2", "llm_model": "gpt-test"},
             "linked_ids": {"job_id": "job-1", "plan_id": "plan-1"},
         }
@@ -30,9 +39,20 @@ def test_feedback_eval_builds_rows_and_jsonl() -> None:
             "sentiment": "negative",
             "reason_codes": ["missing_step"],
             "comment": "Missing review step.",
-            "snapshot": {"plan_id": "plan-1", "task_count": 2},
+            "snapshot": {
+                "plan_id": "plan-1",
+                "task_count": 2,
+                "metadata": {
+                    "boundary_decision": {
+                        "decision": "execution_request",
+                        "evidence": {"top_families": [{"family": "documents"}]},
+                    }
+                },
+            },
             "dimensions": {"planner_version": "planner_v2", "llm_model": "gpt-test"},
             "linked_ids": {"job_id": "job-1", "plan_id": "plan-1"},
+            "boundary_decision": "execution_request",
+            "boundary_evidence": {"top_families": [{"family": "documents"}]},
         }
     ]
 

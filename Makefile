@@ -179,6 +179,12 @@ eval-capability-search:
 eval-capability-search-gate:
 	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_capability_search.py --gold eval/capability_search_gold.jsonl --top-k 5 --min-hit-rate-at-3 0.70 --min-mrr 0.55 --min-ndcg 0.60
 
+eval-chat-boundary:
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --verbose
+
+eval-chat-boundary-gate:
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --min-accuracy 0.95 --max-false-chat-reply-rate 0.05 --min-pending-continuation-rate 0.95
+
 build-capability-feedback:
 	PYTHONPATH=. python3 scripts/build_capability_search_feedback.py --source auto --output artifacts/evals/capability_search_feedback.jsonl
 

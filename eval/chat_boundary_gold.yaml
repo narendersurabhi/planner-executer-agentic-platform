@@ -1,0 +1,74 @@
+cases:
+  - id: document_create_execution_request
+    content: create a document on Kubernetes
+    candidate_goal: create a document on Kubernetes
+    expected_decision: execution_request
+    notes: Real-world misroute shape that should escalate into the execution path.
+    evidence:
+      goal: create a document on Kubernetes
+      conversation_mode_hint: execution_oriented
+      pending_clarification: false
+      workflow_target_available: false
+      intent: generate
+      risk_level: low
+      needs_clarification: false
+      missing_inputs: []
+      top_capabilities:
+        - capability_id: document.spec.generate
+          group: documents
+          subgroup: authoring
+          score: 0.93
+          source: lexical
+        - capability_id: document.docx.render
+          group: documents
+          subgroup: rendering
+          score: 0.84
+          source: lexical
+      top_families:
+        - family: documents
+          score: 1.77
+          capability_ids:
+            - document.spec.generate
+            - document.docx.render
+  - id: continue_pending_output_format
+    content: docx is fine
+    candidate_goal: create a Kubernetes troubleshooting guide
+    expected_decision: continue_pending
+    notes: Pending clarification answers should remain attached to the in-flight execution request.
+    evidence:
+      goal: create a Kubernetes troubleshooting guide
+      conversation_mode_hint: execution_oriented
+      pending_clarification: true
+      workflow_target_available: false
+      intent: generate
+      risk_level: low
+      needs_clarification: true
+      missing_inputs:
+        - output_format
+      top_capabilities:
+        - capability_id: document.spec.generate
+          group: documents
+          subgroup: authoring
+          score: 0.78
+          source: lexical
+      top_families:
+        - family: documents
+          score: 0.78
+          capability_ids:
+            - document.spec.generate
+  - id: greeting_chat_reply
+    content: hello there
+    candidate_goal: hello there
+    expected_decision: chat_reply
+    notes: Clear conversational turns should stay in chat.
+    evidence:
+      goal: hello there
+      conversation_mode_hint: conversational
+      pending_clarification: false
+      workflow_target_available: false
+      intent: other
+      risk_level: low
+      needs_clarification: false
+      missing_inputs: []
+      top_capabilities: []
+      top_families: []

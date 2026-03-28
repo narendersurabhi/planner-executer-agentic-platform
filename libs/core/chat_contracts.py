@@ -23,6 +23,39 @@ class ChatBoundaryDecisionType(str, Enum):
     meta_clarification = "meta_clarification"
 
 
+class ChatBoundaryCapabilityEvidence(BaseModel):
+    capability_id: str
+    group: str | None = None
+    subgroup: str | None = None
+    score: float | None = None
+    source: str | None = None
+    reason: str | None = None
+
+
+class ChatBoundaryFamilyEvidence(BaseModel):
+    family: str
+    score: float = 0.0
+    capability_ids: list[str] = Field(default_factory=list)
+
+
+class ChatBoundaryEvidence(BaseModel):
+    goal: str = ""
+    conversation_mode_hint: str = ""
+    pending_clarification: bool = False
+    workflow_target_available: bool = False
+    likely_clarification_answer: bool = False
+    intent: str = ""
+    risk_level: str = ""
+    needs_clarification: bool = False
+    missing_inputs: list[str] = Field(default_factory=list)
+    top_capability_score: float = 0.0
+    top_family_score: float = 0.0
+    family_concentration: float = 0.0
+    execution_signal_strength: str = ""
+    top_capabilities: list[ChatBoundaryCapabilityEvidence] = Field(default_factory=list)
+    top_families: list[ChatBoundaryFamilyEvidence] = Field(default_factory=list)
+
+
 class AssistantActionType(str, Enum):
     respond = "respond"
     tool_call = "tool_call"
@@ -55,6 +88,7 @@ class ChatBoundaryDecision(BaseModel):
     confidence: float | None = None
     assistant_response: str = ""
     reason_code: str | None = None
+    evidence: ChatBoundaryEvidence | None = None
 
 
 class ChatMessage(BaseModel):

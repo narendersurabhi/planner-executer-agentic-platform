@@ -542,6 +542,9 @@ class FeedbackSummaryResponse(BaseModel):
     planner_versions: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     job_statuses: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     assistant_action_types: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    boundary_decisions: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    boundary_reason_codes: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    boundary_top_families: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     metrics: Dict[str, float] = Field(default_factory=dict)
     correlates: FeedbackCorrelationSummary = Field(default_factory=FeedbackCorrelationSummary)
 
@@ -556,6 +559,20 @@ class FeedbackExample(BaseModel):
 class FeedbackExampleExportResponse(BaseModel):
     total: int = 0
     items: List[FeedbackExample] = Field(default_factory=list)
+
+
+class ChatBoundaryReviewQueueItem(BaseModel):
+    feedback: Feedback
+    dimensions: Dict[str, Any] = Field(default_factory=dict)
+    linked_ids: Dict[str, Optional[str]] = Field(default_factory=dict)
+    review_label: str
+    review_score: int = 0
+    excerpt: Optional[str] = None
+
+
+class ChatBoundaryReviewQueueResponse(BaseModel):
+    total: int = 0
+    items: List[ChatBoundaryReviewQueueItem] = Field(default_factory=list)
 
 
 class JobCreate(BaseModel):

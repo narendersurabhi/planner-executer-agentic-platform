@@ -220,6 +220,7 @@ make lint
 make typecheck
 make eval-intent
 make eval-capability-search
+make eval-chat-boundary
 ```
 
 These Make targets now run through `uv`, so you do not need to preinstall `pytest`, `ruff`, `mypy`, or the Python runtime dependencies manually.
@@ -256,6 +257,8 @@ These Make targets now run through `uv`, so you do not need to preinstall `pytes
 - `make eval-intent-gate`
 - `make eval-capability-search`
 - `make eval-capability-search-gate`
+- `make eval-chat-boundary`
+- `make eval-chat-boundary-gate`
 - `make k8s-up-local`
 - `make k8s-apply-local`
 - `make k8s-down-local`
@@ -285,6 +288,26 @@ make eval-intent-gate
 ```
 
 The Make targets above are the recommended path because they wrap the required dependencies with `uv`.
+
+## Chat Boundary Eval Harness
+
+Use the gold-set harness to keep `response_first` chat boundary behavior stable as routing rules evolve.
+
+Gold cases:
+
+- `eval/chat_boundary_gold.yaml`
+
+Run locally:
+
+```bash
+make eval-chat-boundary
+```
+
+CI gate (thresholded):
+
+```bash
+make eval-chat-boundary-gate
+```
 
 ## Kubernetes
 
@@ -353,6 +376,7 @@ kubectl port-forward -n awe svc/prometheus 9090:9090
 - Operators can use:
   - `GET /feedback/summary` for aggregate rates and breakdowns
   - `GET /feedback/examples` for negative/partial example export
+  - `GET /feedback/chat-boundary/review` for a lightweight queue of likely boundary misroutes
   - the Feedback Insights panel in the UI for quick operational review
 
 ## Worker Reliability and Scaling
@@ -562,11 +586,14 @@ curl "http://localhost:18000/feedback/summary?target_type=plan"
 
 curl "http://localhost:18000/feedback/examples?target_type=chat_message&sentiment=negative&format=jsonl" \
   > eval/chat_feedback_negative.jsonl
+
+curl "http://localhost:18000/feedback/chat-boundary/review?review_label=likely_false_chat_reply"
 ```
 
 - `GET /feedback`
 - `GET /feedback/summary`
 - `GET /feedback/examples`
+- `GET /feedback/chat-boundary/review`
 - `GET /jobs/{job_id}/feedback`
 - `GET /chat/sessions/{session_id}/feedback`
 

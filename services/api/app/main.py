@@ -946,11 +946,31 @@ feedback_examples_export_total = Counter(
     "feedback_examples_export_total",
     "Feedback example export requests",
 )
+chat_boundary_decisions_total = Counter(
+    "chat_boundary_decisions_total",
+    "Chat boundary decisions emitted by the response-first boundary model",
+    ["decision", "conversation_mode_hint", "pending_clarification", "workflow_target_available"],
+)
+chat_boundary_reason_total = Counter(
+    "chat_boundary_reason_total",
+    "Chat boundary reason codes emitted by the response-first boundary model",
+    ["decision", "reason_code"],
+)
+chat_boundary_feedback_total = Counter(
+    "chat_boundary_feedback_total",
+    "Explicit chat-message feedback grouped by prior chat boundary decision",
+    ["decision", "sentiment"],
+)
 
 
 def _intent_source_label(source: Any) -> str:
     normalized = str(source or "").strip().lower()
     return normalized or "unknown"
+
+
+def _metrics_label(value: Any, *, default: str = "unknown") -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized or default
 
 
 def _intent_assessment_fallback_used(source: Any) -> bool:
@@ -2982,45 +3002,70 @@ def _route_chat_turn(
             content=content,
             pending_clarification=pending_clarification,
         )
+    boundary = _postprocess_chat_boundary_decision(boundary)
+    _record_chat_boundary_decision_metrics(boundary)
     decision = boundary.decision
     if pending_clarification and decision == chat_contracts.ChatBoundaryDecisionType.chat_reply:
         decision = chat_contracts.ChatBoundaryDecisionType.exit_pending_to_chat
     if decision == chat_contracts.ChatBoundaryDecisionType.chat_reply:
-        return _chat_response_turn_plan(
-            goal=content.strip(),
-            assistant_content=boundary.assistant_response or _fallback_chat_response(content),
+        return _attach_chat_boundary_decision(
+            _chat_response_turn_plan(
+                goal=content.strip(),
+                assistant_content=boundary.assistant_response or _fallback_chat_response(content),
+            ),
+            boundary,
         )
     if decision == chat_contracts.ChatBoundaryDecisionType.exit_pending_to_chat:
-        return _chat_response_turn_plan(
-            goal=content.strip(),
-            assistant_content=boundary.assistant_response or _fallback_chat_response(content),
-            clear_pending_clarification=True,
+        return _attach_chat_boundary_decision(
+            _chat_response_turn_plan(
+                goal=content.strip(),
+                assistant_content=boundary.assistant_response or _fallback_chat_response(content),
+                clear_pending_clarification=True,
+            ),
+            boundary,
         )
     if decision == chat_contracts.ChatBoundaryDecisionType.meta_clarification:
-        return _chat_response_turn_plan(
-            goal=content.strip(),
-            assistant_content=boundary.assistant_response
-            or (
-                "Do you want to continue the current workflow request, or should I answer "
-                "here in chat instead?"
+        return _attach_chat_boundary_decision(
+            _chat_response_turn_plan(
+                goal=content.strip(),
+                assistant_content=boundary.assistant_response
+                or (
+                    "Do you want to continue the current workflow request, or should I answer "
+                    "here in chat instead?"
+                ),
+                source="chat_boundary_meta_clarification",
             ),
-            source="chat_boundary_meta_clarification",
+            boundary,
         )
     if decision in {
         chat_contracts.ChatBoundaryDecisionType.execution_request,
         chat_contracts.ChatBoundaryDecisionType.continue_pending,
     }:
-        return _route_chat_turn_with_router(
-            content=content,
-            candidate_goal=candidate_goal,
-            session_metadata=session_metadata,
-            merged_context=merged_context,
-            messages=messages,
+        return _attach_chat_boundary_decision(
+            _route_chat_turn_with_router(
+                content=content,
+                candidate_goal=candidate_goal,
+                session_metadata=session_metadata,
+                merged_context=merged_context,
+                messages=messages,
+            ),
+            boundary,
         )
     return _chat_boundary_failure_response(
         content=content,
         pending_clarification=pending_clarification,
     )
+
+
+def _attach_chat_boundary_decision(
+    turn_plan: Mapping[str, Any],
+    boundary: chat_contracts.ChatBoundaryDecision | None,
+) -> dict[str, Any]:
+    if boundary is None:
+        return dict(turn_plan)
+    enriched = dict(turn_plan)
+    enriched["boundary_decision"] = boundary.model_dump(mode="json", exclude_none=True)
+    return enriched
 
 
 def _route_chat_turn_legacy(
@@ -3364,6 +3409,223 @@ def _build_chat_response_prompt(
     return json.dumps(payload, ensure_ascii=True)
 
 
+def _chat_boundary_query_text(content: str, candidate_goal: str) -> str:
+    normalized_goal = str(candidate_goal or "").strip()
+    normalized_content = str(content or "").strip()
+    if normalized_goal and normalized_goal.lower() != normalized_content.lower():
+        return f"{normalized_goal}\n{normalized_content}"
+    return normalized_goal or normalized_content
+
+
+def _chat_boundary_score(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _chat_boundary_capability_evidence(
+    *,
+    query: str,
+) -> tuple[
+    list[chat_contracts.ChatBoundaryCapabilityEvidence],
+    list[chat_contracts.ChatBoundaryFamilyEvidence],
+]:
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return [], []
+    capabilities = _chat_visible_capabilities()
+    if not capabilities:
+        return [], []
+    entries = _chat_capability_search_entries(capabilities)
+    lexical_matches = capability_search.search_capabilities(
+        query=normalized_query,
+        capability_entries=entries,
+        limit=8,
+        rerank_feedback_rows=[],
+    )
+    matches = _hybrid_chat_capability_matches(
+        query=normalized_query,
+        capabilities=capabilities,
+        lexical_matches=lexical_matches,
+        entries=entries,
+    )
+    if not matches:
+        return [], []
+    capability_map = {capability_id: spec for capability_id, spec in capabilities}
+    top_capabilities: list[chat_contracts.ChatBoundaryCapabilityEvidence] = []
+    family_scores: dict[str, float] = {}
+    family_capability_ids: dict[str, list[str]] = {}
+    for match in matches[:5]:
+        capability_id = str(match.get("id") or "").strip()
+        spec = capability_map.get(capability_id)
+        if spec is None:
+            continue
+        try:
+            score = float(match.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        top_capabilities.append(
+            chat_contracts.ChatBoundaryCapabilityEvidence(
+                capability_id=capability_id,
+                group=str(spec.group or "").strip() or None,
+                subgroup=str(spec.subgroup or "").strip() or None,
+                score=round(score, 3),
+                source=str(match.get("source") or "").strip() or None,
+                reason=str(match.get("reason") or "").strip() or None,
+            )
+        )
+        family = str(spec.group or spec.subgroup or "").strip() or capability_id.split(".", 1)[0]
+        family_scores[family] = family_scores.get(family, 0.0) + score
+        family_capability_ids.setdefault(family, [])
+        if capability_id not in family_capability_ids[family]:
+            family_capability_ids[family].append(capability_id)
+    top_families = [
+        chat_contracts.ChatBoundaryFamilyEvidence(
+            family=family,
+            score=round(score, 3),
+            capability_ids=list(family_capability_ids.get(family, [])[:3]),
+        )
+        for family, score in sorted(family_scores.items(), key=lambda item: (-item[1], item[0]))[:3]
+    ]
+    return top_capabilities, top_families
+
+
+def _looks_like_pending_clarification_answer(content: str) -> bool:
+    lowered = str(content or "").strip().lower()
+    if not lowered:
+        return False
+    if _looks_like_execution_confirmation(content):
+        return True
+    if lowered.endswith("?"):
+        return False
+    if _looks_like_conversational_turn(content):
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+    if not normalized:
+        return False
+    token_count = len(normalized.split())
+    return token_count <= 18
+
+
+def _chat_boundary_execution_signal_strength(
+    *,
+    top_capabilities: Sequence[chat_contracts.ChatBoundaryCapabilityEvidence],
+    top_families: Sequence[chat_contracts.ChatBoundaryFamilyEvidence],
+    intent_profile: workflow_contracts.GoalIntentProfile | None,
+) -> tuple[float, float, float, str]:
+    top_capability_score = (
+        _chat_boundary_score(top_capabilities[0].score) if top_capabilities else 0.0
+    )
+    top_family_score = _chat_boundary_score(top_families[0].score) if top_families else 0.0
+    total_family_score = sum(_chat_boundary_score(family.score) for family in top_families)
+    family_concentration = (
+        round(top_family_score / total_family_score, 3)
+        if total_family_score > 0.0
+        else 0.0
+    )
+    intent = str(intent_profile.intent or "").strip().lower() if intent_profile is not None else ""
+    has_execution_intent = intent not in {"", "other", "inform", "clarify"}
+    strength = "none"
+    if top_capability_score >= 0.8 and top_family_score >= 1.1 and family_concentration >= 0.6:
+        strength = "strong"
+    elif (
+        top_capability_score >= 0.65
+        and top_family_score >= 0.8
+        and family_concentration >= 0.5
+        and has_execution_intent
+    ):
+        strength = "strong"
+    elif top_capability_score >= 0.55 and top_family_score >= 0.65:
+        strength = "moderate"
+    elif top_capability_score > 0.0 or top_family_score > 0.0:
+        strength = "weak"
+    return (
+        round(top_capability_score, 3),
+        round(top_family_score, 3),
+        family_concentration,
+        strength,
+    )
+
+
+def _chat_boundary_intent_evidence(
+    *,
+    content: str,
+    candidate_goal: str,
+    pending_clarification: bool,
+) -> workflow_contracts.GoalIntentProfile | None:
+    if not pending_clarification and _looks_like_conversational_turn(content):
+        return None
+    try:
+        normalized = _normalize_goal_intent(
+            candidate_goal,
+            include_decomposition=False,
+            assessment_mode_override="heuristic",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("chat_boundary_intent_evidence_failed")
+        return None
+    return _chat_route_goal_intent_profile(normalized.profile, goal=candidate_goal)
+
+
+def _build_chat_boundary_evidence(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+) -> chat_contracts.ChatBoundaryEvidence:
+    pending = (
+        dict(session_metadata.get("pending_clarification"))
+        if isinstance(session_metadata, Mapping)
+        and isinstance(session_metadata.get("pending_clarification"), Mapping)
+        else {}
+    )
+    workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
+    top_capabilities, top_families = _chat_boundary_capability_evidence(
+        query=_chat_boundary_query_text(content, candidate_goal),
+    )
+    intent_profile = _chat_boundary_intent_evidence(
+        content=content,
+        candidate_goal=candidate_goal,
+        pending_clarification=bool(pending),
+    )
+    likely_clarification_answer = bool(pending) and _looks_like_pending_clarification_answer(content)
+    (
+        top_capability_score,
+        top_family_score,
+        family_concentration,
+        execution_signal_strength,
+    ) = _chat_boundary_execution_signal_strength(
+        top_capabilities=top_capabilities,
+        top_families=top_families,
+        intent_profile=intent_profile,
+    )
+    if likely_clarification_answer:
+        conversation_mode_hint = "clarification_answer"
+    elif _looks_like_conversational_turn(content):
+        conversation_mode_hint = "conversational"
+    else:
+        conversation_mode_hint = "execution_oriented"
+    return chat_contracts.ChatBoundaryEvidence(
+        goal=str(candidate_goal or "").strip(),
+        conversation_mode_hint=conversation_mode_hint,
+        pending_clarification=bool(pending),
+        workflow_target_available=workflow_invocation is not None,
+        likely_clarification_answer=likely_clarification_answer,
+        intent=str(intent_profile.intent or "").strip() if intent_profile is not None else "",
+        risk_level=str(intent_profile.risk_level or "").strip() if intent_profile is not None else "",
+        needs_clarification=bool(intent_profile.needs_clarification) if intent_profile is not None else False,
+        missing_inputs=list(intent_profile.missing_slots) if intent_profile is not None else [],
+        top_capability_score=top_capability_score,
+        top_family_score=top_family_score,
+        family_concentration=family_concentration,
+        execution_signal_strength=execution_signal_strength,
+        top_capabilities=top_capabilities,
+        top_families=top_families,
+    )
+
+
 def _build_chat_boundary_decision_prompt(
     *,
     content: str,
@@ -3371,6 +3633,7 @@ def _build_chat_boundary_decision_prompt(
     session_metadata: Mapping[str, Any] | None,
     merged_context: Mapping[str, Any] | None,
     messages: Sequence[chat_contracts.ChatMessage] | None,
+    boundary_evidence: chat_contracts.ChatBoundaryEvidence | None = None,
 ) -> str:
     recent_messages: list[dict[str, str]] = []
     for message in list(messages or [])[-8:]:
@@ -3402,6 +3665,11 @@ def _build_chat_boundary_decision_prompt(
             if isinstance(question, str) and question.strip()
         ],
         "context_json": dict(merged_context or {}),
+        "boundary_evidence": (
+            boundary_evidence.model_dump(mode="json", exclude_none=True)
+            if boundary_evidence is not None
+            else {}
+        ),
         "recent_messages": recent_messages,
         "workflow_context": {
             "target_available": workflow_invocation is not None,
@@ -3470,6 +3738,12 @@ def _generate_chat_boundary_decision(
 ) -> chat_contracts.ChatBoundaryDecision | None:
     if CHAT_RESPONSE_MODE != "answer_or_handoff" or _chat_response_provider is None:
         return None
+    boundary_evidence = _build_chat_boundary_evidence(
+        content=content,
+        candidate_goal=candidate_goal,
+        session_metadata=session_metadata,
+        merged_context=merged_context,
+    )
     try:
         parsed = _chat_response_provider.generate_request_json_object(
             LLMRequest(
@@ -3479,14 +3753,20 @@ def _generate_chat_boundary_decision(
                     session_metadata=session_metadata,
                     merged_context=merged_context,
                     messages=messages,
+                    boundary_evidence=boundary_evidence,
                 ),
                 system_prompt=(
                     "You are the front-door boundary decision model for an agent platform. "
                     "Choose exactly one bounded decision and return JSON only. "
+                    "Use boundary_evidence as grounding. "
+                    "Strong executable capability-family evidence or an execution-oriented intent should push you toward execution_request unless the user is clearly asking for discussion only. "
+                    "A conversational hint alone is not enough to override strong executable evidence. "
+                    "If boundary_evidence.execution_signal_strength is 'strong' and conversation_mode_hint is not 'conversational', do not choose chat_reply unless the user explicitly asks for discussion, explanation, brainstorming, tutoring, or interview practice only. "
                     "When pending_clarification is false: "
                     "use decision='chat_reply' for normal conversation, explanation, discussion, advice, tutoring, coaching, quizzes, interview practice, roleplay, brainstorming, or any other back-and-forth chat experience. "
                     "Use decision='execution_request' only when the user wants tools, system actions, file changes, workflow execution, job submission, artifact creation, repository or environment inspection, or automation. "
                     "When pending_clarification is true: "
+                    "If boundary_evidence.likely_clarification_answer is true, prefer decision='continue_pending'. "
                     "use decision='continue_pending' if the user is answering the existing workflow clarification or wants to continue that request; "
                     "use decision='exit_pending_to_chat' if the user wants to stop the workflow path and just get a normal chat answer; "
                     "use decision='meta_clarification' if it is ambiguous whether they want to continue the pending workflow or return to normal chat. "
@@ -3509,11 +3789,67 @@ def _generate_chat_boundary_decision(
                     or str(fallback_response or "").strip()
                 ),
                 "reason_code": parsed.get("reason_code"),
+                "evidence": boundary_evidence.model_dump(mode="json", exclude_none=True),
             }
         )
     except Exception:  # noqa: BLE001
         return None
     return decision
+
+
+def _postprocess_chat_boundary_decision(
+    boundary: chat_contracts.ChatBoundaryDecision,
+) -> chat_contracts.ChatBoundaryDecision:
+    evidence = boundary.evidence or chat_contracts.ChatBoundaryEvidence()
+    if (
+        not evidence.pending_clarification
+        and boundary.decision == chat_contracts.ChatBoundaryDecisionType.chat_reply
+        and evidence.execution_signal_strength == "strong"
+        and evidence.conversation_mode_hint != "conversational"
+    ):
+        return boundary.model_copy(
+            update={
+                "decision": chat_contracts.ChatBoundaryDecisionType.execution_request,
+                "assistant_response": "",
+                "reason_code": "execution_signal_override",
+            }
+        )
+    if (
+        evidence.pending_clarification
+        and evidence.likely_clarification_answer
+        and boundary.decision
+        in {
+            chat_contracts.ChatBoundaryDecisionType.chat_reply,
+            chat_contracts.ChatBoundaryDecisionType.meta_clarification,
+        }
+    ):
+        return boundary.model_copy(
+            update={
+                "decision": chat_contracts.ChatBoundaryDecisionType.continue_pending,
+                "assistant_response": "",
+                "reason_code": "clarification_answer_override",
+            }
+        )
+    return boundary
+
+
+def _record_chat_boundary_decision_metrics(
+    boundary: chat_contracts.ChatBoundaryDecision,
+) -> None:
+    evidence = boundary.evidence or chat_contracts.ChatBoundaryEvidence()
+    chat_boundary_decisions_total.labels(
+        decision=boundary.decision.value,
+        conversation_mode_hint=_metrics_label(
+            evidence.conversation_mode_hint,
+            default="unknown",
+        ),
+        pending_clarification="true" if evidence.pending_clarification else "false",
+        workflow_target_available="true" if evidence.workflow_target_available else "false",
+    ).inc()
+    chat_boundary_reason_total.labels(
+        decision=boundary.decision.value,
+        reason_code=_metrics_label(boundary.reason_code, default="none"),
+    ).inc()
 
 
 def _finalize_chat_turn_plan(
@@ -11618,6 +11954,17 @@ def submit_feedback(
             target_type=feedback.target_type.value,
             reason_code=reason_code,
         ).inc()
+    dimensions = (
+        dict(feedback.metadata.get("dimensions") or {})
+        if isinstance(feedback.metadata, Mapping)
+        else {}
+    )
+    boundary_decision = _metrics_label(dimensions.get("boundary_decision"), default="none")
+    if feedback.target_type == models.FeedbackTargetType.chat_message and boundary_decision != "none":
+        chat_boundary_feedback_total.labels(
+            decision=boundary_decision,
+            sentiment=feedback.sentiment.value,
+        ).inc()
     _emit_event("feedback.submitted", feedback.model_dump(mode="json"))
     return feedback
 
@@ -11711,6 +12058,21 @@ def get_feedback_examples(
             media_type="application/x-ndjson",
         )
     return export
+
+
+@app.get("/feedback/chat-boundary/review", response_model=models.ChatBoundaryReviewQueueResponse)
+def get_chat_boundary_review_queue(
+    review_label: str | None = Query(default=None),
+    boundary_decision: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.ChatBoundaryReviewQueueResponse:
+    return feedback_service.chat_boundary_review_queue(
+        db,
+        review_label=review_label,
+        boundary_decision=boundary_decision,
+        limit=limit,
+    )
 
 
 @app.get("/jobs/{job_id}/feedback", response_model=models.FeedbackListResponse)

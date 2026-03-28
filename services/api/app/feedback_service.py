@@ -47,6 +47,48 @@ def _normalize_metadata(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _boundary_decision_payload(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _boundary_decision_fields(boundary_payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = dict(boundary_payload) if isinstance(boundary_payload, Mapping) else {}
+    evidence = payload.get("evidence")
+    normalized_evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+    top_families = normalized_evidence.get("top_families")
+    top_family = None
+    if isinstance(top_families, list):
+        for item in top_families:
+            if not isinstance(item, Mapping):
+                continue
+            top_family = _non_empty_string(item.get("family"))
+            if top_family is not None:
+                break
+    return {
+        "boundary_decision": _non_empty_string(payload.get("decision")),
+        "boundary_reason_code": _non_empty_string(payload.get("reason_code")),
+        "boundary_conversation_mode_hint": _non_empty_string(
+            normalized_evidence.get("conversation_mode_hint")
+        ),
+        "boundary_top_family": top_family,
+    }
+
+
+def _boundary_fields_from_message(
+    message: ChatMessageRecord | None,
+    snapshot: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    message_metadata = (
+        dict(message.metadata_json or {}) if message is not None and isinstance(message.metadata_json, Mapping) else {}
+    )
+    boundary_payload = _boundary_decision_payload(message_metadata.get("boundary_decision"))
+    if not boundary_payload and isinstance(snapshot, Mapping):
+        snapshot_metadata = snapshot.get("metadata")
+        if isinstance(snapshot_metadata, Mapping):
+            boundary_payload = _boundary_decision_payload(snapshot_metadata.get("boundary_decision"))
+    return _boundary_decision_fields(boundary_payload)
+
+
 def _candidate_capabilities_from_graph(
     graph: workflow_contracts.IntentGraph | None,
 ) -> dict[str, list[str]]:
@@ -333,6 +375,7 @@ def derive_feedback_dimensions(
         or _non_empty_string(snapshot.get("status"))
     )
     assistant_action_type = _non_empty_string(message_action.get("type"))
+    boundary_fields = _boundary_fields_from_message(message, snapshot)
     return {
         "target_type": request.target_type.value,
         "target_id": _non_empty_string(request.target_id),
@@ -342,6 +385,10 @@ def derive_feedback_dimensions(
         "planner_version": planner_version,
         "job_status_at_feedback": job_status,
         "assistant_action_type": assistant_action_type,
+        "boundary_decision": boundary_fields.get("boundary_decision"),
+        "boundary_reason_code": boundary_fields.get("boundary_reason_code"),
+        "boundary_conversation_mode_hint": boundary_fields.get("boundary_conversation_mode_hint"),
+        "boundary_top_family": boundary_fields.get("boundary_top_family"),
         "has_comment": bool(comment),
         "reason_count": len(reason_codes),
     }
@@ -370,6 +417,10 @@ def _feedback_dimensions(item: models.Feedback) -> dict[str, Any]:
         action = snapshot.get("action")
         if isinstance(action, Mapping):
             normalized["assistant_action_type"] = _non_empty_string(action.get("type"))
+    boundary_fields = _boundary_fields_from_message(None, snapshot)
+    for key, value in boundary_fields.items():
+        if not _non_empty_string(normalized.get(key)) and value is not None:
+            normalized[key] = value
     return normalized
 
 
@@ -602,6 +653,9 @@ def summarize_feedback_rows(
         planner_versions=dimension_breakdown(items, "planner_version"),
         job_statuses=dimension_breakdown(items, "job_status_at_feedback"),
         assistant_action_types=dimension_breakdown(items, "assistant_action_type"),
+        boundary_decisions=dimension_breakdown(items, "boundary_decision"),
+        boundary_reason_codes=dimension_breakdown(items, "boundary_reason_code"),
+        boundary_top_families=dimension_breakdown(items, "boundary_top_family"),
         metrics={
             "chat_helpfulness_rate": _positive_rate(
                 items,
@@ -855,6 +909,108 @@ def export_feedback_examples(
         for item in filtered
     ]
     return models.FeedbackExampleExportResponse(total=len(examples), items=examples)
+
+
+def _chat_boundary_review_label(item: models.Feedback) -> str | None:
+    if item.target_type != models.FeedbackTargetType.chat_message:
+        return None
+    if item.sentiment not in {
+        models.FeedbackSentiment.negative,
+        models.FeedbackSentiment.partial,
+    }:
+        return None
+    dimensions = _feedback_dimensions(item)
+    boundary_decision = _non_empty_string(dimensions.get("boundary_decision"))
+    assistant_action_type = _non_empty_string(dimensions.get("assistant_action_type"))
+    if boundary_decision == "chat_reply" and assistant_action_type == "respond":
+        return "likely_false_chat_reply"
+    if boundary_decision == "execution_request" and assistant_action_type in {
+        "submit_job",
+        "ask_clarification",
+        "tool_call",
+        "run_workflow",
+    }:
+        return "likely_false_execution_request"
+    if boundary_decision == "continue_pending":
+        return "likely_pending_misroute"
+    return None
+
+
+def _chat_boundary_review_score(item: models.Feedback, review_label: str) -> int:
+    score = 0
+    if item.sentiment == models.FeedbackSentiment.negative:
+        score += 100
+    elif item.sentiment == models.FeedbackSentiment.partial:
+        score += 70
+    if review_label == "likely_false_chat_reply":
+        score += 40
+    elif review_label == "likely_false_execution_request":
+        score += 30
+    elif review_label == "likely_pending_misroute":
+        score += 20
+    reasons = set(_normalize_reason_codes(item.reason_codes))
+    if "missed_request" in reasons:
+        score += 25
+    if "incorrect" in reasons or "wrong_scope" in reasons:
+        score += 15
+    if _non_empty_string(item.comment):
+        score += 5
+    return score
+
+
+def chat_boundary_review_queue(
+    db: Session,
+    *,
+    limit: int = 100,
+    review_label: str | None = None,
+    boundary_decision: str | None = None,
+) -> models.ChatBoundaryReviewQueueResponse:
+    rows = _feedback_records(
+        db,
+        target_type=models.FeedbackTargetType.chat_message,
+        limit=max(limit * 4, 200),
+    )
+    normalized_review_label = _non_empty_string(review_label)
+    normalized_boundary_decision = _non_empty_string(boundary_decision)
+    items: list[models.ChatBoundaryReviewQueueItem] = []
+    for row in rows:
+        feedback = _feedback_from_record(row)
+        dimensions = _feedback_dimensions(feedback)
+        label = _chat_boundary_review_label(feedback)
+        if label is None:
+            continue
+        if normalized_review_label is not None and label != normalized_review_label:
+            continue
+        if (
+            normalized_boundary_decision is not None
+            and _non_empty_string(dimensions.get("boundary_decision")) != normalized_boundary_decision
+        ):
+            continue
+        excerpt = _non_empty_string(feedback.snapshot.get("content")) if isinstance(feedback.snapshot, Mapping) else None
+        items.append(
+            models.ChatBoundaryReviewQueueItem(
+                feedback=feedback,
+                dimensions=dimensions,
+                linked_ids={
+                    "session_id": feedback.session_id,
+                    "job_id": feedback.job_id,
+                    "plan_id": feedback.plan_id,
+                    "message_id": feedback.message_id,
+                    "target_id": feedback.target_id,
+                },
+                review_label=label,
+                review_score=_chat_boundary_review_score(feedback, label),
+                excerpt=excerpt,
+            )
+        )
+    ordered = sorted(
+        items,
+        key=lambda item: (-item.review_score, item.feedback.updated_at),
+    )
+    return models.ChatBoundaryReviewQueueResponse(
+        total=len(ordered),
+        items=ordered[: max(1, min(limit, 500))],
+    )
 
 
 def summary_feedback_response(

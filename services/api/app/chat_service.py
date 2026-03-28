@@ -249,6 +249,11 @@ def handle_turn(
     assessment = workflow_contracts.dump_goal_intent_profile(
         turn_plan.get("goal_intent_profile")
     ) or {}
+    boundary_decision = (
+        dict(turn_plan.get("boundary_decision"))
+        if isinstance(turn_plan.get("boundary_decision"), Mapping)
+        else None
+    )
     route_type = str(turn_plan.get("type") or "").strip().lower() or "respond"
     resolved_goal = str(turn_plan.get("resolved_goal") or candidate_goal or "").strip()
     if not resolved_goal:
@@ -579,7 +584,12 @@ def handle_turn(
         session_id=record.id,
         role=chat_contracts.ChatRole.assistant.value,
         content=assistant_content,
-        metadata_json=_assistant_metadata(assessment, direct_output, workflow_run),
+        metadata_json=_assistant_metadata(
+            assessment,
+            direct_output,
+            workflow_run,
+            boundary_decision=boundary_decision,
+        ),
         action_json=assistant_action.model_dump(mode="json", exclude_none=True),
         job_id=created_job.id if created_job is not None else None,
         created_at=runtime.utcnow(),
@@ -840,6 +850,8 @@ def _assistant_metadata(
     assessment: Mapping[str, Any],
     direct_output: Any = None,
     workflow_run: models.WorkflowRun | None = None,
+    *,
+    boundary_decision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = {
         "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(assessment) or {}
@@ -848,6 +860,8 @@ def _assistant_metadata(
         metadata["tool_output"] = dict(direct_output)
     if isinstance(workflow_run, models.WorkflowRun):
         metadata["workflow_run"] = workflow_run.model_dump(mode="json", exclude_none=True)
+    if isinstance(boundary_decision, Mapping):
+        metadata["boundary_decision"] = dict(boundary_decision)
     return metadata
 
 

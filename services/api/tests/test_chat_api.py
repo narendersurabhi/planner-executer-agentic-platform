@@ -1,4 +1,6 @@
+import json
 import os
+import re
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
@@ -23,6 +25,21 @@ main.CHAT_ROUTING_MODE = "response_first"
 main._chat_router_provider = None
 main._chat_response_provider = None
 main._chat_pending_correction_provider = None
+
+
+def _metric_value(metrics_text: str, metric_name: str, labels: dict[str, str] | None = None) -> float:
+    for line in metrics_text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if labels:
+            if not line.startswith(f"{metric_name}{{"):
+                continue
+            if any(f'{key}="{value}"' not in line for key, value in labels.items()):
+                continue
+            return float(line.rsplit(" ", 1)[-1])
+        if re.match(rf"^{re.escape(metric_name)}\s+[-+0-9.eE]+$", line):
+            return float(line.rsplit(" ", 1)[-1])
+    return 0.0
 
 
 def test_create_chat_session() -> None:
@@ -1446,6 +1463,315 @@ def test_chat_turn_response_first_answer_or_handoff_can_escalate_to_router(monke
     body = response.json()
     assert body["job"] is not None
     assert body["assistant_message"]["action"]["type"] == "submit_job"
+
+
+def test_chat_boundary_uses_semantic_capability_evidence_and_persists_decision(
+    monkeypatch,
+) -> None:
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "document.spec.generate": cap_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a structured document spec from an instruction.",
+                risk_tier="read_only",
+                idempotency="read",
+                group="documents",
+                subgroup="generation",
+                enabled=True,
+            ),
+            "document.docx.render": cap_registry.CapabilitySpec(
+                capability_id="document.docx.render",
+                description="Render a DOCX document from a DocumentSpec.",
+                risk_tier="bounded_write",
+                idempotency="safe_write",
+                group="documents",
+                subgroup="rendering",
+                enabled=True,
+            ),
+            "github.repo.list": cap_registry.CapabilitySpec(
+                capability_id="github.repo.list",
+                description="List repositories.",
+                risk_tier="read_only",
+                idempotency="read",
+                group="github",
+                subgroup="repositories",
+                enabled=True,
+            ),
+        }
+    )
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+                "output_format": "docx",
+            }
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            payload = json.loads(request.prompt)
+            evidence = payload["boundary_evidence"]
+            assert evidence["conversation_mode_hint"] == "execution_oriented"
+            assert any(
+                capability["capability_id"].startswith("document.")
+                for capability in evidence["top_capabilities"]
+            )
+            assert any(family["family"] == "documents" for family in evidence["top_families"])
+            assert evidence["intent"] == "generate"
+            return {
+                "decision": "execution_request",
+                "assistant_response": "",
+                "reason_code": "semantic_capability_evidence",
+            }
+
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(
+        main.capability_registry,
+        "evaluate_capability_allowlist",
+        lambda capability_id, service_name=None: cap_registry.CapabilityAllowDecision(
+            allowed=True,
+            reason="allowed",
+        ),
+    )
+    monkeypatch.setattr(main, "CHAT_CAPABILITY_VECTOR_SEARCH_ENABLED", False)
+    monkeypatch.setattr(main, "CHAT_INTENT_VECTOR_SEARCH_ENABLED", False)
+    monkeypatch.setattr(main, "_chat_intent_vector_synced_namespace", None)
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+
+    before_metrics = client.get("/metrics")
+    assert before_metrics.status_code == 200
+    decision_before = _metric_value(
+        before_metrics.text,
+        "chat_boundary_decisions_total",
+        {
+            "decision": "execution_request",
+            "conversation_mode_hint": "execution_oriented",
+            "pending_clarification": "false",
+            "workflow_target_available": "false",
+        },
+    )
+    reason_before = _metric_value(
+        before_metrics.text,
+        "chat_boundary_reason_total",
+        {
+            "decision": "execution_request",
+            "reason_code": "semantic_capability_evidence",
+        },
+    )
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "create a document on Kubernetes", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    assert (
+        body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
+        == "semantic_capability_evidence"
+    )
+    assert (
+        body["assistant_message"]["metadata"]["boundary_decision"]["evidence"]["intent"]
+        == "generate"
+    )
+    assert any(
+        family["family"] == "documents"
+        for family in body["assistant_message"]["metadata"]["boundary_decision"]["evidence"][
+            "top_families"
+        ]
+    )
+
+    after_metrics = client.get("/metrics")
+    assert after_metrics.status_code == 200
+    assert (
+        _metric_value(
+            after_metrics.text,
+            "chat_boundary_decisions_total",
+            {
+                "decision": "execution_request",
+                "conversation_mode_hint": "execution_oriented",
+                "pending_clarification": "false",
+                "workflow_target_available": "false",
+            },
+        )
+        >= decision_before + 1
+    )
+    assert (
+        _metric_value(
+            after_metrics.text,
+            "chat_boundary_reason_total",
+            {
+                "decision": "execution_request",
+                "reason_code": "semantic_capability_evidence",
+            },
+        )
+        >= reason_before + 1
+    )
+
+
+def test_chat_boundary_overrides_chat_reply_when_execution_signal_is_strong(
+    monkeypatch,
+) -> None:
+    calls = {"router": 0}
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            calls["router"] += 1
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+                "output_format": "docx",
+            }
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            payload = json.loads(request.prompt)
+            evidence = payload["boundary_evidence"]
+            assert evidence["execution_signal_strength"] == "strong"
+            assert evidence["top_family_score"] == 1.73
+            return {
+                "decision": "chat_reply",
+                "assistant_response": "Let me explain what I can do.",
+                "reason_code": "model_chat_bias",
+            }
+
+    monkeypatch.setattr(
+        main,
+        "_chat_boundary_capability_evidence",
+        lambda **_kwargs: (
+            [
+                main.chat_contracts.ChatBoundaryCapabilityEvidence(
+                    capability_id="document.spec.generate",
+                    group="documents",
+                    subgroup="generation",
+                    score=0.91,
+                    source="test",
+                ),
+                main.chat_contracts.ChatBoundaryCapabilityEvidence(
+                    capability_id="document.docx.render",
+                    group="documents",
+                    subgroup="rendering",
+                    score=0.82,
+                    source="test",
+                ),
+            ],
+            [
+                main.chat_contracts.ChatBoundaryFamilyEvidence(
+                    family="documents",
+                    score=1.73,
+                    capability_ids=["document.spec.generate", "document.docx.render"],
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_chat_boundary_intent_evidence",
+        lambda **_kwargs: main.workflow_contracts.GoalIntentProfile(
+            intent="generate",
+            risk_level="bounded_write",
+        ),
+    )
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "create a document on Kubernetes", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    assert body["assistant_message"]["metadata"]["boundary_decision"]["decision"] == "execution_request"
+    assert (
+        body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
+        == "execution_signal_override"
+    )
+    assert (
+        body["assistant_message"]["metadata"]["boundary_decision"]["evidence"][
+            "execution_signal_strength"
+        ]
+        == "strong"
+    )
+    assert calls["router"] == 1
+
+
+def test_chat_boundary_overrides_chat_reply_to_continue_pending_for_clarification_answer(
+    monkeypatch,
+) -> None:
+    session = client.post("/chat/sessions", json={}).json()
+    first_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Generate a deployment report", "context_json": {}, "priority": 0},
+    )
+    assert first_response.status_code == 200
+    assert first_response.json()["assistant_message"]["action"]["type"] == "ask_clarification"
+
+    calls = {"router": 0}
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            calls["router"] += 1
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "render",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+                "output_format": "docx",
+            }
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            payload = json.loads(request.prompt)
+            evidence = payload["boundary_evidence"]
+            assert evidence["pending_clarification"] is True
+            assert evidence["likely_clarification_answer"] is True
+            assert evidence["conversation_mode_hint"] == "clarification_answer"
+            return {
+                "decision": "chat_reply",
+                "assistant_response": "Sure, let's just talk here.",
+                "reason_code": "model_chat_bias",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "docx is fine", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    assert body["assistant_message"]["metadata"]["boundary_decision"]["decision"] == "continue_pending"
+    assert (
+        body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
+        == "clarification_answer_override"
+    )
+    assert calls["router"] == 1
 
 
 def test_chat_route_goal_intent_profile_uses_minimal_pre_submit_slots(monkeypatch) -> None:
