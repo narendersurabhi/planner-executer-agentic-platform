@@ -243,3 +243,52 @@ def dump_normalized_intent_envelope(
     if envelope is None:
         return None
     return envelope.model_dump(mode="json", exclude_none=True)
+
+
+class ContextEnvelopeTrace(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    sources_used: list[str] = Field(default_factory=list)
+    projection: str | None = None
+    profile_loaded: bool | None = None
+    normalized_intent_source: str | None = None
+
+
+class ContextEnvelope(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: str = "context_envelope_v1"
+    goal: str = ""
+    context_json: dict[str, Any] = Field(default_factory=dict)
+    user_scope: dict[str, Any] = Field(default_factory=dict)
+    session_scope: dict[str, Any] = Field(default_factory=dict)
+    workflow_scope: dict[str, Any] = Field(default_factory=dict)
+    normalized_intent_envelope: dict[str, Any] | None = None
+    profile: dict[str, Any] = Field(default_factory=dict)
+    semantic_memory_hints: list[dict[str, Any]] = Field(default_factory=list)
+    interaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    capability_candidates: list[str] = Field(default_factory=list)
+    runtime_metadata: dict[str, Any] = Field(default_factory=dict)
+    missing_inputs: list[str] = Field(default_factory=list)
+    dropped_inputs: list[str] = Field(default_factory=list)
+    trace: ContextEnvelopeTrace = Field(default_factory=ContextEnvelopeTrace)
+
+
+def parse_context_envelope(value: Any) -> ContextEnvelope | None:
+    if isinstance(value, ContextEnvelope):
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return ContextEnvelope.model_validate(value)
+    except ValidationError:
+        return None
+
+
+def dump_context_envelope(
+    value: ContextEnvelope | Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    envelope = parse_context_envelope(value)
+    if envelope is None:
+        return None
+    return envelope.model_dump(mode="json", exclude_none=True)

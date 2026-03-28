@@ -858,6 +858,262 @@ def test_chat_turn_uses_pending_clarification_context_to_submit_job() -> None:
     assert "User clarification:" in body["job"]["goal"]
 
 
+def test_chat_turn_normalizes_document_clarification_before_submit(monkeypatch) -> None:
+    def _normalize_goal_intent(goal, **_kwargs):
+        pending = "User clarification:" not in goal
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="render",
+                source="test",
+                confidence=0.95,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=pending,
+                requires_blocking_clarification=pending,
+                questions=["What output format do you need?"] if pending else [],
+                blocking_slots=["output_format"] if pending else [],
+                missing_slots=["output_format"] if pending else [],
+                slot_values={"intent_action": "render", "risk_level": "bounded_write"},
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        required_inputs=["instruction", "topic", "audience", "tone"],
+                        suggested_capabilities=["document.spec.generate"],
+                    )
+                ]
+            ),
+            candidate_capabilities={"s1": ["document.spec.generate"]},
+        )
+
+    class _Normalizer:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_clarification_normalizer"}
+            return {
+                "normalized_slots": {
+                    "topic": "Deployment report",
+                    "audience": "Senior AI engineers",
+                    "tone": "practical",
+                },
+                "field_confidence": {
+                    "topic": 0.91,
+                    "audience": 0.94,
+                    "tone": 0.96,
+                },
+                "unresolved_fields": [],
+            }
+
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "_chat_clarification_normalizer_provider", _Normalizer())
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", True)
+
+    session = client.post("/chat/sessions", json={}).json()
+    first = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+    assert first.status_code == 200
+    assert first.json()["assistant_message"]["action"]["type"] == "ask_clarification"
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Make it a PDF for senior AI engineers. Give your best.",
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is not None
+    assert body["assistant_message"]["action"]["type"] == "submit_job"
+    assert body["job"]["context_json"]["topic"] == "Deployment report"
+    assert body["job"]["context_json"]["audience"] == "Senior AI engineers"
+    assert body["job"]["context_json"]["tone"] == "practical"
+    assert body["job"]["context_json"]["clarification_normalization"]["source"] == (
+        "chat_clarification_normalizer"
+    )
+
+
+def test_chat_turn_keeps_document_submit_in_clarification_when_normalizer_leaves_required_field_unresolved(
+    monkeypatch,
+) -> None:
+    def _normalize_goal_intent(goal, **_kwargs):
+        pending = "User clarification:" not in goal
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="render",
+                source="test",
+                confidence=0.95,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=pending,
+                requires_blocking_clarification=pending,
+                questions=["What output format do you need?"] if pending else [],
+                blocking_slots=["output_format"] if pending else [],
+                missing_slots=["output_format"] if pending else [],
+                slot_values={"intent_action": "render", "risk_level": "bounded_write"},
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        required_inputs=["instruction", "topic", "audience", "tone"],
+                        suggested_capabilities=["document.spec.generate"],
+                    )
+                ]
+            ),
+            candidate_capabilities={"s1": ["document.spec.generate"]},
+        )
+
+    class _Normalizer:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_clarification_normalizer"}
+            return {
+                "normalized_slots": {
+                    "topic": "Deployment report",
+                    "audience": "Senior AI engineers",
+                },
+                "field_confidence": {
+                    "topic": 0.91,
+                    "audience": 0.94,
+                    "tone": 0.25,
+                },
+                "unresolved_fields": ["tone"],
+            }
+
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "_chat_clarification_normalizer_provider", _Normalizer())
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", True)
+
+    session = client.post("/chat/sessions", json={}).json()
+    client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Make it a PDF for senior AI engineers. Give your best.",
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "what tone should it use" in body["assistant_message"]["content"].lower()
+    assert body["session"]["metadata"]["pending_clarification"]["questions"]
+
+
+def test_chat_turn_normalizes_using_selected_github_capability_contract(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return {
+                    "route": "ask_clarification",
+                    "assistant_response": "What GitHub issues should I search for?",
+                    "intent": "io",
+                    "risk_level": "read_only",
+                    "confidence": 0.95,
+                    "clarification_questions": ["What GitHub issues should I search for?"],
+                }
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "io",
+                "risk_level": "read_only",
+                "confidence": 0.95,
+            }
+
+    def _normalize_goal_intent(goal, **_kwargs):
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="io",
+                source="test",
+                confidence=0.95,
+                risk_level="read_only",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=False,
+                requires_blocking_clarification=False,
+                questions=[],
+                blocking_slots=[],
+                missing_slots=[],
+                slot_values={"intent_action": "io", "risk_level": "read_only"},
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="io",
+                        objective="Search GitHub issues",
+                        required_inputs=["query"],
+                        suggested_capabilities=["github.issue.search"],
+                    )
+                ]
+            ),
+            candidate_capabilities={"s1": ["github.issue.search"]},
+        )
+
+    class _Normalizer:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_clarification_normalizer"}
+            return {
+                "normalized_slots": {"query": "authentication failures in private repos"},
+                "field_confidence": {"query": 0.93},
+                "unresolved_fields": [],
+            }
+
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_clarification_normalizer_provider", _Normalizer())
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", True)
+
+    session = client.post("/chat/sessions", json={}).json()
+    first = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Search GitHub issues", "context_json": {}, "priority": 0},
+    )
+    assert first.status_code == 200
+    assert first.json()["assistant_message"]["action"]["type"] == "ask_clarification"
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "authentication failures in private repos",
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is not None
+    assert body["assistant_message"]["action"]["type"] == "submit_job"
+    assert body["job"]["context_json"]["query"] == "authentication failures in private repos"
+    assert body["job"]["context_json"]["clarification_normalization"]["capability_id"] == (
+        "github.issue.search"
+    )
+
+
 def test_chat_turn_can_run_published_workflow_by_trigger_reference() -> None:
     create_response = client.post(
         "/workflows/definitions",
@@ -1712,6 +1968,44 @@ def test_chat_turn_profile_update_uses_authenticated_user_id_not_context_user_id
     assert alice_profile.preferences.preferred_output_format == "markdown"
     assert alice_profile.preferences.response_verbosity == "concise"
     assert mallory_profile.preferences.preferred_output_format is None
+
+
+def test_chat_route_context_includes_profile_without_persisting_it(monkeypatch) -> None:
+    db = SessionLocal()
+    try:
+        memory_profile_service.write_user_profile(
+            db,
+            user_id="alice",
+            payload={"preferences": {"preferred_output_format": "markdown"}},
+        )
+    finally:
+        db.close()
+
+    def _route_turn(*, content, candidate_goal, session_metadata, merged_context, messages):
+        del content, candidate_goal, session_metadata, messages
+        assert merged_context["user_profile"]["preferences"]["preferred_output_format"] == "markdown"
+        return {
+            "type": "respond",
+            "assistant_content": "Profile-aware route.",
+            "goal_intent_profile": {},
+            "resolved_goal": "Profile-aware route.",
+        }
+
+    monkeypatch.setattr(main, "_route_chat_turn", _route_turn)
+    headers = {"X-Authenticated-User-Id": "alice"}
+    session = client.post("/chat/sessions", json={}, headers=headers).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "hello", "context_json": {}, "priority": 0},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["content"] == "Profile-aware route."
+    if isinstance(body["session"]["metadata"].get("context_json"), dict):
+        assert "user_profile" not in body["session"]["metadata"]["context_json"]
 
 
 def test_chat_session_rejects_authenticated_user_mismatch() -> None:

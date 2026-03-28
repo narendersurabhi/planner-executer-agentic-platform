@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from libs.core import chat_contracts, models, workflow_contracts
 
-from . import memory_profile_service
+from . import context_service, memory_profile_service
 from .models import ChatMessageRecord, ChatSessionRecord
 
 logger = logging.getLogger("api.chat_service")
@@ -27,6 +27,7 @@ class ChatServiceRuntime:
     inspect_workflow: Callable[..., "ChatWorkflowInspection"]
     utcnow: Callable[[], datetime]
     make_id: Callable[[], str]
+    normalize_submit_context: Callable[..., "ChatSubmitNormalizationResult | None"] | None = None
     is_chat_only_correction: Callable[[str], bool] | None = None
 
 
@@ -60,6 +61,13 @@ class ChatDirectRunResult:
     output: dict[str, Any] = field(default_factory=dict)
     assistant_response: str = ""
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class ChatSubmitNormalizationResult:
+    goal: str | None = None
+    context_json: dict[str, Any] = field(default_factory=dict)
+    clarification_questions: list[str] = field(default_factory=list)
 
 
 def looks_like_chat_only_correction(content: str) -> bool:
@@ -202,10 +210,21 @@ def handle_turn(
         content=content,
     )
     turn_context = _sanitize_chat_context(turn_context)
-    merged_context = _merge_chat_context(session_context, turn_context)
-    if bound_user_id:
-        merged_context["user_id"] = bound_user_id
-        merged_context["semantic_user_id"] = bound_user_id
+    candidate_goal = _candidate_goal(
+        content,
+        session_metadata,
+        is_chat_only_correction=runtime.is_chat_only_correction,
+    )
+    context_envelope = context_service.build_chat_context_envelope(
+        db=db,
+        goal=candidate_goal,
+        session_metadata=session_metadata,
+        session_context=session_context,
+        turn_context=turn_context,
+        user_id=bound_user_id,
+    )
+    merged_context = context_service.chat_submit_context_view(context_envelope)
+    route_context = context_service.chat_route_context_view(context_envelope)
 
     user_message = ChatMessageRecord(
         id=runtime.make_id(),
@@ -219,17 +238,12 @@ def handle_turn(
     )
     db.add(user_message)
 
-    candidate_goal = _candidate_goal(
-        content,
-        session_metadata,
-        is_chat_only_correction=runtime.is_chat_only_correction,
-    )
     messages = _message_records_for_session(db, record.id)
     turn_plan = runtime.route_turn(
         content=content,
         candidate_goal=candidate_goal,
         session_metadata=session_metadata,
-        merged_context=merged_context,
+        merged_context=route_context,
         messages=[_message_from_record(message) for message in messages],
     )
     assessment = workflow_contracts.dump_goal_intent_profile(
@@ -267,29 +281,106 @@ def handle_turn(
             "questions": questions,
         }
     elif route_type == "submit_job":
-        created_job = runtime.create_job(
-            models.JobCreate(
-                goal=resolved_goal,
-                context_json=merged_context,
-                priority=request.priority,
-            ),
-            db,
-        )
-        if not assistant_content:
-            assistant_content = (
-                f"Started job {created_job.id}. "
-                "I submitted it to the normal planner and worker pipeline."
+        normalization = None
+        if runtime.normalize_submit_context is not None:
+            try:
+                normalization = runtime.normalize_submit_context(
+                    db=db,
+                    goal=resolved_goal,
+                    content=content,
+                    session_metadata=session_metadata,
+                    merged_context=merged_context,
+                    context_envelope=context_envelope,
+                    user_id=bound_user_id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "chat_submit_normalization_failed",
+                    extra={"session_id": record.id},
+                )
+                normalization = None
+        if normalization is not None:
+            if isinstance(normalization.context_json, Mapping) and normalization.context_json:
+                context_envelope = context_service.update_chat_context_envelope(
+                    context_envelope,
+                    goal=resolved_goal,
+                    context_json=normalization.context_json,
+                )
+                merged_context = context_service.chat_submit_context_view(context_envelope)
+            if isinstance(normalization.goal, str) and normalization.goal.strip():
+                resolved_goal = normalization.goal.strip()
+                context_envelope = context_service.update_chat_context_envelope(
+                    context_envelope,
+                    goal=resolved_goal,
+                )
+            clarification_questions = [
+                str(question).strip()
+                for question in normalization.clarification_questions
+                if isinstance(question, str) and question.strip()
+            ]
+            if clarification_questions:
+                if not assistant_content:
+                    assistant_content = "\n".join(clarification_questions)
+                assistant_action = chat_contracts.AssistantAction(
+                    type=chat_contracts.AssistantActionType.ask_clarification,
+                    goal=resolved_goal,
+                    clarification_questions=clarification_questions,
+                    goal_intent_profile=dict(assessment),
+                    context_json=merged_context,
+                )
+                session_metadata["draft_goal"] = resolved_goal
+                session_metadata["pending_clarification"] = {
+                    "goal_intent_profile": dict(assessment),
+                    "questions": clarification_questions,
+                }
+            else:
+                created_job = runtime.create_job(
+                    models.JobCreate(
+                        goal=resolved_goal,
+                        context_json=merged_context,
+                        priority=request.priority,
+                    ),
+                    db,
+                )
+                if not assistant_content:
+                    assistant_content = (
+                        f"Started job {created_job.id}. "
+                        "I submitted it to the normal planner and worker pipeline."
+                    )
+                assistant_action = chat_contracts.AssistantAction(
+                    type=chat_contracts.AssistantActionType.submit_job,
+                    goal=resolved_goal,
+                    job_id=created_job.id,
+                    goal_intent_profile=dict(assessment),
+                    context_json=merged_context,
+                )
+                session_metadata["active_job_id"] = created_job.id
+                session_metadata.pop("draft_goal", None)
+                session_metadata.pop("pending_clarification", None)
+        else:
+            created_job = runtime.create_job(
+                models.JobCreate(
+                    goal=resolved_goal,
+                    context_json=merged_context,
+                    priority=request.priority,
+                ),
+                db,
             )
-        assistant_action = chat_contracts.AssistantAction(
-            type=chat_contracts.AssistantActionType.submit_job,
-            goal=resolved_goal,
-            job_id=created_job.id,
-            goal_intent_profile=dict(assessment),
-            context_json=merged_context,
-        )
-        session_metadata["active_job_id"] = created_job.id
-        session_metadata.pop("draft_goal", None)
-        session_metadata.pop("pending_clarification", None)
+            if not assistant_content:
+                assistant_content = (
+                    f"Started job {created_job.id}. "
+                    "I submitted it to the normal planner and worker pipeline."
+                )
+            assistant_action = chat_contracts.AssistantAction(
+                type=chat_contracts.AssistantActionType.submit_job,
+                goal=resolved_goal,
+                job_id=created_job.id,
+                goal_intent_profile=dict(assessment),
+                context_json=merged_context,
+            )
+            session_metadata["active_job_id"] = created_job.id
+            session_metadata.pop("draft_goal", None)
+            session_metadata.pop("pending_clarification", None)
     elif route_type == "run_workflow":
         workflow_invocation = workflow_invocation_from_context(merged_context)
         if workflow_invocation is None or not workflow_invocation.has_target():
@@ -471,6 +562,12 @@ def handle_turn(
     if not assistant_content:
         assistant_content = "What should I do next?"
 
+    context_envelope = context_service.update_chat_context_envelope(
+        context_envelope,
+        goal=resolved_goal,
+        context_json=merged_context,
+    )
+    merged_context = context_service.chat_submit_context_view(context_envelope)
     session_metadata["context_json"] = merged_context
     record.metadata_json = session_metadata
     record.updated_at = runtime.utcnow()

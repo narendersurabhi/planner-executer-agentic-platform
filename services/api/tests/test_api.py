@@ -3026,6 +3026,12 @@ def test_list_capabilities_returns_required_inputs(monkeypatch):
     assert item["required_inputs"] == ["query"]
 
 
+def test_capability_required_inputs_uses_repo_local_schema_fallback(monkeypatch):
+    monkeypatch.setattr(main, "SCHEMA_REGISTRY_PATH", "/tmp/missing-schemas")
+    required = main._capability_required_inputs_for_intent_normalization("github.issue.search")
+    assert required == ["query"]
+
+
 def test_composer_recommend_capabilities_heuristic(monkeypatch):
     spec_generate = cap_registry.CapabilitySpec(
         capability_id="document.spec.generate",

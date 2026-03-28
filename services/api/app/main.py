@@ -69,8 +69,10 @@ from .models import (
     WorkflowVersionRecord,
 )
 from . import (
+    chat_clarification_normalizer,
     chat_execution_service,
     chat_service,
+    context_service,
     dispatch_service,
     feedback_service,
     intent_service,
@@ -169,6 +171,19 @@ LLM_MODEL_NAME = os.getenv("OPENAI_MODEL", "").strip()
 CHAT_ROUTER_MODEL = os.getenv("CHAT_ROUTER_MODEL", "").strip()
 CHAT_RESPONSE_MODEL = os.getenv("CHAT_RESPONSE_MODEL", "").strip()
 CHAT_PENDING_CORRECTION_MODEL = os.getenv("CHAT_PENDING_CORRECTION_MODEL", "").strip()
+CHAT_CLARIFICATION_NORMALIZER_ENABLED = (
+    os.getenv("CHAT_CLARIFICATION_NORMALIZER_ENABLED", "true").lower() == "true"
+)
+CHAT_CLARIFICATION_NORMALIZER_MODEL = os.getenv(
+    "CHAT_CLARIFICATION_NORMALIZER_MODEL", ""
+).strip()
+CHAT_CLARIFICATION_NORMALIZER_CONFIDENCE_THRESHOLD = max(
+    0.0,
+    min(
+        1.0,
+        float(os.getenv("CHAT_CLARIFICATION_NORMALIZER_CONFIDENCE_THRESHOLD", "0.7")),
+    ),
+)
 CHAT_RESPONSE_MODE = os.getenv("CHAT_RESPONSE_MODE", "answer_or_handoff").strip().lower()
 if CHAT_RESPONSE_MODE not in {"answer_only", "answer_or_handoff"}:
     CHAT_RESPONSE_MODE = "answer_or_handoff"
@@ -598,6 +613,40 @@ def _build_chat_pending_correction_provider() -> LLMProvider | None:
 
 
 _chat_pending_correction_provider = _build_chat_pending_correction_provider()
+
+
+def _build_chat_clarification_normalizer_provider() -> LLMProvider | None:
+    if not CHAT_CLARIFICATION_NORMALIZER_ENABLED:
+        return None
+    provider_name = (LLM_PROVIDER_NAME or "").strip().lower()
+    if not provider_name or provider_name == "mock":
+        return None
+    model_name = (
+        CHAT_CLARIFICATION_NORMALIZER_MODEL
+        or CHAT_RESPONSE_MODEL
+        or LLM_MODEL_NAME
+        or ""
+    ).strip()
+    if not model_name:
+        return None
+    try:
+        return resolve_provider(
+            provider_name,
+            api_key=OPENAI_API_KEY or None,
+            model=model_name,
+            base_url=OPENAI_BASE_URL or None,
+            timeout_s=max(1.0, OPENAI_TIMEOUT_S),
+            max_retries=max(0, OPENAI_MAX_RETRIES),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "chat_clarification_normalizer_provider_init_failed",
+            extra={"provider": provider_name, "model": model_name},
+        )
+        return None
+
+
+_chat_clarification_normalizer_provider = _build_chat_clarification_normalizer_provider()
 _CHAT_INTENT_VECTOR_CATALOG: tuple[dict[str, str], ...] = (
     {
         "id": "capability_discovery",
@@ -3555,6 +3604,115 @@ def _dispatch_runtime() -> dispatch_service.ApiDispatchRuntime:
     )
 
 
+def _candidate_capability_ids_for_envelope(
+    envelope: workflow_contracts.NormalizedIntentEnvelope,
+) -> list[str]:
+    capability_ids: list[str] = []
+    seen: set[str] = set()
+    for capability_list in envelope.candidate_capabilities.values():
+        for capability_id in capability_list:
+            normalized = capability_registry.canonicalize_capability_id(capability_id)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                capability_ids.append(normalized)
+    for segment in envelope.graph.segments:
+        for capability_id in segment.suggested_capabilities:
+            normalized = capability_registry.canonicalize_capability_id(capability_id)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                capability_ids.append(normalized)
+    return capability_ids
+
+
+def _chat_submit_capability_contracts(
+    capability_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        return []
+    contracts: list[dict[str, Any]] = []
+    for capability_id in capability_ids:
+        spec = registry.get(capability_id)
+        if spec is None:
+            continue
+        planner_hints = dict(spec.planner_hints or {})
+        contracts.append(
+            {
+                "capability_id": spec.capability_id,
+                "description": spec.description,
+                "required_inputs": _capability_required_inputs_for_intent_normalization(
+                    spec.capability_id
+                ),
+                "chat_collectible_fields": planner_hints.get("chat_collectible_fields"),
+                "field_descriptions": planner_hints.get("chat_field_descriptions"),
+                "field_examples": planner_hints.get("chat_field_examples"),
+            }
+        )
+    return contracts
+
+
+def _normalize_chat_submit_context(
+    *,
+    db: Session,
+    goal: str,
+    content: str,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+    context_envelope: workflow_contracts.ContextEnvelope | Mapping[str, Any] | None = None,
+    user_id: str | None,
+) -> chat_service.ChatSubmitNormalizationResult | None:
+    del content
+    if not CHAT_CLARIFICATION_NORMALIZER_ENABLED:
+        return None
+    if not isinstance(session_metadata, Mapping) or not session_metadata.get("pending_clarification"):
+        return None
+    submit_context = (
+        context_service.chat_submit_context_view(context_envelope)
+        if context_envelope is not None
+        else dict(merged_context) if isinstance(merged_context, Mapping) else {}
+    )
+    normalized = _normalize_goal_intent(goal, db=db, user_id=user_id)
+    candidate_capability_ids = _candidate_capability_ids_for_envelope(normalized)
+    capability_contract = chat_clarification_normalizer.build_capability_normalization_contract(
+        goal=goal,
+        merged_context=submit_context,
+        capability_contracts=_chat_submit_capability_contracts(candidate_capability_ids),
+    )
+    if capability_contract is None:
+        return None
+
+    updates, unresolved, accepted_confidence = (
+        chat_clarification_normalizer.normalize_contract_fields_with_llm(
+            goal=goal,
+            contract=capability_contract,
+            provider=_chat_clarification_normalizer_provider,
+            confidence_threshold=CHAT_CLARIFICATION_NORMALIZER_CONFIDENCE_THRESHOLD,
+        )
+    )
+    if not updates and not unresolved:
+        return None
+
+    context_updates: dict[str, Any] = {}
+    if updates:
+        context_updates.update(updates)
+        context_updates["clarification_normalization"] = {
+            "source": "chat_clarification_normalizer",
+            "capability_id": capability_contract.capability_id,
+            "fields": sorted(updates.keys()),
+            "confidence": accepted_confidence,
+        }
+    clarification_questions = [
+        chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+        for field in unresolved
+    ]
+    return chat_service.ChatSubmitNormalizationResult(
+        goal=goal,
+        context_json=context_updates,
+        clarification_questions=clarification_questions,
+    )
+
+
 def _chat_runtime() -> chat_service.ChatServiceRuntime:
     return chat_service.ChatServiceRuntime(
         route_turn=_route_chat_turn,
@@ -3571,6 +3729,7 @@ def _chat_runtime() -> chat_service.ChatServiceRuntime:
         inspect_workflow=_inspect_chat_workflow,
         utcnow=_utcnow,
         make_id=lambda: str(uuid.uuid4()),
+        normalize_submit_context=_normalize_chat_submit_context,
         is_chat_only_correction=_looks_like_chat_only_correction,
     )
 
@@ -4608,17 +4767,27 @@ def _persist_intent_workflow_memory(
 
 def _load_schema_from_ref(schema_ref: str) -> dict[str, Any] | None:
     candidate = Path(schema_ref)
-    if not candidate.is_absolute():
-        candidate = Path(SCHEMA_REGISTRY_PATH) / (
-            schema_ref if schema_ref.endswith(".json") else f"{schema_ref}.json"
-        )
-    if not candidate.exists():
-        return None
-    try:
-        parsed = json.loads(candidate.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    candidates: list[Path] = []
+    normalized_name = schema_ref if schema_ref.endswith(".json") else f"{schema_ref}.json"
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        candidates.append(Path(SCHEMA_REGISTRY_PATH) / normalized_name)
+        repo_schema_dir = Path(__file__).resolve().parents[3] / "schemas"
+        if repo_schema_dir not in candidates:
+            candidates.append(repo_schema_dir / normalized_name)
+        cwd_schema_dir = Path.cwd() / "schemas"
+        if cwd_schema_dir != repo_schema_dir:
+            candidates.append(cwd_schema_dir / normalized_name)
+    for resolved_path in candidates:
+        if not resolved_path.exists():
+            continue
+        try:
+            parsed = json.loads(resolved_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 def _schema_type_label(schema: dict[str, Any]) -> str:

@@ -10,6 +10,10 @@ capabilities:
     tags:
       - github
       - repository
+    planner_hints:
+      chat_collectible_fields: [query]
+      chat_field_descriptions:
+        query: Search text describing the repositories to list or search for.
     enabled: true
     adapters:
       - type: mcp
@@ -63,6 +67,10 @@ capabilities:
       - issues
       - pull-requests
       - search
+    planner_hints:
+      chat_collectible_fields: [query]
+      chat_field_descriptions:
+        query: Search text describing the issues or pull requests to find.
     enabled: true
     adapters:
       - type: mcp
@@ -869,6 +877,10 @@ capabilities:
       - spec
       - generation
       - llm
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -890,6 +902,10 @@ capabilities:
       - generation
       - markdown
       - llm
+    planner_hints:
+      chat_collectible_fields: [markdown_text, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -950,6 +966,10 @@ capabilities:
       - spec
       - iterative
       - llm
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -970,6 +990,10 @@ capabilities:
       - runbook
       - iterative
       - llm
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
