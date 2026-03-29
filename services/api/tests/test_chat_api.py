@@ -1804,6 +1804,95 @@ def test_chat_route_goal_intent_profile_uses_minimal_pre_submit_slots(monkeypatc
     ]
 
 
+def test_chat_route_goal_intent_profile_preserves_intent_disagreement_question(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "CHAT_PRE_SUBMIT_BLOCKING_SLOTS",
+        {"output_format", "target_system", "safety_constraints"},
+    )
+    profile = main.workflow_contracts.GoalIntentProfile(
+        intent="io",
+        source="llm",
+        confidence=0.41,
+        risk_level="read_only",
+        threshold=0.7,
+        low_confidence=True,
+        needs_clarification=True,
+        requires_blocking_clarification=True,
+        questions=["Should I generate new content, or should I fetch, inspect, or list data for this request?"],
+        blocking_slots=["intent_action"],
+        missing_slots=["intent_action"],
+        slot_values={"intent_action": "io"},
+        clarification_mode="intent_disagreement",
+    )
+
+    narrowed = main._chat_route_goal_intent_profile(profile, goal="Create a release report")
+
+    assert narrowed.blocking_slots == ["intent_action"]
+    assert narrowed.missing_slots == ["intent_action"]
+    assert narrowed.questions == profile.questions
+
+
+def test_chat_turn_asks_clarification_for_intent_disagreement(monkeypatch) -> None:
+    session = client.post("/chat/sessions", json={}).json()
+
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda *args, **kwargs: main.workflow_contracts.NormalizedIntentEnvelope(
+            goal="Create a release report",
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="io",
+                source="llm",
+                confidence=0.41,
+                risk_level="read_only",
+                threshold=0.7,
+                low_confidence=True,
+                needs_clarification=True,
+                requires_blocking_clarification=True,
+                questions=[
+                    "Should I generate new content, or should I fetch, inspect, or list data for this request?"
+                ],
+                blocking_slots=["intent_action"],
+                missing_slots=["intent_action"],
+                slot_values={"intent_action": "io"},
+                clarification_mode="intent_disagreement",
+            ),
+            clarification=main.workflow_contracts.ClarificationState(
+                needs_clarification=True,
+                requires_blocking_clarification=True,
+                missing_inputs=["intent_action"],
+                questions=[
+                    "Should I generate new content, or should I fetch, inspect, or list data for this request?"
+                ],
+                blocking_slots=["intent_action"],
+                slot_values={"intent_action": "io"},
+                clarification_mode="intent_disagreement",
+            ),
+            trace=main.workflow_contracts.NormalizationTrace(
+                assessment_source="llm",
+                context_projection="intent",
+                disagreement={"reason_code": "capability_intent_conflict"},
+            ),
+        ),
+    )
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a release report", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert body["assistant_message"]["content"] == (
+        "Should I generate new content, or should I fetch, inspect, or list data for this request?"
+    )
+    assert body["session"]["metadata"]["pending_clarification"]["questions"] == [
+        "Should I generate new content, or should I fetch, inspect, or list data for this request?"
+    ]
+
+
 def test_chat_turn_exits_pending_clarification_when_user_requests_chat_only_response(
     monkeypatch,
 ) -> None:

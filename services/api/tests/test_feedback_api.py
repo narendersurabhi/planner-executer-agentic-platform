@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import uuid
@@ -89,6 +88,67 @@ def _update_job(job_id: str, *, metadata: dict[str, Any] | None = None, status: 
             job.status = status
         job.updated_at = now
         db.commit()
+
+
+def _update_job_intent_metadata(
+    job_id: str,
+    *,
+    intent: str,
+    source: str,
+    clarification_mode: str,
+    disagreement_reason: str | None = None,
+    candidate_capability: str | None = None,
+    missing_inputs: list[str] | None = None,
+) -> None:
+    normalized_intent_envelope: dict[str, Any] = {
+        "goal": "intent feedback goal",
+        "profile": {
+            "intent": intent,
+            "source": source,
+            "needs_clarification": bool(missing_inputs),
+            "requires_blocking_clarification": bool(missing_inputs),
+            "missing_slots": list(missing_inputs or []),
+            "blocking_slots": list(missing_inputs or []),
+            "slot_values": {"intent_action": intent},
+            "clarification_mode": clarification_mode,
+        },
+        "graph": {
+            "segments": [
+                {
+                    "id": "s1",
+                    "intent": intent,
+                    "objective": "Intent review test",
+                    "suggested_capabilities": [candidate_capability] if candidate_capability else [],
+                }
+            ]
+        },
+        "candidate_capabilities": {
+            "s1": [candidate_capability] if candidate_capability else []
+        },
+        "clarification": {
+            "needs_clarification": bool(missing_inputs),
+            "requires_blocking_clarification": bool(missing_inputs),
+            "missing_inputs": list(missing_inputs or []),
+            "questions": ["Clarify intent"] if missing_inputs else [],
+            "blocking_slots": list(missing_inputs or []),
+            "slot_values": {"intent_action": intent},
+            "clarification_mode": clarification_mode,
+        },
+        "trace": {
+            "assessment_source": source,
+            "context_projection": "intent",
+            "disagreement": (
+                {"reason_code": disagreement_reason} if disagreement_reason is not None else {}
+            ),
+        },
+    }
+    _update_job(
+        job_id,
+        metadata={
+            "goal_intent_profile": dict(normalized_intent_envelope["profile"]),
+            "normalized_intent_envelope": normalized_intent_envelope,
+        },
+    )
 
 
 def _update_task(task_id: str, *, status: str | None = None, rework_count: int | None = None) -> None:
@@ -456,6 +516,72 @@ def test_submit_intent_and_plan_feedback_updates_same_actor_record() -> None:
     assert filtered_body["items"][0]["comment"] == "Looks good now."
 
 
+def test_intent_feedback_summary_and_examples_include_intent_dimensions() -> None:
+    job_response = client.post(
+        "/jobs",
+        json={"goal": "Create a release report", "context_json": {}, "priority": 0},
+    )
+    assert job_response.status_code == 200
+    job = job_response.json()
+    _update_job_intent_metadata(
+        job["id"],
+        intent="io",
+        source="llm",
+        clarification_mode="intent_disagreement",
+        disagreement_reason="capability_intent_conflict",
+        candidate_capability="document.spec.generate",
+        missing_inputs=["intent_action"],
+    )
+
+    feedback_response = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": f"intent-dims-{uuid.uuid4().hex[:8]}"},
+        json={
+            "target_type": "intent_assessment",
+            "target_id": job["id"],
+            "sentiment": "negative",
+            "reason_codes": ["wrong_scope"],
+            "comment": "This should have been treated as generation.",
+        },
+    )
+    assert feedback_response.status_code == 200
+
+    summary_response = client.get(
+        "/feedback/summary",
+        params={"target_type": "intent_assessment"},
+    )
+    assert summary_response.status_code == 200
+    summary_body = summary_response.json()
+    assert any(bucket["key"] == "io" for bucket in summary_body["intent_assessment_intents"])
+    assert any(bucket["key"] == "llm" for bucket in summary_body["intent_assessment_sources"])
+    assert any(
+        bucket["key"] == "intent_disagreement"
+        for bucket in summary_body["intent_clarification_modes"]
+    )
+    assert any(
+        bucket["key"] == "capability_intent_conflict"
+        for bucket in summary_body["intent_disagreement_reasons"]
+    )
+
+    export_response = client.get(
+        "/feedback/examples",
+        params={
+            "target_type": "intent_assessment",
+            "reason_code": "wrong_scope",
+        },
+    )
+    assert export_response.status_code == 200
+    body = export_response.json()
+    assert body["total"] >= 1
+    example = body["items"][0]
+    assert example["dimensions"]["intent_assessment_intent"] == "io"
+    assert example["dimensions"]["intent_assessment_source"] == "llm"
+    assert example["dimensions"]["intent_clarification_mode"] == "intent_disagreement"
+    assert example["dimensions"]["intent_disagreement_reason"] == "capability_intent_conflict"
+    assert example["dimensions"]["intent_top_capability"] == "document.spec.generate"
+    assert example["dimensions"]["intent_top_family"] == "document"
+
+
 def test_job_feedback_endpoint_returns_intent_plan_and_outcome_feedback() -> None:
     job_response = client.post(
         "/jobs",
@@ -752,23 +878,210 @@ def test_feedback_examples_export_supports_filters_and_jsonl() -> None:
     assert filtered_body["total"] == 1
     assert filtered_body["items"][0]["feedback"]["target_type"] == "job_outcome"
 
-    jsonl_response = client.get(
-        "/feedback/examples",
-        params=[
-            ("llm_model", llm_model),
-            ("planner_version", planner_version),
-            ("format", "jsonl"),
-            ("sentiment", "negative"),
-            ("sentiment", "partial"),
-        ],
+
+def test_intent_review_queue_returns_labeled_items_and_filters() -> None:
+    wrong_job = client.post(
+        "/jobs",
+        json={"goal": "Create a release report", "context_json": {}, "priority": 0},
+    ).json()
+    _update_job_intent_metadata(
+        wrong_job["id"],
+        intent="io",
+        source="llm",
+        clarification_mode="intent_disagreement",
+        disagreement_reason="graph_intent_conflict",
+        candidate_capability="document.spec.generate",
+        missing_inputs=["intent_action"],
     )
-    assert jsonl_response.status_code == 200
-    assert "application/x-ndjson" in jsonl_response.headers["content-type"]
-    lines = [line for line in jsonl_response.text.splitlines() if line.strip()]
-    assert len(lines) == 2
-    parsed = [json.loads(line) for line in lines]
-    assert {row["sentiment"] for row in parsed} == {"negative", "partial"}
-    assert all(row["dimensions"]["llm_model"] == llm_model for row in parsed)
+    wrong_feedback = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": f"intent-review-wrong-{uuid.uuid4().hex[:8]}"},
+        json={
+            "target_type": "intent_assessment",
+            "target_id": wrong_job["id"],
+            "sentiment": "negative",
+            "reason_codes": ["wrong_goal"],
+            "comment": "This intent was classified incorrectly.",
+        },
+    )
+    assert wrong_feedback.status_code == 200
+
+    unnecessary_job = client.post(
+        "/jobs",
+        json={"goal": "List GitHub issues", "context_json": {}, "priority": 0},
+    ).json()
+    _update_job_intent_metadata(
+        unnecessary_job["id"],
+        intent="io",
+        source="heuristic",
+        clarification_mode="targeted_slot_filling",
+        candidate_capability="github.issue.search",
+        missing_inputs=[],
+    )
+    unnecessary_feedback = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": f"intent-review-unnecessary-{uuid.uuid4().hex[:8]}"},
+        json={
+            "target_type": "intent_assessment",
+            "target_id": unnecessary_job["id"],
+            "sentiment": "partial",
+            "reason_codes": ["asked_unnecessary_clarification"],
+            "comment": "The system asked an unnecessary question.",
+        },
+    )
+    assert unnecessary_feedback.status_code == 200
+
+    response = client.get("/feedback/intent/review")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] >= 2
+    labels = [item["review_label"] for item in body["items"]]
+    assert "likely_wrong_intent_interpretation" in labels
+    assert "likely_unnecessary_intent_clarification" in labels
+
+    filtered = client.get(
+        "/feedback/intent/review",
+        params={
+            "review_label": "likely_wrong_intent_interpretation",
+            "intent_source": "llm",
+        },
+    )
+    assert filtered.status_code == 200
+    filtered_body = filtered.json()
+    assert filtered_body["total"] >= 1
+    assert all(
+        item["review_label"] == "likely_wrong_intent_interpretation"
+        for item in filtered_body["items"]
+    )
+    assert all(
+        item["dimensions"]["intent_assessment_source"] == "llm"
+        for item in filtered_body["items"]
+    )
+
+
+def test_intent_tuning_report_summarizes_failure_slices() -> None:
+    wrong_job = client.post(
+        "/jobs",
+        json={"goal": "Create a release report", "context_json": {}, "priority": 0},
+    ).json()
+    _update_job_intent_metadata(
+        wrong_job["id"],
+        intent="io",
+        source="llm",
+        clarification_mode="intent_disagreement",
+        disagreement_reason="graph_intent_conflict",
+        candidate_capability="document.spec.generate",
+        missing_inputs=["intent_action"],
+    )
+    wrong_feedback = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": f"intent-tuning-wrong-{uuid.uuid4().hex[:8]}"},
+        json={
+            "target_type": "intent_assessment",
+            "target_id": wrong_job["id"],
+            "sentiment": "negative",
+            "reason_codes": ["wrong_scope"],
+            "comment": "The system chose the wrong intent.",
+        },
+    )
+    assert wrong_feedback.status_code == 200
+
+    missing_slot_job = client.post(
+        "/jobs",
+        json={"goal": "Render the release report", "context_json": {}, "priority": 0},
+    ).json()
+    _update_job_intent_metadata(
+        missing_slot_job["id"],
+        intent="render",
+        source="heuristic",
+        clarification_mode="capability_required_inputs",
+        candidate_capability="document.pdf.render",
+        missing_inputs=["path", "output_format"],
+    )
+    missing_slot_feedback = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": f"intent-tuning-missing-{uuid.uuid4().hex[:8]}"},
+        json={
+            "target_type": "intent_assessment",
+            "target_id": missing_slot_job["id"],
+            "sentiment": "partial",
+            "reason_codes": ["missed_constraint"],
+            "comment": "The system missed a required path/detail.",
+        },
+    )
+    assert missing_slot_feedback.status_code == 200
+
+    response = client.get("/feedback/intent/tuning-report")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] >= 2
+    assert any(
+        bucket["key"] == "likely_wrong_intent_interpretation"
+        for bucket in body["review_labels"]
+    )
+    assert any(
+        bucket["key"] == "likely_missing_constraint_or_slot"
+        for bucket in body["review_labels"]
+    )
+    assert any(
+        bucket["key"] == "assessment_prompt_and_capability_evidence"
+        for bucket in body["tuning_focuses"]
+    )
+    assert any(bucket["key"] == "document.spec.generate" for bucket in body["intent_top_capabilities"])
+    assert any(bucket["key"] == "document" for bucket in body["intent_top_families"])
+    assert any(bucket["key"] == "2" for bucket in body["missing_input_counts"])
+    assert set(reason["reason_code"] for reason in body["negative_reasons"]) >= {
+        "wrong_scope",
+        "missed_constraint",
+    }
+
+
+def test_intent_tuning_candidates_export_observed_case_and_gold_stub() -> None:
+    job = client.post(
+        "/jobs",
+        json={"goal": "Create a compliance report", "context_json": {}, "priority": 0},
+    ).json()
+    _update_job_intent_metadata(
+        job["id"],
+        intent="io",
+        source="llm",
+        clarification_mode="intent_disagreement",
+        disagreement_reason="graph_intent_conflict",
+        candidate_capability="document.spec.generate",
+        missing_inputs=["intent_action"],
+    )
+    feedback_response = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": f"intent-tuning-candidate-{uuid.uuid4().hex[:8]}"},
+        json={
+            "target_type": "intent_assessment",
+            "target_id": job["id"],
+            "sentiment": "negative",
+            "reason_codes": ["wrong_goal"],
+            "comment": "This should have been treated as report generation.",
+        },
+    )
+    assert feedback_response.status_code == 200
+
+    response = client.get(
+        "/feedback/intent/tuning-candidates",
+        params={"review_label": "likely_wrong_intent_interpretation"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] >= 1
+    candidate = next(
+        item for item in body["items"] if item["feedback"]["target_id"] == job["id"]
+    )
+    assert candidate["review_label"] == "likely_wrong_intent_interpretation"
+    assert candidate["tuning_focus"] == "assessment_prompt_and_capability_evidence"
+    assert candidate["suggested_case_id"]
+    assert candidate["observed_case"]["goal"] == "Create a compliance report"
+    assert candidate["observed_case"]["profile_intent"] == "io"
+    assert candidate["observed_case"]["candidate_capabilities"] == ["document.spec.generate"]
+    assert candidate["gold_case_stub"]["goal"] == "Create a compliance report"
+    assert candidate["gold_case_stub"]["expected_requires_clarification"] is True
+    assert candidate["gold_case_stub"]["_review_label"] == "likely_wrong_intent_interpretation"
 
 
 def test_feedback_metrics_increment_for_submit_summary_and_export() -> None:

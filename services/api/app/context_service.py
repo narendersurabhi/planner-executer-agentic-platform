@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,7 @@ _WORKFLOW_CONTEXT_KEYS = (
 
 _INTERACTION_SUMMARY_STAGE_LIMITS: dict[str, int] = {
     "envelope": 8,
+    "intent": 6,
     "chat_route": 3,
     "chat_submit": 6,
     "planner": 4,
@@ -32,8 +33,26 @@ _INTERACTION_SUMMARY_STAGE_LIMITS: dict[str, int] = {
 }
 
 _CAPABILITY_CANDIDATE_STAGE_LIMITS: dict[str, int] = {
+    "intent": 8,
     "chat_route": 8,
     "planner": 10,
+}
+
+_INTENT_SLOT_ALIASES: dict[str, tuple[str, ...]] = {
+    "instruction": ("instruction", "goal_details", "goal"),
+    "topic": ("topic", "main_topic", "title", "subject", "document_title"),
+    "audience": ("audience", "target_role_name", "role_name"),
+    "tone": ("tone",),
+    "query": ("query", "github_query"),
+    "path": ("path", "output_path", "filename", "file_name", "output_filename"),
+    "output_format": ("output_format", "format"),
+    "target_system": ("target_system",),
+    "safety_constraints": ("safety_constraints",),
+    "intent_action": ("intent_action",),
+    "risk_level": ("risk_level",),
+    "length": ("length", "target_pages", "page_count", "word_count", "max_words"),
+    "markdown_text": ("markdown_text", "content", "text"),
+    "target_repo": ("target_repo", "repo", "repo_name", "repo_full_name"),
 }
 
 _CONTEXT_NOISE_TOKENS: set[str] = {
@@ -289,6 +308,33 @@ def chat_route_context_view(
             context["capability_candidates"] = ranked
     if parsed.missing_inputs:
         context["missing_inputs"] = list(parsed.missing_inputs)
+    return context
+
+
+def intent_context_view(
+    envelope: workflow_contracts.ContextEnvelope | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    parsed = workflow_contracts.parse_context_envelope(envelope)
+    if parsed is None:
+        return {}
+    context = budget_context_for_stage(parsed, stage="intent")
+    if parsed.profile:
+        context["user_profile"] = dict(parsed.profile)
+    if parsed.capability_candidates:
+        limit = _CAPABILITY_CANDIDATE_STAGE_LIMITS.get("intent", 0)
+        ranked = list(parsed.capability_candidates)
+        if limit > 0:
+            ranked = ranked[:limit]
+        if ranked:
+            context["capability_candidates"] = ranked
+    if parsed.missing_inputs:
+        context["missing_inputs"] = list(parsed.missing_inputs)
+    intent_slot_values, intent_slot_provenance = _intent_slot_values(parsed, context)
+    if intent_slot_values:
+        context["intent_slot_values"] = intent_slot_values
+        context["intent_slot_provenance"] = intent_slot_provenance
+        for key, value in intent_slot_values.items():
+            context.setdefault(key, value)
     return context
 
 
@@ -610,6 +656,100 @@ def _context_has_required_input(context: Mapping[str, Any], key: str) -> bool:
             if isinstance(workflow_inputs, Mapping) and _mapping_has_non_empty_value(workflow_inputs, candidate):
                 return True
     return False
+
+
+def _intent_slot_values(
+    envelope: workflow_contracts.ContextEnvelope,
+    context: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    slot_values: dict[str, Any] = {}
+    provenance: dict[str, str] = {}
+    normalized_fields = _clarification_normalized_fields(context)
+    normalized_intent = workflow_contracts.parse_normalized_intent_envelope(
+        envelope.normalized_intent_envelope
+    )
+    workflow_inputs = _workflow_inputs_from_context(context)
+    clarification_slot_values = (
+        dict(normalized_intent.clarification.slot_values) if normalized_intent is not None else {}
+    )
+    inferred_slot_values = (
+        dict(normalized_intent.profile.slot_values) if normalized_intent is not None else {}
+    )
+    for canonical_key, aliases in _INTENT_SLOT_ALIASES.items():
+        explicit_value = _first_non_empty_value(context, workflow_inputs, aliases)
+        if explicit_value is not None:
+            slot_values[canonical_key] = explicit_value
+            provenance[canonical_key] = (
+                "clarification_normalized"
+                if canonical_key in normalized_fields and canonical_key in context
+                else "explicit"
+            )
+            continue
+        clarification_value = _first_non_empty_value(clarification_slot_values, None, aliases)
+        if clarification_value is not None:
+            slot_values[canonical_key] = clarification_value
+            provenance[canonical_key] = (
+                "clarification_normalized"
+                if canonical_key in normalized_fields
+                else "inferred"
+            )
+            continue
+        inferred_value = _first_non_empty_value(inferred_slot_values, None, aliases)
+        if inferred_value is not None:
+            slot_values[canonical_key] = inferred_value
+            provenance[canonical_key] = "inferred"
+    return slot_values, provenance
+
+
+def _clarification_normalized_fields(context: Mapping[str, Any]) -> set[str]:
+    raw = context.get("clarification_normalization")
+    if not isinstance(raw, Mapping):
+        return set()
+    normalized: set[str] = set()
+    for value in raw.get("fields", []):
+        key = str(value or "").strip()
+        if key:
+            normalized.add(key)
+    return normalized
+
+
+def _workflow_inputs_from_context(context: Mapping[str, Any]) -> Mapping[str, Any]:
+    workflow = context.get("workflow")
+    if not isinstance(workflow, Mapping):
+        return {}
+    inputs = workflow.get("inputs")
+    if not isinstance(inputs, Mapping):
+        return {}
+    return inputs
+
+
+def _first_non_empty_value(
+    primary: Mapping[str, Any] | None,
+    secondary: Mapping[str, Any] | None,
+    aliases: Sequence[str],
+) -> Any:
+    for mapping in (primary, secondary):
+        if not isinstance(mapping, Mapping):
+            continue
+        for alias in aliases:
+            if alias not in mapping:
+                continue
+            value = mapping.get(alias)
+            if isinstance(value, str):
+                if value.strip():
+                    return value.strip()
+                continue
+            if isinstance(value, Mapping):
+                if value:
+                    return dict(value)
+                continue
+            if isinstance(value, list):
+                if value:
+                    return list(value)
+                continue
+            if value is not None:
+                return value
+    return None
 
 
 def _mapping_has_non_empty_value(mapping: Mapping[str, Any], key: str) -> bool:

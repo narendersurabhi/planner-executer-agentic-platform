@@ -29,7 +29,7 @@ from services.api.app.models import (
     WorkflowTriggerRecord,
     WorkflowVersionRecord,
 )
-from libs.core import events, execution_contracts, models, run_specs
+from libs.core import events, execution_contracts, models, run_specs, workflow_contracts
 from libs.core import capability_registry as cap_registry
 from libs.core.llm_provider import LLMProvider, LLMRequest, LLMResponse
 
@@ -1144,6 +1144,49 @@ def test_intent_decompose_endpoint_uses_normalized_envelope_without_assessment_l
     assert body["assessment"]["source"] in {"goal_text", "task_text", "explicit", "default"}
     assert body["normalized_intent_envelope"]["profile"] == body["assessment"]
     assert body["normalized_intent_envelope"]["graph"] == body["intent_graph"]
+
+
+def test_intent_clarify_endpoint_uses_intent_context_projection_for_slots(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_assess_goal_intent",
+        lambda goal_text, mode_override=None: workflow_contracts.GoalIntentProfile(
+            intent="generate",
+            source="test",
+            confidence=0.93,
+            risk_level="read_only",
+            threshold=0.7,
+            low_confidence=False,
+            needs_clarification=True,
+            requires_blocking_clarification=True,
+            questions=["What tone should I use?"],
+            blocking_slots=["tone"],
+            missing_slots=["tone"],
+            slot_values={"intent_action": "generate", "topic": "Deployment report"},
+        ),
+    )
+
+    response = client.post(
+        "/intent/clarify",
+        json={
+            "goal": "Generate a deployment report",
+            "context_json": {
+                "tone": "practical",
+                "clarification_normalization": {"fields": ["tone"]},
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assessment"]["needs_clarification"] is False
+    assert body["assessment"]["missing_slots"] == []
+    assert body["assessment"]["slot_values"]["tone"] == "practical"
+    assert body["normalized_intent_envelope"]["trace"]["context_projection"] == "intent"
+    assert (
+        body["normalized_intent_envelope"]["trace"]["context_slot_provenance"]["tone"]
+        == "clarification_normalized"
+    )
 
 
 def test_capabilities_search_returns_ranked_matches() -> None:

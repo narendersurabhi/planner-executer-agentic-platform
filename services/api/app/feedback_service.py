@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
+import re
 import uuid
 from typing import Any
 
@@ -30,6 +31,20 @@ def _non_empty_string(value: Any) -> str | None:
 
 
 def _normalize_reason_codes(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for entry in value:
+        item = _non_empty_string(entry)
+        if item is None or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     normalized: list[str] = []
@@ -87,6 +102,70 @@ def _boundary_fields_from_message(
         if isinstance(snapshot_metadata, Mapping):
             boundary_payload = _boundary_decision_payload(snapshot_metadata.get("boundary_decision"))
     return _boundary_decision_fields(boundary_payload)
+
+
+def _top_intent_capability(
+    candidate_capabilities: Mapping[str, Any] | None,
+) -> str | None:
+    if not isinstance(candidate_capabilities, Mapping):
+        return None
+    for capability_ids in candidate_capabilities.values():
+        if not isinstance(capability_ids, list):
+            continue
+        for capability_id in capability_ids:
+            normalized = _non_empty_string(capability_id)
+            if normalized is not None:
+                return normalized
+    return None
+
+
+def _intent_fields_from_snapshot(snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = dict(snapshot) if isinstance(snapshot, Mapping) else {}
+    profile = payload.get("goal_intent_profile")
+    if not isinstance(profile, Mapping):
+        envelope = payload.get("normalized_intent_envelope")
+        if isinstance(envelope, Mapping):
+            profile = envelope.get("profile") if isinstance(envelope.get("profile"), Mapping) else {}
+        else:
+            profile = {}
+    envelope = payload.get("normalized_intent_envelope")
+    envelope_map = dict(envelope) if isinstance(envelope, Mapping) else {}
+    clarification = (
+        dict(envelope_map.get("clarification"))
+        if isinstance(envelope_map.get("clarification"), Mapping)
+        else {}
+    )
+    trace = dict(envelope_map.get("trace")) if isinstance(envelope_map.get("trace"), Mapping) else {}
+    candidate_capabilities = (
+        dict(envelope_map.get("candidate_capabilities"))
+        if isinstance(envelope_map.get("candidate_capabilities"), Mapping)
+        else {}
+    )
+    top_capability = _top_intent_capability(candidate_capabilities)
+    missing_inputs = clarification.get("missing_inputs")
+    missing_input_count = len(missing_inputs) if isinstance(missing_inputs, list) else 0
+    top_family = None
+    if top_capability is not None and "." in top_capability:
+        top_family = top_capability.split(".", 1)[0].strip() or None
+    disagreement = trace.get("disagreement")
+    disagreement_map = dict(disagreement) if isinstance(disagreement, Mapping) else {}
+    return {
+        "intent_assessment_intent": _non_empty_string(profile.get("intent")),
+        "intent_assessment_source": _non_empty_string(profile.get("source")),
+        "intent_clarification_mode": (
+            _non_empty_string(clarification.get("clarification_mode"))
+            or _non_empty_string(profile.get("clarification_mode"))
+        ),
+        "intent_requires_clarification": bool(
+            clarification.get("needs_clarification")
+            if "needs_clarification" in clarification
+            else profile.get("needs_clarification")
+        ),
+        "intent_missing_input_count": missing_input_count,
+        "intent_disagreement_reason": _non_empty_string(disagreement_map.get("reason_code")),
+        "intent_top_capability": top_capability,
+        "intent_top_family": top_family,
+    }
 
 
 def _candidate_capabilities_from_graph(
@@ -376,7 +455,7 @@ def derive_feedback_dimensions(
     )
     assistant_action_type = _non_empty_string(message_action.get("type"))
     boundary_fields = _boundary_fields_from_message(message, snapshot)
-    return {
+    dimensions = {
         "target_type": request.target_type.value,
         "target_id": _non_empty_string(request.target_id),
         "workflow_source": workflow_source,
@@ -392,6 +471,9 @@ def derive_feedback_dimensions(
         "has_comment": bool(comment),
         "reason_count": len(reason_codes),
     }
+    if request.target_type == models.FeedbackTargetType.intent_assessment:
+        dimensions.update(_intent_fields_from_snapshot(snapshot))
+    return dimensions
 
 
 def _feedback_dimensions(item: models.Feedback) -> dict[str, Any]:
@@ -421,6 +503,12 @@ def _feedback_dimensions(item: models.Feedback) -> dict[str, Any]:
     for key, value in boundary_fields.items():
         if not _non_empty_string(normalized.get(key)) and value is not None:
             normalized[key] = value
+    if item.target_type == models.FeedbackTargetType.intent_assessment:
+        intent_fields = _intent_fields_from_snapshot(snapshot)
+        for key, value in intent_fields.items():
+            existing = normalized.get(key)
+            if key not in normalized or existing is None or existing == "" or existing == []:
+                normalized[key] = value
     return normalized
 
 
@@ -653,6 +741,10 @@ def summarize_feedback_rows(
         planner_versions=dimension_breakdown(items, "planner_version"),
         job_statuses=dimension_breakdown(items, "job_status_at_feedback"),
         assistant_action_types=dimension_breakdown(items, "assistant_action_type"),
+        intent_assessment_intents=dimension_breakdown(items, "intent_assessment_intent"),
+        intent_assessment_sources=dimension_breakdown(items, "intent_assessment_source"),
+        intent_clarification_modes=dimension_breakdown(items, "intent_clarification_mode"),
+        intent_disagreement_reasons=dimension_breakdown(items, "intent_disagreement_reason"),
         boundary_decisions=dimension_breakdown(items, "boundary_decision"),
         boundary_reason_codes=dimension_breakdown(items, "boundary_reason_code"),
         boundary_top_families=dimension_breakdown(items, "boundary_top_family"),
@@ -958,6 +1050,262 @@ def _chat_boundary_review_score(item: models.Feedback, review_label: str) -> int
     return score
 
 
+def _intent_review_label(item: models.Feedback) -> str | None:
+    if item.target_type != models.FeedbackTargetType.intent_assessment:
+        return None
+    if item.sentiment not in {
+        models.FeedbackSentiment.negative,
+        models.FeedbackSentiment.partial,
+    }:
+        return None
+    reasons = set(_normalize_reason_codes(item.reason_codes))
+    dimensions = _feedback_dimensions(item)
+    if "asked_unnecessary_clarification" in reasons:
+        return "likely_unnecessary_intent_clarification"
+    if (
+        reasons & {"wrong_goal", "wrong_scope"}
+        or _non_empty_string(dimensions.get("intent_disagreement_reason")) is not None
+    ):
+        return "likely_wrong_intent_interpretation"
+    if "missed_constraint" in reasons or int(dimensions.get("intent_missing_input_count") or 0) > 0:
+        return "likely_missing_constraint_or_slot"
+    return "likely_weak_intent_envelope"
+
+
+def _intent_review_score(item: models.Feedback, review_label: str) -> int:
+    score = 0
+    if item.sentiment == models.FeedbackSentiment.negative:
+        score += 100
+    elif item.sentiment == models.FeedbackSentiment.partial:
+        score += 70
+    if review_label == "likely_wrong_intent_interpretation":
+        score += 40
+    elif review_label == "likely_unnecessary_intent_clarification":
+        score += 35
+    elif review_label == "likely_missing_constraint_or_slot":
+        score += 25
+    elif review_label == "likely_weak_intent_envelope":
+        score += 15
+    reasons = set(_normalize_reason_codes(item.reason_codes))
+    if "wrong_goal" in reasons or "wrong_scope" in reasons:
+        score += 20
+    if "missed_constraint" in reasons:
+        score += 15
+    if "asked_unnecessary_clarification" in reasons:
+        score += 15
+    dimensions = _feedback_dimensions(item)
+    if _non_empty_string(dimensions.get("intent_disagreement_reason")):
+        score += 10
+    if _non_empty_string(item.comment):
+        score += 5
+    return score
+
+
+def _intent_tuning_focus(review_label: str) -> str:
+    if review_label == "likely_wrong_intent_interpretation":
+        return "assessment_prompt_and_capability_evidence"
+    if review_label == "likely_unnecessary_intent_clarification":
+        return "clarification_thresholds_and_blocking_slots"
+    if review_label == "likely_missing_constraint_or_slot":
+        return "slot_projection_and_required_input_reconciliation"
+    return "capability_alignment_and_decomposition"
+
+
+def _intent_missing_input_bucket(count: int) -> str:
+    if count <= 0:
+        return "0"
+    if count >= 3:
+        return "3+"
+    return str(count)
+
+
+def _queue_breakdown(
+    items: list[models.IntentReviewQueueItem],
+    extractor: Any,
+) -> list[models.FeedbackBreakdownBucket]:
+    buckets: dict[str, models.FeedbackBreakdownBucket] = {}
+    for item in items:
+        key = _non_empty_string(extractor(item))
+        if key is None:
+            continue
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = models.FeedbackBreakdownBucket(key=key)
+            buckets[key] = bucket
+        _increment_sentiment_bucket(bucket, item.feedback.sentiment)
+    return sorted(buckets.values(), key=lambda bucket: (-bucket.total, bucket.key))
+
+
+def _slugify_feedback_case_id(text: str, feedback_id: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "_", str(text or "").strip().lower()).strip("_")
+    if not base:
+        base = "intent_feedback_case"
+    suffix = re.sub(r"[^a-z0-9]+", "", str(feedback_id or "").lower())[:8]
+    if suffix:
+        return f"{base[:48]}_{suffix}".strip("_")
+    return base[:56]
+
+
+def _intent_observed_case(item: models.IntentReviewQueueItem) -> dict[str, Any]:
+    snapshot = dict(item.feedback.snapshot or {})
+    envelope = (
+        dict(snapshot.get("normalized_intent_envelope"))
+        if isinstance(snapshot.get("normalized_intent_envelope"), Mapping)
+        else {}
+    )
+    graph = dict(envelope.get("graph")) if isinstance(envelope.get("graph"), Mapping) else {}
+    candidate_capabilities = (
+        dict(envelope.get("candidate_capabilities"))
+        if isinstance(envelope.get("candidate_capabilities"), Mapping)
+        else {}
+    )
+    clarification = (
+        dict(envelope.get("clarification"))
+        if isinstance(envelope.get("clarification"), Mapping)
+        else {}
+    )
+    graph_intents: list[str] = []
+    capabilities_by_segment: list[list[str]] = []
+    flattened_capabilities: list[str] = []
+    segments = graph.get("segments") if isinstance(graph.get("segments"), list) else []
+    for raw_segment in segments:
+        if not isinstance(raw_segment, Mapping):
+            continue
+        segment_intent = _non_empty_string(raw_segment.get("intent"))
+        if segment_intent is not None:
+            graph_intents.append(segment_intent)
+        segment_id = _non_empty_string(raw_segment.get("id"))
+        segment_capabilities = (
+            candidate_capabilities.get(segment_id)
+            if segment_id is not None and isinstance(candidate_capabilities.get(segment_id), list)
+            else raw_segment.get("suggested_capabilities")
+        )
+        normalized_capabilities = _normalize_string_list(segment_capabilities)
+        if normalized_capabilities:
+            capabilities_by_segment.append(normalized_capabilities)
+            for capability_id in normalized_capabilities:
+                if capability_id not in flattened_capabilities:
+                    flattened_capabilities.append(capability_id)
+
+    if not flattened_capabilities and isinstance(candidate_capabilities, Mapping):
+        for capability_ids in candidate_capabilities.values():
+            normalized_capabilities = _normalize_string_list(capability_ids)
+            if not normalized_capabilities:
+                continue
+            capabilities_by_segment.append(normalized_capabilities)
+            for capability_id in normalized_capabilities:
+                if capability_id not in flattened_capabilities:
+                    flattened_capabilities.append(capability_id)
+
+    missing_inputs = _normalize_string_list(clarification.get("missing_inputs"))
+    return {
+        "goal": _non_empty_string(snapshot.get("goal")),
+        "profile_intent": _non_empty_string(item.dimensions.get("intent_assessment_intent")),
+        "profile_source": _non_empty_string(item.dimensions.get("intent_assessment_source")),
+        "graph_intents": graph_intents,
+        "candidate_capabilities": flattened_capabilities,
+        "candidate_capabilities_by_segment": capabilities_by_segment,
+        "missing_inputs": missing_inputs,
+        "requires_clarification": bool(item.dimensions.get("intent_requires_clarification")),
+        "clarification_mode": _non_empty_string(item.dimensions.get("intent_clarification_mode")),
+        "disagreement_reason": _non_empty_string(item.dimensions.get("intent_disagreement_reason")),
+        "reason_codes": list(item.feedback.reason_codes),
+        "comment": _non_empty_string(item.feedback.comment),
+    }
+
+
+def _intent_gold_case_stub(
+    item: models.IntentReviewQueueItem,
+    *,
+    tuning_focus: str,
+    suggested_case_id: str,
+    observed_case: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": suggested_case_id,
+        "goal": _non_empty_string(observed_case.get("goal")) or item.excerpt or "",
+        "expected_intents": [],
+        "expected_capabilities": [],
+        "expected_capabilities_by_segment": [],
+        "expected_profile_intent": "",
+        "expected_missing_inputs": list(observed_case.get("missing_inputs") or []),
+        "expected_requires_clarification": bool(observed_case.get("requires_clarification")),
+        "expected_clarification_mode": _non_empty_string(
+            observed_case.get("clarification_mode")
+        )
+        or "",
+        "expected_disagreement_reason": _non_empty_string(
+            observed_case.get("disagreement_reason")
+        )
+        or "",
+        "_review_label": item.review_label,
+        "_tuning_focus": tuning_focus,
+        "_reason_codes": list(item.feedback.reason_codes),
+        "_observed_profile_intent": _non_empty_string(observed_case.get("profile_intent")) or "",
+        "_observed_graph_intents": list(observed_case.get("graph_intents") or []),
+        "_observed_capabilities": list(observed_case.get("candidate_capabilities") or []),
+        "_comment": _non_empty_string(item.feedback.comment),
+    }
+
+
+def _collect_intent_review_items(
+    db: Session,
+    *,
+    limit: int = 100,
+    review_label: str | None = None,
+    intent: str | None = None,
+    intent_source: str | None = None,
+) -> list[models.IntentReviewQueueItem]:
+    rows = _feedback_records(
+        db,
+        target_type=models.FeedbackTargetType.intent_assessment,
+        limit=max(limit * 4, 200),
+    )
+    normalized_review_label = _non_empty_string(review_label)
+    normalized_intent = _non_empty_string(intent)
+    normalized_intent_source = _non_empty_string(intent_source)
+    items: list[models.IntentReviewQueueItem] = []
+    for row in rows:
+        feedback = _feedback_from_record(row)
+        dimensions = _feedback_dimensions(feedback)
+        label = _intent_review_label(feedback)
+        if label is None:
+            continue
+        if normalized_review_label is not None and label != normalized_review_label:
+            continue
+        if (
+            normalized_intent is not None
+            and _non_empty_string(dimensions.get("intent_assessment_intent")) != normalized_intent
+        ):
+            continue
+        if (
+            normalized_intent_source is not None
+            and _non_empty_string(dimensions.get("intent_assessment_source")) != normalized_intent_source
+        ):
+            continue
+        excerpt = _non_empty_string(feedback.snapshot.get("goal")) if isinstance(feedback.snapshot, Mapping) else None
+        items.append(
+            models.IntentReviewQueueItem(
+                feedback=feedback,
+                dimensions=dimensions,
+                linked_ids={
+                    "session_id": feedback.session_id,
+                    "job_id": feedback.job_id,
+                    "plan_id": feedback.plan_id,
+                    "message_id": feedback.message_id,
+                    "target_id": feedback.target_id,
+                },
+                review_label=label,
+                review_score=_intent_review_score(feedback, label),
+                excerpt=excerpt,
+            )
+        )
+    return sorted(
+        items,
+        key=lambda item: (-item.review_score, item.feedback.updated_at),
+    )
+
+
 def chat_boundary_review_queue(
     db: Session,
     *,
@@ -1010,6 +1358,138 @@ def chat_boundary_review_queue(
     return models.ChatBoundaryReviewQueueResponse(
         total=len(ordered),
         items=ordered[: max(1, min(limit, 500))],
+    )
+
+
+def intent_review_queue(
+    db: Session,
+    *,
+    limit: int = 100,
+    review_label: str | None = None,
+    intent: str | None = None,
+    intent_source: str | None = None,
+) -> models.IntentReviewQueueResponse:
+    ordered = _collect_intent_review_items(
+        db,
+        review_label=review_label,
+        intent=intent,
+        intent_source=intent_source,
+        limit=limit,
+    )
+    return models.IntentReviewQueueResponse(
+        total=len(ordered),
+        items=ordered[: max(1, min(limit, 500))],
+    )
+
+
+def intent_tuning_report(
+    db: Session,
+    *,
+    limit: int = 100,
+    review_label: str | None = None,
+    intent: str | None = None,
+    intent_source: str | None = None,
+) -> models.IntentTuningReportResponse:
+    items = _collect_intent_review_items(
+        db,
+        review_label=review_label,
+        intent=intent,
+        intent_source=intent_source,
+        limit=limit,
+    )
+    reason_counts: Counter[str] = Counter()
+    for item in items:
+        for reason_code in _normalize_reason_codes(item.feedback.reason_codes):
+            reason_counts[reason_code] += 1
+    return models.IntentTuningReportResponse(
+        total=len(items),
+        review_labels=_queue_breakdown(items, lambda item: item.review_label),
+        tuning_focuses=_queue_breakdown(
+            items,
+            lambda item: _intent_tuning_focus(item.review_label),
+        ),
+        intent_assessment_intents=_queue_breakdown(
+            items,
+            lambda item: item.dimensions.get("intent_assessment_intent"),
+        ),
+        intent_assessment_sources=_queue_breakdown(
+            items,
+            lambda item: item.dimensions.get("intent_assessment_source"),
+        ),
+        intent_clarification_modes=_queue_breakdown(
+            items,
+            lambda item: item.dimensions.get("intent_clarification_mode"),
+        ),
+        intent_disagreement_reasons=_queue_breakdown(
+            items,
+            lambda item: item.dimensions.get("intent_disagreement_reason"),
+        ),
+        intent_top_capabilities=_queue_breakdown(
+            items,
+            lambda item: item.dimensions.get("intent_top_capability"),
+        ),
+        intent_top_families=_queue_breakdown(
+            items,
+            lambda item: item.dimensions.get("intent_top_family"),
+        ),
+        missing_input_counts=_queue_breakdown(
+            items,
+            lambda item: _intent_missing_input_bucket(
+                int(item.dimensions.get("intent_missing_input_count") or 0)
+            ),
+        ),
+        negative_reasons=[
+            models.FeedbackReasonBucket(reason_code=reason_code, count=count)
+            for reason_code, count in sorted(reason_counts.items(), key=lambda entry: (-entry[1], entry[0]))
+        ],
+    )
+
+
+def intent_tuning_candidates(
+    db: Session,
+    *,
+    limit: int = 100,
+    review_label: str | None = None,
+    intent: str | None = None,
+    intent_source: str | None = None,
+) -> models.IntentTuningCandidateExportResponse:
+    ordered = _collect_intent_review_items(
+        db,
+        review_label=review_label,
+        intent=intent,
+        intent_source=intent_source,
+        limit=limit,
+    )
+    candidates: list[models.IntentTuningCandidate] = []
+    for item in ordered[: max(1, min(limit, 500))]:
+        tuning_focus = _intent_tuning_focus(item.review_label)
+        observed_case = _intent_observed_case(item)
+        suggested_case_id = _slugify_feedback_case_id(
+            _non_empty_string(observed_case.get("goal")) or item.excerpt or item.feedback.id,
+            item.feedback.id,
+        )
+        candidates.append(
+            models.IntentTuningCandidate(
+                feedback=item.feedback,
+                dimensions=item.dimensions,
+                linked_ids=item.linked_ids,
+                review_label=item.review_label,
+                review_score=item.review_score,
+                excerpt=item.excerpt,
+                tuning_focus=tuning_focus,
+                suggested_case_id=suggested_case_id,
+                observed_case=observed_case,
+                gold_case_stub=_intent_gold_case_stub(
+                    item,
+                    tuning_focus=tuning_focus,
+                    suggested_case_id=suggested_case_id,
+                    observed_case=observed_case,
+                ),
+            )
+        )
+    return models.IntentTuningCandidateExportResponse(
+        total=len(ordered),
+        items=candidates,
     )
 
 

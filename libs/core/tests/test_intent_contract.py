@@ -848,3 +848,44 @@ def test_derive_envelope_clarification_skips_target_system_when_capability_is_sp
     )
 
     assert clarification["missing_inputs"] == []
+
+
+def test_derive_envelope_clarification_detects_intent_disagreement() -> None:
+    clarification = intent_contract.derive_envelope_clarification(
+        goal="Create a release report",
+        profile={
+            "intent": "io",
+            "low_confidence": True,
+            "slot_values": {"intent_action": "io"},
+            "blocking_slots": [],
+            "missing_slots": [],
+        },
+        heuristic_profile={
+            "intent": "generate",
+            "source": "heuristic",
+        },
+        graph={
+            "segments": [
+                {
+                    "id": "s1",
+                    "intent": "generate",
+                    "objective": "Generate the release report",
+                    "required_inputs": ["instruction"],
+                    "suggested_capabilities": ["document.spec.generate"],
+                    "slots": {
+                        "artifact_type": "document_spec",
+                        "must_have_inputs": ["instruction"],
+                    },
+                }
+            ]
+        },
+        context_capability_candidates=["document.spec.generate"],
+        candidate_required_inputs_by_segment={"s1": ["instruction"]},
+    )
+
+    assert clarification["missing_inputs"] == ["intent_action"]
+    assert clarification["blocking_slots"] == ["intent_action"]
+    assert clarification["clarification_mode"] == "intent_disagreement"
+    assert clarification["disagreement"]["reason_code"] == "graph_intent_conflict"
+    assert clarification["disagreement"]["capability_intents"] == ["generate"]
+    assert "generate new content" in clarification["questions"][0]

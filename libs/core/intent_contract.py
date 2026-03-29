@@ -154,6 +154,14 @@ _GENERIC_CAPABILITY_SYSTEMS: set[str] = {
     "codegen",
 }
 
+_INTENT_ACTION_PHRASES: dict[str, str] = {
+    "generate": "generate new content",
+    "transform": "transform or improve existing content",
+    "validate": "validate or check something",
+    "render": "render a final artifact",
+    "io": "fetch, inspect, or list data",
+}
+
 _CLAUSE_SPLIT_ACTION_HINTS: tuple[str, ...] = (
     "read",
     "fetch",
@@ -263,6 +271,132 @@ def normalize_required_input_key(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return _extract_required_input_key(value)
+
+
+def capability_intent_hints(capability_ids: Iterable[str]) -> list[str]:
+    hints: list[str] = []
+    seen: set[str] = set()
+    for raw_capability_id in capability_ids:
+        capability_id = str(raw_capability_id or "").strip().lower()
+        if not capability_id:
+            continue
+        hint = _capability_intent_hint(capability_id)
+        if hint and hint not in seen:
+            seen.add(hint)
+            hints.append(hint)
+    return hints
+
+
+def detect_intent_disagreement(
+    *,
+    goal: str,
+    profile: Mapping[str, Any] | None,
+    heuristic_profile: Mapping[str, Any] | None = None,
+    graph: Mapping[str, Any] | None = None,
+    context_capability_candidates: Iterable[str] = (),
+    missing_inputs: Iterable[str] = (),
+) -> dict[str, Any]:
+    del goal
+    profile_map = profile if isinstance(profile, Mapping) else {}
+    heuristic_map = heuristic_profile if isinstance(heuristic_profile, Mapping) else {}
+    graph_map = graph if isinstance(graph, Mapping) else {}
+
+    profile_intent = normalize_task_intent(profile_map.get("intent"))
+    heuristic_intent = normalize_task_intent(heuristic_map.get("intent"))
+    profile_low_confidence = bool(profile_map.get("low_confidence"))
+    graph_source = str(graph_map.get("source") or "").strip().lower()
+    try:
+        graph_confidence = float(graph_map.get("overall_confidence") or 0.0)
+    except (TypeError, ValueError):
+        graph_confidence = 0.0
+    trusted_graph = bool(
+        profile_low_confidence
+        or graph_source not in {"", "heuristic"}
+        or graph_confidence >= 0.75
+    )
+    graph_intents: list[str] = []
+    graph_capabilities: list[str] = []
+    segments = graph_map.get("segments") if isinstance(graph_map.get("segments"), list) else []
+    if trusted_graph:
+        for raw_segment in segments:
+            if not isinstance(raw_segment, Mapping):
+                continue
+            segment_intent = normalize_task_intent(raw_segment.get("intent"))
+            if segment_intent and segment_intent not in graph_intents:
+                graph_intents.append(segment_intent)
+            for capability_id in _coerce_string_tuple(raw_segment.get("suggested_capabilities")):
+                if capability_id not in graph_capabilities:
+                    graph_capabilities.append(capability_id)
+    capability_intents = capability_intent_hints(
+        list(context_capability_candidates) + graph_capabilities
+    )
+    normalized_missing_inputs = [
+        normalize_required_input_key(value)
+        for value in missing_inputs
+        if normalize_required_input_key(value)
+    ]
+
+    reason_code: str | None = None
+    evidence_intent: str | None = None
+    if len(graph_intents) == 1 and profile_intent and graph_intents[0] != profile_intent:
+        reason_code = "graph_intent_conflict"
+        evidence_intent = graph_intents[0]
+    elif (
+        len(capability_intents) == 1
+        and profile_intent
+        and capability_intents[0] != profile_intent
+        and (profile_low_confidence or capability_intents[0] == heuristic_intent)
+    ):
+        reason_code = "capability_intent_conflict"
+        evidence_intent = capability_intents[0]
+    elif heuristic_intent and profile_intent and heuristic_intent != profile_intent and profile_low_confidence:
+        reason_code = "heuristic_intent_conflict"
+        evidence_intent = heuristic_intent
+    elif profile_intent == "io" and any(
+        key in {"path", "output_format"} for key in normalized_missing_inputs
+    ):
+        reason_code = "required_inputs_conflict"
+        evidence_intent = (
+            graph_intents[0]
+            if len(graph_intents) == 1
+            else capability_intents[0]
+            if len(capability_intents) == 1
+            else "render"
+        )
+    elif profile_intent in {"generate", "render"} and "target_system" in normalized_missing_inputs:
+        reason_code = "required_inputs_conflict"
+        evidence_intent = (
+            graph_intents[0]
+            if len(graph_intents) == 1
+            else capability_intents[0]
+            if len(capability_intents) == 1
+            else "io"
+        )
+
+    if not reason_code:
+        return {}
+
+    ordered_intents: list[str] = []
+    for candidate_intent in (
+        evidence_intent,
+        heuristic_intent,
+        profile_intent,
+    ):
+        if candidate_intent and candidate_intent not in ordered_intents:
+            ordered_intents.append(candidate_intent)
+    question = _intent_disagreement_question(ordered_intents)
+    return {
+        "detected": True,
+        "reason_code": reason_code,
+        "profile_intent": profile_intent,
+        "heuristic_intent": heuristic_intent,
+        "graph_intents": graph_intents,
+        "capability_intents": capability_intents,
+        "question": question,
+        "blocking_slots": ["intent_action"],
+        "missing_inputs": ["intent_action"],
+        "clarification_mode": "intent_disagreement",
+    }
 
 
 def _infer_segment_output_format(
@@ -621,7 +755,9 @@ def derive_envelope_clarification(
     *,
     goal: str,
     profile: Mapping[str, Any] | None,
+    heuristic_profile: Mapping[str, Any] | None = None,
     graph: Mapping[str, Any] | None,
+    context_capability_candidates: Iterable[str] = (),
     candidate_required_inputs_by_segment: Mapping[str, Iterable[str]] | None = None,
 ) -> dict[str, Any]:
     profile_map = profile if isinstance(profile, Mapping) else {}
@@ -661,7 +797,34 @@ def derive_envelope_clarification(
             if normalized and normalized not in missing_inputs:
                 missing_inputs.append(normalized)
 
+    disagreement = detect_intent_disagreement(
+        goal=goal,
+        profile=profile_map,
+        heuristic_profile=heuristic_profile,
+        graph=graph_map,
+        context_capability_candidates=context_capability_candidates,
+        missing_inputs=missing_inputs,
+    )
+    if disagreement:
+        disagreement_missing = [
+            normalize_required_input_key(value)
+            for value in disagreement.get("missing_inputs", [])
+            if normalize_required_input_key(value)
+        ]
+        missing_inputs = _prepend_unique(missing_inputs, *disagreement_missing)
+
     questions = [required_input_question(key, goal) for key in missing_inputs]
+    clarification_mode = "capability_required_inputs"
+    if disagreement:
+        disagreement_question = str(disagreement.get("question") or "").strip()
+        remaining_questions = [
+            question
+            for question, missing_input in zip(questions, missing_inputs)
+            if normalize_required_input_key(missing_input) != "intent_action"
+        ]
+        questions = [disagreement_question] if disagreement_question else []
+        questions.extend(remaining_questions)
+        clarification_mode = str(disagreement.get("clarification_mode") or "").strip() or clarification_mode
     return {
         "needs_clarification": bool(missing_inputs),
         "requires_blocking_clarification": bool(missing_inputs),
@@ -669,7 +832,8 @@ def derive_envelope_clarification(
         "questions": questions,
         "blocking_slots": list(missing_inputs),
         "slot_values": dict(slot_values),
-        "clarification_mode": "capability_required_inputs",
+        "clarification_mode": clarification_mode,
+        "disagreement": disagreement,
     }
 
 def _tool_output_format_hint(tool_name: str) -> str | None:
@@ -797,6 +961,68 @@ def _payload_has_required_input(
         if _value_present(value, key=key):
             return True
     return False
+
+
+def _capability_intent_hint(capability_id: str) -> str | None:
+    normalized = str(capability_id or "").strip().lower()
+    if not normalized:
+        return None
+    if any(token in normalized for token in (".validate", "validate.", "schema.validate")):
+        return "validate"
+    if any(token in normalized for token in (".render", ".render_", "render.")):
+        return "render"
+    if any(
+        token in normalized
+        for token in (
+            ".transform",
+            ".improve",
+            ".repair",
+            "derive_output_filename",
+            ".rerank",
+        )
+    ):
+        return "transform"
+    if any(
+        token in normalized
+        for token in (
+            ".search",
+            ".list",
+            ".read",
+            ".retrieve",
+            ".download",
+            ".load",
+            ".me",
+        )
+    ):
+        return "io"
+    if any(
+        token in normalized
+        for token in (
+            ".generate",
+            ".create",
+            ".compose",
+            "generate_iterative",
+        )
+    ):
+        return "generate"
+    return None
+
+
+def _intent_disagreement_question(intents: Iterable[str]) -> str:
+    normalized = [
+        intent
+        for intent in (normalize_task_intent(value) for value in intents)
+        if intent
+    ]
+    ordered: list[str] = []
+    for intent in normalized:
+        if intent not in ordered:
+            ordered.append(intent)
+    if len(ordered) >= 2:
+        primary = _INTENT_ACTION_PHRASES.get(ordered[0], ordered[0])
+        secondary = _INTENT_ACTION_PHRASES.get(ordered[1], ordered[1])
+        return f"Should I {primary}, or should I {secondary} for this request?"
+    return slot_question("intent_action", "")
 
 
 def _risk_rank(value: Any) -> int:

@@ -265,3 +265,51 @@ def test_planner_and_execution_context_views_use_stage_specific_projection() -> 
     assert "missing_inputs" not in execution_view
     assert "user_profile" not in execution_view
     assert "interaction_summaries_ref" not in execution_view
+
+
+def test_intent_context_view_merges_slot_values_with_provenance() -> None:
+    normalized = workflow_contracts.NormalizedIntentEnvelope(
+        goal="Generate a deployment report",
+        profile=workflow_contracts.GoalIntentProfile(
+            intent="generate",
+            source="test",
+            confidence=0.95,
+            risk_level="read_only",
+            slot_values={
+                "intent_action": "generate",
+                "topic": "Deployment report",
+            },
+        ),
+        clarification=workflow_contracts.ClarificationState(
+            slot_values={
+                "tone": "practical",
+                "topic": "Deployment report",
+            },
+        ),
+    )
+    envelope = workflow_contracts.ContextEnvelope(
+        goal="Generate a deployment report",
+        context_json={
+            "tone": "executive",
+            "clarification_normalization": {
+                "source": "chat_clarification_normalizer",
+                "fields": ["tone"],
+            },
+        },
+        normalized_intent_envelope=workflow_contracts.dump_normalized_intent_envelope(normalized),
+        profile={"preferences": {"response_verbosity": "concise"}},
+        capability_candidates=["document.spec.generate"],
+        missing_inputs=["output_format"],
+    )
+
+    intent_view = context_service.intent_context_view(envelope)
+
+    assert intent_view["user_profile"]["preferences"]["response_verbosity"] == "concise"
+    assert intent_view["capability_candidates"] == ["document.spec.generate"]
+    assert intent_view["missing_inputs"] == ["output_format"]
+    assert intent_view["intent_slot_values"]["tone"] == "executive"
+    assert intent_view["intent_slot_values"]["topic"] == "Deployment report"
+    assert intent_view["intent_slot_values"]["intent_action"] == "generate"
+    assert intent_view["intent_slot_provenance"]["tone"] == "clarification_normalized"
+    assert intent_view["intent_slot_provenance"]["topic"] == "inferred"
+    assert intent_view["intent_slot_provenance"]["intent_action"] == "inferred"

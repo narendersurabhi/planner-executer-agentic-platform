@@ -1562,21 +1562,39 @@ def _chat_route_goal_intent_profile(
     *,
     goal: str,
 ) -> workflow_contracts.GoalIntentProfile:
+    preserve_intent_disagreement = (
+        str(profile.clarification_mode or "").strip().lower() == "intent_disagreement"
+    )
     chat_blocking_slots: list[str] = []
     for raw_slot in profile.blocking_slots:
         normalized = intent_contract.normalize_required_input_key(raw_slot)
-        if normalized in CHAT_PRE_SUBMIT_BLOCKING_SLOTS and normalized not in chat_blocking_slots:
+        if (
+            normalized in CHAT_PRE_SUBMIT_BLOCKING_SLOTS
+            or (preserve_intent_disagreement and normalized == "intent_action")
+        ) and normalized not in chat_blocking_slots:
             chat_blocking_slots.append(normalized)
     chat_missing_slots: list[str] = []
     for raw_slot in profile.missing_slots:
         normalized = intent_contract.normalize_required_input_key(raw_slot)
-        if normalized in CHAT_PRE_SUBMIT_BLOCKING_SLOTS and normalized not in chat_missing_slots:
+        if (
+            normalized in CHAT_PRE_SUBMIT_BLOCKING_SLOTS
+            or (preserve_intent_disagreement and normalized == "intent_action")
+        ) and normalized not in chat_missing_slots:
             chat_missing_slots.append(normalized)
+    questions = (
+        [
+            str(question).strip()
+            for question in profile.questions
+            if isinstance(question, str) and question.strip()
+        ]
+        if preserve_intent_disagreement and profile.questions
+        else [_slot_question(slot_name, goal) for slot_name in chat_missing_slots]
+    )
     return profile.model_copy(
         update={
             "needs_clarification": bool(chat_missing_slots),
             "requires_blocking_clarification": bool(chat_missing_slots),
-            "questions": [_slot_question(slot_name, goal) for slot_name in chat_missing_slots],
+            "questions": questions,
             "blocking_slots": chat_blocking_slots,
             "missing_slots": chat_missing_slots,
         }
@@ -2884,6 +2902,7 @@ def _normalize_goal_intent(
     db: Session | None = None,
     user_id: str | None = None,
     interaction_summaries: list[dict[str, Any]] | None = None,
+    context_envelope: workflow_contracts.ContextEnvelope | Mapping[str, Any] | None = None,
     include_decomposition: bool | None = None,
     assessment_mode_override: str | None = None,
 ) -> workflow_contracts.NormalizedIntentEnvelope:
@@ -2895,11 +2914,23 @@ def _normalize_goal_intent(
         normalized_assessment_mode = (
             INTENT_ASSESS_MODE if INTENT_ASSESS_ENABLED else "disabled"
         )
+    intent_context = (
+        context_service.intent_context_view(context_envelope)
+        if context_envelope is not None
+        else {}
+    )
+    if interaction_summaries is None:
+        raw_summaries = intent_context.get("interaction_summaries")
+        if isinstance(raw_summaries, list):
+            interaction_summaries = [
+                dict(item) for item in raw_summaries if isinstance(item, Mapping)
+            ]
     return intent_service.normalize_goal_intent(
         goal,
         db=db,
         user_id=user_id,
         interaction_summaries=interaction_summaries,
+        intent_context=intent_context,
         config=intent_service.IntentNormalizeConfig(
             include_decomposition=decomposition_enabled,
             assessment_mode=normalized_assessment_mode,
@@ -2919,6 +2950,10 @@ def _normalize_goal_intent(
             assess_goal_intent=lambda goal_text: _assess_goal_intent(
                 goal_text,
                 mode_override=normalized_assessment_mode,
+            ),
+            assess_goal_intent_heuristic=lambda goal_text: _assess_goal_intent(
+                goal_text,
+                mode_override="heuristic",
             ),
             decompose_goal_intent=_decompose_goal_intent,
             capability_required_inputs=_capability_required_inputs_for_intent_normalization,
@@ -4108,7 +4143,12 @@ def _normalize_chat_submit_context(
         if context_envelope is not None
         else dict(merged_context) if isinstance(merged_context, Mapping) else {}
     )
-    normalized = _normalize_goal_intent(goal, db=db, user_id=user_id)
+    normalized = _normalize_goal_intent(
+        goal,
+        db=db,
+        user_id=user_id,
+        context_envelope=context_envelope,
+    )
     candidate_capability_ids = _candidate_capability_ids_for_envelope(normalized)
     capability_contract = chat_clarification_normalizer.build_capability_normalization_contract(
         goal=goal,
@@ -5536,7 +5576,6 @@ def _heuristic_capability_recommendations(
                 (last_node.get("output_path") or "").strip()
                 or _infer_capability_output_path(last_node.get("capability_id", ""))
             )
-            last_capability_id = (last_node.get("capability_id") or "").strip()
             if last_output and last_output in required_inputs:
                 score += 32
                 reasons.append(f"uses previous output '{last_output}'")
@@ -12075,6 +12114,60 @@ def get_chat_boundary_review_queue(
     )
 
 
+@app.get("/feedback/intent/review", response_model=models.IntentReviewQueueResponse)
+def get_intent_review_queue(
+    review_label: str | None = Query(default=None),
+    intent: str | None = Query(default=None),
+    intent_source: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.IntentReviewQueueResponse:
+    return feedback_service.intent_review_queue(
+        db,
+        review_label=review_label,
+        intent=intent,
+        intent_source=intent_source,
+        limit=limit,
+    )
+
+
+@app.get("/feedback/intent/tuning-report", response_model=models.IntentTuningReportResponse)
+def get_intent_tuning_report(
+    review_label: str | None = Query(default=None),
+    intent: str | None = Query(default=None),
+    intent_source: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.IntentTuningReportResponse:
+    return feedback_service.intent_tuning_report(
+        db,
+        review_label=review_label,
+        intent=intent,
+        intent_source=intent_source,
+        limit=limit,
+    )
+
+
+@app.get(
+    "/feedback/intent/tuning-candidates",
+    response_model=models.IntentTuningCandidateExportResponse,
+)
+def get_intent_tuning_candidates(
+    review_label: str | None = Query(default=None),
+    intent: str | None = Query(default=None),
+    intent_source: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.IntentTuningCandidateExportResponse:
+    return feedback_service.intent_tuning_candidates(
+        db,
+        review_label=review_label,
+        intent=intent,
+        intent_source=intent_source,
+        limit=limit,
+    )
+
+
 @app.get("/jobs/{job_id}/feedback", response_model=models.FeedbackListResponse)
 def get_job_feedback(
     job_id: str,
@@ -12152,11 +12245,21 @@ def _create_job_internal(
     semantic_user_id = _semantic_user_id_from_context(
         context_json_for_job if isinstance(context_json_for_job, Mapping) else None
     )
+    intent_context_envelope = context_service.build_context_envelope(
+        db=db,
+        goal=job.goal,
+        context_sources=context_service.collect_context_sources(
+            job_context=context_json_for_job,
+        ),
+        user_id=semantic_user_id,
+        runtime_metadata={"surface": "job_create_intent"},
+    )
     normalized_intent_envelope = _normalize_goal_intent(
         job.goal,
         db=db,
         user_id=semantic_user_id,
         interaction_summaries=interaction_summaries_compact or interaction_summaries_raw,
+        context_envelope=intent_context_envelope,
     )
     if interaction_summaries_raw and INTENT_DECOMPOSE_ENABLED:
         normalized_intent_envelope = normalized_intent_envelope.model_copy(
@@ -13428,13 +13531,33 @@ def preflight_plan(
 
 
 @app.post("/intent/clarify")
-def clarify_intent(payload: dict[str, Any]) -> dict[str, Any]:
+def clarify_intent(
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="invalid_intent_payload")
     goal = str(payload.get("goal") or "").strip()
     if not goal:
         raise HTTPException(status_code=400, detail="goal_required")
-    normalized = _normalize_goal_intent(goal)
+    explicit_user_id = _semantic_normalize_text(payload.get("user_id"), max_len=120)
+    context_obj = _coerce_context_object(
+        payload.get("context_json") or payload.get("job_context")
+    )
+    semantic_user_id = explicit_user_id or _semantic_user_id_from_context(context_obj)
+    context_envelope = context_service.build_context_envelope(
+        db=db,
+        goal=goal,
+        context_sources=context_service.collect_context_sources(intent_request_context=context_obj),
+        user_id=semantic_user_id,
+        runtime_metadata={"surface": "intent_clarify"},
+    )
+    normalized = _normalize_goal_intent(
+        goal,
+        db=db,
+        user_id=semantic_user_id,
+        context_envelope=context_envelope,
+    )
     return _normalized_intent_response_payload(normalized)
 
 
@@ -13460,11 +13583,19 @@ def decompose_intent(
         payload.get("context_json") or payload.get("job_context")
     )
     semantic_user_id = explicit_user_id or _semantic_user_id_from_context(context_obj)
+    context_envelope = context_service.build_context_envelope(
+        db=db,
+        goal=goal,
+        context_sources=context_service.collect_context_sources(intent_request_context=context_obj),
+        user_id=semantic_user_id,
+        runtime_metadata={"surface": "intent_decompose"},
+    )
     normalized = _normalize_goal_intent(
         goal,
         db=db,
         user_id=semantic_user_id,
         interaction_summaries=compacted_summaries or interaction_summaries,
+        context_envelope=context_envelope,
         include_decomposition=True,
         assessment_mode_override="heuristic",
     )

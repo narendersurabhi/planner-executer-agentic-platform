@@ -13,6 +13,10 @@ cases:
       - llm.text.generate
     expected_capabilities_by_segment:
       - [document.spec.generate, llm.text.generate]
+    expected_profile_intent: generate
+    expected_missing_inputs: [output_format]
+    expected_requires_clarification: true
+    expected_clarification_mode: capability_required_inputs
 
   - id: render_explicit_pdf_path
     goal: Render the approved document spec to /shared/artifacts/q1-plan.pdf.
@@ -21,6 +25,10 @@ cases:
       - document.pdf.render
     expected_capabilities_by_segment:
       - [document.pdf.render]
+    expected_profile_intent: render
+    expected_missing_inputs: []
+    expected_requires_clarification: false
+    expected_clarification_mode: capability_required_inputs
 
   - id: repo_branch_release_summary
     goal: List GitHub branches and summarize release readiness.
@@ -32,6 +40,10 @@ cases:
     expected_capabilities_by_segment:
       - [github.branch.list]
       - [document.spec.generate, llm.text.generate]
+    expected_profile_intent: transform
+    expected_missing_inputs: []
+    expected_requires_clarification: false
+    expected_clarification_mode: capability_required_inputs
 
   - id: workspace_timeout_retrieval
     goal: Search workspace files for timeout errors and summarize the findings.
@@ -43,6 +55,10 @@ cases:
     expected_capabilities_by_segment:
       - [filesystem.workspace.search_text]
       - [document.spec.generate, llm.text.generate]
+    expected_profile_intent: transform
+    expected_missing_inputs: []
+    expected_requires_clarification: false
+    expected_clarification_mode: capability_required_inputs
 
   - id: high_risk_workspace_delete
     goal: Delete the production deployment manifest from the workspace.
@@ -51,3 +67,7 @@ cases:
       - filesystem.workspace.delete
     expected_capabilities_by_segment:
       - [filesystem.workspace.delete]
+    expected_profile_intent: generate
+    expected_missing_inputs: [output_format, safety_constraints, intent_action]
+    expected_requires_clarification: true
+    expected_clarification_mode: capability_required_inputs

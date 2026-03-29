@@ -542,6 +542,10 @@ class FeedbackSummaryResponse(BaseModel):
     planner_versions: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     job_statuses: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     assistant_action_types: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_assessment_intents: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_assessment_sources: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_clarification_modes: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_disagreement_reasons: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     boundary_decisions: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     boundary_reason_codes: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     boundary_top_families: List[FeedbackBreakdownBucket] = Field(default_factory=list)
@@ -573,6 +577,52 @@ class ChatBoundaryReviewQueueItem(BaseModel):
 class ChatBoundaryReviewQueueResponse(BaseModel):
     total: int = 0
     items: List[ChatBoundaryReviewQueueItem] = Field(default_factory=list)
+
+
+class IntentReviewQueueItem(BaseModel):
+    feedback: Feedback
+    dimensions: Dict[str, Any] = Field(default_factory=dict)
+    linked_ids: Dict[str, Optional[str]] = Field(default_factory=dict)
+    review_label: str
+    review_score: int = 0
+    excerpt: Optional[str] = None
+
+
+class IntentReviewQueueResponse(BaseModel):
+    total: int = 0
+    items: List[IntentReviewQueueItem] = Field(default_factory=list)
+
+
+class IntentTuningReportResponse(BaseModel):
+    total: int = 0
+    review_labels: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    tuning_focuses: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_assessment_intents: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_assessment_sources: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_clarification_modes: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_disagreement_reasons: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_top_capabilities: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    intent_top_families: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    missing_input_counts: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    negative_reasons: List[FeedbackReasonBucket] = Field(default_factory=list)
+
+
+class IntentTuningCandidate(BaseModel):
+    feedback: Feedback
+    dimensions: Dict[str, Any] = Field(default_factory=dict)
+    linked_ids: Dict[str, Optional[str]] = Field(default_factory=dict)
+    review_label: str
+    review_score: int = 0
+    excerpt: Optional[str] = None
+    tuning_focus: str
+    suggested_case_id: str
+    observed_case: Dict[str, Any] = Field(default_factory=dict)
+    gold_case_stub: Dict[str, Any] = Field(default_factory=dict)
+
+
+class IntentTuningCandidateExportResponse(BaseModel):
+    total: int = 0
+    items: List[IntentTuningCandidate] = Field(default_factory=list)
 
 
 class JobCreate(BaseModel):
