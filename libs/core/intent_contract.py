@@ -70,6 +70,15 @@ class GoalIntentSegment:
     slots: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ActiveExecutionTarget:
+    segment_id: str | None
+    capability_id: str | None
+    capability_ids: tuple[str, ...]
+    required_fields: tuple[str, ...]
+    unresolved_fields: tuple[str, ...]
+
+
 _INTENT_SOURCE_EXPLICIT = "explicit"
 _INTENT_SOURCE_TASK_TEXT = "task_text"
 _INTENT_SOURCE_GOAL_TEXT = "goal_text"
@@ -263,6 +272,10 @@ def _extract_required_input_key(value: str) -> str:
     alias_map = {
         "path_or_format": "path",
         "source_or_query": "query",
+        "output_path": "path",
+        "filename": "path",
+        "file_name": "path",
+        "output_filename": "path",
     }
     return alias_map.get(token, token)
 
@@ -271,6 +284,127 @@ def normalize_required_input_key(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return _extract_required_input_key(value)
+
+
+def select_active_execution_target(
+    *,
+    graph: Mapping[str, Any] | None,
+    candidate_capabilities: Mapping[str, Any] | None = None,
+    known_slot_values: Mapping[str, Any] | None = None,
+    pending_fields: Iterable[Any] = (),
+    preferred_segment_id: str | None = None,
+    preferred_capability_id: str | None = None,
+) -> ActiveExecutionTarget | None:
+    graph_map = graph if isinstance(graph, Mapping) else {}
+    raw_segments = graph_map.get("segments")
+    if not isinstance(raw_segments, list):
+        return None
+
+    candidate_map = candidate_capabilities if isinstance(candidate_capabilities, Mapping) else {}
+    normalized_pending_fields = {
+        normalized
+        for value in pending_fields
+        if (normalized := normalize_required_input_key(value))
+    }
+    known_fields = {
+        normalized
+        for raw_key, raw_value in (known_slot_values or {}).items()
+        if raw_value is not None
+        and (not isinstance(raw_value, str) or raw_value.strip())
+        and (normalized := normalize_required_input_key(raw_key))
+    }
+    preferred_segment = str(preferred_segment_id or "").strip()
+    preferred_capability = str(preferred_capability_id or "").strip()
+
+    best_target: ActiveExecutionTarget | None = None
+    best_score: tuple[int, int, int, int, int, int] | None = None
+    fallback_target: ActiveExecutionTarget | None = None
+
+    for index, raw_segment in enumerate(raw_segments):
+        if not isinstance(raw_segment, Mapping):
+            continue
+        segment_id = str(raw_segment.get("id") or "").strip()
+        if not segment_id:
+            continue
+        required_fields = _segment_required_fields(raw_segment)
+        unresolved_required_fields = tuple(
+            field for field in required_fields if field and field not in known_fields
+        )
+        overlapping_unresolved_fields = tuple(
+            field
+            for field in unresolved_required_fields
+            if not normalized_pending_fields or field in normalized_pending_fields
+        )
+        unresolved_fields = overlapping_unresolved_fields or unresolved_required_fields
+        capability_ids = _segment_capability_ids(
+            raw_segment,
+            candidate_capabilities=candidate_map.get(segment_id),
+        )
+        capability_match = int(bool(preferred_capability and preferred_capability in capability_ids))
+        segment_match = int(bool(preferred_segment and segment_id == preferred_segment))
+        overlap = len(normalized_pending_fields.intersection(unresolved_required_fields))
+        has_relevant_unresolved = int(bool(unresolved_required_fields))
+
+        selected_capability = (
+            preferred_capability
+            if capability_match
+            else (capability_ids[0] if capability_ids else None)
+        )
+        target = ActiveExecutionTarget(
+            segment_id=segment_id,
+            capability_id=selected_capability,
+            capability_ids=capability_ids,
+            required_fields=required_fields,
+            unresolved_fields=unresolved_fields,
+        )
+        if segment_match and fallback_target is None:
+            fallback_target = target
+
+        score = (
+            overlap,
+            has_relevant_unresolved,
+            capability_match,
+            segment_match,
+            len(unresolved_required_fields),
+            -index,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_target = target
+
+    if best_target is None:
+        return fallback_target
+    if best_score is not None and best_score[1] == 0 and fallback_target is not None:
+        return fallback_target
+    return best_target
+
+
+def _segment_required_fields(segment: Mapping[str, Any]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for raw_value in segment.get("required_inputs", []) or []:
+        key = normalize_required_input_key(raw_value)
+        if key and key not in normalized:
+            normalized.append(key)
+    slots = segment.get("slots")
+    if isinstance(slots, Mapping):
+        for raw_value in slots.get("must_have_inputs", []) or []:
+            key = normalize_required_input_key(raw_value)
+            if key and key not in normalized:
+                normalized.append(key)
+    return tuple(normalized)
+
+
+def _segment_capability_ids(
+    segment: Mapping[str, Any],
+    *,
+    candidate_capabilities: Any = None,
+) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for source in (candidate_capabilities, segment.get("suggested_capabilities")):
+        for raw_value in _coerce_string_tuple(source):
+            if raw_value and raw_value not in normalized:
+                normalized.append(raw_value)
+    return tuple(normalized)
 
 
 def capability_intent_hints(capability_ids: Iterable[str]) -> list[str]:
@@ -1022,7 +1156,7 @@ def _intent_disagreement_question(intents: Iterable[str]) -> str:
         primary = _INTENT_ACTION_PHRASES.get(ordered[0], ordered[0])
         secondary = _INTENT_ACTION_PHRASES.get(ordered[1], ordered[1])
         return f"Should I {primary}, or should I {secondary} for this request?"
-    return slot_question("intent_action", "")
+    return required_input_question("intent_action", "")
 
 
 def _risk_rank(value: Any) -> int:

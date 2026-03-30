@@ -889,3 +889,76 @@ def test_derive_envelope_clarification_detects_intent_disagreement() -> None:
     assert clarification["disagreement"]["reason_code"] == "graph_intent_conflict"
     assert clarification["disagreement"]["capability_intents"] == ["generate"]
     assert "generate new content" in clarification["questions"][0]
+
+
+def test_select_active_execution_target_prefers_segment_with_pending_overlap() -> None:
+    target = intent_contract.select_active_execution_target(
+        graph={
+            "segments": [
+                {
+                    "id": "s1",
+                    "intent": "generate",
+                    "required_inputs": ["instruction", "audience", "tone"],
+                    "suggested_capabilities": ["document.spec.generate"],
+                },
+                {
+                    "id": "s2",
+                    "intent": "io",
+                    "required_inputs": ["query"],
+                    "suggested_capabilities": ["github.issue.search"],
+                },
+            ]
+        },
+        candidate_capabilities={
+            "s1": ["document.spec.generate"],
+            "s2": ["github.issue.search"],
+        },
+        known_slot_values={"instruction": "Create a report", "audience": "SSE"},
+        pending_fields=["tone", "query"],
+        preferred_segment_id="s1",
+        preferred_capability_id="document.spec.generate",
+    )
+
+    assert target is not None
+    assert target.segment_id == "s1"
+    assert target.capability_id == "document.spec.generate"
+    assert target.unresolved_fields == ("tone",)
+
+
+def test_select_active_execution_target_shifts_to_render_when_path_is_only_remaining_field() -> None:
+    target = intent_contract.select_active_execution_target(
+        graph={
+            "segments": [
+                {
+                    "id": "s1",
+                    "intent": "generate",
+                    "required_inputs": ["instruction", "topic", "audience", "tone"],
+                    "suggested_capabilities": ["document.spec.generate"],
+                },
+                {
+                    "id": "s2",
+                    "intent": "render",
+                    "required_inputs": ["document_spec", "output_filename"],
+                    "suggested_capabilities": ["document.docx.render"],
+                },
+            ]
+        },
+        candidate_capabilities={
+            "s1": ["document.spec.generate"],
+            "s2": ["document.docx.render"],
+        },
+        known_slot_values={
+            "instruction": "Create a report",
+            "topic": "Kubernetes",
+            "audience": "SSE",
+            "tone": "practical",
+        },
+        pending_fields=["path"],
+        preferred_segment_id="s1",
+        preferred_capability_id="document.spec.generate",
+    )
+
+    assert target is not None
+    assert target.segment_id == "s2"
+    assert target.capability_id == "document.docx.render"
+    assert target.unresolved_fields == ("path",)

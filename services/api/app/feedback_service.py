@@ -9,10 +9,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from libs.core import models, workflow_contracts
+from libs.core import chat_contracts, intent_contract, models, workflow_contracts
 
 from .models import (
     ChatMessageRecord,
+    ChatSessionRecord,
     FeedbackRecord,
     JobRecord,
     PlanRecord,
@@ -165,6 +166,86 @@ def _intent_fields_from_snapshot(snapshot: Mapping[str, Any] | None) -> dict[str
         "intent_disagreement_reason": _non_empty_string(disagreement_map.get("reason_code")),
         "intent_top_capability": top_capability,
         "intent_top_family": top_family,
+    }
+
+
+def _normalized_required_input_keys(values: Any) -> set[str]:
+    if not isinstance(values, list):
+        return set()
+    normalized: set[str] = set()
+    for value in values:
+        key = intent_contract.normalize_required_input_key(value)
+        if key:
+            normalized.add(key)
+    return normalized
+
+
+def _clarification_slot_loss_state(
+    state: chat_contracts.ClarificationState,
+) -> str:
+    pending_fields = _normalized_required_input_keys(
+        list(state.pending_fields or state.required_fields or [])
+    )
+    resolved_fields = {
+        normalized
+        for raw_key in dict(state.known_slot_values or state.resolved_slots or {}).keys()
+        if (normalized := intent_contract.normalize_required_input_key(raw_key))
+    }
+    answered_fields = {
+        normalized
+        for raw_key in list(state.answered_fields or [])
+        if (normalized := intent_contract.normalize_required_input_key(raw_key))
+    }
+    answer_count = len(list(state.answer_history or []))
+    if pending_fields & (resolved_fields | answered_fields):
+        return "resolved_field_still_pending"
+    if answer_count >= 2 and pending_fields and not resolved_fields:
+        return "answers_without_resolved_slots"
+    if answer_count >= 3 and pending_fields and len(resolved_fields) < min(answer_count, 2):
+        return "answer_slot_gap"
+    return "none"
+
+
+def _clarification_fields_from_session(
+    session: ChatSessionRecord | None,
+    *,
+    boundary_top_family: str | None,
+) -> dict[str, Any]:
+    metadata = dict(session.metadata_json or {}) if session is not None else {}
+    raw_state = metadata.get("pending_clarification")
+    if not isinstance(raw_state, Mapping):
+        return {}
+    try:
+        state = chat_contracts.ClarificationState.model_validate(dict(raw_state))
+    except Exception:  # noqa: BLE001
+        return {}
+    known_slot_values = dict(state.known_slot_values or state.resolved_slots or {})
+    pending_fields = list(state.pending_fields or state.required_fields or [])
+    question_history = list(state.question_history or state.questions or [])
+    answer_history = list(state.answer_history or [])
+    active_family = _non_empty_string(state.active_family or state.execution_frame.active_family)
+    active_capability = _non_empty_string(
+        state.active_capability_id or state.execution_frame.active_capability_id
+    )
+    active_segment_id = _non_empty_string(
+        state.active_segment_id or state.execution_frame.active_segment_id
+    )
+    if active_family is not None and boundary_top_family is not None:
+        family_alignment = "match" if active_family == boundary_top_family else "drift"
+    elif active_family is not None:
+        family_alignment = "unknown"
+    else:
+        family_alignment = None
+    return {
+        "clarification_active_family": active_family,
+        "clarification_active_capability_id": active_capability,
+        "clarification_active_segment_id": active_segment_id,
+        "clarification_resolved_slot_count": len(known_slot_values),
+        "clarification_pending_field_count": len(pending_fields),
+        "clarification_question_count": len(question_history),
+        "clarification_answer_count": len(answer_history),
+        "clarification_slot_loss_state": _clarification_slot_loss_state(state),
+        "clarification_family_alignment": family_alignment,
     }
 
 
@@ -433,6 +514,11 @@ def derive_feedback_dimensions(
         if message_id
         else None
     )
+    session = (
+        db.query(ChatSessionRecord).filter(ChatSessionRecord.id == resolution.get("session_id")).first()
+        if _non_empty_string(resolution.get("session_id"))
+        else None
+    )
     job_metadata = dict(job.metadata_json or {}) if job is not None else {}
     message_action = (
         dict(message.action_json or {})
@@ -455,6 +541,10 @@ def derive_feedback_dimensions(
     )
     assistant_action_type = _non_empty_string(message_action.get("type"))
     boundary_fields = _boundary_fields_from_message(message, snapshot)
+    clarification_fields = _clarification_fields_from_session(
+        session,
+        boundary_top_family=_non_empty_string(boundary_fields.get("boundary_top_family")),
+    )
     dimensions = {
         "target_type": request.target_type.value,
         "target_id": _non_empty_string(request.target_id),
@@ -471,6 +561,7 @@ def derive_feedback_dimensions(
         "has_comment": bool(comment),
         "reason_count": len(reason_codes),
     }
+    dimensions.update(clarification_fields)
     if request.target_type == models.FeedbackTargetType.intent_assessment:
         dimensions.update(_intent_fields_from_snapshot(snapshot))
     return dimensions
@@ -503,6 +594,23 @@ def _feedback_dimensions(item: models.Feedback) -> dict[str, Any]:
     for key, value in boundary_fields.items():
         if not _non_empty_string(normalized.get(key)) and value is not None:
             normalized[key] = value
+    for key in (
+        "clarification_active_family",
+        "clarification_active_capability_id",
+        "clarification_active_segment_id",
+        "clarification_slot_loss_state",
+        "clarification_family_alignment",
+    ):
+        if key not in normalized:
+            normalized[key] = None
+    for key in (
+        "clarification_resolved_slot_count",
+        "clarification_pending_field_count",
+        "clarification_question_count",
+        "clarification_answer_count",
+    ):
+        if key not in normalized:
+            normalized[key] = 0
     if item.target_type == models.FeedbackTargetType.intent_assessment:
         intent_fields = _intent_fields_from_snapshot(snapshot)
         for key, value in intent_fields.items():
@@ -727,6 +835,24 @@ def _positive_rate(
     return round(positive / len(scoped), 4)
 
 
+def _dimension_rate(
+    items: list[models.Feedback],
+    *,
+    target_type: models.FeedbackTargetType,
+    dimension_key: str,
+    matches: set[str],
+) -> float:
+    scoped = [item for item in items if item.target_type == target_type]
+    if not scoped:
+        return 0.0
+    matched = 0
+    for item in scoped:
+        value = _non_empty_string(_feedback_dimensions(item).get(dimension_key))
+        if value in matches:
+            matched += 1
+    return round(matched / len(scoped), 4)
+
+
 def summarize_feedback_rows(
     db: Session,
     items: list[models.Feedback],
@@ -748,6 +874,9 @@ def summarize_feedback_rows(
         boundary_decisions=dimension_breakdown(items, "boundary_decision"),
         boundary_reason_codes=dimension_breakdown(items, "boundary_reason_code"),
         boundary_top_families=dimension_breakdown(items, "boundary_top_family"),
+        clarification_active_families=dimension_breakdown(items, "clarification_active_family"),
+        clarification_slot_loss_states=dimension_breakdown(items, "clarification_slot_loss_state"),
+        clarification_family_alignments=dimension_breakdown(items, "clarification_family_alignment"),
         metrics={
             "chat_helpfulness_rate": _positive_rate(
                 items,
@@ -764,6 +893,22 @@ def summarize_feedback_rows(
             "job_outcome_positive_rate": _positive_rate(
                 items,
                 models.FeedbackTargetType.job_outcome,
+            ),
+            "clarification_slot_loss_feedback_rate": _dimension_rate(
+                items,
+                target_type=models.FeedbackTargetType.chat_message,
+                dimension_key="clarification_slot_loss_state",
+                matches={
+                    "resolved_field_still_pending",
+                    "answers_without_resolved_slots",
+                    "answer_slot_gap",
+                },
+            ),
+            "clarification_family_drift_feedback_rate": _dimension_rate(
+                items,
+                target_type=models.FeedbackTargetType.chat_message,
+                dimension_key="clarification_family_alignment",
+                matches={"drift"},
             ),
         },
         correlates=collect_job_feedback_correlates(db, items),
@@ -1045,6 +1190,53 @@ def _chat_boundary_review_score(item: models.Feedback, review_label: str) -> int
         score += 25
     if "incorrect" in reasons or "wrong_scope" in reasons:
         score += 15
+    if _non_empty_string(item.comment):
+        score += 5
+    return score
+
+
+def _chat_clarification_review_label(item: models.Feedback) -> str | None:
+    if item.target_type != models.FeedbackTargetType.chat_message:
+        return None
+    if item.sentiment not in {
+        models.FeedbackSentiment.negative,
+        models.FeedbackSentiment.partial,
+    }:
+        return None
+    dimensions = _feedback_dimensions(item)
+    slot_loss_state = _non_empty_string(dimensions.get("clarification_slot_loss_state"))
+    family_alignment = _non_empty_string(dimensions.get("clarification_family_alignment"))
+    pending_field_count = int(dimensions.get("clarification_pending_field_count") or 0)
+    answer_count = int(dimensions.get("clarification_answer_count") or 0)
+    if slot_loss_state not in {None, "none"}:
+        return "likely_slot_loss"
+    if family_alignment == "drift":
+        return "likely_active_family_drift"
+    if pending_field_count > 0 and answer_count >= 2:
+        return "likely_stalled_clarification"
+    return None
+
+
+def _chat_clarification_review_score(item: models.Feedback, review_label: str) -> int:
+    score = 0
+    if item.sentiment == models.FeedbackSentiment.negative:
+        score += 100
+    elif item.sentiment == models.FeedbackSentiment.partial:
+        score += 70
+    if review_label == "likely_slot_loss":
+        score += 45
+    elif review_label == "likely_active_family_drift":
+        score += 35
+    elif review_label == "likely_stalled_clarification":
+        score += 25
+    reasons = set(_normalize_reason_codes(item.reason_codes))
+    if "missed_request" in reasons or "wrong_scope" in reasons:
+        score += 20
+    if "did_not_finish" in reasons or "incorrect" in reasons:
+        score += 10
+    dimensions = _feedback_dimensions(item)
+    if _non_empty_string(dimensions.get("clarification_slot_loss_state")) not in {None, "none"}:
+        score += 10
     if _non_empty_string(item.comment):
         score += 5
     return score
@@ -1356,6 +1548,66 @@ def chat_boundary_review_queue(
         key=lambda item: (-item.review_score, item.feedback.updated_at),
     )
     return models.ChatBoundaryReviewQueueResponse(
+        total=len(ordered),
+        items=ordered[: max(1, min(limit, 500))],
+    )
+
+
+def chat_clarification_review_queue(
+    db: Session,
+    *,
+    limit: int = 100,
+    review_label: str | None = None,
+    active_family: str | None = None,
+) -> models.ChatClarificationReviewQueueResponse:
+    rows = _feedback_records(
+        db,
+        target_type=models.FeedbackTargetType.chat_message,
+        limit=max(limit * 4, 200),
+    )
+    normalized_review_label = _non_empty_string(review_label)
+    normalized_active_family = _non_empty_string(active_family)
+    items: list[models.ChatClarificationReviewQueueItem] = []
+    for row in rows:
+        feedback = _feedback_from_record(row)
+        dimensions = _feedback_dimensions(feedback)
+        label = _chat_clarification_review_label(feedback)
+        if label is None:
+            continue
+        if normalized_review_label is not None and label != normalized_review_label:
+            continue
+        if (
+            normalized_active_family is not None
+            and _non_empty_string(dimensions.get("clarification_active_family"))
+            != normalized_active_family
+        ):
+            continue
+        excerpt = (
+            _non_empty_string(feedback.snapshot.get("content"))
+            if isinstance(feedback.snapshot, Mapping)
+            else None
+        )
+        items.append(
+            models.ChatClarificationReviewQueueItem(
+                feedback=feedback,
+                dimensions=dimensions,
+                linked_ids={
+                    "session_id": feedback.session_id,
+                    "job_id": feedback.job_id,
+                    "plan_id": feedback.plan_id,
+                    "message_id": feedback.message_id,
+                    "target_id": feedback.target_id,
+                },
+                review_label=label,
+                review_score=_chat_clarification_review_score(feedback, label),
+                excerpt=excerpt,
+            )
+        )
+    ordered = sorted(
+        items,
+        key=lambda item: (-item.review_score, item.feedback.updated_at),
+    )
+    return models.ChatClarificationReviewQueueResponse(
         total=len(ordered),
         items=ordered[: max(1, min(limit, 500))],
     )

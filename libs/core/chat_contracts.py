@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from libs.core import models, workflow_contracts
 
@@ -48,12 +48,137 @@ class ChatBoundaryEvidence(BaseModel):
     risk_level: str = ""
     needs_clarification: bool = False
     missing_inputs: list[str] = Field(default_factory=list)
+    active_family: str = ""
+    active_capability_id: str = ""
+    clarification_resolved_slot_count: int = 0
+    clarification_pending_field_count: int = 0
+    clarification_answer_count: int = 0
     top_capability_score: float = 0.0
     top_family_score: float = 0.0
     family_concentration: float = 0.0
     execution_signal_strength: str = ""
     top_capabilities: list[ChatBoundaryCapabilityEvidence] = Field(default_factory=list)
     top_families: list[ChatBoundaryFamilyEvidence] = Field(default_factory=list)
+
+
+class ClarificationResolvedField(BaseModel):
+    field: str
+    value: Any
+    confidence: float | None = None
+    source: str | None = None
+
+
+class ClarificationState(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: str = "clarification_state_v1"
+    state_version: int = 1
+    execution_frame: workflow_contracts.ExecutionFrame = Field(
+        default_factory=workflow_contracts.ExecutionFrame
+    )
+    original_goal: str = ""
+    active_family: str | None = None
+    active_segment_id: str | None = None
+    active_capability_id: str | None = None
+    goal_intent_profile: dict[str, Any] = Field(default_factory=dict)
+    questions: list[str] = Field(default_factory=list)
+    pending_questions: list[str] = Field(default_factory=list)
+    pending_fields: list[str] = Field(default_factory=list)
+    required_fields: list[str] = Field(default_factory=list)
+    known_slot_values: dict[str, Any] = Field(default_factory=dict)
+    resolved_slots: dict[str, Any] = Field(default_factory=dict)
+    slot_provenance: dict[str, str] = Field(default_factory=dict)
+    answered_fields: list[str] = Field(default_factory=list)
+    question_history: list[str] = Field(default_factory=list)
+    answer_history: list[str] = Field(default_factory=list)
+    candidate_capabilities: list[str] = Field(default_factory=list)
+    auto_path_allowed: bool = False
+
+    @field_validator("candidate_capabilities", mode="before")
+    @classmethod
+    def _normalize_candidate_capabilities(cls, value: Any) -> list[str] | Any:
+        if not isinstance(value, list):
+            return value
+        return workflow_contracts._canonicalize_capability_id_list(value)
+
+    @field_validator("active_capability_id", mode="before")
+    @classmethod
+    def _normalize_active_capability_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        candidate = workflow_contracts._canonicalize_capability_id(value)
+        return candidate or None
+
+    @field_validator("slot_provenance", mode="before")
+    @classmethod
+    def _normalize_slot_provenance(cls, value: Any) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, str] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            candidate = str(raw_value or "").strip()
+            if not candidate:
+                continue
+            try:
+                normalized[key] = workflow_contracts.SlotProvenance(candidate).value
+            except ValueError:
+                normalized[key] = candidate
+        return normalized
+
+    @model_validator(mode="after")
+    def _synchronize_state(self) -> "ClarificationState":
+        if not self.questions and self.pending_questions:
+            self.questions = list(self.pending_questions)
+        if not self.pending_questions and self.questions:
+            self.pending_questions = list(self.questions)
+        if not self.known_slot_values and self.resolved_slots:
+            self.known_slot_values = dict(self.resolved_slots)
+        if not self.resolved_slots and self.known_slot_values:
+            self.resolved_slots = dict(self.known_slot_values)
+        if not self.answered_fields and self.known_slot_values:
+            self.answered_fields = sorted(str(key) for key in self.known_slot_values.keys())
+        if not self.required_fields and self.pending_fields:
+            self.required_fields = list(self.pending_fields)
+        if self.execution_frame.mode == workflow_contracts.ExecutionFrameMode.chat and (
+            self.pending_questions or self.pending_fields
+        ):
+            self.execution_frame.mode = workflow_contracts.ExecutionFrameMode.clarification
+        if not self.original_goal and self.execution_frame.original_goal:
+            self.original_goal = self.execution_frame.original_goal
+        if self.original_goal and not self.execution_frame.original_goal:
+            self.execution_frame.original_goal = self.original_goal
+        for attr in ("active_family", "active_segment_id", "active_capability_id"):
+            current = getattr(self, attr)
+            frame_value = getattr(self.execution_frame, attr)
+            if not current and frame_value:
+                setattr(self, attr, frame_value)
+            elif current and not frame_value:
+                setattr(self.execution_frame, attr, current)
+        return self
+
+
+class ClarificationPendingState(ClarificationState):
+    pass
+
+
+class ClarificationMappingRequest(BaseModel):
+    original_goal: str = ""
+    latest_answer: str = ""
+    pending_state: ClarificationPendingState = Field(default_factory=ClarificationPendingState)
+    context_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClarificationMappingResult(BaseModel):
+    resolved_fields: list[ClarificationResolvedField] = Field(default_factory=list)
+    remaining_fields: list[str] = Field(default_factory=list)
+    confidence_by_field: dict[str, float] = Field(default_factory=dict)
+    question_answer_map: dict[str, str] = Field(default_factory=dict)
+    user_intent_changed: bool = False
+    revised_goal_summary: str | None = None
+    auto_path_allowed: bool = False
 
 
 class AssistantActionType(str, Enum):

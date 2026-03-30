@@ -230,6 +230,39 @@ def test_chat_submit_context_view_drops_interaction_summary_refs() -> None:
     assert "interaction_summaries_meta" not in submit_view
 
 
+def test_chat_submit_context_view_projects_pending_clarification_slot_ledger() -> None:
+    envelope = workflow_contracts.ContextEnvelope(
+        goal="Generate a deployment report",
+        context_json={
+            "topic": "Deployment report",
+            "interaction_summaries_ref": {"memory_name": "interaction_summaries_compact"},
+        },
+        session_scope={
+            "pending_clarification": {
+                "resolved_slots": {
+                    "audience": "Senior AI engineers",
+                    "tone": "practical",
+                    "path": "artifacts/deployment-report.docx",
+                },
+                "slot_provenance": {
+                    "audience": "explicit_user",
+                    "tone": "clarification_normalized",
+                    "path": "explicit_user",
+                },
+            }
+        },
+    )
+
+    submit_view = context_service.chat_submit_context_view(envelope)
+
+    assert submit_view["topic"] == "Deployment report"
+    assert submit_view["audience"] == "Senior AI engineers"
+    assert submit_view["tone"] == "practical"
+    assert submit_view["path"] == "artifacts/deployment-report.docx"
+    assert submit_view["clarification_resolved_slots"]["tone"] == "practical"
+    assert submit_view["clarification_slot_provenance"]["tone"] == "clarification_normalized"
+
+
 def test_planner_and_execution_context_views_use_stage_specific_projection() -> None:
     envelope = workflow_contracts.ContextEnvelope(
         goal="Search GitHub issues",

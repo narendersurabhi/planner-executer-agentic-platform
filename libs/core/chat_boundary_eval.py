@@ -26,6 +26,13 @@ class ChatBoundaryEvalCase:
     def workflow_target_available(self) -> bool:
         return bool(self.evidence.workflow_target_available) if self.evidence is not None else False
 
+    @property
+    def active_family(self) -> str | None:
+        if self.evidence is None:
+            return None
+        normalized = _normalize_string(self.evidence.active_family)
+        return normalized or None
+
 
 def _normalize_string(value: Any) -> str:
     return str(value or "").strip()
@@ -196,6 +203,12 @@ def evaluate_chat_boundary_case(
             if normalized:
                 top_family = normalized
                 break
+    active_family = case.active_family
+    family_alignment = "unknown"
+    if active_family is not None and top_family is not None:
+        family_alignment = "match" if active_family == top_family else "drift"
+    elif active_family is not None:
+        family_alignment = "unknown"
     return {
         "case_id": case.case_id,
         "content": case.content,
@@ -206,6 +219,8 @@ def evaluate_chat_boundary_case(
         "pending_clarification": case.pending_clarification,
         "workflow_target_available": case.workflow_target_available,
         "top_family": top_family,
+        "active_family": active_family,
+        "family_alignment": family_alignment,
         "notes": case.notes,
     }
 
@@ -237,6 +252,12 @@ def evaluate_chat_boundary_cases(
         if result["predicted_decision"]
         == chat_contracts.ChatBoundaryDecisionType.continue_pending.value
     )
+    active_family_cases = [
+        result for result in results if _normalize_string(result.get("active_family"))
+    ]
+    active_family_drifts = sum(
+        1 for result in active_family_cases if result.get("family_alignment") == "drift"
+    )
 
     expected_counts = {
         decision.value: sum(1 for result in results if result["expected_decision"] == decision.value)
@@ -254,6 +275,7 @@ def evaluate_chat_boundary_cases(
             "false_chat_reply_rate": _safe_div(false_chat_replies, case_count),
             "execution_escalation_rate": _safe_div(execution_escalations, case_count),
             "pending_continuation_rate": _safe_div(pending_continuations, len(pending_cases)),
+            "active_family_drift_rate": _safe_div(active_family_drifts, len(active_family_cases)),
             "expected_counts": expected_counts,
             "predicted_counts": predicted_counts,
         },

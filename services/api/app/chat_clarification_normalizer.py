@@ -35,18 +35,20 @@ class CapabilityNormalizationContract:
     description: str
     required_inputs: tuple[str, ...] = ()
     collectible_fields: tuple[str, ...] = ()
+    required_fields: tuple[str, ...] = ()
     missing_fields: tuple[str, ...] = ()
     existing_fields: dict[str, str] = field(default_factory=dict)
     field_descriptions: dict[str, str] = field(default_factory=dict)
     field_examples: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
-def build_capability_normalization_contract(
+def build_capability_normalization_contracts(
     *,
     goal: str,
     merged_context: Mapping[str, Any] | None,
     capability_contracts: Sequence[Mapping[str, Any]],
-) -> CapabilityNormalizationContract | None:
+) -> list[CapabilityNormalizationContract]:
+    contracts: list[CapabilityNormalizationContract] = []
     for raw_contract in capability_contracts:
         if not isinstance(raw_contract, Mapping):
             continue
@@ -59,6 +61,7 @@ def build_capability_normalization_contract(
         if not collectible_fields:
             continue
         required_inputs = _normalized_field_list(raw_contract.get("required_inputs"))
+        chat_required_fields = _normalized_field_list(raw_contract.get("chat_required_fields"))
         field_descriptions = _normalized_field_map(raw_contract.get("field_descriptions"))
         field_examples = _normalized_field_examples(raw_contract.get("field_examples"))
         existing_fields = _existing_fields_for_context(
@@ -66,24 +69,32 @@ def build_capability_normalization_contract(
             merged_context=merged_context,
             field_names=collectible_fields,
         )
+        required_fields = tuple(
+            field
+            for field in collectible_fields
+            if field in required_inputs or field in chat_required_fields
+        )
         missing_fields = tuple(
             field
             for field in collectible_fields
-            if field in required_inputs and not existing_fields.get(field)
+            if not existing_fields.get(field)
         )
         if not missing_fields:
             continue
-        return CapabilityNormalizationContract(
-            capability_id=capability_id,
-            description=str(raw_contract.get("description") or "").strip(),
-            required_inputs=required_inputs,
-            collectible_fields=collectible_fields,
-            missing_fields=missing_fields,
-            existing_fields=existing_fields,
-            field_descriptions=field_descriptions,
-            field_examples=field_examples,
+        contracts.append(
+            CapabilityNormalizationContract(
+                capability_id=capability_id,
+                description=str(raw_contract.get("description") or "").strip(),
+                required_inputs=required_inputs,
+                collectible_fields=collectible_fields,
+                required_fields=required_fields,
+                missing_fields=missing_fields,
+                existing_fields=existing_fields,
+                field_descriptions=field_descriptions,
+                field_examples=field_examples,
+            )
         )
-    return None
+    return contracts
 
 
 def normalize_contract_fields_with_llm(
@@ -92,14 +103,25 @@ def normalize_contract_fields_with_llm(
     provider: LLMProvider | None,
     confidence_threshold: float,
     goal: str,
+    conversation_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, str], list[str], dict[str, float]]:
     if not contract.missing_fields:
         return {}, [], {}
     if provider is None:
-        return {}, list(contract.missing_fields), {}
+        return {}, list(contract.required_fields), {}
 
     payload = {
         "goal_with_clarifications": goal,
+        "conversation_history": [
+            {
+                "role": str(item.get("role") or "").strip(),
+                "content": str(item.get("content") or "").strip(),
+            }
+            for item in (conversation_history or [])
+            if isinstance(item, Mapping)
+            and str(item.get("role") or "").strip()
+            and str(item.get("content") or "").strip()
+        ],
         "capability_id": contract.capability_id,
         "capability_description": contract.description,
         "required_inputs": list(contract.required_inputs),
@@ -130,7 +152,7 @@ def normalize_contract_fields_with_llm(
             )
         )
     except (LLMProviderError, ValueError):
-        return {}, list(contract.missing_fields), {}
+        return {}, list(contract.required_fields), {}
 
     raw_slots = parsed.get("normalized_slots")
     slot_map = dict(raw_slots) if isinstance(raw_slots, Mapping) else {}
@@ -141,30 +163,36 @@ def normalize_contract_fields_with_llm(
         str(field).strip()
         for field in raw_unresolved
         if isinstance(field, str) and str(field).strip() in contract.missing_fields
+        and str(field).strip() in contract.required_fields
     }
 
     updates: dict[str, str] = {}
     accepted_confidence: dict[str, float] = {}
-    for field in contract.missing_fields:
-        raw_value = slot_map.get(field)
+    for field_name in contract.missing_fields:
+        raw_value = slot_map.get(field_name)
         if not isinstance(raw_value, str) or not raw_value.strip():
-            unresolved.add(field)
+            if field_name in contract.required_fields:
+                unresolved.add(field_name)
             continue
-        confidence = _coerce_confidence(confidence_map.get(field))
+        confidence = _coerce_confidence(confidence_map.get(field_name))
         if confidence < confidence_threshold:
-            unresolved.add(field)
+            if field_name in contract.required_fields:
+                unresolved.add(field_name)
             continue
-        value = _normalize_field_value(field, raw_value.strip())
+        value = _normalize_field_value(field_name, raw_value.strip())
         if not value:
-            unresolved.add(field)
+            if field_name in contract.required_fields:
+                unresolved.add(field_name)
             continue
-        updates[field] = value
-        accepted_confidence[field] = confidence
-        unresolved.discard(field)
+        updates[field_name] = value
+        accepted_confidence[field_name] = confidence
+        unresolved.discard(field_name)
 
-    for field in contract.missing_fields:
-        if field not in updates and field not in unresolved:
-            unresolved.add(field)
+    for field_name in contract.required_fields:
+        if field_name not in contract.missing_fields:
+            continue
+        if field_name not in updates and field_name not in unresolved:
+            unresolved.add(field_name)
 
     return updates, sorted(unresolved), accepted_confidence
 
@@ -185,17 +213,44 @@ def _existing_fields_for_context(
     context = dict(merged_context) if isinstance(merged_context, Mapping) else {}
     nested_job = context.get("job_context")
     job_context = dict(nested_job) if isinstance(nested_job, Mapping) else {}
+    clarification_slots = _clarification_slot_values_from_context(context)
     existing: dict[str, str] = {}
-    for field in field_names:
-        aliases = _FIELD_ALIASES.get(field, (field,))
+    for field_name in field_names:
+        aliases = _FIELD_ALIASES.get(field_name, (field_name,))
         value = _first_non_empty_str(*(context.get(alias) for alias in aliases))
         if not value:
             value = _first_non_empty_str(*(job_context.get(alias) for alias in aliases))
-        if not value and field == "instruction":
+        if not value:
+            value = _first_non_empty_str(*(clarification_slots.get(alias) for alias in aliases))
+        if not value and field_name == "instruction":
             value = _first_non_empty_str(goal)
         if value:
-            existing[field] = _normalize_field_value(field, value)
+            existing[field_name] = _normalize_field_value(field_name, value)
     return existing
+
+
+def _clarification_slot_values_from_context(
+    context: Mapping[str, Any],
+) -> dict[str, str]:
+    slot_values: dict[str, str] = {}
+    pending = context.get("pending_clarification")
+    if isinstance(pending, Mapping):
+        for key in ("known_slot_values", "resolved_slots"):
+            raw_slots = pending.get(key)
+            if isinstance(raw_slots, Mapping):
+                for raw_key, raw_value in raw_slots.items():
+                    normalized_key = str(raw_key or "").strip()
+                    normalized_value = str(raw_value or "").strip()
+                    if normalized_key and normalized_value:
+                        slot_values.setdefault(normalized_key, normalized_value)
+    raw_slots = context.get("clarification_resolved_slots")
+    if isinstance(raw_slots, Mapping):
+        for raw_key, raw_value in raw_slots.items():
+            normalized_key = str(raw_key or "").strip()
+            normalized_value = str(raw_value or "").strip()
+            if normalized_key and normalized_value:
+                slot_values.setdefault(normalized_key, normalized_value)
+    return slot_values
 
 
 def _normalized_field_list(value: Any) -> tuple[str, ...]:
@@ -253,6 +308,8 @@ def _normalize_field_value(field: str, value: str) -> str:
         return ""
     if field == "tone":
         return normalized.lower()
+    if field == "path":
+        return normalized.strip("\"'")
     return normalized
 
 

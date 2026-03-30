@@ -53,6 +53,11 @@ def test_feedback_eval_builds_rows_and_jsonl() -> None:
             "linked_ids": {"job_id": "job-1", "plan_id": "plan-1"},
             "boundary_decision": "execution_request",
             "boundary_evidence": {"top_families": [{"family": "documents"}]},
+            "clarification_active_family": None,
+            "clarification_slot_loss_state": None,
+            "clarification_family_alignment": None,
+            "clarification_answer_count": 0,
+            "clarification_resolved_slot_count": 0,
         }
     ]
 

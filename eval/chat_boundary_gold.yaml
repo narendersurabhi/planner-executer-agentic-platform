@@ -43,6 +43,11 @@ cases:
       intent: generate
       risk_level: low
       needs_clarification: true
+      active_family: documents
+      active_capability_id: document.spec.generate
+      clarification_resolved_slot_count: 2
+      clarification_pending_field_count: 1
+      clarification_answer_count: 2
       missing_inputs:
         - output_format
       top_capabilities:
@@ -55,6 +60,117 @@ cases:
         - family: documents
           score: 0.78
           capability_ids:
+            - document.spec.generate
+  - id: pending_document_family_scope
+    content: medic.docx
+    candidate_goal: create a Kubernetes deployment report
+    expected_decision: continue_pending
+    notes: Pending document clarification should keep boundary evidence scoped to the document family.
+    evidence:
+      goal: create a Kubernetes deployment report
+      conversation_mode_hint: clarification_answer
+      pending_clarification: true
+      workflow_target_available: false
+      intent: render
+      risk_level: bounded_write
+      needs_clarification: true
+      active_family: documents
+      active_capability_id: document.docx.render
+      clarification_resolved_slot_count: 3
+      clarification_pending_field_count: 1
+      clarification_answer_count: 4
+      missing_inputs:
+        - path
+      top_capabilities:
+        - capability_id: document.docx.render
+          group: documents
+          subgroup: rendering
+          score: 0.91
+          source: lexical
+        - capability_id: document.spec.generate
+          group: documents
+          subgroup: authoring
+          score: 0.64
+          source: lexical
+      top_families:
+        - family: documents
+          score: 1.55
+          capability_ids:
+            - document.docx.render
+            - document.spec.generate
+  - id: long_turn_document_slot_fill
+    content: senior engineers, practical tone, two pages
+    candidate_goal: create a Kubernetes deployment guide
+    expected_decision: continue_pending
+    notes: Multi-turn document clarification should keep using the document family while accumulating slots.
+    evidence:
+      goal: create a Kubernetes deployment guide
+      conversation_mode_hint: clarification_answer
+      pending_clarification: true
+      workflow_target_available: false
+      intent: generate
+      risk_level: bounded_write
+      needs_clarification: true
+      active_family: documents
+      active_capability_id: document.spec.generate
+      clarification_resolved_slot_count: 3
+      clarification_pending_field_count: 1
+      clarification_answer_count: 5
+      missing_inputs:
+        - path
+      top_capabilities:
+        - capability_id: document.spec.generate
+          group: documents
+          subgroup: authoring
+          score: 0.88
+          source: lexical
+        - capability_id: document.docx.render
+          group: documents
+          subgroup: rendering
+          score: 0.67
+          source: lexical
+      top_families:
+        - family: documents
+          score: 1.55
+          capability_ids:
+            - document.spec.generate
+            - document.docx.render
+  - id: long_turn_document_filename_answer
+    content: save it as kubernetes_ai_workflows.docx in the workspace
+    candidate_goal: create a Kubernetes deployment guide
+    expected_decision: continue_pending
+    notes: Long clarification loops should preserve earlier document slots and keep the final filename answer in-family.
+    evidence:
+      goal: create a Kubernetes deployment guide
+      conversation_mode_hint: clarification_answer
+      pending_clarification: true
+      workflow_target_available: false
+      intent: render
+      risk_level: bounded_write
+      needs_clarification: true
+      active_family: documents
+      active_capability_id: document.docx.render
+      clarification_resolved_slot_count: 4
+      clarification_pending_field_count: 1
+      clarification_answer_count: 6
+      missing_inputs:
+        - path
+      top_capabilities:
+        - capability_id: document.docx.render
+          group: documents
+          subgroup: rendering
+          score: 0.92
+          source: lexical
+        - capability_id: document.spec.generate
+          group: documents
+          subgroup: authoring
+          score: 0.59
+          source: lexical
+      top_families:
+        - family: documents
+          score: 1.51
+          capability_ids:
+            - document.docx.render
             - document.spec.generate
   - id: greeting_chat_reply
     content: hello there

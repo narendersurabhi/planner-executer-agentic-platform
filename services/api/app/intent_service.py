@@ -128,7 +128,7 @@ def normalize_goal_intent(
                     "missing_slots": missing_slots,
                     "needs_clarification": bool(missing_slots),
                     "requires_blocking_clarification": bool(missing_slots),
-                    "questions": [intent_contract.slot_question(slot_name, goal) for slot_name in missing_slots],
+                    "questions": [slot_question(slot_name, goal) for slot_name in missing_slots],
                 }
             )
     graph = workflow_contracts.IntentGraph()

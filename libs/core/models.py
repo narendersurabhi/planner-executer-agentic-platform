@@ -549,6 +549,9 @@ class FeedbackSummaryResponse(BaseModel):
     boundary_decisions: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     boundary_reason_codes: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     boundary_top_families: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    clarification_active_families: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    clarification_slot_loss_states: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    clarification_family_alignments: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     metrics: Dict[str, float] = Field(default_factory=dict)
     correlates: FeedbackCorrelationSummary = Field(default_factory=FeedbackCorrelationSummary)
 
@@ -577,6 +580,20 @@ class ChatBoundaryReviewQueueItem(BaseModel):
 class ChatBoundaryReviewQueueResponse(BaseModel):
     total: int = 0
     items: List[ChatBoundaryReviewQueueItem] = Field(default_factory=list)
+
+
+class ChatClarificationReviewQueueItem(BaseModel):
+    feedback: Feedback
+    dimensions: Dict[str, Any] = Field(default_factory=dict)
+    linked_ids: Dict[str, Optional[str]] = Field(default_factory=dict)
+    review_label: str
+    review_score: int = 0
+    excerpt: Optional[str] = None
+
+
+class ChatClarificationReviewQueueResponse(BaseModel):
+    total: int = 0
+    items: List[ChatClarificationReviewQueueItem] = Field(default_factory=list)
 
 
 class IntentReviewQueueItem(BaseModel):

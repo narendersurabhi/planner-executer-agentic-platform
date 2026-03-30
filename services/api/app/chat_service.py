@@ -5,17 +5,39 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from sqlalchemy.orm import Session
 
-from libs.core import chat_contracts, models, workflow_contracts
+from libs.core import capability_registry, chat_contracts, intent_contract, models, workflow_contracts
 
 from . import context_service, memory_profile_service
 from .models import ChatMessageRecord, ChatSessionRecord
 
 logger = logging.getLogger("api.chat_service")
 _INTERNAL_CHAT_USER_ID_KEY = "_chat_user_id"
+_CHAT_STATE_VERSION_KEY = "_chat_state_version"
+_CHAT_STATE_CONFLICT_COUNT_KEY = "_chat_state_conflict_count"
+_PENDING_CLARIFICATION_SLOT_KEYS = (
+    "instruction",
+    "topic",
+    "audience",
+    "tone",
+    "query",
+    "path",
+    "output_path",
+    "filename",
+    "file_name",
+    "output_filename",
+    "output_format",
+    "target_system",
+    "safety_constraints",
+    "intent_action",
+    "risk_level",
+    "length",
+    "markdown_text",
+    "target_repo",
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +90,559 @@ class ChatSubmitNormalizationResult:
     goal: str | None = None
     context_json: dict[str, Any] = field(default_factory=dict)
     clarification_questions: list[str] = field(default_factory=list)
+
+
+def _submit_normalization_failure_questions(
+    *,
+    session_metadata: Mapping[str, Any] | None,
+    assessment: Mapping[str, Any] | None,
+) -> list[str]:
+    questions: list[str] = []
+
+    def _append(raw_question: Any) -> None:
+        if isinstance(raw_question, str):
+            question = raw_question.strip()
+            if question and question not in questions:
+                questions.append(question)
+
+    pending = _parse_pending_clarification_state(session_metadata)
+    for raw_question in (pending.questions if pending is not None else []):
+        _append(raw_question)
+
+    if isinstance(assessment, Mapping):
+        for raw_question in assessment.get("questions") or []:
+            _append(raw_question)
+
+    if not questions:
+        questions.append(
+            "I still need the remaining required details before I can submit this request."
+        )
+    return questions
+
+
+def _parse_pending_clarification_state(
+    metadata: Mapping[str, Any] | None,
+) -> chat_contracts.ClarificationState | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    raw = metadata.get("pending_clarification")
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return chat_contracts.ClarificationState.model_validate(dict(raw))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _coerce_clarification_state(
+    value: Mapping[str, Any] | None,
+) -> chat_contracts.ClarificationState | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return chat_contracts.ClarificationState.model_validate(dict(value))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _session_state_version(metadata: Mapping[str, Any] | None) -> int:
+    if not isinstance(metadata, Mapping):
+        return 0
+    raw = metadata.get(_CHAT_STATE_VERSION_KEY)
+    if isinstance(raw, int):
+        return max(0, raw)
+    if isinstance(raw, str):
+        try:
+            return max(0, int(raw.strip()))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _unique_string_list(*values: Sequence[Any] | None) -> list[str]:
+    normalized: list[str] = []
+    for collection in values:
+        if not isinstance(collection, Sequence) or isinstance(collection, (str, bytes)):
+            continue
+        for item in collection:
+            if not isinstance(item, str):
+                continue
+            value = item.strip()
+            if value and value not in normalized:
+                normalized.append(value)
+    return normalized
+
+
+def _merge_clarification_state_for_persistence(
+    latest: Mapping[str, Any] | None,
+    desired: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    latest_state = _coerce_clarification_state(latest)
+    desired_state = _coerce_clarification_state(desired)
+    if latest_state is None and desired_state is None:
+        return {}
+    if latest_state is None:
+        return desired_state.model_dump(mode="json", exclude_none=True)
+    if desired_state is None:
+        return latest_state.model_dump(mode="json", exclude_none=True)
+
+    known_slot_values = dict(latest_state.known_slot_values or {})
+    known_slot_values.update(dict(desired_state.known_slot_values or {}))
+    resolved_slots = dict(latest_state.resolved_slots or {})
+    resolved_slots.update(dict(desired_state.resolved_slots or {}))
+    slot_provenance = dict(latest_state.slot_provenance or {})
+    slot_provenance.update(dict(desired_state.slot_provenance or {}))
+    workflow_target = dict(latest_state.execution_frame.workflow_target or {})
+    workflow_target.update(dict(desired_state.execution_frame.workflow_target or {}))
+
+    execution_frame = latest_state.execution_frame.model_copy(deep=True)
+    execution_frame.original_goal = (
+        str(desired_state.execution_frame.original_goal or "").strip()
+        or str(latest_state.execution_frame.original_goal or "").strip()
+    )
+    execution_frame.mode = desired_state.execution_frame.mode
+    execution_frame.active_family = desired_state.execution_frame.active_family or execution_frame.active_family
+    execution_frame.active_segment_id = (
+        desired_state.execution_frame.active_segment_id or execution_frame.active_segment_id
+    )
+    execution_frame.active_capability_id = (
+        desired_state.execution_frame.active_capability_id or execution_frame.active_capability_id
+    )
+    execution_frame.workflow_target = workflow_target
+    execution_frame.state_version = max(
+        int(latest_state.execution_frame.state_version or 0),
+        int(desired_state.execution_frame.state_version or 0),
+    ) + 1
+
+    merged = desired_state.model_copy(deep=True)
+    merged.schema_version = desired_state.schema_version or latest_state.schema_version
+    merged.state_version = max(
+        int(latest_state.state_version or 0),
+        int(desired_state.state_version or 0),
+    ) + 1
+    merged.execution_frame = execution_frame
+    merged.original_goal = str(desired_state.original_goal or "").strip() or str(
+        latest_state.original_goal or ""
+    ).strip()
+    merged.active_family = desired_state.active_family or latest_state.active_family
+    merged.active_segment_id = desired_state.active_segment_id or latest_state.active_segment_id
+    merged.active_capability_id = (
+        desired_state.active_capability_id or latest_state.active_capability_id
+    )
+    merged.goal_intent_profile = {
+        **dict(latest_state.goal_intent_profile or {}),
+        **dict(desired_state.goal_intent_profile or {}),
+    }
+    merged.questions = _unique_string_list(desired_state.questions, latest_state.questions)
+    merged.pending_questions = _unique_string_list(
+        desired_state.pending_questions,
+        desired_state.questions,
+        latest_state.pending_questions,
+        latest_state.questions,
+    )
+    merged.pending_fields = _unique_string_list(
+        desired_state.pending_fields,
+        latest_state.pending_fields,
+    )
+    merged.required_fields = _unique_string_list(
+        desired_state.required_fields,
+        latest_state.required_fields,
+    )
+    merged.known_slot_values = known_slot_values
+    merged.resolved_slots = resolved_slots
+    merged.slot_provenance = slot_provenance
+    merged.answered_fields = sorted(
+        {
+            *[str(value).strip() for value in latest_state.answered_fields if str(value).strip()],
+            *[str(value).strip() for value in desired_state.answered_fields if str(value).strip()],
+            *[str(key).strip() for key in known_slot_values.keys() if str(key).strip()],
+        }
+    )
+    merged.question_history = _unique_string_list(
+        latest_state.question_history,
+        desired_state.question_history,
+        merged.questions,
+    )
+    merged.answer_history = _unique_string_list(
+        latest_state.answer_history,
+        desired_state.answer_history,
+    )
+    merged.candidate_capabilities = _unique_string_list(
+        desired_state.candidate_capabilities,
+        latest_state.candidate_capabilities,
+    )
+    merged.auto_path_allowed = bool(
+        latest_state.auto_path_allowed or desired_state.auto_path_allowed
+    )
+    return merged.model_dump(mode="json", exclude_none=True)
+
+
+def _merge_session_metadata_for_persistence(
+    *,
+    latest_metadata: Mapping[str, Any] | None,
+    desired_metadata: Mapping[str, Any] | None,
+    cleared_keys: set[str],
+    loaded_state_version: int,
+) -> tuple[dict[str, Any], bool]:
+    latest = dict(latest_metadata or {})
+    desired = dict(desired_metadata or {})
+    latest_state_version = _session_state_version(latest)
+    conflict_detected = latest_state_version > loaded_state_version
+
+    merged = dict(latest)
+    for key, value in desired.items():
+        if key in {"context_json", "pending_clarification"}:
+            continue
+        merged[key] = value
+
+    latest_context = latest.get("context_json")
+    desired_context = desired.get("context_json")
+    if isinstance(latest_context, Mapping) or isinstance(desired_context, Mapping):
+        merged["context_json"] = _merge_chat_context(
+            dict(latest_context) if isinstance(latest_context, Mapping) else {},
+            dict(desired_context) if isinstance(desired_context, Mapping) else {},
+        )
+
+    if "pending_clarification" in cleared_keys:
+        merged.pop("pending_clarification", None)
+    else:
+        merged_pending = _merge_clarification_state_for_persistence(
+            latest.get("pending_clarification")
+            if isinstance(latest.get("pending_clarification"), Mapping)
+            else None,
+            desired.get("pending_clarification")
+            if isinstance(desired.get("pending_clarification"), Mapping)
+            else None,
+        )
+        if merged_pending:
+            merged["pending_clarification"] = merged_pending
+
+    for key in cleared_keys:
+        if key == "pending_clarification":
+            continue
+        merged.pop(key, None)
+
+    merged[_CHAT_STATE_VERSION_KEY] = max(latest_state_version, loaded_state_version) + 1
+    if conflict_detected:
+        merged[_CHAT_STATE_CONFLICT_COUNT_KEY] = int(
+            latest.get(_CHAT_STATE_CONFLICT_COUNT_KEY) or 0
+        ) + 1
+    elif _CHAT_STATE_CONFLICT_COUNT_KEY in latest:
+        merged[_CHAT_STATE_CONFLICT_COUNT_KEY] = int(latest.get(_CHAT_STATE_CONFLICT_COUNT_KEY) or 0)
+    return merged, conflict_detected
+
+
+def _resolved_session_title(
+    *,
+    latest_title: str,
+    desired_title: str,
+) -> str:
+    normalized_latest = str(latest_title or "").strip() or "New chat"
+    normalized_desired = str(desired_title or "").strip() or normalized_latest
+    if normalized_latest != "New chat":
+        return normalized_latest
+    return normalized_desired
+
+
+def _persist_chat_session_state(
+    *,
+    db: Session,
+    record: ChatSessionRecord,
+    desired_metadata: Mapping[str, Any] | None,
+    desired_title: str,
+    loaded_updated_at: datetime,
+    loaded_state_version: int,
+    cleared_keys: set[str],
+    runtime: ChatServiceRuntime,
+) -> dict[str, Any]:
+    expected_updated_at = loaded_updated_at
+    for _attempt in range(3):
+        db.expire_all()
+        latest_record = (
+            db.query(ChatSessionRecord).filter(ChatSessionRecord.id == record.id).first()
+        )
+        if latest_record is None:
+            raise KeyError(record.id)
+        merged_metadata, _conflict_detected = _merge_session_metadata_for_persistence(
+            latest_metadata=latest_record.metadata_json,
+            desired_metadata=desired_metadata,
+            cleared_keys=cleared_keys,
+            loaded_state_version=loaded_state_version,
+        )
+        resolved_title = _resolved_session_title(
+            latest_title=latest_record.title,
+            desired_title=desired_title,
+        )
+        updated_at = runtime.utcnow()
+        updated_rows = (
+            db.query(ChatSessionRecord)
+            .filter(
+                ChatSessionRecord.id == record.id,
+                ChatSessionRecord.updated_at == expected_updated_at,
+            )
+            .update(
+                {
+                    ChatSessionRecord.metadata_json: merged_metadata,
+                    ChatSessionRecord.updated_at: updated_at,
+                    ChatSessionRecord.title: resolved_title,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated_rows:
+            record.metadata_json = dict(merged_metadata)
+            record.updated_at = updated_at
+            record.title = resolved_title
+            return dict(merged_metadata)
+        expected_updated_at = latest_record.updated_at
+    raise RuntimeError("chat_session_state_conflict")
+
+
+def _normalized_clarification_fields(context_json: Mapping[str, Any] | None) -> set[str]:
+    if not isinstance(context_json, Mapping):
+        return set()
+    raw = context_json.get("clarification_normalization")
+    if not isinstance(raw, Mapping):
+        return set()
+    normalized: set[str] = set()
+    for value in raw.get("fields", []):
+        key = str(value or "").strip()
+        if key:
+            normalized.add(key)
+    return normalized
+
+
+def _workflow_target_state(context_json: Mapping[str, Any] | None) -> dict[str, Any]:
+    invocation = workflow_invocation_from_context(context_json)
+    if invocation is None or not invocation.has_target():
+        return {}
+    workflow_target: dict[str, Any] = {}
+    if invocation.trigger_id:
+        workflow_target["trigger_id"] = invocation.trigger_id
+    if invocation.version_id:
+        workflow_target["version_id"] = invocation.version_id
+    if invocation.definition_id:
+        workflow_target["definition_id"] = invocation.definition_id
+    return workflow_target
+
+
+def _execution_family_for_capability(capability_id: str | None) -> str | None:
+    normalized = capability_registry.canonicalize_capability_id(str(capability_id or "").strip())
+    if not normalized:
+        return None
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        registry = None
+    spec = registry.get(normalized) if registry is not None else None
+    family = str(spec.group or spec.subgroup or "").strip() if spec is not None else ""
+    if family:
+        return family
+    prefix = normalized.split(".", 1)[0].strip()
+    return prefix or None
+
+
+def _active_execution_target(
+    *,
+    normalized_intent_envelope: Mapping[str, Any] | None,
+    candidate_capabilities: list[str],
+    context_json: Mapping[str, Any] | None,
+    existing_state: chat_contracts.ClarificationState | None,
+    known_slot_values: Mapping[str, Any] | None,
+    pending_fields: Sequence[str] | None,
+) -> tuple[str | None, str | None, str | None, dict[str, Any]]:
+    active_family = existing_state.active_family if existing_state is not None else None
+    active_segment_id = existing_state.active_segment_id if existing_state is not None else None
+    active_capability_id = existing_state.active_capability_id if existing_state is not None else None
+    workflow_target = (
+        dict(existing_state.execution_frame.workflow_target)
+        if existing_state is not None
+        and isinstance(existing_state.execution_frame.workflow_target, Mapping)
+        else {}
+    )
+
+    envelope = workflow_contracts.parse_normalized_intent_envelope(normalized_intent_envelope)
+    if envelope is not None:
+        active_target = intent_contract.select_active_execution_target(
+            graph=workflow_contracts.dump_intent_graph(envelope.graph) or {},
+            candidate_capabilities=envelope.candidate_capabilities,
+            known_slot_values=known_slot_values,
+            pending_fields=pending_fields or (),
+            preferred_segment_id=active_segment_id,
+            preferred_capability_id=active_capability_id,
+        )
+        if active_target is not None:
+            active_segment_id = active_target.segment_id or active_segment_id
+            active_capability_id = active_target.capability_id or active_capability_id
+    if not active_capability_id and candidate_capabilities:
+        active_capability_id = next(
+            (str(capability_id).strip() for capability_id in candidate_capabilities if str(capability_id).strip()),
+            None,
+        )
+    if active_capability_id:
+        active_capability_id = capability_registry.canonicalize_capability_id(active_capability_id) or active_capability_id
+        active_family = _execution_family_for_capability(active_capability_id) or active_family
+    latest_workflow_target = _workflow_target_state(context_json)
+    if latest_workflow_target:
+        workflow_target = latest_workflow_target
+        active_family = active_family or "workflow"
+    return active_family, active_segment_id, active_capability_id, workflow_target
+
+
+def _pending_clarification_state(
+    *,
+    resolved_goal: str,
+    questions: list[str],
+    assessment: Mapping[str, Any] | None,
+    session_metadata: Mapping[str, Any] | None,
+    context_json: Mapping[str, Any] | None,
+    normalized_intent_envelope: Mapping[str, Any] | None = None,
+    latest_user_answer: str | None = None,
+) -> dict[str, Any]:
+    existing_state = _parse_pending_clarification_state(session_metadata)
+    original_goal = str(
+        (existing_state.original_goal if existing_state is not None else "")
+        or (session_metadata.get("draft_goal") if isinstance(session_metadata, Mapping) else "")
+        or resolved_goal
+        or ""
+    ).strip()
+    known_slot_values = (
+        dict(existing_state.known_slot_values)
+        if existing_state is not None and isinstance(existing_state.known_slot_values, Mapping)
+        else {}
+    )
+    slot_provenance = (
+        dict(existing_state.slot_provenance)
+        if existing_state is not None and isinstance(existing_state.slot_provenance, Mapping)
+        else {}
+    )
+    normalized_fields = _normalized_clarification_fields(context_json)
+    if isinstance(context_json, Mapping):
+        for key in _PENDING_CLARIFICATION_SLOT_KEYS:
+            value = context_json.get(key)
+            if isinstance(value, str):
+                if value.strip():
+                    known_slot_values[key] = value.strip()
+                    slot_provenance[key] = (
+                        workflow_contracts.SlotProvenance.clarification_normalized.value
+                        if key in normalized_fields
+                        else workflow_contracts.SlotProvenance.explicit_user.value
+                    )
+                continue
+            if value is not None:
+                known_slot_values[key] = value
+                slot_provenance[key] = (
+                    workflow_contracts.SlotProvenance.clarification_normalized.value
+                    if key in normalized_fields
+                    else workflow_contracts.SlotProvenance.explicit_user.value
+                )
+    pending_fields: list[str] = []
+    required_fields: list[str] = []
+    if isinstance(assessment, Mapping):
+        for raw_field in (assessment.get("missing_slots") or []) + (assessment.get("blocking_slots") or []):
+            if isinstance(raw_field, str):
+                field = raw_field.strip()
+                if field and field not in required_fields:
+                    required_fields.append(field)
+                if field and field not in pending_fields:
+                    pending_fields.append(field)
+    for raw_field in (existing_state.pending_fields if existing_state is not None else []):
+        if isinstance(raw_field, str):
+            field = raw_field.strip()
+            if field and field not in pending_fields and field not in known_slot_values:
+                pending_fields.append(field)
+    if existing_state is not None:
+        for raw_field in existing_state.required_fields:
+            if isinstance(raw_field, str):
+                field = raw_field.strip()
+                if field and field not in required_fields:
+                    required_fields.append(field)
+    question_history: list[str] = []
+    for raw_question in (existing_state.question_history if existing_state is not None else []):
+        if isinstance(raw_question, str):
+            question = raw_question.strip()
+            if question and question not in question_history:
+                question_history.append(question)
+    for question in questions:
+        normalized = str(question or "").strip()
+        if normalized and normalized not in question_history:
+            question_history.append(normalized)
+    answer_history: list[str] = []
+    for raw_answer in (existing_state.answer_history if existing_state is not None else []):
+        if isinstance(raw_answer, str):
+            answer = raw_answer.strip()
+            if answer and answer not in answer_history:
+                answer_history.append(answer)
+    if existing_state is not None and isinstance(latest_user_answer, str):
+        latest_answer = latest_user_answer.strip()
+        if latest_answer and latest_answer not in answer_history:
+            answer_history.append(latest_answer)
+    candidate_capabilities: list[str] = []
+    raw_candidates = context_json.get("capability_candidates") if isinstance(context_json, Mapping) else None
+    if isinstance(raw_candidates, list):
+        for raw_value in raw_candidates:
+            if isinstance(raw_value, str):
+                value = raw_value.strip()
+                if value and value not in candidate_capabilities:
+                    candidate_capabilities.append(value)
+    if not candidate_capabilities:
+        for raw_value in (existing_state.candidate_capabilities if existing_state is not None else []):
+            if isinstance(raw_value, str):
+                value = raw_value.strip()
+                if value and value not in candidate_capabilities:
+                    candidate_capabilities.append(value)
+    active_family, active_segment_id, active_capability_id, workflow_target = _active_execution_target(
+        normalized_intent_envelope=normalized_intent_envelope,
+        candidate_capabilities=candidate_capabilities,
+        context_json=context_json,
+        existing_state=existing_state,
+        known_slot_values=known_slot_values,
+        pending_fields=pending_fields,
+    )
+    execution_frame = (
+        existing_state.execution_frame.model_copy(deep=True)
+        if existing_state is not None
+        else workflow_contracts.ExecutionFrame()
+    )
+    execution_frame.original_goal = original_goal
+    execution_frame.mode = workflow_contracts.ExecutionFrameMode.clarification
+    execution_frame.active_family = active_family
+    execution_frame.active_segment_id = active_segment_id
+    execution_frame.active_capability_id = active_capability_id
+    execution_frame.workflow_target = workflow_target
+    execution_frame.state_version = (
+        existing_state.execution_frame.state_version + 1
+        if existing_state is not None
+        else 1
+    )
+    if not str(execution_frame.frame_id or "").strip():
+        execution_frame.frame_id = (
+            active_segment_id or active_capability_id or active_family or "clarification"
+        )
+
+    state = chat_contracts.ClarificationState(
+        schema_version="clarification_state_v1",
+        state_version=(existing_state.state_version + 1) if existing_state is not None else 1,
+        execution_frame=execution_frame,
+        original_goal=original_goal,
+        active_family=active_family,
+        active_segment_id=active_segment_id,
+        active_capability_id=active_capability_id,
+        goal_intent_profile=dict(assessment or {}),
+        questions=list(questions),
+        pending_questions=list(questions),
+        pending_fields=pending_fields,
+        required_fields=required_fields,
+        known_slot_values=known_slot_values,
+        resolved_slots=dict(known_slot_values),
+        slot_provenance=slot_provenance,
+        answered_fields=sorted(str(key) for key in known_slot_values.keys()),
+        question_history=question_history,
+        answer_history=answer_history,
+        candidate_capabilities=candidate_capabilities,
+        auto_path_allowed=bool(existing_state.auto_path_allowed) if existing_state is not None else False,
+    )
+    return state.model_dump(mode="json", exclude_none=True)
 
 
 def looks_like_chat_only_correction(content: str) -> bool:
@@ -148,6 +723,7 @@ def create_session(
         metadata["context_json"] = _sanitize_chat_context(metadata.get("context_json"))
     if _normalized_user_id(user_id):
         metadata[_INTERNAL_CHAT_USER_ID_KEY] = _normalized_user_id(user_id)
+    metadata[_CHAT_STATE_VERSION_KEY] = max(1, _session_state_version(metadata) or 1)
     record = ChatSessionRecord(
         id=runtime.make_id(),
         title=title,
@@ -200,6 +776,9 @@ def handle_turn(
 
     now = runtime.utcnow()
     session_metadata = dict(record.metadata_json or {})
+    loaded_updated_at = record.updated_at
+    loaded_state_version = _session_state_version(session_metadata)
+    cleared_session_keys: set[str] = set()
     bound_user_id = _normalized_user_id(user_id) or _chat_session_user_id(session_metadata)
     if bound_user_id and not _chat_session_user_id(session_metadata):
         session_metadata[_INTERNAL_CHAT_USER_ID_KEY] = bound_user_id
@@ -236,15 +815,14 @@ def handle_turn(
         job_id=None,
         created_at=now,
     )
-    db.add(user_message)
-
     messages = _message_records_for_session(db, record.id)
+    chat_messages = [_message_from_record(message) for message in messages]
     turn_plan = runtime.route_turn(
         content=content,
         candidate_goal=candidate_goal,
         session_metadata=session_metadata,
         merged_context=route_context,
-        messages=[_message_from_record(message) for message in messages],
+        messages=chat_messages,
     )
     assessment = workflow_contracts.dump_goal_intent_profile(
         turn_plan.get("goal_intent_profile")
@@ -281,10 +859,15 @@ def handle_turn(
             context_json=merged_context,
         )
         session_metadata["draft_goal"] = resolved_goal
-        session_metadata["pending_clarification"] = {
-            "goal_intent_profile": dict(assessment),
-            "questions": questions,
-        }
+        session_metadata["pending_clarification"] = _pending_clarification_state(
+            resolved_goal=resolved_goal,
+            questions=questions,
+            assessment=assessment,
+            session_metadata=session_metadata,
+            context_json=merged_context,
+            normalized_intent_envelope=turn_plan.get("normalized_intent_envelope"),
+            latest_user_answer=content,
+        )
     elif route_type == "submit_job":
         normalization = None
         if runtime.normalize_submit_context is not None:
@@ -297,13 +880,20 @@ def handle_turn(
                     merged_context=merged_context,
                     context_envelope=context_envelope,
                     user_id=bound_user_id,
+                    messages=chat_messages,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "chat_submit_normalization_failed",
                     extra={"session_id": record.id},
                 )
-                normalization = None
+                normalization = ChatSubmitNormalizationResult(
+                    goal=resolved_goal,
+                    clarification_questions=_submit_normalization_failure_questions(
+                        session_metadata=session_metadata,
+                        assessment=assessment,
+                    ),
+                )
         if normalization is not None:
             if isinstance(normalization.context_json, Mapping) and normalization.context_json:
                 context_envelope = context_service.update_chat_context_envelope(
@@ -324,8 +914,7 @@ def handle_turn(
                 if isinstance(question, str) and question.strip()
             ]
             if clarification_questions:
-                if not assistant_content:
-                    assistant_content = "\n".join(clarification_questions)
+                assistant_content = "\n".join(clarification_questions)
                 assistant_action = chat_contracts.AssistantAction(
                     type=chat_contracts.AssistantActionType.ask_clarification,
                     goal=resolved_goal,
@@ -334,10 +923,15 @@ def handle_turn(
                     context_json=merged_context,
                 )
                 session_metadata["draft_goal"] = resolved_goal
-                session_metadata["pending_clarification"] = {
-                    "goal_intent_profile": dict(assessment),
-                    "questions": clarification_questions,
-                }
+                session_metadata["pending_clarification"] = _pending_clarification_state(
+                    resolved_goal=resolved_goal,
+                    questions=clarification_questions,
+                    assessment=assessment,
+                    session_metadata=session_metadata,
+                    context_json=merged_context,
+                    normalized_intent_envelope=turn_plan.get("normalized_intent_envelope"),
+                    latest_user_answer=content,
+                )
             else:
                 created_job = runtime.create_job(
                     models.JobCreate(
@@ -362,6 +956,7 @@ def handle_turn(
                 session_metadata["active_job_id"] = created_job.id
                 session_metadata.pop("draft_goal", None)
                 session_metadata.pop("pending_clarification", None)
+                cleared_session_keys.update({"draft_goal", "pending_clarification"})
         else:
             created_job = runtime.create_job(
                 models.JobCreate(
@@ -386,6 +981,7 @@ def handle_turn(
             session_metadata["active_job_id"] = created_job.id
             session_metadata.pop("draft_goal", None)
             session_metadata.pop("pending_clarification", None)
+            cleared_session_keys.update({"draft_goal", "pending_clarification"})
     elif route_type == "run_workflow":
         workflow_invocation = workflow_invocation_from_context(merged_context)
         if workflow_invocation is None or not workflow_invocation.has_target():
@@ -403,10 +999,15 @@ def handle_turn(
                 context_json=merged_context,
             )
             session_metadata["draft_goal"] = resolved_goal
-            session_metadata["pending_clarification"] = {
-                "goal_intent_profile": dict(assessment),
-                "questions": [question],
-            }
+            session_metadata["pending_clarification"] = _pending_clarification_state(
+                resolved_goal=resolved_goal,
+                questions=[question],
+                assessment=assessment,
+                session_metadata=session_metadata,
+                context_json=merged_context,
+                normalized_intent_envelope=turn_plan.get("normalized_intent_envelope"),
+                latest_user_answer=content,
+            )
         else:
             try:
                 workflow_inspection = runtime.inspect_workflow(
@@ -430,10 +1031,15 @@ def handle_turn(
                         context_json=merged_context,
                     )
                     session_metadata["draft_goal"] = resolved_goal
-                    session_metadata["pending_clarification"] = {
-                        "goal_intent_profile": dict(assessment),
-                        "questions": [question],
-                    }
+                    session_metadata["pending_clarification"] = _pending_clarification_state(
+                        resolved_goal=resolved_goal,
+                        questions=[question],
+                        assessment=assessment,
+                        session_metadata=session_metadata,
+                        context_json=merged_context,
+                        normalized_intent_envelope=turn_plan.get("normalized_intent_envelope"),
+                        latest_user_answer=content,
+                    )
                     session_metadata["pending_workflow_input"] = dict(next_input)
                 else:
                     workflow_result = runtime.run_workflow(
@@ -476,9 +1082,13 @@ def handle_turn(
                         session_metadata["active_workflow_trigger_id"] = workflow_run.trigger_id
                     else:
                         session_metadata.pop("active_workflow_trigger_id", None)
+                        cleared_session_keys.add("active_workflow_trigger_id")
                     session_metadata.pop("draft_goal", None)
                     session_metadata.pop("pending_clarification", None)
                     session_metadata.pop("pending_workflow_input", None)
+                    cleared_session_keys.update(
+                        {"draft_goal", "pending_clarification", "pending_workflow_input"}
+                    )
             except Exception as exc:  # noqa: BLE001
                 assistant_content = (
                     "I could not start that published workflow from chat. "
@@ -542,6 +1152,9 @@ def handle_turn(
                 session_metadata.pop("draft_goal", None)
                 session_metadata.pop("pending_clarification", None)
                 session_metadata.pop("pending_workflow_input", None)
+                cleared_session_keys.update(
+                    {"draft_goal", "pending_clarification", "pending_workflow_input"}
+                )
         except Exception as exc:  # noqa: BLE001
             assistant_content = (
                 "I could not complete that directly in chat. "
@@ -564,6 +1177,9 @@ def handle_turn(
             session_metadata.pop("draft_goal", None)
             session_metadata.pop("pending_clarification", None)
             session_metadata.pop("pending_workflow_input", None)
+            cleared_session_keys.update(
+                {"draft_goal", "pending_clarification", "pending_workflow_input"}
+            )
     if not assistant_content:
         assistant_content = "What should I do next?"
 
@@ -574,10 +1190,19 @@ def handle_turn(
     )
     merged_context = context_service.chat_submit_context_view(context_envelope)
     session_metadata["context_json"] = merged_context
-    record.metadata_json = session_metadata
-    record.updated_at = runtime.utcnow()
-    if record.title == "New chat":
-        record.title = _default_session_title(resolved_goal)
+    desired_title = record.title
+    if desired_title == "New chat":
+        desired_title = _default_session_title(resolved_goal)
+    session_metadata = _persist_chat_session_state(
+        db=db,
+        record=record,
+        desired_metadata=session_metadata,
+        desired_title=desired_title,
+        loaded_updated_at=loaded_updated_at,
+        loaded_state_version=loaded_state_version,
+        cleared_keys=cleared_session_keys,
+        runtime=runtime,
+    )
 
     assistant_message = ChatMessageRecord(
         id=runtime.make_id(),
@@ -594,6 +1219,7 @@ def handle_turn(
         job_id=created_job.id if created_job is not None else None,
         created_at=runtime.utcnow(),
     )
+    db.add(user_message)
     db.add(assistant_message)
     db.commit()
     if bound_user_id:
@@ -628,8 +1254,11 @@ def _candidate_goal(
     is_chat_only_correction: Callable[[str], bool] | None = None,
 ) -> str:
     draft_goal = session_metadata.get("draft_goal")
-    pending = session_metadata.get("pending_clarification")
-    if isinstance(draft_goal, str) and draft_goal.strip() and isinstance(pending, Mapping):
+    pending_state = _parse_pending_clarification_state(session_metadata)
+    original_goal = str(pending_state.original_goal or "").strip() if pending_state is not None else ""
+    if original_goal:
+        return f"{original_goal}\n\nUser clarification: {content.strip()}"
+    if isinstance(draft_goal, str) and draft_goal.strip() and pending_state is not None:
         return f"{draft_goal.strip()}\n\nUser clarification: {content.strip()}"
     return content.strip()
 
@@ -875,6 +1504,8 @@ def _sanitize_chat_context(value: Mapping[str, Any] | None) -> dict[str, Any]:
 def _public_session_metadata(value: Any) -> dict[str, Any]:
     metadata = dict(value) if isinstance(value, Mapping) else {}
     metadata.pop(_INTERNAL_CHAT_USER_ID_KEY, None)
+    metadata.pop(_CHAT_STATE_VERSION_KEY, None)
+    metadata.pop(_CHAT_STATE_CONFLICT_COUNT_KEY, None)
     if isinstance(metadata.get("context_json"), Mapping):
         metadata["context_json"] = _sanitize_chat_context(metadata.get("context_json"))
     return metadata

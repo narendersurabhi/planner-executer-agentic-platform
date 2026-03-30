@@ -515,7 +515,10 @@ def test_chat_turn_can_submit_job() -> None:
         f"/chat/sessions/{session['id']}/messages",
         json={
             "content": "Render a PDF deployment report",
-            "context_json": {"topic": "Deployment report"},
+            "context_json": {
+                "topic": "Deployment report",
+                "path": "artifacts/deployment-report.pdf",
+            },
             "priority": 1,
         },
     )
@@ -538,7 +541,10 @@ def test_chat_turn_does_not_spawn_new_job_for_active_job_confirmation() -> None:
         f"/chat/sessions/{session['id']}/messages",
         json={
             "content": "Render a PDF deployment report",
-            "context_json": {"topic": "Deployment report"},
+            "context_json": {
+                "topic": "Deployment report",
+                "path": "artifacts/deployment-report.pdf",
+            },
             "priority": 1,
         },
     )
@@ -865,7 +871,11 @@ def test_chat_turn_uses_pending_clarification_context_to_submit_job() -> None:
 
     response = client.post(
         f"/chat/sessions/{session['id']}/messages",
-        json={"content": "PDF for leadership, dry run only", "context_json": {}, "priority": 0},
+        json={
+            "content": "PDF for leadership, dry run only. Save it as artifacts/deployment-report.pdf",
+            "context_json": {"path": "artifacts/deployment-report.pdf"},
+            "priority": 0,
+        },
     )
 
     assert response.status_code == 200
@@ -1034,6 +1044,835 @@ def test_chat_turn_keeps_document_submit_in_clarification_when_normalizer_leaves
     assert body["assistant_message"]["action"]["type"] == "ask_clarification"
     assert "what tone should it use" in body["assistant_message"]["content"].lower()
     assert body["session"]["metadata"]["pending_clarification"]["questions"]
+
+
+def test_chat_turn_blocks_first_submit_when_selected_capability_required_fields_are_missing(
+    monkeypatch,
+) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.97,
+            }
+
+    def _normalize_goal_intent(goal, **kwargs):
+        context_envelope = kwargs.get("context_envelope")
+        missing_fields: list[str] = []
+        if context_envelope is not None:
+            intent_context = main.context_service.intent_context_view(context_envelope)
+            for field in ("audience", "tone"):
+                if not str(intent_context.get(field) or "").strip():
+                    missing_fields.append(field)
+
+        questions = [
+            main.chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+            for field in missing_fields
+        ]
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="test",
+                confidence=0.97,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=bool(missing_fields),
+                requires_blocking_clarification=bool(missing_fields),
+                questions=questions,
+                blocking_slots=list(missing_fields),
+                missing_slots=list(missing_fields),
+                slot_values={"intent_action": "generate", "risk_level": "bounded_write"},
+                clarification_mode="capability_required_inputs" if missing_fields else None,
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        required_inputs=["instruction", "topic", "audience", "tone"],
+                        suggested_capabilities=["document.spec.generate"],
+                    )
+                ]
+            ),
+            candidate_capabilities={"s1": ["document.spec.generate"]},
+        )
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", False)
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "target audience" in body["assistant_message"]["content"].lower()
+    assert "tone" in body["assistant_message"]["content"].lower()
+    assert body["session"]["metadata"]["pending_clarification"]["questions"]
+
+
+def test_chat_turn_persists_typed_pending_clarification_state_with_active_target(
+    monkeypatch,
+) -> None:
+    def _normalize_goal_intent(goal, **_kwargs):
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="test",
+                confidence=0.97,
+                risk_level="bounded_write",
+                threshold=0.7,
+                needs_clarification=True,
+                requires_blocking_clarification=True,
+                questions=["Who is the target audience?", "What tone should it use?"],
+                blocking_slots=["audience", "tone"],
+                missing_slots=["audience", "tone"],
+                slot_values={"intent_action": "generate", "risk_level": "bounded_write"},
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        suggested_capabilities=["document.spec.generate"],
+                    )
+                ]
+            ),
+            candidate_capabilities={"s1": ["document.spec.generate"]},
+        )
+
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "document.spec.generate": cap_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a document spec.",
+                risk_tier="bounded_write",
+                idempotency="write",
+                group="documents",
+                subgroup="generation",
+            )
+        }
+    )
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(chat_service.capability_registry, "load_capability_registry", lambda: registry)
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    pending = body["session"]["metadata"]["pending_clarification"]
+    assert pending["schema_version"] == "clarification_state_v1"
+    assert pending["state_version"] == 1
+    assert pending["original_goal"] == "Create a deployment report"
+    assert pending["active_family"] == "documents"
+    assert pending["active_segment_id"] == "s1"
+    assert pending["active_capability_id"] == "document.spec.generate"
+    assert pending["execution_frame"]["schema_version"] == "execution_frame_v1"
+    assert pending["execution_frame"]["mode"] == "clarification"
+    assert pending["execution_frame"]["active_capability_id"] == "document.spec.generate"
+
+
+def test_chat_turn_scopes_follow_up_clarification_to_active_segment(
+    monkeypatch,
+) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.97,
+            }
+
+    def _normalize_goal_intent(goal, **kwargs):
+        context_envelope = kwargs.get("context_envelope")
+        intent_context = (
+            main.context_service.intent_context_view(context_envelope)
+            if context_envelope is not None
+            else {}
+        )
+        has_audience = bool(str(intent_context.get("audience") or "").strip())
+        missing_fields = ["tone", "query"] if has_audience else ["audience", "tone", "query"]
+        questions = [
+            main.chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+            for field in missing_fields
+        ]
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="test",
+                confidence=0.97,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=bool(missing_fields),
+                requires_blocking_clarification=bool(missing_fields),
+                questions=questions,
+                blocking_slots=list(missing_fields),
+                missing_slots=list(missing_fields),
+                slot_values={"intent_action": "generate", "risk_level": "bounded_write"},
+                clarification_mode="capability_required_inputs" if missing_fields else None,
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        required_inputs=["instruction", "audience", "tone"],
+                        suggested_capabilities=["document.spec.generate"],
+                    ),
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s2",
+                        intent="io",
+                        objective="Search GitHub issues",
+                        required_inputs=["query"],
+                        suggested_capabilities=["github.issue.search"],
+                    ),
+                ]
+            ),
+            candidate_capabilities={
+                "s1": ["document.spec.generate"],
+                "s2": ["github.issue.search"],
+            },
+        )
+
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "document.spec.generate": cap_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a document spec.",
+                risk_tier="bounded_write",
+                idempotency="write",
+                group="documents",
+                subgroup="generation",
+                planner_hints={
+                    "chat_collectible_fields": ["instruction", "audience", "tone"],
+                    "chat_required_fields": ["audience", "tone"],
+                },
+            ),
+            "github.issue.search": cap_registry.CapabilitySpec(
+                capability_id="github.issue.search",
+                description="Search GitHub issues.",
+                risk_tier="read_only",
+                idempotency="read",
+                group="github",
+                subgroup="issues",
+                planner_hints={
+                    "chat_collectible_fields": ["query"],
+                    "chat_required_fields": ["query"],
+                },
+            ),
+        }
+    )
+
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(chat_service.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", False)
+
+    session = client.post("/chat/sessions", json={}).json()
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    first = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    pending = first_body["session"]["metadata"]["pending_clarification"]
+    assert pending["active_segment_id"] == "s1"
+    assert pending["active_capability_id"] == "document.spec.generate"
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    second = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Audience is SSE",
+            "context_json": {"audience": "SSE"},
+            "priority": 0,
+        },
+    )
+
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["job"] is None
+    assert second_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "tone" in second_body["assistant_message"]["content"].lower()
+    assert "search query" not in second_body["assistant_message"]["content"].lower()
+
+
+def test_chat_turn_keeps_submit_in_clarification_when_submit_normalization_throws(
+    monkeypatch,
+) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            return {
+                "route": "submit_job",
+                "assistant_response": "Starting the job now.",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.96,
+            }
+
+    def _raise_normalization_error(**_kwargs):
+        raise RuntimeError("submit normalization blew up")
+
+    def _normalize_goal_intent(goal, **kwargs):
+        context_envelope = kwargs.get("context_envelope")
+        missing_fields = []
+        if context_envelope is not None:
+            missing_fields.append("output_format")
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="test",
+                confidence=0.96,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=bool(missing_fields),
+                requires_blocking_clarification=bool(missing_fields),
+                questions=[
+                    "What output format do you need (for example PDF, DOCX, JSON, or Markdown)?"
+                ]
+                if missing_fields
+                else [],
+                blocking_slots=list(missing_fields),
+                missing_slots=list(missing_fields),
+                slot_values={"intent_action": "generate", "risk_level": "bounded_write"},
+                clarification_mode="targeted_slot_filling" if missing_fields else None,
+            ),
+            graph=main.workflow_contracts.IntentGraph(),
+            candidate_capabilities={},
+        )
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_normalize_chat_submit_context", _raise_normalization_error)
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "remaining required details" in body["assistant_message"]["content"].lower()
+    assert body["session"]["metadata"]["pending_clarification"]["questions"] == [
+        "I still need the remaining required details before I can submit this request."
+    ]
+
+
+def test_chat_turn_preserves_original_goal_and_filename_across_clarification_turns(
+    monkeypatch,
+) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.97,
+            }
+
+    def _normalize_goal_intent(goal, **kwargs):
+        context_envelope = kwargs.get("context_envelope")
+        intent_context = (
+            main.context_service.intent_context_view(context_envelope)
+            if context_envelope is not None
+            else {}
+        )
+        missing_fields: list[str] = []
+        for field in ("topic", "audience", "tone"):
+            if not str(intent_context.get(field) or "").strip():
+                missing_fields.append(field)
+        questions = [
+            main.chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+            for field in missing_fields
+        ]
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="test",
+                confidence=0.97,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=bool(missing_fields),
+                requires_blocking_clarification=bool(missing_fields),
+                questions=questions,
+                blocking_slots=list(missing_fields),
+                missing_slots=list(missing_fields),
+                slot_values={"intent_action": "generate", "risk_level": "bounded_write"},
+                clarification_mode="capability_required_inputs" if missing_fields else None,
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        required_inputs=["instruction", "topic", "audience", "tone"],
+                        suggested_capabilities=["document.spec.generate"],
+                    ),
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s2",
+                        intent="render",
+                        objective="Render DOCX",
+                        required_inputs=["document_spec", "output_filename"],
+                        suggested_capabilities=["document.docx.render"],
+                    ),
+                ]
+            ),
+            candidate_capabilities={
+                "s1": ["document.spec.generate"],
+                "s2": ["document.docx.render"],
+            },
+        )
+
+    class _Normalizer:
+        def generate_request_json_object(self, request):
+            payload = json.loads(request.prompt)
+            capability_id = payload["capability_id"]
+            goal = payload["goal_with_clarifications"]
+            if capability_id == "document.spec.generate":
+                slots = {}
+                confidence = {}
+                if "How AI workflows are deployed to Kubernetes" in goal:
+                    slots["topic"] = "How AI workflows are deployed to Kubernetes"
+                    confidence["topic"] = 0.95
+                if "SSE" in goal:
+                    slots["audience"] = "SSE"
+                    confidence["audience"] = 0.96
+                if "practical" in goal.lower():
+                    slots["tone"] = "practical"
+                    confidence["tone"] = 0.98
+                unresolved = [
+                    field for field in payload["missing_fields"] if field not in slots
+                ]
+                return {
+                    "normalized_slots": slots,
+                    "field_confidence": confidence,
+                    "unresolved_fields": unresolved,
+                }
+            if capability_id == "document.docx.render":
+                if "Kubernetes AI Deployments.docx" in goal:
+                    return {
+                        "normalized_slots": {"path": "Kubernetes AI Deployments.docx"},
+                        "field_confidence": {"path": 0.97},
+                        "unresolved_fields": [],
+                    }
+            return {
+                "normalized_slots": {},
+                "field_confidence": {},
+                "unresolved_fields": payload["missing_fields"],
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "_chat_clarification_normalizer_provider", _Normalizer())
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", True)
+
+    session = client.post("/chat/sessions", json={}).json()
+    first = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a document", "context_json": {}, "priority": 0},
+    )
+
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert (
+        first_body["session"]["metadata"]["pending_clarification"]["original_goal"]
+        == "Create a document"
+    )
+
+    second = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": (
+                '1) Document title and desired filename. Answer: "Kubernetes AI Deployments.docx"\n'
+                '2) The full content or an outline. Answer: "How AI workflows are deployed to Kubernetes"\n'
+                "3) Intended audience and purpose. Answer: SSE\n"
+                "8) Where should I deliver/save the .docx? Answer: save to workspace folder"
+            ),
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["job"] is None
+    assert second_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "tone" in second_body["assistant_message"]["content"].lower()
+    assert (
+        second_body["session"]["metadata"]["pending_clarification"]["original_goal"]
+        == "Create a document"
+    )
+    assert second_body["session"]["metadata"]["context_json"]["path"] == (
+        "Kubernetes AI Deployments.docx"
+    )
+
+    third = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Practical",
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert third.status_code == 200
+    third_body = third.json()
+    assert third_body["job"] is not None
+    assert third_body["assistant_message"]["action"]["type"] == "submit_job"
+    assert third_body["job"]["context_json"]["topic"] == "How AI workflows are deployed to Kubernetes"
+    assert third_body["job"]["context_json"]["audience"] == "SSE"
+    assert third_body["job"]["context_json"]["tone"] == "practical"
+    assert third_body["job"]["context_json"]["path"] == "Kubernetes AI Deployments.docx"
+
+
+def test_chat_submit_normalization_uses_prior_chat_turns_to_fill_document_slots(
+    monkeypatch,
+) -> None:
+    calls = {"router": 0}
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            calls["router"] += 1
+            if calls["router"] == 1:
+                return {
+                    "route": "ask_clarification",
+                    "assistant_response": "",
+                    "intent": "generate",
+                    "risk_level": "bounded_write",
+                    "confidence": 0.97,
+                    "clarification_questions": [
+                        "Who is the target audience?",
+                        "What tone should it use?",
+                        "What output path or filename should be used?",
+                    ],
+                    "missing_slots": ["audience", "tone", "path"],
+                }
+            if calls["router"] == 2:
+                return {
+                    "route": "ask_clarification",
+                    "assistant_response": "",
+                    "intent": "generate",
+                    "risk_level": "bounded_write",
+                    "confidence": 0.97,
+                    "clarification_questions": ["What output path or filename should be used?"],
+                    "missing_slots": ["path"],
+                }
+            return {
+                "route": "submit_job",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.97,
+            }
+
+    def _normalize_goal_intent(goal, **kwargs):
+        context_envelope = kwargs.get("context_envelope")
+        intent_context = (
+            main.context_service.intent_context_view(context_envelope)
+            if context_envelope is not None
+            else {}
+        )
+        missing_fields: list[str] = []
+        for field in ("topic", "audience", "tone", "path"):
+            if not str(intent_context.get(field) or "").strip():
+                missing_fields.append(field)
+        questions = [
+            main.chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+            for field in missing_fields
+        ]
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="test",
+                confidence=0.97,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=bool(missing_fields),
+                requires_blocking_clarification=bool(missing_fields),
+                questions=questions,
+                blocking_slots=list(missing_fields),
+                missing_slots=list(missing_fields),
+                slot_values={"intent_action": "generate", "risk_level": "bounded_write"},
+                clarification_mode="capability_required_inputs" if missing_fields else None,
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        required_inputs=["instruction", "topic", "audience", "tone"],
+                        suggested_capabilities=["document.spec.generate"],
+                    ),
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s2",
+                        intent="render",
+                        objective="Render DOCX",
+                        required_inputs=["document_spec", "output_filename"],
+                        suggested_capabilities=["document.docx.render"],
+                    ),
+                ]
+            ),
+            candidate_capabilities={
+                "s1": ["document.spec.generate"],
+                "s2": ["document.docx.render"],
+            },
+        )
+
+    class _Normalizer:
+        def generate_request_json_object(self, request):
+            payload = json.loads(request.prompt)
+            history = payload["conversation_history"]
+            combined = " ".join(entry["content"] for entry in history).lower()
+            capability_id = payload["capability_id"]
+            if capability_id == "document.spec.generate":
+                assert any(
+                    "target audience is senior ai engineers" in entry["content"].lower()
+                    for entry in history
+                )
+                assert any("practical tone" in entry["content"].lower() for entry in history)
+                slots = {}
+                if "kubernetes deployment report" in payload["goal_with_clarifications"].lower():
+                    slots["topic"] = "Kubernetes deployment report"
+                if "senior ai engineers" in combined:
+                    slots["audience"] = "Senior AI engineers"
+                if "practical" in combined:
+                    slots["tone"] = "practical"
+                unresolved = [
+                    field for field in payload["missing_fields"] if field not in slots
+                ]
+                return {
+                    "normalized_slots": slots,
+                    "field_confidence": {field: 0.99 for field in slots},
+                    "unresolved_fields": unresolved,
+                }
+            if capability_id == "document.docx.render":
+                assert "medic.docx" in payload["goal_with_clarifications"].lower()
+                return {
+                    "normalized_slots": {"path": "medic.docx"},
+                    "field_confidence": {"path": 0.99},
+                    "unresolved_fields": [],
+                }
+            return {
+                "normalized_slots": {},
+                "field_confidence": {},
+                "unresolved_fields": payload["missing_fields"],
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "_chat_clarification_normalizer_provider", _Normalizer())
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", True)
+
+    session = client.post("/chat/sessions", json={}).json()
+    first = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a Kubernetes deployment report", "context_json": {}, "priority": 0},
+    )
+    assert first.status_code == 200
+    assert first.json()["assistant_message"]["action"]["type"] == "ask_clarification"
+
+    second = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Target audience is Senior AI engineers. Use a practical tone.",
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "path" not in second_body["session"]["metadata"]["context_json"]
+    assert "audience" not in second_body["session"]["metadata"]["context_json"]
+    assert "tone" not in second_body["session"]["metadata"]["context_json"]
+
+    third = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "medic.docx", "context_json": {}, "priority": 0},
+    )
+
+    assert third.status_code == 200
+    third_body = third.json()
+    assert third_body["job"] is not None
+    assert third_body["assistant_message"]["action"]["type"] == "submit_job"
+    assert third_body["job"]["context_json"]["topic"] == "Kubernetes deployment report"
+    assert third_body["job"]["context_json"]["audience"] == "Senior AI engineers"
+    assert third_body["job"]["context_json"]["tone"] == "practical"
+    assert third_body["job"]["context_json"]["path"] == "medic.docx"
+
+
+def test_chat_submit_normalization_prefers_pending_clarification_slot_ledger(
+    monkeypatch,
+) -> None:
+    def _normalize_goal_intent(goal, **kwargs):
+        context_envelope = kwargs.get("context_envelope")
+        intent_context = (
+            main.context_service.intent_context_view(context_envelope)
+            if context_envelope is not None
+            else {}
+        )
+        missing_fields = [
+            field
+            for field in ("topic", "audience", "tone", "path")
+            if not str(intent_context.get(field) or "").strip()
+        ]
+        questions = [
+            main.chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+            for field in missing_fields
+        ]
+        return main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="test",
+                confidence=0.97,
+                risk_level="bounded_write",
+                threshold=0.7,
+                low_confidence=False,
+                needs_clarification=bool(missing_fields),
+                requires_blocking_clarification=bool(missing_fields),
+                questions=questions,
+                blocking_slots=list(missing_fields),
+                missing_slots=list(missing_fields),
+                slot_values={"intent_action": "generate", "risk_level": "bounded_write"},
+                clarification_mode="capability_required_inputs" if missing_fields else None,
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Generate document spec",
+                        required_inputs=["instruction", "topic", "audience", "tone"],
+                        suggested_capabilities=["document.spec.generate"],
+                    ),
+                    main.workflow_contracts.IntentGraphSegment(
+                        id="s2",
+                        intent="render",
+                        objective="Render DOCX",
+                        required_inputs=["document_spec", "output_filename"],
+                        suggested_capabilities=["document.docx.render"],
+                    ),
+                ]
+            ),
+            candidate_capabilities={
+                "s1": ["document.spec.generate"],
+                "s2": ["document.docx.render"],
+            },
+        )
+
+    monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", False)
+
+    pending_state = main.chat_contracts.ClarificationState(
+        original_goal="Create a Kubernetes deployment report",
+        active_family="documents",
+        active_segment_id="s1",
+        active_capability_id="document.spec.generate",
+        questions=[],
+        pending_fields=[],
+        required_fields=["topic", "audience", "tone", "path"],
+        known_slot_values={
+            "topic": "Kubernetes deployment report",
+            "audience": "Senior AI engineers",
+            "tone": "practical",
+            "path": "artifacts/medic.docx",
+        },
+        resolved_slots={
+            "topic": "Kubernetes deployment report",
+            "audience": "Senior AI engineers",
+            "tone": "practical",
+            "path": "artifacts/medic.docx",
+        },
+        slot_provenance={
+            "topic": "explicit_user",
+            "audience": "explicit_user",
+            "tone": "clarification_normalized",
+            "path": "explicit_user",
+        },
+    ).model_dump(mode="json", exclude_none=True)
+    session_metadata = {
+        "draft_goal": "Create a Kubernetes deployment report",
+        "pending_clarification": pending_state,
+    }
+
+    db = SessionLocal()
+    try:
+        context_envelope = main.context_service.build_chat_context_envelope(
+            db=db,
+            goal="Create a Kubernetes deployment report\n\nUser clarification: submit it now",
+            session_metadata=session_metadata,
+            session_context={},
+            turn_context={},
+            user_id=None,
+        )
+        result = main._normalize_chat_submit_context(
+            db=db,
+            goal="Create a Kubernetes deployment report\n\nUser clarification: submit it now",
+            content="submit it now",
+            session_metadata=session_metadata,
+            merged_context={},
+            context_envelope=context_envelope,
+            user_id=None,
+            messages=[],
+        )
+    finally:
+        db.close()
+
+    assert result is None
+    submit_view = main.context_service.chat_submit_context_view(context_envelope)
+    assert submit_view["topic"] == "Kubernetes deployment report"
+    assert submit_view["audience"] == "Senior AI engineers"
+    assert submit_view["tone"] == "practical"
+    assert submit_view["path"] == "artifacts/medic.docx"
 
 
 def test_chat_turn_normalizes_using_selected_github_capability_contract(monkeypatch) -> None:
@@ -1456,7 +2295,14 @@ def test_chat_turn_response_first_answer_or_handoff_can_escalate_to_router(monke
 
     response = client.post(
         f"/chat/sessions/{session['id']}/messages",
-        json={"content": "Can you prepare a deployment report?", "context_json": {}, "priority": 0},
+        json={
+            "content": "Can you prepare a deployment report?",
+            "context_json": {
+                "topic": "Deployment report",
+                "path": "artifacts/deployment-report.pdf",
+            },
+            "priority": 0,
+        },
     )
 
     assert response.status_code == 200
@@ -1621,6 +2467,73 @@ def test_chat_boundary_uses_semantic_capability_evidence_and_persists_decision(
     )
 
 
+def test_chat_boundary_capability_evidence_scopes_to_active_family(
+    monkeypatch,
+) -> None:
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "document.spec.generate": cap_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a structured document spec from an instruction.",
+                risk_tier="bounded_write",
+                idempotency="write",
+                group="documents",
+                subgroup="generation",
+                enabled=True,
+                planner_hints={"required_inputs": ["instruction", "topic", "audience", "tone"]},
+            ),
+            "document.docx.render": cap_registry.CapabilitySpec(
+                capability_id="document.docx.render",
+                description="Render a DOCX document from a DocumentSpec to a path.",
+                risk_tier="bounded_write",
+                idempotency="safe_write",
+                group="documents",
+                subgroup="rendering",
+                enabled=True,
+                planner_hints={"required_inputs": ["document_spec", "path"]},
+            ),
+            "github.issue.search": cap_registry.CapabilitySpec(
+                capability_id="github.issue.search",
+                description="Search GitHub issues by query.",
+                risk_tier="read_only",
+                idempotency="read",
+                group="github",
+                subgroup="issues",
+                enabled=True,
+                planner_hints={"required_inputs": ["query"]},
+            ),
+        }
+    )
+
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(
+        main.capability_registry,
+        "evaluate_capability_allowlist",
+        lambda capability_id, service_name=None: cap_registry.CapabilityAllowDecision(
+            allowed=True,
+            reason="allowed",
+        ),
+    )
+    monkeypatch.setattr(main, "CHAT_CAPABILITY_VECTOR_SEARCH_ENABLED", False)
+
+    top_capabilities, top_families = main._chat_boundary_capability_evidence(
+        query="search github issues",
+        preferred_family="documents",
+        preferred_capability_ids=["document.docx.render"],
+        pending_fields=["path"],
+    )
+
+    assert top_capabilities
+    assert all(capability.capability_id.startswith("document.") for capability in top_capabilities)
+    assert top_families
+    assert top_families[0].family == "documents"
+    assert all(
+        capability_id.startswith("document.")
+        for capability_id in top_families[0].capability_ids
+    )
+
+
 def test_chat_boundary_overrides_chat_reply_when_execution_signal_is_strong(
     monkeypatch,
 ) -> None:
@@ -1770,6 +2683,142 @@ def test_chat_boundary_overrides_chat_reply_to_continue_pending_for_clarificatio
     assert (
         body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
         == "clarification_answer_override"
+    )
+    assert calls["router"] == 1
+
+
+def test_chat_boundary_preserves_pending_clarification_for_execution_oriented_long_answer(
+    monkeypatch,
+) -> None:
+    session = client.post("/chat/sessions", json={}).json()
+    first_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Generate a deployment report", "context_json": {}, "priority": 0},
+    )
+    assert first_response.status_code == 200
+    first_body = first_response.json()
+    assert first_body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert first_body["session"]["metadata"]["pending_clarification"]["original_goal"] == (
+        "Generate a deployment report"
+    )
+
+    calls = {"router": 0}
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            calls["router"] += 1
+            return {
+                "route": "ask_clarification",
+                "assistant_response": "",
+                "intent": "render",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+                "clarification_questions": ["What tone should it use?"],
+                "missing_slots": ["tone"],
+            }
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            payload = json.loads(request.prompt)
+            evidence = payload["boundary_evidence"]
+            assert evidence["pending_clarification"] is True
+            assert evidence["likely_clarification_answer"] is False
+            assert evidence["conversation_mode_hint"] == "execution_oriented"
+            return {
+                "decision": "chat_reply",
+                "assistant_response": "Let me explain Kubernetes automation instead.",
+                "reason_code": "model_chat_bias",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": (
+                "Create automation to run in cluster to document how to deploy AI workflows "
+                "to Kubernetes. The file name should be Deployment of AI workflows to "
+                "Kubernetes.docx"
+            ),
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert body["assistant_message"]["metadata"]["boundary_decision"]["decision"] == "continue_pending"
+    assert (
+        body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
+        == "pending_clarification_state_preservation"
+    )
+    assert body["session"]["metadata"]["pending_clarification"]["original_goal"] == (
+        "Generate a deployment report"
+    )
+    assert "pending_clarification" in body["session"]["metadata"]
+    assert calls["router"] == 1
+
+
+def test_chat_boundary_coerces_non_pending_meta_clarification_back_to_execution(
+    monkeypatch,
+) -> None:
+    calls = {"router": 0}
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            calls["router"] += 1
+            return {
+                "route": "ask_clarification",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+                "clarification_questions": [
+                    "What output format do you need (for example PDF, DOCX, JSON, or Markdown)?"
+                ],
+                "missing_slots": ["output_format"],
+            }
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            payload = json.loads(request.prompt)
+            evidence = payload["boundary_evidence"]
+            assert evidence["pending_clarification"] is False
+            assert evidence["needs_clarification"] is True
+            assert evidence["conversation_mode_hint"] == "execution_oriented"
+            return {
+                "decision": "meta_clarification",
+                "assistant_response": "Could you specify the desired output format?",
+                "reason_code": "missing_output_format",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "create a document on Kubernetes", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert body["assistant_message"]["metadata"]["boundary_decision"]["decision"] == "execution_request"
+    assert (
+        body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
+        == "non_pending_meta_clarification_execution_override"
+    )
+    assert body["session"]["metadata"]["pending_clarification"]["original_goal"] == (
+        "create a document on Kubernetes"
     )
     assert calls["router"] == 1
 
@@ -2046,7 +3095,7 @@ def test_chat_turn_answer_or_handoff_classifier_failure_does_not_fallback_to_exe
     assert "workflow" in body["assistant_message"]["content"].lower()
 
 
-def test_chat_turn_pending_boundary_failure_returns_meta_clarification(monkeypatch) -> None:
+def test_chat_turn_pending_boundary_failure_returns_ask_clarification(monkeypatch) -> None:
     session = client.post("/chat/sessions", json={}).json()
     first_response = client.post(
         f"/chat/sessions/{session['id']}/messages",
@@ -2091,9 +3140,94 @@ def test_chat_turn_pending_boundary_failure_returns_meta_clarification(monkeypat
     assert response.status_code == 200
     body = response.json()
     assert body["job"] is None
-    assert body["assistant_message"]["action"]["type"] == "respond"
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
     assert "continue the current workflow request" in body["assistant_message"]["content"].lower()
     assert body["session"]["metadata"]["pending_clarification"]["questions"]
+
+
+def test_chat_turn_pending_meta_clarification_uses_ask_clarification_path(
+    monkeypatch,
+) -> None:
+    session = client.post("/chat/sessions", json={}).json()
+    first_response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Generate a deployment report", "context_json": {}, "priority": 0},
+    )
+    assert first_response.status_code == 200
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            raise AssertionError("router should not run when pending clarification stays ambiguous")
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            return {
+                "decision": "meta_clarification",
+                "assistant_response": (
+                    "Do you want to continue the current workflow request, or should I answer here in chat instead?"
+                ),
+                "reason_code": "ambiguous_pending_direction",
+            }
+
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={
+            "content": "Can you clarify what you still need from me?",
+            "context_json": {},
+            "priority": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "continue the current workflow request" in body["assistant_message"]["content"].lower()
+    assert body["session"]["metadata"]["pending_clarification"]["questions"] == [
+        "Do you want to continue the current workflow request, or should I answer here in chat instead?"
+    ]
+
+
+def test_chat_turn_router_execution_question_does_not_stay_in_respond(
+    monkeypatch,
+) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            return {
+                "route": "respond",
+                "assistant_response": "What output format do you need?",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.96,
+                "clarification_questions": ["What output format do you need?"],
+                "missing_slots": ["output_format"],
+            }
+
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+
+    session = client.post("/chat/sessions", json={}).json()
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert body["assistant_message"]["content"] == "What output format do you need?"
+    assert body["session"]["metadata"]["pending_clarification"]["questions"] == [
+        "What output format do you need?"
+    ]
 
 
 def test_build_chat_pending_correction_provider_prefers_dedicated_model(monkeypatch) -> None:

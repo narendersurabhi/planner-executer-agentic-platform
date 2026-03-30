@@ -217,6 +217,7 @@ def _create_chat_message_with_boundary_decision(
     content: str = "I can help with that.",
     action_type: str = "respond",
     boundary_decision: dict[str, Any] | None = None,
+    session_metadata: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     session_id = str(uuid.uuid4())
     message_id = str(uuid.uuid4())
@@ -226,7 +227,7 @@ def _create_chat_message_with_boundary_decision(
             ChatSessionRecord(
                 id=session_id,
                 title="Boundary feedback session",
-                metadata_json={},
+                metadata_json=dict(session_metadata or {}),
                 created_at=now,
                 updated_at=now,
             )
@@ -465,6 +466,182 @@ def test_chat_boundary_review_queue_orders_likely_misroutes() -> None:
     assert filtered_body["total"] >= 1
     assert all(item["dimensions"]["boundary_decision"] == "chat_reply" for item in filtered_body["items"])
     assert all(item["review_label"] == "likely_false_chat_reply" for item in filtered_body["items"])
+
+
+def test_chat_clarification_feedback_captures_slot_loss_and_family_drift() -> None:
+    before_metrics = client.get("/metrics")
+    assert before_metrics.status_code == 200
+    slot_loss_before = _metric_value(
+        before_metrics.text,
+        "chat_clarification_slot_loss_feedback_total",
+        {"slot_loss_state": "resolved_field_still_pending", "sentiment": "negative"},
+    )
+    family_drift_before = _metric_value(
+        before_metrics.text,
+        "chat_clarification_family_alignment_feedback_total",
+        {"alignment": "drift", "sentiment": "negative"},
+    )
+
+    _session_id, message_id = _create_chat_message_with_boundary_decision(
+        content="Let me ask one more question.",
+        action_type="ask_clarification",
+        boundary_decision={
+            "decision": "chat_reply",
+            "reason_code": "conversation_first",
+            "evidence": {
+                "conversation_mode_hint": "clarification_answer",
+                "active_family": "documents",
+                "top_families": [{"family": "github", "score": 1.1}],
+            },
+        },
+        session_metadata={
+            "pending_clarification": {
+                "original_goal": "create a Kubernetes deployment guide",
+                "active_family": "documents",
+                "active_capability_id": "document.docx.render",
+                "pending_fields": ["path"],
+                "required_fields": ["path"],
+                "known_slot_values": {
+                    "topic": "Kubernetes deployment guide",
+                    "audience": "Senior Software Engineers",
+                },
+                "resolved_slots": {
+                    "topic": "Kubernetes deployment guide",
+                    "audience": "Senior Software Engineers",
+                },
+                "answered_fields": ["topic", "audience", "path"],
+                "question_history": ["What filename should I use?"],
+                "answer_history": [
+                    "Senior Software Engineers",
+                    "save it as medic.docx in the workspace",
+                ],
+                "slot_provenance": {
+                    "topic": "clarification_normalized",
+                    "audience": "clarification_normalized",
+                },
+            }
+        },
+    )
+
+    feedback_response = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": "tester-clarification"},
+        json={
+            "target_type": "chat_message",
+            "target_id": message_id,
+            "sentiment": "negative",
+            "reason_codes": ["missed_request"],
+            "comment": "It lost the filename and drifted away from documents.",
+        },
+    )
+    assert feedback_response.status_code == 200
+    body = feedback_response.json()
+    assert body["metadata"]["dimensions"]["clarification_active_family"] == "documents"
+    assert body["metadata"]["dimensions"]["clarification_slot_loss_state"] == "resolved_field_still_pending"
+    assert body["metadata"]["dimensions"]["clarification_family_alignment"] == "drift"
+    assert body["metadata"]["dimensions"]["clarification_answer_count"] == 2
+    assert body["metadata"]["dimensions"]["clarification_resolved_slot_count"] == 2
+
+    summary_response = client.get(
+        "/feedback/summary",
+        params={"target_type": "chat_message"},
+    )
+    assert summary_response.status_code == 200
+    summary = summary_response.json()
+    assert any(
+        bucket["key"] == "documents" and bucket["total"] >= 1
+        for bucket in summary["clarification_active_families"]
+    )
+    assert any(
+        bucket["key"] == "resolved_field_still_pending" and bucket["total"] >= 1
+        for bucket in summary["clarification_slot_loss_states"]
+    )
+    assert any(
+        bucket["key"] == "drift" and bucket["total"] >= 1
+        for bucket in summary["clarification_family_alignments"]
+    )
+    assert summary["metrics"]["clarification_slot_loss_feedback_rate"] > 0.0
+    assert summary["metrics"]["clarification_family_drift_feedback_rate"] > 0.0
+
+    after_metrics = client.get("/metrics")
+    assert after_metrics.status_code == 200
+    assert (
+        _metric_value(
+            after_metrics.text,
+            "chat_clarification_slot_loss_feedback_total",
+            {"slot_loss_state": "resolved_field_still_pending", "sentiment": "negative"},
+        )
+        >= slot_loss_before + 1
+    )
+    assert (
+        _metric_value(
+            after_metrics.text,
+            "chat_clarification_family_alignment_feedback_total",
+            {"alignment": "drift", "sentiment": "negative"},
+        )
+        >= family_drift_before + 1
+    )
+
+
+def test_chat_clarification_review_queue_returns_slot_loss_items() -> None:
+    _session_id, message_id = _create_chat_message_with_boundary_decision(
+        content="I need one more detail before I can continue.",
+        action_type="ask_clarification",
+        boundary_decision={
+            "decision": "continue_pending",
+            "reason_code": "pending_clarification_state_preservation",
+            "evidence": {
+                "conversation_mode_hint": "clarification_answer",
+                "active_family": "documents",
+                "top_families": [{"family": "documents", "score": 1.4}],
+            },
+        },
+        session_metadata={
+            "pending_clarification": {
+                "original_goal": "create a Kubernetes deployment guide",
+                "active_family": "documents",
+                "active_capability_id": "document.docx.render",
+                "pending_fields": ["path"],
+                "required_fields": ["path"],
+                "known_slot_values": {"topic": "Kubernetes deployment guide"},
+                "resolved_slots": {"topic": "Kubernetes deployment guide"},
+                "answered_fields": ["path"],
+                "question_history": ["What filename should I use?"],
+                "answer_history": ["save it as medic.docx in the workspace"],
+            }
+        },
+    )
+    created = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": "tester-clarification-review"},
+        json={
+            "target_type": "chat_message",
+            "target_id": message_id,
+            "sentiment": "negative",
+            "reason_codes": ["missed_request"],
+            "comment": "The clarification loop is still dropping the filename.",
+        },
+    )
+    assert created.status_code == 200
+
+    response = client.get("/feedback/chat-clarification/review")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] >= 1
+    assert any(item["review_label"] == "likely_slot_loss" for item in body["items"])
+
+    filtered = client.get(
+        "/feedback/chat-clarification/review",
+        params={"review_label": "likely_slot_loss", "active_family": "documents"},
+    )
+    assert filtered.status_code == 200
+    filtered_body = filtered.json()
+    assert filtered_body["total"] >= 1
+    assert all(item["review_label"] == "likely_slot_loss" for item in filtered_body["items"])
+    assert all(
+        item["dimensions"]["clarification_active_family"] == "documents"
+        for item in filtered_body["items"]
+    )
 
 
 def test_submit_intent_and_plan_feedback_updates_same_actor_record() -> None:

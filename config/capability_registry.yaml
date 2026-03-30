@@ -1037,6 +1037,11 @@ capabilities:
       - transform
     planner_hints:
       task_intents: [io, transform]
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or destination path for the rendered document artifact.
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.docx", "workspace/Kubernetes AI Deployments.docx", "artifacts/report.docx"]
     enabled: true
     adapters:
       - type: tool
@@ -1061,6 +1066,11 @@ capabilities:
     planner_hints:
       task_intents: [render]
       required_output_extension: docx
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or path where the rendered DOCX should be saved.
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.docx", "workspace/Kubernetes AI Deployments.docx", "artifacts/report.docx"]
     enabled: true
     adapters:
       - type: tool
@@ -1105,6 +1115,11 @@ capabilities:
     planner_hints:
       task_intents: [render]
       required_output_extension: pdf
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or path where the rendered PDF should be saved.
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.pdf", "workspace/Kubernetes AI Deployments.pdf", "artifacts/report.pdf"]
     enabled: true
     adapters:
       - type: tool

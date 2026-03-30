@@ -30,6 +30,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-accuracy", type=float, default=None)
     parser.add_argument("--max-false-chat-reply-rate", type=float, default=None)
     parser.add_argument("--min-pending-continuation-rate", type=float, default=None)
+    parser.add_argument("--max-active-family-drift-rate", type=float, default=None)
     return parser
 
 
@@ -45,6 +46,9 @@ def _print_summary(summary: Mapping[str, Any]) -> None:
         "  pending_continuation_rate: "
         f"{float(summary.get('pending_continuation_rate', 0.0)):.3f}"
     )
+    print(
+        f"  active_family_drift_rate: {float(summary.get('active_family_drift_rate', 0.0)):.3f}"
+    )
 
 
 def _print_case_rows(case_results: list[Mapping[str, Any]]) -> None:
@@ -56,7 +60,9 @@ def _print_case_rows(case_results: list[Mapping[str, Any]]) -> None:
             + f"expected={case.get('expected_decision', 'unknown')} "
             + f"predicted={case.get('predicted_decision', 'unknown')} "
             + f"match={bool(case.get('match'))} "
-            + f"family={case.get('top_family') or '-'}"
+            + f"family={case.get('top_family') or '-'} "
+            + f"active_family={case.get('active_family') or '-'} "
+            + f"alignment={case.get('family_alignment') or '-'}"
         )
 
 
@@ -66,6 +72,7 @@ def _check_thresholds(report: Mapping[str, Any], args: argparse.Namespace) -> li
     accuracy = float(summary.get("accuracy", 0.0))
     false_chat_reply_rate = float(summary.get("false_chat_reply_rate", 0.0))
     pending_continuation_rate = float(summary.get("pending_continuation_rate", 0.0))
+    active_family_drift_rate = float(summary.get("active_family_drift_rate", 0.0))
     if args.min_accuracy is not None and accuracy < args.min_accuracy:
         failures.append(f"accuracy_below_threshold:{accuracy:.3f}<{float(args.min_accuracy):.3f}")
     if (
@@ -83,6 +90,14 @@ def _check_thresholds(report: Mapping[str, Any], args: argparse.Namespace) -> li
         failures.append(
             "pending_continuation_rate_below_threshold:"
             + f"{pending_continuation_rate:.3f}<{float(args.min_pending_continuation_rate):.3f}"
+        )
+    if (
+        args.max_active_family_drift_rate is not None
+        and active_family_drift_rate > args.max_active_family_drift_rate
+    ):
+        failures.append(
+            "active_family_drift_rate_above_threshold:"
+            + f"{active_family_drift_rate:.3f}>{float(args.max_active_family_drift_rate):.3f}"
         )
     return failures
 

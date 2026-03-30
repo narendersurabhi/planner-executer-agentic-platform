@@ -40,6 +40,34 @@ def build_feedback_eval_rows(examples: Iterable[Mapping[str, Any]]) -> list[dict
                 "linked_ids": dict(linked_ids) if isinstance(linked_ids, Mapping) else {},
                 "boundary_decision": boundary_decision,
                 "boundary_evidence": boundary_evidence,
+                "clarification_active_family": (
+                    str(dimensions.get("clarification_active_family") or "").strip()
+                    if isinstance(dimensions, Mapping)
+                    else ""
+                )
+                or None,
+                "clarification_slot_loss_state": (
+                    str(dimensions.get("clarification_slot_loss_state") or "").strip()
+                    if isinstance(dimensions, Mapping)
+                    else ""
+                )
+                or None,
+                "clarification_family_alignment": (
+                    str(dimensions.get("clarification_family_alignment") or "").strip()
+                    if isinstance(dimensions, Mapping)
+                    else ""
+                )
+                or None,
+                "clarification_answer_count": (
+                    int(dimensions.get("clarification_answer_count") or 0)
+                    if isinstance(dimensions, Mapping)
+                    else 0
+                ),
+                "clarification_resolved_slot_count": (
+                    int(dimensions.get("clarification_resolved_slot_count") or 0)
+                    if isinstance(dimensions, Mapping)
+                    else 0
+                ),
             }
         )
     return rows

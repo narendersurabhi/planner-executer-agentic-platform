@@ -10,6 +10,7 @@ import ScreenHeader, {
 } from "./components/ScreenHeader";
 import ComposerStepInspector from "./components/composer/ComposerStepInspector";
 import ComposerValidationPanel from "./components/composer/ComposerValidationPanel";
+import { ThinkingState } from "./components/chat/ThinkingState";
 import FeedbackControl from "./components/feedback/FeedbackControl";
 import FeedbackInsightsPanel from "./components/feedback/FeedbackInsightsPanel";
 import {
@@ -9123,15 +9124,7 @@ const openTemplateModal = (template: Template) => {
                         );
                       })}
                       {chatLoading ? (
-                        <div className="max-w-[92%] rounded-2xl border border-white/10 bg-white/10 px-4 py-3 text-sm text-slate-100 shadow-sm">
-                          <div className="flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.18em]">
-                            <span className="text-slate-300">assistant</span>
-                            <span className="rounded-full border border-sky-300/20 bg-sky-300/10 px-2 py-0.5 text-[9px] font-semibold tracking-[0.12em] text-sky-200">
-                              Thinking
-                            </span>
-                          </div>
-                          <div className="mt-2 text-slate-300">Working on your request...</div>
-                        </div>
+                        <ThinkingState />
                       ) : null}
                     </>
                   )}

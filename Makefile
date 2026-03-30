@@ -184,7 +184,7 @@ eval-chat-boundary:
 	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --verbose
 
 eval-chat-boundary-gate:
-	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --min-accuracy 0.95 --max-false-chat-reply-rate 0.05 --min-pending-continuation-rate 0.95
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --min-accuracy 0.95 --max-false-chat-reply-rate 0.05 --min-pending-continuation-rate 0.95 --max-active-family-drift-rate 0.05
 
 build-capability-feedback:
 	PYTHONPATH=. python3 scripts/build_capability_search_feedback.py --source auto --output artifacts/evals/capability_search_feedback.jsonl

@@ -961,6 +961,16 @@ chat_boundary_feedback_total = Counter(
     "Explicit chat-message feedback grouped by prior chat boundary decision",
     ["decision", "sentiment"],
 )
+chat_clarification_slot_loss_feedback_total = Counter(
+    "chat_clarification_slot_loss_feedback_total",
+    "Explicit chat-message feedback grouped by observed clarification slot-loss state",
+    ["slot_loss_state", "sentiment"],
+)
+chat_clarification_family_alignment_feedback_total = Counter(
+    "chat_clarification_family_alignment_feedback_total",
+    "Explicit chat-message feedback grouped by clarification active-family alignment",
+    ["alignment", "sentiment"],
+)
 
 
 def _intent_source_label(source: Any) -> str:
@@ -2712,18 +2722,69 @@ def _chat_response_turn_plan(
     }
 
 
+def _chat_clarification_turn_plan(
+    *,
+    goal: str,
+    clarification_questions: Sequence[str],
+    session_metadata: Mapping[str, Any] | None = None,
+    assistant_content: str = "",
+    source: str = "chat_clarification",
+) -> dict[str, Any]:
+    resolved_goal = str(goal or "").strip()
+    normalized_questions: list[str] = []
+    for raw_question in clarification_questions:
+        if not isinstance(raw_question, str):
+            continue
+        question = raw_question.strip()
+        if question and question not in normalized_questions:
+            normalized_questions.append(question)
+
+    pending_state = _pending_clarification_state_from_metadata(session_metadata)
+    assessment = (
+        dict(pending_state.goal_intent_profile)
+        if pending_state is not None and isinstance(pending_state.goal_intent_profile, Mapping)
+        else {}
+    )
+    existing_questions = [
+        str(question).strip()
+        for question in assessment.get("questions", [])
+        if isinstance(question, str) and str(question).strip()
+    ]
+    if normalized_questions:
+        assessment["questions"] = normalized_questions
+    elif existing_questions:
+        normalized_questions = existing_questions
+    assessment["needs_clarification"] = True
+    assessment["requires_blocking_clarification"] = True
+    assessment["source"] = str(assessment.get("source") or source).strip() or source
+
+    resolved_assistant_content = (
+        str(assistant_content or "").strip()
+        or "\n".join(normalized_questions)
+        or "I still need the remaining required details before I can continue."
+    )
+    return {
+        "type": "ask_clarification",
+        "assistant_content": resolved_assistant_content,
+        "clarification_questions": normalized_questions,
+        "goal_intent_profile": assessment,
+        "resolved_goal": resolved_goal,
+    }
+
+
 def _chat_boundary_failure_response(
     *,
     content: str,
+    session_metadata: Mapping[str, Any] | None = None,
     pending_clarification: bool,
 ) -> dict[str, Any]:
     if pending_clarification:
-        return _chat_response_turn_plan(
+        return _chat_clarification_turn_plan(
             goal=content.strip(),
-            assistant_content=(
-                "I can either continue the current workflow request or answer here in chat. "
-                "Tell me which one you want."
-            ),
+            clarification_questions=[
+                "I can either continue the current workflow request or answer here in chat. Tell me which one you want."
+            ],
+            session_metadata=session_metadata,
             source="chat_boundary_failure",
         )
     return _chat_response_turn_plan(
@@ -2736,15 +2797,16 @@ def _chat_boundary_failure_response(
 def _chat_router_failure_response(
     *,
     content: str,
+    session_metadata: Mapping[str, Any] | None = None,
     pending_clarification: bool,
 ) -> dict[str, Any]:
     if pending_clarification:
-        return _chat_response_turn_plan(
+        return _chat_clarification_turn_plan(
             goal=content.strip(),
-            assistant_content=(
-                "I could not determine how to continue the current workflow request. "
-                "Reply with the missing detail, or say you want the answer here in chat."
-            ),
+            clarification_questions=[
+                "I could not determine how to continue the current workflow request. Reply with the missing detail, or say you want the answer here in chat."
+            ],
+            session_metadata=session_metadata,
             source="chat_router_failure",
         )
     return _chat_response_turn_plan(
@@ -3035,13 +3097,12 @@ def _route_chat_turn(
     if boundary is None:
         return _chat_boundary_failure_response(
             content=content,
+            session_metadata=session_metadata,
             pending_clarification=pending_clarification,
         )
-    boundary = _postprocess_chat_boundary_decision(boundary)
+    boundary = _postprocess_chat_boundary_decision(boundary, content=content)
     _record_chat_boundary_decision_metrics(boundary)
     decision = boundary.decision
-    if pending_clarification and decision == chat_contracts.ChatBoundaryDecisionType.chat_reply:
-        decision = chat_contracts.ChatBoundaryDecisionType.exit_pending_to_chat
     if decision == chat_contracts.ChatBoundaryDecisionType.chat_reply:
         return _attach_chat_boundary_decision(
             _chat_response_turn_plan(
@@ -3060,6 +3121,22 @@ def _route_chat_turn(
             boundary,
         )
     if decision == chat_contracts.ChatBoundaryDecisionType.meta_clarification:
+        if pending_clarification:
+            return _attach_chat_boundary_decision(
+                _chat_clarification_turn_plan(
+                    goal=candidate_goal,
+                    clarification_questions=[
+                        boundary.assistant_response
+                        or (
+                            "Do you want to continue the current workflow request, or should I answer "
+                            "here in chat instead?"
+                        )
+                    ],
+                    session_metadata=session_metadata,
+                    source="chat_boundary_meta_clarification",
+                ),
+                boundary,
+            )
         return _attach_chat_boundary_decision(
             _chat_response_turn_plan(
                 goal=content.strip(),
@@ -3088,6 +3165,7 @@ def _route_chat_turn(
         )
     return _chat_boundary_failure_response(
         content=content,
+        session_metadata=session_metadata,
         pending_clarification=pending_clarification,
     )
 
@@ -3213,6 +3291,7 @@ def _route_chat_turn_with_router(
     if _chat_router_provider is None:
         return _chat_router_failure_response(
             content=content,
+            session_metadata=session_metadata,
             pending_clarification=pending_clarification,
         )
     try:
@@ -3258,6 +3337,7 @@ def _route_chat_turn_with_router(
         logger.exception("chat_router_failed")
         return _chat_router_failure_response(
             content=content,
+            session_metadata=session_metadata,
             pending_clarification=pending_clarification,
         )
 
@@ -3307,6 +3387,15 @@ def _fallback_chat_turn_route(
     assessment = _chat_route_goal_intent_profile(normalized.profile, goal=candidate_goal)
     assessment_json = workflow_contracts.dump_goal_intent_profile(assessment) or {}
     normalized_json = workflow_contracts.dump_normalized_intent_envelope(normalized) or {}
+    active_target = (
+        _active_execution_target_for_chat(
+            normalized=normalized,
+            session_metadata=session_metadata,
+            merged_context=merged_context,
+        )
+        if pending_clarification
+        else None
+    )
     if pending_clarification or not _looks_like_conversational_turn(content):
         if workflow_invocation is not None:
             return {
@@ -3317,11 +3406,23 @@ def _fallback_chat_turn_route(
                 "normalized_intent_envelope": normalized_json,
             }
         if bool(assessment.requires_blocking_clarification):
-            questions = [
-                str(question).strip()
-                for question in assessment.questions
-                if isinstance(question, str) and question.strip()
-            ]
+            scoped_fields = (
+                list(active_target.unresolved_fields or active_target.required_fields)
+                if active_target is not None
+                else []
+            )
+            questions = _chat_submit_clarification_questions(
+                normalized,
+                goal=candidate_goal,
+                unresolved_fields=scoped_fields,
+                scoped_fields=scoped_fields,
+            )
+            if not questions:
+                questions = [
+                    str(question).strip()
+                    for question in assessment.questions
+                    if isinstance(question, str) and question.strip()
+                ]
             return {
                 "type": "ask_clarification",
                 "assistant_content": "\n".join(questions) if questions else "What should I do next?",
@@ -3452,6 +3553,59 @@ def _chat_boundary_query_text(content: str, candidate_goal: str) -> str:
     return normalized_goal or normalized_content
 
 
+def _chat_boundary_field_hint_tokens(pending_fields: Sequence[str] | None) -> list[str]:
+    hint_tokens: list[str] = []
+    field_hints = {
+        "path": ("path", "filename", "output"),
+        "output_format": ("format", "docx", "pdf", "markdown"),
+        "query": ("query", "search"),
+        "tone": ("tone", "style"),
+        "audience": ("audience", "role"),
+        "topic": ("topic", "title"),
+        "instruction": ("instruction", "details"),
+        "target_system": ("target", "system"),
+    }
+    for raw_field in pending_fields or ():
+        field_name = intent_contract.normalize_required_input_key(raw_field)
+        if not field_name:
+            continue
+        for token in field_hints.get(field_name, (field_name,)):
+            normalized = str(token or "").strip().lower()
+            if normalized and normalized not in hint_tokens:
+                hint_tokens.append(normalized)
+    return hint_tokens
+
+
+def _chat_boundary_scoped_query_text(
+    *,
+    query: str,
+    preferred_family: str | None = None,
+    preferred_capability_ids: Sequence[str] | None = None,
+    pending_fields: Sequence[str] | None = None,
+) -> str:
+    parts: list[str] = []
+    normalized_query = str(query or "").strip()
+    if normalized_query:
+        parts.append(normalized_query)
+    normalized_family = str(preferred_family or "").strip()
+    if normalized_family:
+        parts.append(normalized_family)
+    capability_hints: list[str] = []
+    for raw_capability_id in preferred_capability_ids or ():
+        capability_id = capability_registry.canonicalize_capability_id(raw_capability_id)
+        if not capability_id:
+            continue
+        hint = capability_id.replace(".", " ").strip().lower()
+        if hint and hint not in capability_hints:
+            capability_hints.append(hint)
+    if capability_hints:
+        parts.append(" ".join(capability_hints[:2]))
+    field_hints = _chat_boundary_field_hint_tokens(pending_fields)
+    if field_hints:
+        parts.append(" ".join(field_hints))
+    return "\n".join(part for part in parts if part)
+
+
 def _chat_boundary_score(value: Any) -> float:
     try:
         return max(0.0, float(value or 0.0))
@@ -3462,17 +3616,37 @@ def _chat_boundary_score(value: Any) -> float:
 def _chat_boundary_capability_evidence(
     *,
     query: str,
+    preferred_family: str | None = None,
+    preferred_capability_ids: Sequence[str] = (),
+    pending_fields: Sequence[str] = (),
 ) -> tuple[
     list[chat_contracts.ChatBoundaryCapabilityEvidence],
     list[chat_contracts.ChatBoundaryFamilyEvidence],
 ]:
-    normalized_query = str(query or "").strip()
+    normalized_query = _chat_boundary_scoped_query_text(
+        query=query,
+        preferred_family=preferred_family,
+        preferred_capability_ids=preferred_capability_ids,
+        pending_fields=pending_fields,
+    )
     if not normalized_query:
         return [], []
     capabilities = _chat_visible_capabilities()
     if not capabilities:
         return [], []
-    entries = _chat_capability_search_entries(capabilities)
+    normalized_family = str(preferred_family or "").strip().lower()
+    if normalized_family:
+        scoped_capabilities = [
+            (capability_id, spec)
+            for capability_id, spec in capabilities
+            if str(spec.group or "").strip().lower() == normalized_family
+            or str(spec.subgroup or "").strip().lower() == normalized_family
+            or capability_id.split(".", 1)[0].strip().lower() == normalized_family
+        ]
+    else:
+        scoped_capabilities = list(capabilities)
+    search_capabilities_for_evidence = scoped_capabilities or capabilities
+    entries = _chat_capability_search_entries(search_capabilities_for_evidence)
     lexical_matches = capability_search.search_capabilities(
         query=normalized_query,
         capability_entries=entries,
@@ -3481,13 +3655,30 @@ def _chat_boundary_capability_evidence(
     )
     matches = _hybrid_chat_capability_matches(
         query=normalized_query,
-        capabilities=capabilities,
+        capabilities=search_capabilities_for_evidence,
         lexical_matches=lexical_matches,
         entries=entries,
     )
+    if not matches and search_capabilities_for_evidence is not capabilities:
+        entries = _chat_capability_search_entries(capabilities)
+        lexical_matches = capability_search.search_capabilities(
+            query=normalized_query,
+            capability_entries=entries,
+            limit=8,
+            rerank_feedback_rows=[],
+        )
+        matches = _hybrid_chat_capability_matches(
+            query=normalized_query,
+            capabilities=capabilities,
+            lexical_matches=lexical_matches,
+            entries=entries,
+        )
+        search_capabilities_for_evidence = capabilities
     if not matches:
         return [], []
-    capability_map = {capability_id: spec for capability_id, spec in capabilities}
+    capability_map = {
+        capability_id: spec for capability_id, spec in search_capabilities_for_evidence
+    }
     top_capabilities: list[chat_contracts.ChatBoundaryCapabilityEvidence] = []
     family_scores: dict[str, float] = {}
     family_capability_ids: dict[str, list[str]] = {}
@@ -3610,15 +3801,29 @@ def _build_chat_boundary_evidence(
     session_metadata: Mapping[str, Any] | None,
     merged_context: Mapping[str, Any] | None,
 ) -> chat_contracts.ChatBoundaryEvidence:
+    pending_state = _pending_clarification_state_from_metadata(session_metadata)
     pending = (
-        dict(session_metadata.get("pending_clarification"))
-        if isinstance(session_metadata, Mapping)
-        and isinstance(session_metadata.get("pending_clarification"), Mapping)
+        pending_state.model_dump(mode="json", exclude_none=True)
+        if pending_state is not None
         else {}
+    )
+    preferred_capability_ids: list[str] = []
+    if pending_state is not None:
+        for raw_capability_id in (
+            [pending_state.active_capability_id] + list(pending_state.candidate_capabilities or [])
+        ):
+            capability_id = capability_registry.canonicalize_capability_id(raw_capability_id)
+            if capability_id and capability_id not in preferred_capability_ids:
+                preferred_capability_ids.append(capability_id)
+    pending_fields = list(
+        pending_state.pending_fields or pending_state.required_fields if pending_state is not None else []
     )
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     top_capabilities, top_families = _chat_boundary_capability_evidence(
         query=_chat_boundary_query_text(content, candidate_goal),
+        preferred_family=(pending_state.active_family if pending_state is not None else None),
+        preferred_capability_ids=preferred_capability_ids,
+        pending_fields=pending_fields,
     )
     intent_profile = _chat_boundary_intent_evidence(
         content=content,
@@ -3642,6 +3847,15 @@ def _build_chat_boundary_evidence(
         conversation_mode_hint = "conversational"
     else:
         conversation_mode_hint = "execution_oriented"
+    missing_inputs = [
+        str(field).strip()
+        for field in (
+            list(intent_profile.missing_slots)
+            if intent_profile is not None and intent_profile.missing_slots
+            else pending_fields
+        )
+        if isinstance(field, str) and str(field).strip()
+    ]
     return chat_contracts.ChatBoundaryEvidence(
         goal=str(candidate_goal or "").strip(),
         conversation_mode_hint=conversation_mode_hint,
@@ -3651,7 +3865,34 @@ def _build_chat_boundary_evidence(
         intent=str(intent_profile.intent or "").strip() if intent_profile is not None else "",
         risk_level=str(intent_profile.risk_level or "").strip() if intent_profile is not None else "",
         needs_clarification=bool(intent_profile.needs_clarification) if intent_profile is not None else False,
-        missing_inputs=list(intent_profile.missing_slots) if intent_profile is not None else [],
+        missing_inputs=missing_inputs,
+        active_family=str(pending_state.active_family or "").strip()
+        if pending_state is not None
+        else "",
+        active_capability_id=str(pending_state.active_capability_id or "").strip()
+        if pending_state is not None
+        else "",
+        clarification_resolved_slot_count=(
+            len(
+                dict(
+                    pending_state.known_slot_values
+                    or pending_state.resolved_slots
+                    or {}
+                )
+            )
+            if pending_state is not None
+            else 0
+        ),
+        clarification_pending_field_count=(
+            len(list(pending_fields))
+            if pending_state is not None
+            else 0
+        ),
+        clarification_answer_count=(
+            len(list(pending_state.answer_history or []))
+            if pending_state is not None
+            else 0
+        ),
         top_capability_score=top_capability_score,
         top_family_score=top_family_score,
         family_concentration=family_concentration,
@@ -3834,6 +4075,8 @@ def _generate_chat_boundary_decision(
 
 def _postprocess_chat_boundary_decision(
     boundary: chat_contracts.ChatBoundaryDecision,
+    *,
+    content: str,
 ) -> chat_contracts.ChatBoundaryDecision:
     evidence = boundary.evidence or chat_contracts.ChatBoundaryEvidence()
     if (
@@ -3850,6 +4093,30 @@ def _postprocess_chat_boundary_decision(
             }
         )
     if (
+        not evidence.pending_clarification
+        and boundary.decision == chat_contracts.ChatBoundaryDecisionType.meta_clarification
+    ):
+        if (
+            evidence.conversation_mode_hint != "conversational"
+            and (
+                evidence.needs_clarification
+                or evidence.execution_signal_strength in {"moderate", "strong"}
+            )
+        ):
+            return boundary.model_copy(
+                update={
+                    "decision": chat_contracts.ChatBoundaryDecisionType.execution_request,
+                    "assistant_response": "",
+                    "reason_code": "non_pending_meta_clarification_execution_override",
+                }
+            )
+        return boundary.model_copy(
+            update={
+                "decision": chat_contracts.ChatBoundaryDecisionType.chat_reply,
+                "reason_code": "non_pending_meta_clarification_chat_override",
+            }
+        )
+    if (
         evidence.pending_clarification
         and evidence.likely_clarification_answer
         and boundary.decision
@@ -3863,6 +4130,38 @@ def _postprocess_chat_boundary_decision(
                 "decision": chat_contracts.ChatBoundaryDecisionType.continue_pending,
                 "assistant_response": "",
                 "reason_code": "clarification_answer_override",
+            }
+        )
+    if (
+        evidence.pending_clarification
+        and boundary.decision == chat_contracts.ChatBoundaryDecisionType.chat_reply
+    ):
+        if _looks_like_chat_only_correction(content):
+            return boundary.model_copy(
+                update={
+                    "decision": chat_contracts.ChatBoundaryDecisionType.exit_pending_to_chat,
+                    "reason_code": "explicit_chat_only_correction",
+                }
+            )
+        if evidence.conversation_mode_hint != "conversational":
+            return boundary.model_copy(
+                update={
+                    "decision": chat_contracts.ChatBoundaryDecisionType.continue_pending,
+                    "assistant_response": "",
+                    "reason_code": "pending_clarification_state_preservation",
+                }
+            )
+        return boundary.model_copy(
+            update={
+                "decision": chat_contracts.ChatBoundaryDecisionType.meta_clarification,
+                "assistant_response": (
+                    boundary.assistant_response
+                    or (
+                        "Do you want to continue the current workflow request, "
+                        "or should I answer here in chat instead?"
+                    )
+                ),
+                "reason_code": "pending_clarification_ambiguous",
             }
         )
     return boundary
@@ -3996,6 +4295,18 @@ def _normalize_chat_route(
         for question in parsed.get("clarification_questions", [])
         if isinstance(question, str) and question.strip()
     ]
+    assistant_response = str(parsed.get("assistant_response") or "").strip()
+    if (
+        route == "respond"
+        and (
+            clarification_questions
+            or (
+                missing_slots
+                and not _looks_like_conversational_turn(content)
+            )
+        )
+    ):
+        route = "ask_clarification"
     if route == "ask_clarification" and not clarification_questions:
         clarification_questions = [
             str(question).strip()
@@ -4006,7 +4317,8 @@ def _normalize_chat_route(
             clarification_questions = [
                 _slot_question(slot_name, candidate_goal) for slot_name in missing_slots
             ]
-    assistant_response = str(parsed.get("assistant_response") or "").strip()
+    if route == "ask_clarification" and not assistant_response:
+        assistant_response = "\n".join(clarification_questions)
     if route == "respond" and not assistant_response:
         assistant_response = _fallback_chat_response(content)
     if route in {"respond", "tool_call", "run_workflow"}:
@@ -4077,7 +4389,29 @@ def _dispatch_runtime() -> dispatch_service.ApiDispatchRuntime:
 
 def _candidate_capability_ids_for_envelope(
     envelope: workflow_contracts.NormalizedIntentEnvelope,
+    *,
+    active_target: intent_contract.ActiveExecutionTarget | None = None,
+    preferred_family: str | None = None,
 ) -> list[str]:
+    if active_target is not None and active_target.capability_ids:
+        capability_ids: list[str] = []
+        seen: set[str] = set()
+        preferred_capability = str(active_target.capability_id or "").strip()
+        ordered = list(active_target.capability_ids)
+        if preferred_capability and preferred_capability in ordered:
+            ordered = [preferred_capability] + [
+                capability_id
+                for capability_id in ordered
+                if capability_id != preferred_capability
+            ]
+        for capability_id in ordered:
+            normalized = capability_registry.canonicalize_capability_id(capability_id)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                capability_ids.append(normalized)
+        if capability_ids:
+            return capability_ids
+
     capability_ids: list[str] = []
     seen: set[str] = set()
     for capability_list in envelope.candidate_capabilities.values():
@@ -4092,7 +4426,73 @@ def _candidate_capability_ids_for_envelope(
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 capability_ids.append(normalized)
+    normalized_family = str(preferred_family or "").strip().lower()
+    if normalized_family:
+        filtered = [
+            capability_id
+            for capability_id in capability_ids
+            if str(_capability_family_for_id(capability_id) or "").strip().lower() == normalized_family
+        ]
+        if filtered:
+            return filtered
     return capability_ids
+
+
+def _pending_clarification_state_from_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> chat_contracts.ClarificationState | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    raw = metadata.get("pending_clarification")
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return chat_contracts.ClarificationState.model_validate(dict(raw))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _capability_family_for_id(capability_id: str) -> str | None:
+    normalized = capability_registry.canonicalize_capability_id(capability_id)
+    if not normalized:
+        return None
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        registry = None
+    spec = registry.get(normalized) if registry is not None else None
+    family = str(spec.group or spec.subgroup or "").strip() if spec is not None else ""
+    if family:
+        return family
+    prefix = normalized.split(".", 1)[0].strip()
+    return prefix or None
+
+
+def _active_execution_target_for_chat(
+    *,
+    normalized: workflow_contracts.NormalizedIntentEnvelope,
+    session_metadata: Mapping[str, Any] | None,
+    merged_context: Mapping[str, Any] | None,
+) -> intent_contract.ActiveExecutionTarget | None:
+    pending_state = _pending_clarification_state_from_metadata(session_metadata)
+    if pending_state is None:
+        return None
+    known_slot_values = dict(pending_state.known_slot_values or {})
+    if isinstance(merged_context, Mapping):
+        for key, raw_value in merged_context.items():
+            if raw_value is None:
+                continue
+            if isinstance(raw_value, str) and not raw_value.strip():
+                continue
+            known_slot_values.setdefault(str(key), raw_value)
+    return intent_contract.select_active_execution_target(
+        graph=workflow_contracts.dump_intent_graph(normalized.graph) or {},
+        candidate_capabilities=normalized.candidate_capabilities,
+        known_slot_values=known_slot_values,
+        pending_fields=tuple(pending_state.pending_fields or pending_state.required_fields),
+        preferred_segment_id=pending_state.active_segment_id,
+        preferred_capability_id=pending_state.active_capability_id,
+    )
 
 
 def _chat_submit_capability_contracts(
@@ -4116,11 +4516,104 @@ def _chat_submit_capability_contracts(
                     spec.capability_id
                 ),
                 "chat_collectible_fields": planner_hints.get("chat_collectible_fields"),
+                "chat_required_fields": planner_hints.get("chat_required_fields"),
                 "field_descriptions": planner_hints.get("chat_field_descriptions"),
                 "field_examples": planner_hints.get("chat_field_examples"),
             }
         )
     return contracts
+
+
+def _chat_submit_clarification_questions(
+    normalized: workflow_contracts.NormalizedIntentEnvelope,
+    *,
+    goal: str,
+    unresolved_fields: Sequence[str] = (),
+    scoped_fields: Sequence[str] = (),
+) -> list[str]:
+    questions: list[str] = []
+
+    def _append_question(question: Any) -> None:
+        if isinstance(question, str):
+            normalized_question = question.strip()
+            if normalized_question and normalized_question not in questions:
+                questions.append(normalized_question)
+
+    fallback_fields: list[str] = []
+    scoped_field_set = {
+        normalized_field
+        for raw_field in scoped_fields
+        if (normalized_field := intent_contract.normalize_required_input_key(raw_field))
+    }
+    for raw_field in unresolved_fields:
+        normalized_field = intent_contract.normalize_required_input_key(raw_field)
+        if not normalized_field:
+            continue
+        if scoped_field_set and normalized_field not in scoped_field_set:
+            continue
+        if normalized_field not in fallback_fields:
+            fallback_fields.append(normalized_field)
+    for raw_field in normalized.clarification.missing_inputs:
+        normalized_field = intent_contract.normalize_required_input_key(raw_field)
+        if not normalized_field:
+            continue
+        if scoped_field_set and normalized_field not in scoped_field_set:
+            continue
+        if normalized_field not in fallback_fields:
+            fallback_fields.append(normalized_field)
+    for raw_field in normalized.profile.missing_slots:
+        normalized_field = intent_contract.normalize_required_input_key(raw_field)
+        if not normalized_field:
+            continue
+        if scoped_field_set and normalized_field not in scoped_field_set:
+            continue
+        if normalized_field not in fallback_fields:
+            fallback_fields.append(normalized_field)
+
+    if scoped_field_set and fallback_fields:
+        for field in fallback_fields:
+            _append_question(
+                chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+            )
+        return questions
+
+    for raw_question in normalized.clarification.questions:
+        _append_question(raw_question)
+    for raw_question in normalized.profile.questions:
+        _append_question(raw_question)
+
+    if not questions:
+        for field in fallback_fields:
+            _append_question(
+                chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
+            )
+    return questions
+
+
+def _chat_submit_conversation_history(
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+) -> list[dict[str, str]]:
+    if not isinstance(messages, Sequence):
+        return []
+    history: list[dict[str, str]] = []
+    for message in list(messages)[-12:]:
+        role_value = getattr(message, "role", "")
+        role = str(getattr(role_value, "value", role_value) or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(getattr(message, "content", "") or "").strip()
+        if not content:
+            continue
+        normalized_content = " ".join(content.split())
+        if not normalized_content:
+            continue
+        history.append(
+            {
+                "role": role,
+                "content": normalized_content[:500],
+            }
+        )
+    return history
 
 
 def _normalize_chat_submit_context(
@@ -4132,12 +4625,9 @@ def _normalize_chat_submit_context(
     merged_context: Mapping[str, Any] | None,
     context_envelope: workflow_contracts.ContextEnvelope | Mapping[str, Any] | None = None,
     user_id: str | None,
+    messages: Sequence[chat_contracts.ChatMessage] | None = None,
 ) -> chat_service.ChatSubmitNormalizationResult | None:
     del content
-    if not CHAT_CLARIFICATION_NORMALIZER_ENABLED:
-        return None
-    if not isinstance(session_metadata, Mapping) or not session_metadata.get("pending_clarification"):
-        return None
     submit_context = (
         context_service.chat_submit_context_view(context_envelope)
         if context_envelope is not None
@@ -4149,39 +4639,111 @@ def _normalize_chat_submit_context(
         user_id=user_id,
         context_envelope=context_envelope,
     )
-    candidate_capability_ids = _candidate_capability_ids_for_envelope(normalized)
-    capability_contract = chat_clarification_normalizer.build_capability_normalization_contract(
-        goal=goal,
-        merged_context=submit_context,
-        capability_contracts=_chat_submit_capability_contracts(candidate_capability_ids),
+    pending_state = _pending_clarification_state_from_metadata(session_metadata)
+    conversation_history = _chat_submit_conversation_history(messages)
+    updates: dict[str, str] = {}
+    unresolved: list[str] = []
+    accepted_confidence: dict[str, float] = {}
+    normalized_capability_ids: list[str] = []
+    running_context = dict(submit_context)
+    active_target = _active_execution_target_for_chat(
+        normalized=normalized,
+        session_metadata=session_metadata,
+        merged_context=running_context,
     )
-    if capability_contract is None:
-        return None
-
-    updates, unresolved, accepted_confidence = (
-        chat_clarification_normalizer.normalize_contract_fields_with_llm(
+    active_candidate_ids = _candidate_capability_ids_for_envelope(
+        normalized,
+        active_target=active_target,
+        preferred_family=pending_state.active_family if pending_state is not None else None,
+    )
+    all_candidate_ids = _candidate_capability_ids_for_envelope(
+        normalized,
+        preferred_family=pending_state.active_family if pending_state is not None else None,
+    )
+    candidate_capability_ids: list[str] = []
+    for capability_id in list(active_candidate_ids) + list(all_candidate_ids):
+        if capability_id and capability_id not in candidate_capability_ids:
+            candidate_capability_ids.append(capability_id)
+    scoped_fields = (
+        list(active_target.unresolved_fields or active_target.required_fields)
+        if active_target is not None
+        else []
+    )
+    active_capability_set = set(active_candidate_ids)
+    for raw_contract in _chat_submit_capability_contracts(candidate_capability_ids):
+        contracts = chat_clarification_normalizer.build_capability_normalization_contracts(
             goal=goal,
-            contract=capability_contract,
-            provider=_chat_clarification_normalizer_provider,
-            confidence_threshold=CHAT_CLARIFICATION_NORMALIZER_CONFIDENCE_THRESHOLD,
+            merged_context=running_context,
+            capability_contracts=[raw_contract],
         )
-    )
-    if not updates and not unresolved:
-        return None
+        if not contracts:
+            continue
+        contract = contracts[0]
+        contract_updates: dict[str, str] = {}
+        contract_unresolved: list[str] = []
+        contract_confidence: dict[str, float] = {}
+        if CHAT_CLARIFICATION_NORMALIZER_ENABLED:
+            contract_updates, contract_unresolved, contract_confidence = (
+                chat_clarification_normalizer.normalize_contract_fields_with_llm(
+                    goal=goal,
+                    contract=contract,
+                    provider=_chat_clarification_normalizer_provider,
+                    confidence_threshold=CHAT_CLARIFICATION_NORMALIZER_CONFIDENCE_THRESHOLD,
+                    conversation_history=conversation_history,
+                )
+            )
+        else:
+            contract_unresolved = [
+                field for field in contract.required_fields if field in contract.missing_fields
+            ]
+        if contract_updates:
+            updates.update(contract_updates)
+            running_context.update(contract_updates)
+            accepted_confidence.update(contract_confidence)
+            if contract.capability_id not in normalized_capability_ids:
+                normalized_capability_ids.append(contract.capability_id)
+        if active_target is None or contract.capability_id in active_capability_set:
+            for field in contract_unresolved:
+                normalized_field = intent_contract.normalize_required_input_key(field)
+                if normalized_field and normalized_field not in unresolved:
+                    unresolved.append(normalized_field)
 
     context_updates: dict[str, Any] = {}
     if updates:
         context_updates.update(updates)
         context_updates["clarification_normalization"] = {
             "source": "chat_clarification_normalizer",
-            "capability_id": capability_contract.capability_id,
+            "capability_id": normalized_capability_ids[0] if normalized_capability_ids else None,
+            "capability_ids": sorted(set(normalized_capability_ids)),
             "fields": sorted(updates.keys()),
             "confidence": accepted_confidence,
         }
-    clarification_questions = [
-        chat_clarification_normalizer.clarification_question_for_field(field, goal=goal)
-        for field in unresolved
-    ]
+    updated_envelope = context_envelope
+    if updates and context_envelope is not None:
+        updated_envelope = context_service.update_chat_context_envelope(
+            context_envelope,
+            goal=goal,
+            context_json=context_updates,
+        )
+
+    refreshed_normalized = (
+        _normalize_goal_intent(
+            goal,
+            db=db,
+            user_id=user_id,
+            context_envelope=updated_envelope,
+        )
+        if updated_envelope is not None
+        else normalized
+    )
+    clarification_questions = _chat_submit_clarification_questions(
+        refreshed_normalized,
+        goal=goal,
+        unresolved_fields=unresolved,
+        scoped_fields=scoped_fields,
+    )
+    if not context_updates and not clarification_questions:
+        return None
     return chat_service.ChatSubmitNormalizationResult(
         goal=goal,
         context_json=context_updates,
@@ -12004,6 +12566,25 @@ def submit_feedback(
             decision=boundary_decision,
             sentiment=feedback.sentiment.value,
         ).inc()
+    if feedback.target_type == models.FeedbackTargetType.chat_message:
+        slot_loss_state = _metrics_label(
+            dimensions.get("clarification_slot_loss_state"),
+            default="none",
+        )
+        if slot_loss_state != "none":
+            chat_clarification_slot_loss_feedback_total.labels(
+                slot_loss_state=slot_loss_state,
+                sentiment=feedback.sentiment.value,
+            ).inc()
+        family_alignment = _metrics_label(
+            dimensions.get("clarification_family_alignment"),
+            default="unknown",
+        )
+        if family_alignment != "unknown":
+            chat_clarification_family_alignment_feedback_total.labels(
+                alignment=family_alignment,
+                sentiment=feedback.sentiment.value,
+            ).inc()
     _emit_event("feedback.submitted", feedback.model_dump(mode="json"))
     return feedback
 
@@ -12110,6 +12691,24 @@ def get_chat_boundary_review_queue(
         db,
         review_label=review_label,
         boundary_decision=boundary_decision,
+        limit=limit,
+    )
+
+
+@app.get(
+    "/feedback/chat-clarification/review",
+    response_model=models.ChatClarificationReviewQueueResponse,
+)
+def get_chat_clarification_review_queue(
+    review_label: str | None = Query(default=None),
+    active_family: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.ChatClarificationReviewQueueResponse:
+    return feedback_service.chat_clarification_review_queue(
+        db,
+        review_label=review_label,
+        active_family=active_family,
         limit=limit,
     )
 

@@ -317,7 +317,8 @@ def intent_context_view(
     parsed = workflow_contracts.parse_context_envelope(envelope)
     if parsed is None:
         return {}
-    context = budget_context_for_stage(parsed, stage="intent")
+    base_context = budget_context_for_stage(parsed, stage="intent")
+    context = _merge_clarification_slot_ledger(base_context, parsed.session_scope)
     if parsed.profile:
         context["user_profile"] = dict(parsed.profile)
     if parsed.capability_candidates:
@@ -329,7 +330,7 @@ def intent_context_view(
             context["capability_candidates"] = ranked
     if parsed.missing_inputs:
         context["missing_inputs"] = list(parsed.missing_inputs)
-    intent_slot_values, intent_slot_provenance = _intent_slot_values(parsed, context)
+    intent_slot_values, intent_slot_provenance = _intent_slot_values(parsed, base_context)
     if intent_slot_values:
         context["intent_slot_values"] = intent_slot_values
         context["intent_slot_provenance"] = intent_slot_provenance
@@ -383,7 +384,11 @@ def preflight_context_view(
 def chat_submit_context_view(
     envelope: workflow_contracts.ContextEnvelope | Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    return budget_context_for_stage(envelope, stage="chat_submit")
+    parsed = workflow_contracts.parse_context_envelope(envelope)
+    if parsed is None:
+        return {}
+    context = budget_context_for_stage(parsed, stage="chat_submit")
+    return _merge_clarification_slot_ledger(context, parsed.session_scope)
 
 
 def rank_context_items(
@@ -546,13 +551,55 @@ def _session_scope_from_metadata(metadata: Mapping[str, Any] | None) -> dict[str
         session_scope[key] = value
     pending_clarification = metadata.get("pending_clarification")
     if isinstance(pending_clarification, Mapping):
-        session_scope["pending_clarification"] = {
+        pending_scope = {
             "questions": [
                 str(question).strip()
                 for question in pending_clarification.get("questions", [])
                 if isinstance(question, str) and question.strip()
             ]
         }
+        for key in (
+            "state_version",
+            "active_family",
+            "active_segment_id",
+            "active_capability_id",
+            "original_goal",
+            "auto_path_allowed",
+        ):
+            value = pending_clarification.get(key)
+            if isinstance(value, str):
+                if value.strip():
+                    pending_scope[key] = value.strip()
+                continue
+            if value is not None:
+                pending_scope[key] = value
+        for key in (
+            "pending_fields",
+            "required_fields",
+            "answered_fields",
+            "candidate_capabilities",
+            "question_history",
+            "answer_history",
+        ):
+            value = pending_clarification.get(key)
+            if not isinstance(value, list):
+                continue
+            normalized_values = []
+            for item in value:
+                if isinstance(item, str):
+                    normalized = item.strip()
+                    if normalized:
+                        normalized_values.append(normalized)
+                    continue
+                if item is not None:
+                    normalized_values.append(item)
+            if normalized_values:
+                pending_scope[key] = normalized_values
+        for key in ("known_slot_values", "resolved_slots", "slot_provenance"):
+            value = pending_clarification.get(key)
+            if isinstance(value, Mapping) and value:
+                pending_scope[key] = dict(value)
+        session_scope["pending_clarification"] = pending_scope
     pending_workflow_input = metadata.get("pending_workflow_input")
     if isinstance(pending_workflow_input, Mapping):
         session_scope["pending_workflow_input"] = dict(pending_workflow_input)
@@ -669,8 +716,19 @@ def _intent_slot_values(
         envelope.normalized_intent_envelope
     )
     workflow_inputs = _workflow_inputs_from_context(context)
+    clarification_slot_values, clarification_slot_provenance = _clarification_slot_ledger(
+        envelope.session_scope,
+        context,
+    )
     clarification_slot_values = (
-        dict(normalized_intent.clarification.slot_values) if normalized_intent is not None else {}
+        {
+            **(
+                dict(normalized_intent.clarification.slot_values)
+                if normalized_intent is not None
+                else {}
+            ),
+            **clarification_slot_values,
+        }
     )
     inferred_slot_values = (
         dict(normalized_intent.profile.slot_values) if normalized_intent is not None else {}
@@ -688,17 +746,90 @@ def _intent_slot_values(
         clarification_value = _first_non_empty_value(clarification_slot_values, None, aliases)
         if clarification_value is not None:
             slot_values[canonical_key] = clarification_value
-            provenance[canonical_key] = (
-                "clarification_normalized"
-                if canonical_key in normalized_fields
-                else "inferred"
+            canonical_provenance = _first_non_empty_value(
+                clarification_slot_provenance,
+                None,
+                aliases,
             )
+            if isinstance(canonical_provenance, str) and canonical_provenance.strip():
+                provenance[canonical_key] = canonical_provenance.strip()
+            else:
+                provenance[canonical_key] = (
+                    "clarification_normalized"
+                    if canonical_key in normalized_fields
+                    else "inferred"
+                )
             continue
         inferred_value = _first_non_empty_value(inferred_slot_values, None, aliases)
         if inferred_value is not None:
             slot_values[canonical_key] = inferred_value
             provenance[canonical_key] = "inferred"
     return slot_values, provenance
+
+
+def _clarification_slot_ledger(
+    session_scope: Mapping[str, Any] | None,
+    context: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    slot_values: dict[str, Any] = {}
+    provenance: dict[str, str] = {}
+
+    pending_scope = (
+        session_scope.get("pending_clarification")
+        if isinstance(session_scope, Mapping)
+        and isinstance(session_scope.get("pending_clarification"), Mapping)
+        else None
+    )
+    if isinstance(pending_scope, Mapping):
+        for key in ("known_slot_values", "resolved_slots"):
+            raw_value = pending_scope.get(key)
+            if isinstance(raw_value, Mapping):
+                for raw_key, raw_slot in raw_value.items():
+                    normalized_key = str(raw_key or "").strip()
+                    if normalized_key and raw_slot is not None:
+                        slot_values[normalized_key] = raw_slot
+        raw_provenance = pending_scope.get("slot_provenance")
+        if isinstance(raw_provenance, Mapping):
+            for raw_key, raw_value in raw_provenance.items():
+                normalized_key = str(raw_key or "").strip()
+                normalized_value = str(raw_value or "").strip()
+                if normalized_key and normalized_value:
+                    provenance[normalized_key] = normalized_value
+
+    if isinstance(context, Mapping):
+        raw_context_slots = context.get("clarification_resolved_slots")
+        if isinstance(raw_context_slots, Mapping):
+            for raw_key, raw_slot in raw_context_slots.items():
+                normalized_key = str(raw_key or "").strip()
+                if normalized_key and raw_slot is not None:
+                    slot_values.setdefault(normalized_key, raw_slot)
+        raw_context_provenance = context.get("clarification_slot_provenance")
+        if isinstance(raw_context_provenance, Mapping):
+            for raw_key, raw_value in raw_context_provenance.items():
+                normalized_key = str(raw_key or "").strip()
+                normalized_value = str(raw_value or "").strip()
+                if normalized_key and normalized_value:
+                    provenance.setdefault(normalized_key, normalized_value)
+
+    return slot_values, provenance
+
+
+def _merge_clarification_slot_ledger(
+    context: Mapping[str, Any] | None,
+    session_scope: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(context) if isinstance(context, Mapping) else {}
+    slot_values, provenance = _clarification_slot_ledger(session_scope, context)
+    if not slot_values:
+        return merged
+
+    merged["clarification_resolved_slots"] = dict(slot_values)
+    if provenance:
+        merged["clarification_slot_provenance"] = dict(provenance)
+    for key, value in slot_values.items():
+        if not _mapping_has_non_empty_value(merged, key):
+            merged[key] = value
+    return merged
 
 
 def _clarification_normalized_fields(context: Mapping[str, Any]) -> set[str]:

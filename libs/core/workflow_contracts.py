@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -26,6 +27,48 @@ def _canonicalize_capability_id_list(values: Any) -> list[str]:
             seen.add(canonical)
             normalized.append(canonical)
     return normalized
+
+
+class SlotProvenance(str, Enum):
+    explicit_user = "explicit_user"
+    clarification_normalized = "clarification_normalized"
+    inferred = "inferred"
+    defaulted = "defaulted"
+
+
+class ExecutionFrameMode(str, Enum):
+    chat = "chat"
+    clarification = "clarification"
+    execution = "execution"
+
+
+class ExecutionFrame(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: str = "execution_frame_v1"
+    frame_id: str = ""
+    original_goal: str = ""
+    mode: ExecutionFrameMode = ExecutionFrameMode.chat
+    active_family: str | None = None
+    active_segment_id: str | None = None
+    active_capability_id: str | None = None
+    workflow_target: dict[str, Any] = Field(default_factory=dict)
+    state_version: int = 1
+
+    @field_validator("active_capability_id", mode="before")
+    @classmethod
+    def _normalize_active_capability_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        candidate = _canonicalize_capability_id(value)
+        return candidate or None
+
+    @field_validator("workflow_target", mode="before")
+    @classmethod
+    def _normalize_workflow_target(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        return {str(key): raw_value for key, raw_value in value.items() if raw_value is not None}
 
 
 class IntentGraphSlots(BaseModel):

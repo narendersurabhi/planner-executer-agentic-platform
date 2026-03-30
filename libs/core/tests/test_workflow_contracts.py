@@ -210,3 +210,23 @@ def test_dump_normalized_intent_envelope_returns_json_mapping() -> None:
             "assessment_fallback_used": True,
         },
     }
+
+
+def test_execution_frame_canonicalizes_active_capability_and_preserves_workflow_target() -> None:
+    frame = workflow_contracts.ExecutionFrame.model_validate(
+        {
+            "frame_id": "frame-1",
+            "original_goal": "Render the deployment guide",
+            "mode": "execution",
+            "active_family": "documents",
+            "active_segment_id": "s2",
+            "active_capability_id": "document.pdf.generate",
+            "workflow_target": {"version_id": "wf-v1"},
+        }
+    )
+
+    dumped = frame.model_dump(mode="json")
+
+    assert dumped["active_capability_id"] == "document.pdf.render"
+    assert dumped["workflow_target"] == {"version_id": "wf-v1"}
+    assert dumped["mode"] == "execution"
