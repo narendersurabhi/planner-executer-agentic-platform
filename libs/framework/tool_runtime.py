@@ -30,17 +30,23 @@ class Tool:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._aliases: dict[str, str] = {}
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.spec.name] = tool
+        for alias in getattr(tool.spec, "aliases", []) or []:
+            normalized = str(alias or "").strip()
+            if normalized:
+                self._aliases[normalized] = tool.spec.name
 
     def list_specs(self) -> list[ToolSpec]:
         return [tool.spec for tool in self._tools.values()]
 
     def get(self, name: str) -> Tool:
-        if name not in self._tools:
+        canonical = self._aliases.get(name, name)
+        if canonical not in self._tools:
             raise KeyError(f"Tool not found: {name}")
-        return self._tools[name]
+        return self._tools[canonical]
 
     def execute(
         self,
@@ -51,6 +57,7 @@ class ToolRegistry:
         max_output_bytes: int = 50000,
     ) -> ToolCall:
         tool = self.get(name)
+        canonical_name = tool.spec.name
         started_at = time.time()
         payload_for_call = sanitize_payload(payload)
         try:
@@ -73,7 +80,7 @@ class ToolRegistry:
             output = {"error": raw_error, "error_code": "runtime.unhandled"}
         finished_at = time.time()
         return ToolCall(
-            tool_name=name,
+            tool_name=canonical_name,
             input=payload_for_call,
             idempotency_key=idempotency_key,
             trace_id=trace_id,

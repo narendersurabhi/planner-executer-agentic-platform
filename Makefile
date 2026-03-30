@@ -1,12 +1,14 @@
 .PHONY: up up-workers down lint format typecheck test schemas eval-intent eval-intent-gate \
 	eval-capability-search eval-capability-search-gate \
 	build-capability-feedback \
+	build-intent-tuning-candidates \
 	build-capability-reranker-dataset \
 	eval-capability-feedback \
 	k8s-apply k8s-delete k8s-apply-local k8s-delete-local \
 	k8s-apply-observability k8s-delete-observability \
 	k8s-apply-keda-worker k8s-delete-keda-worker \
 	k8s-up-local k8s-down-local k8s-restart-local \
+	clear-local-registry \
 	k8s-sync-shared k8s-sync-workspace k8s-sync-artifacts \
 	images-list images-build images-push \
 	k8s-pin-local-images
@@ -119,6 +121,9 @@ k8s-up-local:
 k8s-down-local:
 	$(MAKE) k8s-delete-local
 
+clear-local-registry:
+	./scripts/clear_local_registry.sh --yes
+
 k8s-restart-local:
 	kubectl rollout restart deployment -n awe api planner policy worker coder qdrant rag-retriever-mcp ui
 	kubectl rollout status deployment/api -n awe --timeout=180s
@@ -164,10 +169,10 @@ schemas:
 	PYTHONPATH=. uv run $(UV_QUALITY_DEPS) python -c "from pathlib import Path; from libs.core.schemas import export_schemas; export_schemas(Path('schemas'))"
 
 eval-intent:
-	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_intent_decompose.py --gold eval/intent_gold.yaml --mode heuristic --top-k 3 --verbose
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_intent_decompose.py --gold eval/intent_gold.yaml --normalization-gold eval/intent_normalization_gold.yaml --mode heuristic --top-k 3 --verbose
 
 eval-intent-gate:
-	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_intent_decompose.py --gold eval/intent_gold.yaml --mode heuristic --top-k 3 --min-intent-f1 0.80 --min-capability-f1 0.60 --min-segment-hit-rate 0.30
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_intent_decompose.py --gold eval/intent_gold.yaml --normalization-gold eval/intent_normalization_gold.yaml --mode heuristic --top-k 3 --min-intent-f1 0.80 --min-capability-f1 0.60 --min-segment-hit-rate 0.30 --min-normalization-intent-accuracy 0.80 --min-normalization-capability-alignment 0.75 --min-missing-input-precision 0.85 --min-disagreement-clarification-rate 0.95
 
 eval-capability-search:
 	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_capability_search.py --gold eval/capability_search_gold.jsonl --top-k 5 --verbose
@@ -175,8 +180,17 @@ eval-capability-search:
 eval-capability-search-gate:
 	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_capability_search.py --gold eval/capability_search_gold.jsonl --top-k 5 --min-hit-rate-at-3 0.70 --min-mrr 0.55 --min-ndcg 0.60
 
+eval-chat-boundary:
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --verbose
+
+eval-chat-boundary-gate:
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --min-accuracy 0.95 --max-false-chat-reply-rate 0.05 --min-pending-continuation-rate 0.95 --max-active-family-drift-rate 0.05
+
 build-capability-feedback:
 	PYTHONPATH=. python3 scripts/build_capability_search_feedback.py --source auto --output artifacts/evals/capability_search_feedback.jsonl
+
+build-intent-tuning-candidates:
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/build_intent_tuning_candidates.py --jsonl-output artifacts/evals/intent_tuning_candidates.jsonl --yaml-output artifacts/evals/intent_tuning_candidates.yaml
 
 build-capability-reranker-dataset:
 	PYTHONPATH=. python3 training/build_capability_reranker_dataset.py --feedback artifacts/evals/capability_search_feedback.jsonl --output training/capability_reranker_train.jsonl

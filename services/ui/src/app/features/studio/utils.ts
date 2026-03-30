@@ -2,6 +2,7 @@
 
 import type {
   CanvasPoint,
+  CapabilitySchemaField,
   CapabilityItem,
   ChainPreflightResult,
   ComposerCompileResponse,
@@ -10,8 +11,8 @@ import type {
   ComposerValidationIssue,
 } from "./types";
 
-export const DAG_CANVAS_NODE_WIDTH = 220;
-export const DAG_CANVAS_NODE_HEIGHT = 96;
+export const DAG_CANVAS_NODE_WIDTH = 320;
+export const DAG_CANVAS_NODE_HEIGHT = 76;
 export const DAG_CANVAS_PADDING = 16;
 export const DAG_CANVAS_SNAP = 8;
 export const DAG_CANVAS_MIN_WIDTH = 960;
@@ -79,6 +80,54 @@ export const capabilityInputSchemaProperties = (
   ) as Record<string, Record<string, unknown>>;
 };
 
+export const capabilityOutputSchemaProperties = (
+  item: CapabilityItem | undefined | null
+): Record<string, Record<string, unknown>> => {
+  if (!item?.output_schema || typeof item.output_schema !== "object" || Array.isArray(item.output_schema)) {
+    return {};
+  }
+  const properties = (item.output_schema as Record<string, unknown>).properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(properties).filter(
+      ([, value]) => value && typeof value === "object" && !Array.isArray(value)
+    )
+  ) as Record<string, Record<string, unknown>>;
+};
+
+export const capabilityOutputSchemaFields = (
+  item: CapabilityItem | undefined | null
+): CapabilitySchemaField[] => {
+  if (!item) {
+    return [];
+  }
+  const explicitFields = Array.isArray(item.output_fields)
+    ? item.output_fields
+        .map((field) => ({
+          path: String(field.path || "").trim(),
+          type: String(field.type || "string").trim() || "string",
+          required: Boolean(field.required),
+          description:
+            typeof field.description === "string" ? field.description : null,
+        }))
+        .filter((field) => field.path)
+    : [];
+  const seen = new Set(explicitFields.map((field) => field.path));
+  const schemaProperties = capabilityOutputSchemaProperties(item);
+  const inferredFields = Object.entries(schemaProperties)
+    .filter(([path]) => !seen.has(path))
+    .map(([path, property]) => ({
+      path,
+      type: schemaPropertyTypeLabel(property),
+      required: false,
+      description:
+        typeof property.description === "string" ? property.description : null,
+    }));
+  return [...explicitFields, ...inferredFields];
+};
+
 export const schemaPropertyTypeLabel = (property: Record<string, unknown> | undefined) => {
   if (!property) {
     return "string";
@@ -143,9 +192,6 @@ export const collectContextPathSuggestions = (
 };
 
 export const inferCapabilityOutputPath = (capabilityId: string) => {
-  if (capabilityId.includes("output.derive")) {
-    return "path";
-  }
   if (capabilityId.includes("spec.validate")) {
     return "validation_report";
   }
@@ -232,7 +278,7 @@ export const outputPathSuggestionsForCapability = (
   if (normalized.includes("docx") || normalized.includes("pdf") || normalized.includes("render")) {
     add("path");
   }
-  if (normalized.includes("filename") || normalized.includes("output.derive")) {
+  if (normalized.includes("filename")) {
     add("path");
     add("output_path");
   }
@@ -247,10 +293,24 @@ export const outputPathSuggestionsForCapability = (
 };
 
 export const outputPathSuggestionsForNode = (node: ComposerDraftNode | undefined) => {
+  return outputPathSuggestionsForNodeWithCapability(node);
+};
+
+export const outputPathSuggestionsForNodeWithCapability = (
+  node: ComposerDraftNode | undefined,
+  capability?: CapabilityItem | null
+) => {
   if (!node) {
     return ["result"];
   }
   const suggestions = new Set(outputPathSuggestionsForCapability(node.capabilityId, node.outputPath));
+  capabilityOutputSchemaFields(capability).forEach((field) => {
+    suggestions.add(field.path);
+    const topLevel = topLevelFieldFromPath(field.path);
+    if (topLevel) {
+      suggestions.add(topLevel);
+    }
+  });
   node.outputs.forEach((output) => {
     if (output.name.trim()) {
       suggestions.add(output.name.trim());

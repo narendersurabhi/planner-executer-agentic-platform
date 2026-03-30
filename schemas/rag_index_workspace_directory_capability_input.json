@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RagIndexWorkspaceDirectoryCapabilityInput",
+  "type": "object",
+  "properties": {
+    "directory_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Directory path relative to WORKSPACE_DIR."
+    },
+    "collection_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ensure_collection": {
+      "type": "boolean"
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    },
+    "recursive": {
+      "type": "boolean"
+    },
+    "extensions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "max_files": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500
+    },
+    "chunk_size_chars": {
+      "type": "integer",
+      "minimum": 200,
+      "maximum": 20000
+    },
+    "chunk_overlap_chars": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 5000
+    },
+    "max_chunks_per_file": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "required": ["directory_path"],
+  "additionalProperties": false
+}

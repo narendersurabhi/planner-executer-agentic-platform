@@ -113,7 +113,7 @@ SEMANTIC_MEMORY_AUTO_WRITE_TOOL_PATTERNS = [
     for value in os.getenv(
         "SEMANTIC_MEMORY_AUTO_WRITE_TOOLS",
         "llm.text.generate,document.spec.generate,document.spec.improve,"
-        "document.spec.generate_iterative,llm_generate,llm_generate_document_spec,"
+        "document.spec.generate_iterative,llm.prompt.generate,llm_generate,llm_generate_with_context,llm_generate_document_spec,"
         "llm_improve_document_spec,llm_iterative_improve_document_spec,openapi.iterative.improve",
     ).split(",")
     if value.strip()
@@ -1326,9 +1326,13 @@ def _is_render_request(request_id: Any) -> bool:
         return False
     normalized = request_id.strip().lower()
     return normalized in {
+        "docx_render_from_spec",
         "docx_generate_from_spec",
+        "pdf_render_from_spec",
         "pdf_generate_from_spec",
+        "document.docx.render",
         "document.docx.generate",
+        "document.pdf.render",
         "document.pdf.generate",
     }
 
@@ -1649,6 +1653,9 @@ def _process_task_ready_message(message_id: str, envelope: Mapping[str, Any]) ->
             "started_at": datetime.utcnow().isoformat(),
             "finished_at": datetime.utcnow().isoformat(),
             "error": error,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "worker_consumer": WORKER_CONSUMER,
             "run_id": run_id,
         }
         _emit_task_event("task.failed", envelope, failed_payload)
@@ -1685,6 +1692,9 @@ def _process_task_ready_message(message_id: str, envelope: Mapping[str, Any]) ->
 
     event_type = "task.failed" if result.status == models.TaskStatus.failed else "task.completed"
     result_payload = result.model_dump(mode="json")
+    result_payload["attempts"] = attempts
+    result_payload["max_attempts"] = max_attempts
+    result_payload["worker_consumer"] = WORKER_CONSUMER
     result_payload["run_id"] = run_id
     _emit_task_event(event_type, envelope, result_payload)
     if result.status == models.TaskStatus.failed:

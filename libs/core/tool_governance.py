@@ -254,6 +254,12 @@ def evaluate_tool_allowlist(
     context: dict[str, Any] | None = None,
     tool_spec: ToolSpec | None = None,
 ) -> ToolAllowDecision:
+    normalized_tool_name = str(tool_name or "").strip()
+    if tool_spec is not None:
+        canonical_name = str(tool_spec.name or "").strip()
+        aliases = {str(alias or "").strip() for alias in getattr(tool_spec, "aliases", []) or []}
+        if normalized_tool_name == canonical_name or normalized_tool_name in aliases:
+            normalized_tool_name = canonical_name
     sets = _resolve_allowlist_sets(service_name, context=context)
     mode = str(sets.get("mode") or "enforce")
 
@@ -266,7 +272,7 @@ def evaluate_tool_allowlist(
         ("config_job_type_deny", sets["config_job_type_deny"]),
     )
     for reason, denied_set in deny_checks:
-        if denied_set and tool_name in denied_set:
+        if denied_set and normalized_tool_name in denied_set:
             return _deny_decision(mode, reason)
 
     blocked_risk_levels = sets.get("blocked_risk_levels", set())
@@ -288,7 +294,7 @@ def evaluate_tool_allowlist(
         ("not_in_config_job_type_allow", sets["config_job_type_allow"]),
     )
     for reason, allowed_set in allow_checks:
-        if allowed_set and tool_name not in allowed_set:
+        if allowed_set and normalized_tool_name not in allowed_set:
             return _deny_decision(mode, reason)
     return ToolAllowDecision(True, "allowed", mode=mode, violated=False)
 

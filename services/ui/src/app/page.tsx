@@ -10,6 +10,21 @@ import ScreenHeader, {
 } from "./components/ScreenHeader";
 import ComposerStepInspector from "./components/composer/ComposerStepInspector";
 import ComposerValidationPanel from "./components/composer/ComposerValidationPanel";
+import { ThinkingState } from "./components/chat/ThinkingState";
+import FeedbackControl from "./components/feedback/FeedbackControl";
+import FeedbackInsightsPanel from "./components/feedback/FeedbackInsightsPanel";
+import {
+  CHAT_FEEDBACK_REASONS,
+  INTENT_FEEDBACK_REASONS,
+  OUTCOME_FEEDBACK_REASONS,
+  PLAN_FEEDBACK_REASONS,
+  feedbackTargetKey,
+  getFeedbackActorId,
+  type FeedbackEntry,
+  type FeedbackListResponse,
+  type FeedbackSummaryResponse,
+  type FeedbackTargetType
+} from "./lib/feedback";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
 const jaegerUiUrl = (process.env.NEXT_PUBLIC_JAEGER_URL || "http://localhost:16686").replace(
@@ -48,12 +63,12 @@ const GUIDED_STARTER_TEMPLATES: Array<{
   {
     id: "document_pipeline",
     label: "Document Pipeline",
-    description: "Generate a DocumentSpec, derive output path, and render to selected format."
+    description: "Generate a DocumentSpec and render to the selected format at an explicit path."
   },
   {
     id: "runbook_pipeline",
     label: "Runbook Pipeline",
-    description: "Generate a runbook-style spec, derive output path, and render to selected format."
+    description: "Generate a runbook-style spec and render to the selected format at an explicit path."
   }
 ];
 
@@ -580,7 +595,7 @@ const outputPathSuggestionsForCapability = (
   if (normalized.includes("docx") || normalized.includes("pdf") || normalized.includes("render")) {
     add("path");
   }
-  if (normalized.includes("filename") || normalized.includes("output.derive")) {
+  if (normalized.includes("filename")) {
     add("path");
     add("output_path");
   }
@@ -651,9 +666,20 @@ type Job = {
 };
 
 type ChatAssistantAction = {
-  type: "respond" | "tool_call" | "ask_clarification" | "submit_job" | "attach_to_job" | "summarize_job";
+  type:
+    | "respond"
+    | "tool_call"
+    | "ask_clarification"
+    | "submit_job"
+    | "run_workflow"
+    | "attach_to_job"
+    | "summarize_job";
   goal?: string | null;
   job_id?: string | null;
+  workflow_run_id?: string | null;
+  workflow_definition_id?: string | null;
+  workflow_version_id?: string | null;
+  workflow_trigger_id?: string | null;
   capability_id?: string | null;
   tool_name?: string | null;
   clarification_questions?: string[];
@@ -687,7 +713,31 @@ type ChatTurnResponse = {
   user_message: ChatMessage;
   assistant_message: ChatMessage;
   job?: Job | null;
+  workflow_run?: Record<string, unknown> | null;
 };
+
+const makeOptimisticChatMessage = (sessionId: string, content: string): ChatMessage => {
+  const createdAt = new Date().toISOString();
+  return {
+    id: `optimistic-${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
+    session_id: sessionId,
+    role: "user",
+    content,
+    created_at: createdAt,
+    metadata: {
+      optimistic: true,
+      pending: true,
+    },
+    action: null,
+    job_id: null,
+  };
+};
+
+const appendChatMessage = (session: ChatSession, message: ChatMessage): ChatSession => ({
+  ...session,
+  updated_at: message.created_at,
+  messages: [...(Array.isArray(session.messages) ? session.messages : []), message],
+});
 
 type Plan = {
   id: string;
@@ -705,6 +755,15 @@ type JobDetailsPayload = {
   tasks?: Task[];
   task_results?: Record<string, TaskResult>;
 };
+
+const mapViewerFeedback = (items: FeedbackEntry[], actorId: string) =>
+  items.reduce<Record<string, FeedbackEntry>>((acc, item) => {
+    if (!item || item.actor_key !== actorId) {
+      return acc;
+    }
+    acc[feedbackTargetKey(item.target_type, item.target_id)] = item;
+    return acc;
+  }, {});
 
 type ContextBuilderFieldEditor = {
   originalKey: string;
@@ -964,6 +1023,7 @@ type ComposerCompileResponse = {
     warnings: ComposerCompileDiagnostic[];
   };
   plan: PlanCreatePayload | null;
+  run_spec?: Record<string, unknown> | null;
   preflight_errors: Record<string, string>;
 };
 
@@ -1325,9 +1385,6 @@ const isContextInputPresent = (value: unknown) => {
 };
 
 const inferCapabilityOutputPath = (capabilityId: string) => {
-  if (capabilityId.includes("output.derive")) {
-    return "path";
-  }
   if (capabilityId.includes("spec.validate")) {
     return "validation_report";
   }
@@ -1347,23 +1404,6 @@ const inferCapabilityOutputPath = (capabilityId: string) => {
     return "text";
   }
   return "result";
-};
-
-const inferOutputExtensionForCapability = (capabilityId: string): string => {
-  const normalized = capabilityId.toLowerCase();
-  if (normalized.includes(".docx.")) {
-    return "docx";
-  }
-  if (normalized.includes(".pdf.")) {
-    return "pdf";
-  }
-  if (normalized.includes("write_text")) {
-    return "txt";
-  }
-  if (normalized.includes("write_content")) {
-    return "json";
-  }
-  return "txt";
 };
 
 const isPathOutputReference = (sourcePath: string): boolean => {
@@ -1626,10 +1666,9 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Use llm_generate_document_spec to create a DocumentSpec about '{{topic}}' for '{{audience}}' in a '{{tone}}' tone. " +
       "Provide allowed_block_types as [text, paragraph, heading, bullets, spacer, optional_paragraph, repeat]. " +
       "Validate with document_spec_validate (strict). " +
-      "Derive a filesystem-safe output path with document.output.derive (derive_output_path) using topic '{{topic}}', output_dir '{{output_dir}}', and today's date. " +
-      "Render a DOCX with docx_generate_from_spec using the derived path.",
+      "Render a DOCX with docx_render_from_spec using explicit path '{{path}}'.",
     contextJson:
-      '{\n  "topic": "{{topic}}",\n  "audience": "{{audience}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
+      '{\n  "topic": "{{topic}}",\n  "audience": "{{audience}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "path": "{{path}}"\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -1661,13 +1700,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
         required: true,
         placeholder: "2026-02-10"
       },
-      {
-        key: "output_dir",
-        label: "Output Folder",
-        scope: "default",
-        required: false,
-        placeholder: "documents"
-      }
+      { key: "path", label: "Output Path", scope: "per_run", required: true, placeholder: "documents/report.docx" }
     ]
   },
   {
@@ -1684,10 +1717,9 @@ const BUILT_IN_TEMPLATES: Template[] = [
       "Do not invent sections beyond the markdown structure. " +
       "Set allowed_block_types to [\"text\",\"paragraph\",\"heading\",\"bullets\",\"spacer\",\"optional_paragraph\",\"repeat\"], strict=true, and document_type=\"document\". " +
       "Validate the result with document_spec_validate strict=true. " +
-      "Then call document.output.derive (derive_output_path) with topic '{{topic}}', output_dir '{{output_dir}}', date '{{today}}'. " +
-      "Finally, call document.docx.generate with document_spec from document.spec.generate_from_markdown and path from derive_output_path.",
+      "Finally, call document.docx.render with document_spec from document.spec.generate_from_markdown and explicit path '{{path}}'.",
     contextJson:
-      '{\n  "markdown_text": "{{markdown_text}}",\n  "topic": "{{topic}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
+      '{\n  "markdown_text": "{{markdown_text}}",\n  "topic": "{{topic}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "path": "{{path}}"\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -1719,13 +1751,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
         required: true,
         placeholder: "2026-03-12"
       },
-      {
-        key: "output_dir",
-        label: "Output Folder",
-        scope: "default",
-        required: false,
-        placeholder: "documents"
-      }
+      { key: "path", label: "Output Path", scope: "per_run", required: true, placeholder: "documents/report.docx" }
     ]
   },
   {
@@ -1734,16 +1760,16 @@ const BUILT_IN_TEMPLATES: Template[] = [
     description:
       "Demonstrate capability chaining by passing outputs to downstream inputs with $from references.",
     goal:
-      "Create a 4-task plan with these exact task names: GenerateSpec, ValidateSpec, DeriveOutputPath, RenderDocx. " +
-      "Use capability IDs document.spec.generate, document.spec.validate, document.output.derive, and document.docx.generate. " +
+      "Create a 3-task plan with these exact task names: GenerateSpec, ValidateSpec, RenderDocx. " +
+      "Use capability IDs document.spec.generate, document.spec.validate, and document.docx.render. " +
       "You MUST use explicit tool_inputs reference objects for chaining. " +
       "For ValidateSpec.document_spec use {\"$from\":[\"dependencies_by_name\",\"GenerateSpec\",\"document.spec.generate\",\"document_spec\"]}. " +
       "For RenderDocx.document_spec use the same GenerateSpec reference. " +
-      "For RenderDocx.path use {\"$from\":[\"dependencies_by_name\",\"DeriveOutputPath\",\"document.output.derive\",\"path\"]}. " +
+      "For RenderDocx.path use {\"$from\":[\"job_context\",\"path\"]}. " +
       "Set allowed_block_types to [\"text\",\"paragraph\",\"heading\",\"bullets\",\"spacer\",\"optional_paragraph\",\"repeat\"], set strict=true, and set document_type='document'. " +
       "Keep references as array paths because capability IDs contain dots.",
     contextJson:
-      '{\n  "topic": "{{topic}}",\n  "audience": "{{audience}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "output_dir": "{{output_dir}}"\n}',
+      '{\n  "topic": "{{topic}}",\n  "audience": "{{audience}}",\n  "tone": "{{tone}}",\n  "today": "{{today}}",\n  "path": "{{path}}"\n}',
     priority: 2,
     builtIn: true,
     variables: [
@@ -1775,13 +1801,7 @@ const BUILT_IN_TEMPLATES: Template[] = [
         required: true,
         placeholder: "2026-02-24"
       },
-      {
-        key: "output_dir",
-        label: "Output Folder",
-        scope: "default",
-        required: false,
-        placeholder: "documents"
-      }
+      { key: "path", label: "Output Path", scope: "per_run", required: true, placeholder: "documents/report.docx" }
     ]
   }
 ];
@@ -2013,6 +2033,7 @@ function HomeContent() {
   const [selectedTasks, setSelectedTasks] = useState<Task[]>([]);
   const [taskResults, setTaskResults] = useState<Record<string, TaskResult>>({});
   const selectedJobIdRef = useRef<string | null>(null);
+  const chatSessionRef = useRef<ChatSession | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [jobDebugger, setJobDebugger] = useState<JobDebuggerPayload | null>(null);
@@ -2057,8 +2078,15 @@ function HomeContent() {
   const [chatSession, setChatSession] = useState<ChatSession | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
+  const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatUseComposeContext, setChatUseComposeContext] = useState(true);
+  const [feedbackByTarget, setFeedbackByTarget] = useState<Record<string, FeedbackEntry>>({});
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState<Record<string, boolean>>({});
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [feedbackSummary, setFeedbackSummary] = useState<FeedbackSummaryResponse | null>(null);
+  const [feedbackSummaryLoading, setFeedbackSummaryLoading] = useState(false);
+  const [feedbackSummaryError, setFeedbackSummaryError] = useState<string | null>(null);
   const [showTaskInputs, setShowTaskInputs] = useState(false);
   const [showRecentEvents, setShowRecentEvents] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
@@ -2137,7 +2165,7 @@ function HomeContent() {
   const [chainSourceCapabilityId, setChainSourceCapabilityId] = useState("document.spec.generate");
   const [chainSourceOutputPath, setChainSourceOutputPath] = useState("document_spec");
   const [chainTargetTaskName, setChainTargetTaskName] = useState("RenderDocx");
-  const [chainTargetCapabilityId, setChainTargetCapabilityId] = useState("document.docx.generate");
+  const [chainTargetCapabilityId, setChainTargetCapabilityId] = useState("document.docx.render");
   const [chainTargetInputField, setChainTargetInputField] = useState("document_spec");
   const [chainDefaultValue, setChainDefaultValue] = useState("");
   const [chainCapabilityQuery, setChainCapabilityQuery] = useState("");
@@ -2212,6 +2240,7 @@ function HomeContent() {
     null
   );
   const [composerCompileLoading, setComposerCompileLoading] = useState(false);
+  const feedbackActorId = useMemo(() => getFeedbackActorId(workspaceUserId), [workspaceUserId]);
   const [isDesktop, setIsDesktop] = useState(false);
   const [hasSetInitialSidebar, setHasSetInitialSidebar] = useState(false);
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
@@ -2425,12 +2454,16 @@ function HomeContent() {
   }, [selectedJobId]);
 
   useEffect(() => {
+    chatSessionRef.current = chatSession;
+  }, [chatSession]);
+
+  useEffect(() => {
     const node = chatTranscriptRef.current;
     if (!node) {
       return;
     }
     node.scrollTop = node.scrollHeight;
-  }, [chatMessages.length]);
+  }, [chatMessages.length, chatLoading]);
 
   const loadJobs = async () => {
     const response = await fetch(`${apiUrl}/jobs`);
@@ -2655,21 +2688,6 @@ function HomeContent() {
         if (item.requiredInputs.includes(lastOutput)) {
           score += 32;
           reasons.push(`uses previous output '${lastOutput}'`);
-        }
-        if (
-          item.id === "document.output.derive" &&
-          (lastNode.capabilityId.startsWith("document.spec.") ||
-            lastNode.capabilityId.startsWith("document.runbook."))
-        ) {
-          score += 30;
-          reasons.push("common next step after document spec generation");
-        }
-        if (
-          (item.id === "document.docx.generate" || item.id === "document.pdf.generate") &&
-          lastNode.capabilityId === "document.output.derive"
-        ) {
-          score += 36;
-          reasons.push("render after derive output path");
         }
       }
 
@@ -3434,34 +3452,6 @@ function HomeContent() {
     );
   };
 
-  const buildDeriveOutputBindings = (
-    context: Record<string, unknown>,
-    targetCapabilityId: string,
-    documentTypeHint: string
-  ): Record<string, ComposerInputBinding> => {
-    const extension = inferOutputExtensionForCapability(targetCapabilityId);
-    const topicValue =
-      typeof context.topic === "string" && context.topic.trim().length > 0
-        ? context.topic.trim()
-        : "generated_document";
-    const outputDirValue =
-      typeof context.output_dir === "string" && context.output_dir.trim().length > 0
-        ? context.output_dir.trim()
-        : "documents";
-    const todayValue =
-      typeof context.today === "string" && context.today.trim().length > 0
-        ? context.today.trim()
-        : formatLocalIsoDate(new Date());
-
-    return {
-      topic: { kind: "literal", value: topicValue },
-      output_dir: { kind: "literal", value: outputDirValue },
-      document_type: { kind: "literal", value: documentTypeHint || "document" },
-      output_extension: { kind: "literal", value: extension },
-      today: { kind: "literal", value: todayValue }
-    };
-  };
-
   const parseGuidedStarterIterations = () => {
     const raw = Number(guidedStarterMaxIterations);
     if (!Number.isFinite(raw)) {
@@ -3479,12 +3469,10 @@ function HomeContent() {
         : useIterativeGenerator
           ? "document.spec.generate_iterative"
           : "document.spec.generate";
-    const starterSequence =
-      [
-        generatorCapability,
-        "document.output.derive",
-        guidedStarterFormat === "pdf" ? "document.pdf.generate" : "document.docx.generate"
-      ];
+    const starterSequence = [
+      generatorCapability,
+      guidedStarterFormat === "pdf" ? "document.pdf.render" : "document.docx.render"
+    ];
 
     const missing = starterSequence.filter((capabilityId) => !capabilityById.has(capabilityId));
     if (missing.length > 0) {
@@ -3518,15 +3506,15 @@ function HomeContent() {
         const inputBindings: Record<string, ComposerInputBinding> = {};
         const requiredInputs = getCapabilityRequiredInputs(capabilityById.get(capabilityId));
 
-        if (capabilityId === "document.output.derive") {
-          Object.assign(
-            inputBindings,
-            buildDeriveOutputBindings(
-              context,
-              guidedStarterFormat === "pdf" ? "document.pdf.generate" : "document.docx.generate",
-              guidedStarterTemplate === "runbook_pipeline" ? "runbook" : "document"
-            )
-          );
+        if (
+          (capabilityId === "document.docx.render" || capabilityId === "document.pdf.render") &&
+          typeof context.path === "string" &&
+          context.path.trim().length > 0
+        ) {
+          inputBindings.path = {
+            kind: "context",
+            path: "path"
+          };
         }
         requiredInputs.forEach((field) => {
           if (inputBindings[field]) {
@@ -3547,20 +3535,6 @@ function HomeContent() {
             sourcePath: previousNode.outputPath || "result"
           };
         });
-
-        if (
-          (capabilityId === "document.docx.generate" || capabilityId === "document.pdf.generate") &&
-          !inputBindings.path
-        ) {
-          const deriveNode = [...nodes].reverse().find((node) => node.capabilityId === "document.output.derive");
-          if (deriveNode) {
-            inputBindings.path = {
-              kind: "step_output",
-              sourceNodeId: deriveNode.id,
-              sourcePath: "path"
-            };
-          }
-        }
 
         nodes.push({
           id: nodeId,
@@ -3593,64 +3567,6 @@ function HomeContent() {
           : "Generate a practical technical document and render it to a downloadable document."
       );
     }
-  };
-
-  const insertDeriveOutputPathStepForNode = (nodeId: string) => {
-    const context = readContextObject();
-    setComposerDraft((prev) => {
-      const targetIndex = prev.nodes.findIndex((node) => node.id === nodeId);
-      if (targetIndex < 0) {
-        return prev;
-      }
-      const targetNode = prev.nodes[targetIndex];
-      if (targetNode.capabilityId === "document.output.derive") {
-        return prev;
-      }
-
-      const deriveNodeId = `chain-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const deriveNode: ComposerDraftNode = {
-        id: deriveNodeId,
-        taskName: uniqueTaskName("DeriveOutputPath", prev.nodes),
-        capabilityId: "document.output.derive",
-        outputPath: "path",
-        inputBindings: buildDeriveOutputBindings(
-          context,
-          targetNode.capabilityId,
-          targetNode.capabilityId.includes("runbook") ? "runbook" : "document"
-        )
-      };
-
-      const updatedTargetNode: ComposerDraftNode = {
-        ...targetNode,
-        inputBindings: {
-          ...targetNode.inputBindings,
-          path: {
-            kind: "step_output",
-            sourceNodeId: deriveNodeId,
-            sourcePath: "path"
-          }
-        }
-      };
-
-      const nextNodes = [
-        ...prev.nodes.slice(0, targetIndex),
-        deriveNode,
-        updatedTargetNode,
-        ...prev.nodes.slice(targetIndex + 1)
-      ];
-      const nextEdges = normalizeComposerEdges(nextNodes, [
-        ...prev.edges,
-        { fromNodeId: deriveNodeId, toNodeId: targetNode.id }
-      ]);
-
-      return {
-        ...prev,
-        nodes: nextNodes,
-        edges: nextEdges
-      };
-    });
-    setSelectedDagNodeId(nodeId);
-    setChainComposerNotice("Inserted derive-output-path step and wired target path input.");
   };
 
   const updateVisualChainNode = (
@@ -4801,30 +4717,6 @@ function HomeContent() {
     [selectedDagNodeId, visualChainNodes]
   );
 
-  const canInsertDeriveForSelectedNode = useMemo(() => {
-    if (!selectedDagNode) {
-      return false;
-    }
-    if (!capabilityById.has("document.output.derive")) {
-      return false;
-    }
-    if (selectedDagNode.capabilityId === "document.output.derive") {
-      return false;
-    }
-    const requiredInputs = getCapabilityRequiredInputs(capabilityById.get(selectedDagNode.capabilityId));
-    if (!requiredInputs.includes("path")) {
-      return false;
-    }
-    const pathBinding = selectedDagNode.inputBindings.path;
-    if (pathBinding?.kind === "step_output") {
-      const sourceNode = visualChainNodes.find((node) => node.id === pathBinding.sourceNodeId);
-      if (sourceNode?.capabilityId === "document.output.derive") {
-        return false;
-      }
-    }
-    return true;
-  }, [capabilityById, selectedDagNode, visualChainNodes]);
-
   const focusComposerValidationIssue = (issue: ComposerValidationIssue) => {
     const nodeId = issue.nodeId;
     if (!nodeId) {
@@ -5303,7 +5195,7 @@ function HomeContent() {
         const envelope = JSON.parse(event.data) as EventEnvelope;
         setEvents((prev) => [envelope, ...prev].slice(0, 50));
         const activeJobId = selectedJobIdRef.current;
-        if (!activeJobId || !envelope?.type) {
+        if (!envelope?.type) {
           return;
         }
         if (envelope.type === "task.heartbeat") {
@@ -5314,7 +5206,19 @@ function HomeContent() {
           (typeof envelope.payload?.job_id === "string" && envelope.payload.job_id) ||
           (typeof envelope.payload?.id === "string" && envelope.payload.id) ||
           null;
-        if (payloadJobId && payloadJobId === activeJobId) {
+        const activeChatSession = chatSessionRef.current;
+        if (
+          activeChatSession?.id &&
+          activeChatSession.active_job_id &&
+          payloadJobId &&
+          payloadJobId === activeChatSession.active_job_id &&
+          (envelope.type === "task.completed" || envelope.type === "task.failed")
+        ) {
+          window.setTimeout(() => {
+            void loadChatSession(activeChatSession.id);
+          }, 250);
+        }
+        if (activeJobId && payloadJobId && payloadJobId === activeJobId) {
           loadJobDetails(activeJobId);
         }
       } catch {
@@ -6049,6 +5953,91 @@ const openTemplateModal = (template: Template) => {
     }
   };
 
+  const mergeViewerFeedback = (items: FeedbackEntry[]) => {
+    const viewerFeedback = mapViewerFeedback(items, feedbackActorId);
+    setFeedbackByTarget((previous) => ({ ...previous, ...viewerFeedback }));
+  };
+
+  const loadChatFeedback = async (sessionId: string) => {
+    const result = await fetchJson(`${apiUrl}/chat/sessions/${encodeURIComponent(sessionId)}/feedback`);
+    if (result.ok && result.data && typeof result.data === "object") {
+      const payload = result.data as FeedbackListResponse;
+      mergeViewerFeedback(Array.isArray(payload.items) ? payload.items : []);
+    }
+  };
+
+  const loadJobFeedback = async (jobId: string) => {
+    const result = await fetchJson(`${apiUrl}/jobs/${encodeURIComponent(jobId)}/feedback`);
+    if (result.ok && result.data && typeof result.data === "object") {
+      const payload = result.data as FeedbackListResponse;
+      mergeViewerFeedback(Array.isArray(payload.items) ? payload.items : []);
+    }
+  };
+
+  const loadFeedbackSummary = async () => {
+    setFeedbackSummaryLoading(true);
+    setFeedbackSummaryError(null);
+    const result = await fetchJson(`${apiUrl}/feedback/summary?limit=500`);
+    if (!result.ok || !result.data || typeof result.data !== "object") {
+      setFeedbackSummaryError(result.error || "Failed to load feedback summary.");
+      setFeedbackSummaryLoading(false);
+      return;
+    }
+    setFeedbackSummary(result.data as FeedbackSummaryResponse);
+    setFeedbackSummaryLoading(false);
+  };
+
+  useEffect(() => {
+    void loadFeedbackSummary();
+  }, []);
+
+  const submitFeedback = async (
+    targetType: FeedbackTargetType,
+    targetId: string,
+    payload: {
+      sentiment: "positive" | "negative" | "neutral" | "partial";
+      reason_codes: string[];
+      comment?: string;
+      score?: number;
+    }
+  ) => {
+    const key = feedbackTargetKey(targetType, targetId);
+    setFeedbackSubmitting((previous) => ({ ...previous, [key]: true }));
+    setFeedbackError(null);
+    try {
+      const response = await fetch(`${apiUrl}/feedback`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Feedback-Actor-Id": feedbackActorId
+        },
+        body: JSON.stringify({
+          target_type: targetType,
+          target_id: targetId,
+          sentiment: payload.sentiment,
+          reason_codes: payload.reason_codes,
+          comment: payload.comment,
+          score: payload.score
+        })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Failed to submit feedback (${response.status}).`);
+      }
+      const body = (await response.json()) as FeedbackEntry;
+      setFeedbackByTarget((previous) => ({
+        ...previous,
+        [feedbackTargetKey(body.target_type, body.target_id)]: body
+      }));
+      void loadFeedbackSummary();
+    } catch (error) {
+      setFeedbackError(error instanceof Error ? error.message : "Failed to submit feedback.");
+      throw error;
+    } finally {
+      setFeedbackSubmitting((previous) => ({ ...previous, [key]: false }));
+    }
+  };
+
   const createChatSession = async () => {
     const response = await fetch(`${apiUrl}/chat/sessions`, {
       method: "POST",
@@ -6072,6 +6061,34 @@ const openTemplateModal = (template: Template) => {
     setChatSession(null);
     setChatInput("");
     setChatError(null);
+    setChatNotice(null);
+    setFeedbackError(null);
+  };
+
+  const loadChatSession = async (sessionId: string) => {
+    const response = await fetch(`${apiUrl}/chat/sessions/${encodeURIComponent(sessionId)}`);
+    if (!response.ok) {
+      return;
+    }
+    const session = (await response.json()) as ChatSession;
+    setChatSession(session);
+    void loadChatFeedback(session.id);
+  };
+
+  const refreshChatJobViews = async (jobId: string) => {
+    setChatNotice("Refreshing jobs and details in the background...");
+    try {
+      await loadJobs();
+      await loadJobDetails(jobId);
+      setChatNotice(null);
+    } catch (error) {
+      setChatNotice(null);
+      setChatError(
+        error instanceof Error
+          ? `Message sent, but failed to refresh job data (${error.message}).`
+          : "Message sent, but failed to refresh job data."
+      );
+    }
   };
 
   const submitChatTurn = async () => {
@@ -6085,12 +6102,31 @@ const openTemplateModal = (template: Template) => {
       return;
     }
 
+    const previousSession = chatSessionRef.current;
+    const optimisticSessionId = previousSession?.id || `pending-${Date.now()}`;
+    const optimisticMessage = makeOptimisticChatMessage(optimisticSessionId, content);
+    const optimisticSession = previousSession
+      ? appendChatMessage(previousSession, optimisticMessage)
+      : {
+          id: optimisticSessionId,
+          title: content.slice(0, 80) || "New chat",
+          created_at: optimisticMessage.created_at,
+          updated_at: optimisticMessage.created_at,
+          metadata: {},
+          active_job_id: null,
+          messages: [optimisticMessage],
+        };
+
     try {
       setChatLoading(true);
       setChatError(null);
-      let session = chatSession;
+      setChatNotice(null);
+      setChatInput("");
+      setChatSession(optimisticSession);
+      let session = previousSession;
       if (!session) {
         session = await createChatSession();
+        setChatSession(appendChatMessage(session, { ...optimisticMessage, session_id: session.id }));
       }
       const response = await fetch(`${apiUrl}/chat/sessions/${encodeURIComponent(session.id)}/messages`, {
         method: "POST",
@@ -6113,12 +6149,17 @@ const openTemplateModal = (template: Template) => {
       }
       const body = (await response.json()) as ChatTurnResponse;
       setChatSession(body.session);
-      setChatInput("");
+      void loadChatFeedback(body.session.id);
       if (body.job?.id) {
-        await loadJobs();
-        await loadJobDetails(body.job.id);
+        setChatLoading(false);
+        void refreshChatJobViews(body.job.id);
+        return;
       }
+      setChatNotice(null);
     } catch (error) {
+      setChatSession(previousSession);
+      setChatInput((current) => (current.trim() ? current : content));
+      setChatNotice(null);
       setChatError(error instanceof Error ? error.message : "Network error while sending chat.");
     } finally {
       setChatLoading(false);
@@ -6134,14 +6175,17 @@ const openTemplateModal = (template: Template) => {
     setJobDetailsIntentGraphCollapsed(true);
     setShowDebugger(false);
     setDebuggerActionNotice(null);
+    let terminalJobStatus: string | null = null;
 
     const detailsResult = await fetchJson(`${apiUrl}/jobs/${jobId}/details`);
     if (detailsResult.ok && detailsResult.data && typeof detailsResult.data === "object") {
       const payload = detailsResult.data as JobDetailsPayload;
-      setSelectedJobStatus(
+      terminalJobStatus =
         typeof payload.job_status === "string" && payload.job_status.trim()
           ? payload.job_status.trim()
-          : null
+          : null;
+      setSelectedJobStatus(
+        terminalJobStatus
       );
       setSelectedJobPlanError(
         typeof payload.job_error === "string" && payload.job_error.trim()
@@ -6166,7 +6210,23 @@ const openTemplateModal = (template: Template) => {
       }
     }
 
-    await Promise.all([loadMemoryEntries(jobId), loadDlqEntries(jobId), loadJobDebugger(jobId)]);
+    await Promise.all([
+      loadMemoryEntries(jobId),
+      loadDlqEntries(jobId),
+      loadJobDebugger(jobId),
+      loadJobFeedback(jobId)
+    ]);
+
+    const currentChatSession = chatSessionRef.current;
+    if (
+      currentChatSession?.id &&
+      currentChatSession.active_job_id === jobId &&
+      (terminalJobStatus === "succeeded" ||
+        terminalJobStatus === "failed" ||
+        terminalJobStatus === "canceled")
+    ) {
+      await loadChatSession(currentChatSession.id);
+    }
 
     setDetailsLoading(false);
   };
@@ -6591,10 +6651,10 @@ const openTemplateModal = (template: Template) => {
           <ScreenHeader
             eyebrow="Agentic Workflow Studio"
             title="Welcome"
-            description="Choose the surface you want to work in. Compose, Chat, Workflow Studio, and Memory each open as dedicated screens in the same planner-executor workflow platform."
+            description="Choose the surface you want to work in. Compose, Chat, Workflow Studio, RAG, and Memory each open as dedicated screens in the same planner-executor workflow platform."
             activeScreen="home"
           >
-            <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+            <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-5">
                 <Link
                   href="/compose"
                   className="group rounded-3xl border border-white/15 bg-white/10 p-6 transition hover:bg-white/15"
@@ -6642,6 +6702,22 @@ const openTemplateModal = (template: Template) => {
                     Inspect and edit user-scoped memory entries like profile data and semantic facts.
                   </p>
                   <div className="mt-6 text-sm font-semibold text-white">Open Memory</div>
+                </Link>
+                <Link
+                  href="/rag"
+                  className="group rounded-3xl border border-white/15 bg-white/10 p-6 transition hover:bg-white/15"
+                >
+                  <div className="text-xs font-semibold uppercase tracking-[0.24em] text-cyan-200">
+                    RAG
+                  </div>
+                  <h2 className="mt-4 font-display text-2xl text-white">
+                    Manage indexed knowledge.
+                  </h2>
+                  <p className="mt-3 text-sm text-slate-200">
+                    Index markdown, text, and workspace content into the vector store, then inspect
+                    and update stored documents.
+                  </p>
+                  <div className="mt-6 text-sm font-semibold text-white">Open RAG</div>
                 </Link>
             </div>
           </ScreenHeader>
@@ -7506,8 +7582,6 @@ const openTemplateModal = (template: Template) => {
               updateVisualBindingContextPath={updateVisualBindingContextPath}
               updateVisualBindingMemory={updateVisualBindingMemory}
               setVisualBindingFromPrevious={setVisualBindingFromPrevious}
-              canInsertDeriveOutputPath={canInsertDeriveForSelectedNode}
-              onInsertDeriveOutputPath={insertDeriveOutputPathStepForNode}
             />
             <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-3">
               <div className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-slate-700">
@@ -8978,45 +9052,81 @@ const openTemplateModal = (template: Template) => {
                       “Open a PR for the generated repository”.
                     </div>
                   ) : (
-                    chatMessages.map((message) => (
-                      <div
-                        key={message.id}
-                        className={`max-w-[92%] rounded-2xl px-4 py-3 text-sm shadow-sm ${
-                          message.role === "user"
-                            ? "ml-auto bg-white text-slate-900"
-                            : "border border-white/10 bg-white/10 text-slate-100"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.18em]">
-                          <span className={message.role === "user" ? "text-slate-500" : "text-slate-300"}>
-                            {message.role}
-                          </span>
-                          <span className={message.role === "user" ? "text-slate-400" : "text-slate-400"}>
-                            {formatTimestamp(message.created_at)}
-                          </span>
-                        </div>
-                        <div className="mt-2 whitespace-pre-wrap break-words">{message.content}</div>
-                        {message.action?.clarification_questions &&
-                        message.action.clarification_questions.length > 0 ? (
-                          <div className="mt-3 space-y-1 rounded-xl border border-amber-300/20 bg-amber-300/10 px-3 py-2 text-[12px] text-amber-100">
-                            {message.action.clarification_questions.map((question, index) => (
-                              <div key={`${message.id}-question-${index}`}>{question}</div>
-                            ))}
+                    <>
+                      {chatMessages.map((message) => {
+                        const isPending = Boolean(message.metadata?.pending);
+                        return (
+                          <div
+                            key={message.id}
+                            className={`max-w-[92%] rounded-2xl px-4 py-3 text-sm shadow-sm ${
+                              message.role === "user"
+                                ? "ml-auto bg-white text-slate-900"
+                                : "border border-white/10 bg-white/10 text-slate-100"
+                            } ${isPending ? "opacity-80" : ""}`}
+                          >
+                            <div className="flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.18em]">
+                              <div className="flex items-center gap-2">
+                                <span className={message.role === "user" ? "text-slate-500" : "text-slate-300"}>
+                                  {message.role}
+                                </span>
+                                {isPending ? (
+                                  <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-[9px] font-semibold tracking-[0.12em] text-amber-200">
+                                    Pending
+                                  </span>
+                                ) : null}
+                              </div>
+                              <span className={message.role === "user" ? "text-slate-400" : "text-slate-400"}>
+                                {formatTimestamp(message.created_at)}
+                              </span>
+                            </div>
+                            <div className="mt-2 whitespace-pre-wrap break-words">{message.content}</div>
+                            {message.action?.clarification_questions &&
+                            message.action.clarification_questions.length > 0 ? (
+                              <div className="mt-3 space-y-1 rounded-xl border border-amber-300/20 bg-amber-300/10 px-3 py-2 text-[12px] text-amber-100">
+                                {message.action.clarification_questions.map((question, index) => (
+                                  <div key={`${message.id}-question-${index}`}>{question}</div>
+                                ))}
+                              </div>
+                            ) : null}
+                            {message.job_id ? (
+                              <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-emerald-300/20 bg-emerald-300/10 px-3 py-2 text-[12px] text-emerald-100">
+                                <span>Job {message.job_id}</span>
+                                <button
+                                  className="rounded-full border border-emerald-200/30 px-2 py-1 text-[11px] font-semibold text-emerald-50 transition hover:border-emerald-100/60"
+                                  onClick={() => loadJobDetails(message.job_id || "")}
+                                >
+                                  Open
+                                </button>
+                              </div>
+                            ) : null}
+                            {message.role === "assistant" && !isPending ? (
+                              <FeedbackControl
+                                title="Was this response helpful?"
+                                reasonOptions={CHAT_FEEDBACK_REASONS}
+                                sentimentOptions={[
+                                  { value: "positive", label: "Helpful" },
+                                  { value: "negative", label: "Not helpful" }
+                                ]}
+                                existing={
+                                  feedbackByTarget[feedbackTargetKey("chat_message", message.id)] || null
+                                }
+                                submitting={
+                                  Boolean(
+                                    feedbackSubmitting[feedbackTargetKey("chat_message", message.id)]
+                                  )
+                                }
+                                onSubmit={(payload) =>
+                                  submitFeedback("chat_message", message.id, payload)
+                                }
+                              />
+                            ) : null}
                           </div>
-                        ) : null}
-                        {message.job_id ? (
-                          <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-emerald-300/20 bg-emerald-300/10 px-3 py-2 text-[12px] text-emerald-100">
-                            <span>Job {message.job_id}</span>
-                            <button
-                              className="rounded-full border border-emerald-200/30 px-2 py-1 text-[11px] font-semibold text-emerald-50 transition hover:border-emerald-100/60"
-                              onClick={() => loadJobDetails(message.job_id || "")}
-                            >
-                              Open
-                            </button>
-                          </div>
-                        ) : null}
-                      </div>
-                    ))
+                        );
+                      })}
+                      {chatLoading ? (
+                        <ThinkingState />
+                      ) : null}
+                    </>
                   )}
                 </div>
                 <div className="mt-4 flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-300">
@@ -9034,6 +9144,16 @@ const openTemplateModal = (template: Template) => {
                 {chatError ? (
                   <div className="mt-3 rounded-xl border border-rose-300/20 bg-rose-300/10 px-3 py-2 text-sm text-rose-100">
                     {chatError}
+                  </div>
+                ) : null}
+                {chatNotice ? (
+                  <div className="mt-3 rounded-xl border border-sky-300/20 bg-sky-300/10 px-3 py-2 text-sm text-sky-100">
+                    {chatNotice}
+                  </div>
+                ) : null}
+                {feedbackError && showChatScreen ? (
+                  <div className="mt-3 rounded-xl border border-amber-300/20 bg-amber-300/10 px-3 py-2 text-sm text-amber-100">
+                    Feedback error: {feedbackError}
                   </div>
                 ) : null}
                 <div className="mt-4 space-y-3">
@@ -9060,7 +9180,7 @@ const openTemplateModal = (template: Template) => {
                       onClick={submitChatTurn}
                       disabled={chatLoading || !chatInput.trim()}
                     >
-                      {chatLoading ? "Sending..." : "Send"}
+                      Send
                     </button>
                   </div>
                 </div>
@@ -9068,6 +9188,13 @@ const openTemplateModal = (template: Template) => {
               ) : null}
             </div>
         </ScreenHeader>
+      <FeedbackInsightsPanel
+        summary={feedbackSummary}
+        loading={feedbackSummaryLoading}
+        error={feedbackSummaryError}
+        onRefresh={() => void loadFeedbackSummary()}
+      />
+
         <section className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm animate-fade-up-delayed">
         <div className="flex items-center justify-between gap-4">
           <div>
@@ -9241,6 +9368,19 @@ const openTemplateModal = (template: Template) => {
               ) : (
                 <div className="text-xs text-slate-600">Plan not created yet.</div>
               )}
+              {selectedPlan ? (
+                <FeedbackControl
+                  title="Does this plan make sense?"
+                  reasonOptions={PLAN_FEEDBACK_REASONS}
+                  sentimentOptions={[
+                    { value: "positive", label: "Yes" },
+                    { value: "negative", label: "No" }
+                  ]}
+                  existing={feedbackByTarget[feedbackTargetKey("plan", selectedPlan.id)] || null}
+                  submitting={Boolean(feedbackSubmitting[feedbackTargetKey("plan", selectedPlan.id)])}
+                  onSubmit={(payload) => submitFeedback("plan", selectedPlan.id, payload)}
+                />
+              ) : null}
               <div className="mt-3 flex items-center justify-between gap-2">
                 <div className="font-medium">Intent Graph</div>
                 <button
@@ -9345,6 +9485,25 @@ const openTemplateModal = (template: Template) => {
                   No intent graph stored for this job.
                 </div>
               )}
+              {selectedJobId ? (
+                <FeedbackControl
+                  title="Did we understand your request correctly?"
+                  reasonOptions={INTENT_FEEDBACK_REASONS}
+                  sentimentOptions={[
+                    { value: "positive", label: "Yes" },
+                    { value: "negative", label: "No" }
+                  ]}
+                  existing={
+                    feedbackByTarget[feedbackTargetKey("intent_assessment", selectedJobId)] || null
+                  }
+                  submitting={
+                    Boolean(
+                      feedbackSubmitting[feedbackTargetKey("intent_assessment", selectedJobId)]
+                    )
+                  }
+                  onSubmit={(payload) => submitFeedback("intent_assessment", selectedJobId, payload)}
+                />
+              ) : null}
               <div className="mt-3 font-medium">Downloads</div>
               {jobDownloadPaths.length > 0 ? (
                 <div className="mt-2 flex flex-wrap gap-2">
@@ -9363,6 +9522,27 @@ const openTemplateModal = (template: Template) => {
               ) : (
                 <div className="text-xs text-slate-600">No downloadable artifacts yet.</div>
               )}
+              {selectedJobId &&
+              ((selectedJobStatus || selectedJob?.status) === "succeeded" ||
+                (selectedJobStatus || selectedJob?.status) === "failed" ||
+                (selectedJobStatus || selectedJob?.status) === "canceled") ? (
+                <FeedbackControl
+                  title="Did the system accomplish your goal?"
+                  reasonOptions={OUTCOME_FEEDBACK_REASONS}
+                  sentimentOptions={[
+                    { value: "positive", label: "Success" },
+                    { value: "partial", label: "Partial" },
+                    { value: "negative", label: "Failed" }
+                  ]}
+                  existing={feedbackByTarget[feedbackTargetKey("job_outcome", selectedJobId)] || null}
+                  submitting={Boolean(feedbackSubmitting[feedbackTargetKey("job_outcome", selectedJobId)])}
+                  autoSubmitSentiments={["positive"]}
+                  onSubmit={(payload) => submitFeedback("job_outcome", selectedJobId, payload)}
+                />
+              ) : null}
+              {feedbackError ? (
+                <div className="mt-3 text-xs text-amber-700">Feedback error: {feedbackError}</div>
+              ) : null}
             </div>
 
             <div className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">

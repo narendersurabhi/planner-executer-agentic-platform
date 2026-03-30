@@ -3,6 +3,8 @@
 import { useState } from "react";
 
 import type {
+  CapabilityItem,
+  CapabilitySchemaField,
   ComposerDraftNode,
   ComposerIssueFocus,
   ComposerInputBinding,
@@ -14,18 +16,22 @@ import type {
 type StudioInspectorField = {
   field: string;
   required: boolean;
+  custom: boolean;
   status: "missing" | "from_chain" | "from_context" | "provided";
   detail: string;
   schemaType: string;
   schemaDescription: string;
+  schemaProperty: Record<string, unknown> | null;
 };
 
 type StudioNodeInspectorProps = {
   selectedDagNode: ComposerDraftNode | null;
+  selectedCapability: CapabilityItem | null;
   selectedDagNodeStatus: {
     requiredCount: number;
   } | null;
   inputFields: StudioInspectorField[];
+  outputSchemaFields: CapabilitySchemaField[];
   activeComposerIssueFocus: ComposerIssueFocus | null;
   inspectorBindingRefs: React.MutableRefObject<Record<string, HTMLDivElement | null>>;
   visualChainNodes: ComposerDraftNode[];
@@ -71,9 +77,8 @@ type StudioNodeInspectorProps = {
     variableKey: string
   ) => void;
   setVisualBindingFromPrevious: (nodeId: string, field: string) => void;
-  canInsertDeriveOutputPath: boolean;
-  onInsertDeriveOutputPath: (nodeId: string) => void;
   addNodeOutput: (nodeId: string) => void;
+  upsertNodeOutputFromSchema: (nodeId: string, field: CapabilitySchemaField) => void;
   updateNodeOutput: (
     nodeId: string,
     outputId: string,
@@ -116,10 +121,35 @@ const bindingModeForField = (binding: ComposerInputBinding | undefined) => {
   return "context";
 };
 
+const schemaPropertyEnum = (property: Record<string, unknown> | null) =>
+  Array.isArray(property?.enum)
+    ? property.enum.map((value) => String(value)).filter(Boolean)
+    : [];
+
+const schemaPropertyDefault = (property: Record<string, unknown> | null) => {
+  if (!property || !Object.prototype.hasOwnProperty.call(property, "default")) {
+    return "";
+  }
+  const value = property.default;
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
 export default function StudioNodeInspector({
   selectedDagNode,
+  selectedCapability,
   selectedDagNodeStatus,
   inputFields,
+  outputSchemaFields,
   activeComposerIssueFocus,
   inspectorBindingRefs,
   visualChainNodes,
@@ -144,9 +174,8 @@ export default function StudioNodeInspector({
   updateVisualBindingWorkflowInput,
   updateVisualBindingWorkflowVariable,
   setVisualBindingFromPrevious,
-  canInsertDeriveOutputPath,
-  onInsertDeriveOutputPath,
   addNodeOutput,
+  upsertNodeOutputFromSchema,
   updateNodeOutput,
   removeNodeOutput,
   addNodeVariable,
@@ -198,13 +227,6 @@ export default function StudioNodeInspector({
             onClick={() => quickFixNodeBindings(selectedDagNode.id)}
           >
             Quick Fix
-          </button>
-          <button
-            className="rounded-full border border-slate-300 px-3 py-1.5 text-[11px] font-semibold text-slate-700 disabled:opacity-40"
-            onClick={() => onInsertDeriveOutputPath(selectedDagNode.id)}
-            disabled={!canInsertDeriveOutputPath}
-          >
-            Insert Derive Path
           </button>
           <button
             className="rounded-full border border-slate-300 px-3 py-1.5 text-[11px] font-semibold text-slate-700"
@@ -275,7 +297,12 @@ export default function StudioNodeInspector({
             Control Flow
           </div>
           <div className="mt-1 text-xs text-amber-900">
-            These nodes are design-time Studio controls. They do not compile into backend plans yet.
+            <code>if</code>, <code>if_else</code>, and <code>parallel</code> compile into
+            execution gates and dependency structure. <code>switch</code> is still authoring-only.
+          </div>
+          <div className="mt-2 text-[11px] text-amber-800">
+            Supported expressions: <code>context.*</code>, <code>workflow.input.*</code>, and{" "}
+            <code>workflow.variable.*</code> with truthy checks, <code>==</code>, or <code>!=</code>.
           </div>
           <div className="mt-4 grid gap-3">
             <label className="block">
@@ -291,7 +318,7 @@ export default function StudioNodeInspector({
                 placeholder={
                   selectedDagNode.controlKind === "parallel"
                     ? "Optional branch grouping note"
-                    : "context.approval === true"
+                    : "workflow.variable.should_publish == true"
                 }
               />
             </label>
@@ -418,7 +445,7 @@ export default function StudioNodeInspector({
               Inputs
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              Required fields are listed automatically. Each field can point at context data, step outputs, literals, or memory.
+              Schema-defined fields are listed automatically. Each field can point at context data, step outputs, literals, memory, or workflow interface bindings.
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2 text-[11px]">
@@ -465,6 +492,10 @@ export default function StudioNodeInspector({
             const sourceNodes = visualChainNodes.filter((candidate) => candidate.id !== selectedDagNode.id);
             const sourcePathListId = `studio-inspector-${selectedDagNode.id}-${status.field}-source-path-options`;
             const contextPathListId = `studio-inspector-${selectedDagNode.id}-${status.field}-context-path-options`;
+            const literalValue = binding?.kind === "literal" ? binding.value : "";
+            const enumOptions = schemaPropertyEnum(status.schemaProperty);
+            const schemaDefaultValue = schemaPropertyDefault(status.schemaProperty);
+            const schemaType = status.schemaType.trim().toLowerCase();
             const selectedSourceNode =
               binding?.kind === "step_output"
                 ? visualChainNodes.find((candidate) => candidate.id === binding.sourceNodeId) ||
@@ -493,10 +524,12 @@ export default function StudioNodeInspector({
                         className={`rounded-full px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] ${
                           status.required
                             ? "bg-slate-900 text-white"
-                            : "border border-slate-300 bg-white text-slate-600"
+                            : status.custom
+                              ? "border border-slate-300 bg-white text-slate-600"
+                              : "bg-sky-50 text-sky-700"
                         }`}
                       >
-                        {status.required ? "required" : "custom"}
+                        {status.required ? "required" : status.custom ? "custom" : "optional"}
                       </span>
                       <span
                         className={`rounded-full px-2 py-0.5 text-[10px] ${
@@ -516,6 +549,13 @@ export default function StudioNodeInspector({
                       {status.schemaType}
                       {status.schemaDescription ? ` • ${status.schemaDescription}` : ""}
                     </div>
+                    {enumOptions.length > 0 || schemaDefaultValue ? (
+                      <div className="mt-1 text-[11px] text-slate-500">
+                        {enumOptions.length > 0 ? `Allowed: ${enumOptions.join(", ")}` : ""}
+                        {enumOptions.length > 0 && schemaDefaultValue ? " • " : ""}
+                        {schemaDefaultValue ? `Default: ${schemaDefaultValue}` : ""}
+                      </div>
+                    ) : null}
                     <div className="mt-1 text-[11px] text-slate-500">{status.detail}</div>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -533,7 +573,7 @@ export default function StudioNodeInspector({
                     >
                       Clear
                     </button>
-                    {!status.required ? (
+                    {status.custom ? (
                       <button
                         className="rounded-full border border-rose-200 bg-rose-50 px-2.5 py-1 text-[11px] text-rose-700"
                         onClick={() => removeCustomInputField(selectedDagNode.id, status.field)}
@@ -612,14 +652,67 @@ export default function StudioNodeInspector({
                 ) : null}
 
                 {bindingMode === "literal" ? (
-                  <input
-                    className="mt-3 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
-                    value={binding?.kind === "literal" ? binding.value : ""}
-                    onChange={(event) =>
-                      updateVisualBindingLiteral(selectedDagNode.id, status.field, event.target.value)
-                    }
-                    placeholder="literal value"
-                  />
+                  <div className="mt-3 grid gap-2">
+                    {enumOptions.length > 0 ? (
+                      <select
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                        value={literalValue}
+                        onChange={(event) =>
+                          updateVisualBindingLiteral(selectedDagNode.id, status.field, event.target.value)
+                        }
+                      >
+                        <option value="">Select value</option>
+                        {enumOptions.map((option) => (
+                          <option key={`studio-literal-${status.field}-${option}`} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    ) : schemaType === "boolean" ? (
+                      <select
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                        value={literalValue}
+                        onChange={(event) =>
+                          updateVisualBindingLiteral(selectedDagNode.id, status.field, event.target.value)
+                        }
+                      >
+                        <option value="">Select boolean</option>
+                        <option value="true">true</option>
+                        <option value="false">false</option>
+                      </select>
+                    ) : schemaType === "number" || schemaType === "integer" ? (
+                      <input
+                        type="number"
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                        value={literalValue}
+                        onChange={(event) =>
+                          updateVisualBindingLiteral(selectedDagNode.id, status.field, event.target.value)
+                        }
+                        placeholder="literal number"
+                      />
+                    ) : schemaType === "object" || schemaType === "array" ? (
+                      <textarea
+                        className="min-h-[96px] w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                        value={literalValue}
+                        onChange={(event) =>
+                          updateVisualBindingLiteral(selectedDagNode.id, status.field, event.target.value)
+                        }
+                        placeholder={schemaType === "array" ? '[{"key":"value"}]' : '{"key":"value"}'}
+                      />
+                    ) : (
+                      <input
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                        value={literalValue}
+                        onChange={(event) =>
+                          updateVisualBindingLiteral(selectedDagNode.id, status.field, event.target.value)
+                        }
+                        placeholder="literal value"
+                      />
+                    )}
+                    <div className="text-[11px] text-slate-500">
+                      Literal values are stored as text in the draft and coerced by the target capability at run time.
+                    </div>
+                  </div>
                 ) : null}
 
                 {bindingMode === "context" ? (
@@ -758,6 +851,48 @@ export default function StudioNodeInspector({
             Add Output
           </button>
         </div>
+
+        {outputSchemaFields.length > 0 ? (
+          <div className="mt-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-800">Available Schema Outputs</div>
+                <div className="mt-1 text-[11px] text-slate-500">
+                  Derived from the capability output schema for {selectedCapability?.id || selectedDagNode.capabilityId}.
+                </div>
+              </div>
+              <div className="rounded-full bg-white px-3 py-1 text-[11px] text-slate-600">
+                {outputSchemaFields.length} field{outputSchemaFields.length === 1 ? "" : "s"}
+              </div>
+            </div>
+            <div className="mt-3 space-y-2">
+              {outputSchemaFields.map((field) => (
+                <div
+                  key={`studio-schema-output-${selectedDagNode.id}-${field.path}`}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3 py-2"
+                >
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-sm font-semibold text-slate-800">{field.path}</div>
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-slate-600">
+                        {field.type}
+                      </span>
+                    </div>
+                    {field.description ? (
+                      <div className="mt-1 text-[11px] text-slate-500">{field.description}</div>
+                    ) : null}
+                  </div>
+                  <button
+                    className="rounded-full border border-slate-300 px-3 py-1 text-[11px] font-semibold text-slate-700"
+                    onClick={() => upsertNodeOutputFromSchema(selectedDagNode.id, field)}
+                  >
+                    Add Alias
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         <div className="mt-3 space-y-3">
           {selectedDagNode.outputs.length === 0 ? (

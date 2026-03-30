@@ -1,6 +1,7 @@
+import json
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import redis
 from fastapi.testclient import TestClient
@@ -9,12 +10,26 @@ os.environ["DATABASE_URL"] = "sqlite:///./test.db"
 os.environ["ORCHESTRATOR_ENABLED"] = "false"
 os.environ["JOB_RECOVERY_ENABLED"] = "false"
 os.environ["POLICY_GATE_ENABLED"] = "false"
+os.environ["CAPABILITY_MODE"] = "enabled"
 
 from services.api.app import main, memory_store  # noqa: E402
 from services.api.app.database import Base, engine
 from services.api.app.database import SessionLocal
-from services.api.app.models import EventOutboxRecord, JobRecord, PlanRecord, TaskRecord
-from libs.core import events, execution_contracts, models
+from services.api.app.models import (
+    EventOutboxRecord,
+    InvocationRecord,
+    JobRecord,
+    PlanRecord,
+    RunEventRecord,
+    StepAttemptRecord,
+    TaskRecord,
+    TaskResultRecord,
+    WorkflowDefinitionRecord,
+    WorkflowRunRecord,
+    WorkflowTriggerRecord,
+    WorkflowVersionRecord,
+)
+from libs.core import events, execution_contracts, models, run_specs, workflow_contracts
 from libs.core import capability_registry as cap_registry
 from libs.core.llm_provider import LLMProvider, LLMRequest, LLMResponse
 
@@ -28,6 +43,67 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _document_render_registry() -> cap_registry.CapabilityRegistry:
+    return cap_registry.CapabilityRegistry(
+        capabilities={
+            "document.spec.generate": cap_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a document spec.",
+                enabled=True,
+                risk_tier="read_only",
+                idempotency="read",
+                group="document",
+                subgroup="spec",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="llm_generate_document_spec",
+                    ),
+                ),
+                planner_hints={"task_intents": ["generate"]},
+            ),
+            "derive_output_filename": cap_registry.CapabilitySpec(
+                capability_id="derive_output_filename",
+                description="Derive a safe output path.",
+                enabled=True,
+                risk_tier="read_only",
+                idempotency="read",
+                group="document",
+                subgroup="paths",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="derive_output_filename",
+                    ),
+                ),
+                planner_hints={"task_intents": ["transform"]},
+            ),
+            "document.docx.render": cap_registry.CapabilitySpec(
+                capability_id="document.docx.render",
+                description="Render a DOCX document.",
+                enabled=True,
+                risk_tier="bounded_write",
+                idempotency="safe_write",
+                group="document",
+                subgroup="render",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="docx_render_from_spec",
+                    ),
+                ),
+                planner_hints={
+                    "task_intents": ["render"],
+                    "required_output_extension": "docx",
+                },
+            ),
+        }
+    )
+
+
 def test_create_job():
     response = client.post(
         "/jobs",
@@ -36,6 +112,36 @@ def test_create_job():
     assert response.status_code == 200
     data = response.json()
     assert data["goal"] == "demo"
+    assert data["metadata"]["normalized_intent_envelope"]["goal"] == "demo"
+    assert data["metadata"]["render_path_mode"] == "explicit"
+
+
+def test_intent_assessment_fallback_used_respects_mode(monkeypatch) -> None:
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "hybrid")
+
+    assert main._intent_assessment_fallback_used("heuristic") is True
+    assert main._intent_assessment_fallback_used("llm") is False
+
+
+def test_intent_decompose_fallback_used_respects_mode(monkeypatch) -> None:
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_MODE", "hybrid")
+
+    assert main._intent_decompose_fallback_used("heuristic") is True
+    assert main._intent_decompose_fallback_used("llm") is False
+
+
+def test_intent_segment_contract_reason_parses_prefixed_error() -> None:
+    assert (
+        main._intent_segment_contract_reason(
+            "intent_segment_invalid:llm_generate:GenerateText:must_have_inputs_missing:path"
+        )
+        == "must_have_inputs_missing"
+    )
+    assert main._intent_segment_contract_reason("output_format_mismatch:pdf:docx") == (
+        "output_format_mismatch"
+    )
 
 
 def test_workflow_definition_publish_and_run_bypasses_planner_job_event() -> None:
@@ -69,6 +175,8 @@ def test_workflow_definition_publish_and_run_bypasses_planner_job_event() -> Non
     version = publish_response.json()
     assert version["version_number"] == 1
     assert version["compiled_plan"]["tasks"][0]["name"] == "ListWorkspace"
+    assert version["run_spec"]["steps"][0]["name"] == "ListWorkspace"
+    assert version["metadata"]["run_spec"]["steps"][0]["name"] == "ListWorkspace"
 
     run_response = client.post(
         f"/workflows/versions/{version['id']}/run",
@@ -81,6 +189,7 @@ def test_workflow_definition_publish_and_run_bypasses_planner_job_event() -> Non
     assert run_body["workflow_run"]["version_id"] == version["id"]
     assert run_body["workflow_run"]["job_id"] == job_id
     assert run_body["job"]["metadata"]["workflow_source"] == "studio"
+    assert run_body["job"]["metadata"]["render_path_mode"] == "auto"
     assert run_body["job"]["metadata"]["workflow_definition_id"] == definition["id"]
     assert run_body["job"]["metadata"]["workflow_version_id"] == version["id"]
     assert run_body["job"]["metadata"]["workflow_run_id"] == run_body["workflow_run"]["id"]
@@ -109,6 +218,251 @@ def test_workflow_definition_publish_and_run_bypasses_planner_job_event() -> Non
         models.JobStatus.running.value,
         models.JobStatus.planning.value,
     }
+
+
+def test_workflow_run_uses_postgres_scheduler_when_flag_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(main, "STUDIO_RUN_SCHEDULER_ENABLED", True)
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Scheduled workspace listing",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Scheduled workspace listing",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 1},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    job_id = run_body["job"]["id"]
+    assert (
+        run_body["workflow_run"]["metadata"]["scheduler_mode"]
+        == main.POSTGRES_RUN_SPEC_SCHEDULER_MODE
+    )
+    assert run_body["job"]["metadata"]["scheduler_mode"] == main.POSTGRES_RUN_SPEC_SCHEDULER_MODE
+
+    with SessionLocal() as db:
+        task_records = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        assert len(task_records) == 1
+        assert task_records[0].status == models.TaskStatus.ready.value
+        assert task_records[0].attempts == 1
+        event_records = db.query(EventOutboxRecord).all()
+    matching_events = [
+        row
+        for row in event_records
+        if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id
+    ]
+    event_types = {row.event_type for row in matching_events}
+    assert "task.ready" in event_types
+    assert "plan.created" not in event_types
+
+
+def test_workflow_version_run_allows_derived_render_paths_in_studio_mode(monkeypatch) -> None:
+    registry = _document_render_registry()
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+    monkeypatch.setattr(main, "RUNTIME_CONFORMANCE_ENABLED", False)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", False)
+
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Render DOCX workflow",
+            "goal": "Render a DOCX deployment report",
+            "context_json": {},
+            "draft": {
+                "summary": "Render DOCX workflow",
+                "nodes": [
+                    {
+                        "id": "spec",
+                        "taskName": "GenerateDocumentSpec",
+                        "capabilityId": "document.spec.generate",
+                        "bindings": {
+                            "instruction": {
+                                "kind": "literal",
+                                "value": "Create a deployment report document.",
+                            },
+                            "topic": {"kind": "literal", "value": "Deployment report"},
+                            "audience": {"kind": "literal", "value": "Engineers"},
+                        },
+                    },
+                    {
+                        "id": "path",
+                        "taskName": "DeriveOutputPath",
+                        "capabilityId": "derive_output_filename",
+                        "bindings": {
+                            "document_type": {"kind": "literal", "value": "document"},
+                            "output_extension": {"kind": "literal", "value": "docx"},
+                            "target_role_name": {
+                                "kind": "literal",
+                                "value": "deployment_report",
+                            },
+                        },
+                    },
+                    {
+                        "id": "render",
+                        "taskName": "RenderDocument",
+                        "capabilityId": "document.docx.render",
+                        "bindings": {
+                            "document_spec": {
+                                "kind": "step_output",
+                                "sourceNodeId": "spec",
+                                "sourcePath": "document_spec",
+                            },
+                            "path": {
+                                "kind": "step_output",
+                                "sourceNodeId": "path",
+                                "sourcePath": "path",
+                            },
+                        },
+                    },
+                ],
+                "edges": [
+                    {"fromNodeId": "spec", "toNodeId": "render"},
+                    {"fromNodeId": "path", "toNodeId": "render"},
+                ],
+            },
+        },
+    )
+
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={},
+    )
+
+    assert run_response.status_code == 200
+    body = run_response.json()
+    assert body["job"]["metadata"]["workflow_source"] == "studio"
+    assert body["job"]["metadata"]["render_path_mode"] == "auto"
+
+
+def test_studio_scheduler_advances_dependency_from_durable_step_state(monkeypatch) -> None:
+    monkeypatch.setattr(main, "STUDIO_RUN_SCHEDULER_ENABLED", True)
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Durable dependency scheduling",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Durable dependency scheduling",
+                "nodes": [
+                    {
+                        "id": "source",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    },
+                    {
+                        "id": "target",
+                        "taskName": "CaptureWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    },
+                ],
+                "edges": [{"fromNodeId": "source", "toNodeId": "target"}],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 1},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    workflow_run_id = run_body["workflow_run"]["id"]
+    job_id = run_body["job"]["id"]
+    now = _utcnow()
+
+    with SessionLocal() as db:
+        tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        tasks_by_name = {task.name: task for task in tasks}
+        source_task = tasks_by_name["ListWorkspace"]
+        target_task = tasks_by_name["CaptureWorkspace"]
+        assert source_task.status == models.TaskStatus.ready.value
+        assert target_task.status == models.TaskStatus.pending.value
+        source_task.status = models.TaskStatus.pending.value
+        source_task.updated_at = now
+        db.add(
+            StepAttemptRecord(
+                id=main._step_attempt_record_id(source_task.id, 1),
+                run_id=workflow_run_id,
+                job_id=job_id,
+                step_id=source_task.id,
+                attempt_number=1,
+                status=models.TaskStatus.completed.value,
+                worker_id="worker-a",
+                started_at=now,
+                finished_at=now,
+                error_code=None,
+                error_message=None,
+                retry_classification="succeeded",
+                result_summary_json={},
+            )
+        )
+        for row in db.query(EventOutboxRecord).all():
+            if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id:
+                db.delete(row)
+        db.commit()
+
+    main._schedule_workflow_run(workflow_run_id, correlation_id="corr-durable")
+
+    with SessionLocal() as db:
+        tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        tasks_by_name = {task.name: task for task in tasks}
+        assert tasks_by_name["ListWorkspace"].status == models.TaskStatus.completed.value
+        assert tasks_by_name["CaptureWorkspace"].status == models.TaskStatus.ready.value
+        assert tasks_by_name["CaptureWorkspace"].attempts == 1
+        event_records = db.query(EventOutboxRecord).all()
+    matching_events = [
+        row
+        for row in event_records
+        if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id
+    ]
+    ready_payloads = [
+        row.envelope_json.get("payload", {})
+        for row in matching_events
+        if row.event_type == "task.ready"
+    ]
+    assert len(ready_payloads) == 1
+    assert ready_payloads[0]["name"] == "CaptureWorkspace"
 
 
 def test_workflow_trigger_create_invoke_and_list() -> None:
@@ -176,6 +530,261 @@ def test_workflow_trigger_create_invoke_and_list() -> None:
     runs = runs_response.json()
     assert len(runs) >= 1
     assert runs[0]["trigger_id"] == trigger["id"]
+
+
+def test_task_result_persists_to_postgres_and_workflow_run_history_surfaces_latest_error() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Runtime failure visibility",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Runtime failure visibility",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 1},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    job_id = run_body["job"]["id"]
+
+    tasks_response = client.get(f"/jobs/{job_id}/tasks")
+    assert tasks_response.status_code == 200
+    task = tasks_response.json()[0]
+    task_id = task["id"]
+    task_name = task["name"]
+    now = _utcnow().isoformat()
+
+    main._handle_task_failed(
+        {
+            "task_id": task_id,
+            "payload": {
+                "task_id": task_id,
+                "status": models.TaskStatus.failed.value,
+                "outputs": {"tool_error": {"error": "contract.input_missing:job"}},
+                "artifacts": [],
+                "tool_calls": [],
+                "started_at": now,
+                "finished_at": now,
+                "error": "contract.input_missing:job",
+            },
+        }
+    )
+
+    with SessionLocal() as db:
+        row = db.query(TaskResultRecord).filter(TaskResultRecord.task_id == task_id).first()
+        assert row is not None
+        assert row.latest_error == "contract.input_missing:job"
+
+    loaded_result = main._load_task_result(task_id)
+    assert loaded_result["error"] == "contract.input_missing:job"
+
+    runs_response = client.get(f"/workflows/definitions/{definition['id']}/runs?limit=5")
+    assert runs_response.status_code == 200
+    runs = runs_response.json()
+    assert runs[0]["job_id"] == job_id
+    assert runs[0]["job_status"] == models.JobStatus.failed.value
+    assert runs[0]["latest_task_name"] == task_name
+    assert runs[0]["latest_task_error"] == "contract.input_missing:job"
+
+
+def test_publish_workflow_definition_rejects_runtime_conformance_when_secret_missing(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "GitHub capability publish gate",
+            "goal": "Check repository visibility",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "GitHub capability publish gate",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "CheckRepo",
+                        "capabilityId": "github.repo.list",
+                        "bindings": {
+                            "query": {
+                                "kind": "literal",
+                                "value": "repo:planner-executer-agentic-platform owner:narendersurabhi",
+                            }
+                        },
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 400
+    detail = publish_response.json()["detail"]
+    assert detail["error"] == "workflow_preflight_failed"
+    assert "CheckRepo" in detail["preflight_errors"]
+    assert "runtime conformance failed" in detail["preflight_errors"]["CheckRepo"]
+    assert "GITHUB_TOKEN" in detail["preflight_errors"]["CheckRepo"]
+
+
+def test_run_workflow_version_rechecks_runtime_conformance(monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "GitHub capability run gate",
+            "goal": "Check repository visibility",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "GitHub capability run gate",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "CheckRepo",
+                        "capabilityId": "github.repo.list",
+                        "bindings": {
+                            "query": {
+                                "kind": "literal",
+                                "value": "repo:planner-executer-agentic-platform owner:narendersurabhi",
+                            }
+                        },
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 1},
+    )
+    assert run_response.status_code == 400
+    detail = run_response.json()["detail"]
+    assert detail["error"] == "workflow_preflight_failed"
+    assert "CheckRepo" in detail["preflight_errors"]
+    assert "runtime conformance failed" in detail["preflight_errors"]["CheckRepo"]
+    assert "GITHUB_TOKEN" in detail["preflight_errors"]["CheckRepo"]
+
+
+def test_delete_workflow_definition_removes_related_records() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Delete me",
+            "goal": "Delete workflow definition",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Delete me",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    trigger_response = client.post(
+        f"/workflows/definitions/{definition['id']}/triggers",
+        json={
+            "title": "Delete trigger",
+            "trigger_type": "manual",
+            "enabled": True,
+            "config": {"version_mode": "latest_published"},
+        },
+    )
+    assert trigger_response.status_code == 200
+    trigger = trigger_response.json()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 0},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    assert run_body["workflow_run"]["definition_id"] == definition["id"]
+
+    delete_response = client.delete(f"/workflows/definitions/{definition['id']}")
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"ok": True}
+
+    with SessionLocal() as db:
+        assert (
+            db.query(WorkflowDefinitionRecord)
+            .filter(WorkflowDefinitionRecord.id == definition["id"])
+            .count()
+            == 0
+        )
+        assert (
+            db.query(WorkflowVersionRecord)
+            .filter(WorkflowVersionRecord.definition_id == definition["id"])
+            .count()
+            == 0
+        )
+        assert (
+            db.query(WorkflowTriggerRecord)
+            .filter(WorkflowTriggerRecord.definition_id == definition["id"])
+            .count()
+            == 0
+        )
+        assert (
+            db.query(WorkflowRunRecord)
+            .filter(WorkflowRunRecord.definition_id == definition["id"])
+            .count()
+            == 0
+        )
+
+    get_response = client.get(f"/workflows/definitions/{definition['id']}")
+    assert get_response.status_code == 404
+
+    list_response = client.get("/workflows/definitions?user_id=narendersurabhi")
+    assert list_response.status_code == 200
+    definition_ids = {item["id"] for item in list_response.json()}
+    assert definition["id"] not in definition_ids
 
 
 def test_build_workflow_interface_runtime_context_resolves_bindings() -> None:
@@ -252,10 +861,238 @@ def test_intent_clarify_endpoint_returns_assessment():
     assert response.status_code == 200
     body = response.json()
     assessment = body["assessment"]
+    envelope = body["normalized_intent_envelope"]
     assert body["goal"] == "Render a PDF status report"
     assert assessment["intent"] == "render"
-    assert assessment["needs_clarification"] is False
+    assert assessment["needs_clarification"] is True
+    assert assessment["missing_slots"] == ["path"]
     assert assessment["source"] in {"goal_text", "task_text", "explicit", "default"}
+    assert envelope["goal"] == "Render a PDF status report"
+    assert envelope["profile"]["intent"] == assessment["intent"]
+    assert envelope["clarification"]["missing_inputs"] == ["path"]
+
+
+def test_intent_clarify_endpoint_skips_vector_search_for_strong_heuristic(monkeypatch):
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del path, method, body, query, timeout_s
+        raise AssertionError("vector retriever should not run for strong heuristic intent matches")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "heuristic")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post("/intent/clarify", json={"goal": "Render a PDF status report"})
+
+    assert response.status_code == 200
+    assert response.json()["assessment"]["intent"] == "render"
+
+
+def test_intent_clarify_endpoint_skips_llm_for_strong_hybrid_inference(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            raise AssertionError(f"LLM assessment should be skipped for strong hybrid inference: {request}")
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del path, method, body, query, timeout_s
+        raise AssertionError("vector retriever should not run for strong heuristic intent matches")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "hybrid")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_intent_assess_provider", _Provider())
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post("/intent/clarify", json={"goal": "Render a PDF status report"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assessment"]["intent"] == "render"
+    assert body["assessment"]["source"] in {"goal_text", "task_text", "explicit"}
+
+
+def test_intent_clarify_endpoint_uses_llm_assessment_with_capability_catalog(monkeypatch):
+    requests: list[LLMRequest] = []
+
+    class _Provider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            requests.append(request)
+            return LLMResponse(
+                content=(
+                    '{"intent":"render","confidence":0.94,'
+                    '"suggested_capabilities":["document.pdf.render"],'
+                    '"reason":"PDF rendering capability best matches the goal"}'
+                )
+            )
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "llm")
+    monkeypatch.setattr(main, "INTENT_CAPABILITY_TOP_K", 3)
+    monkeypatch.setattr(main, "_intent_assess_provider", _Provider())
+    monkeypatch.setattr(
+        main,
+        "_intent_catalog_capability_entries",
+        lambda: [
+            {
+                "id": "document.pdf.render",
+                "group": "document",
+                "subgroup": "render",
+                "description": "Render a PDF from a document spec",
+            },
+            {
+                "id": "llm.text.generate",
+                "group": "llm",
+                "subgroup": "generate",
+                "description": "Generate text with an LLM",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "_intent_catalog_capability_ids",
+        lambda: {"document.pdf.render", "llm.text.generate"},
+    )
+    monkeypatch.setattr(
+        main,
+        "_semantic_goal_capability_hints",
+        lambda **_kwargs: [
+            {
+                "id": "document.pdf.render",
+                "score": 0.99,
+                "reason": "semantic match",
+                "source": "semantic_search",
+            }
+        ],
+    )
+
+    response = client.post("/intent/clarify", json={"goal": "Render a PDF status report"})
+    assert response.status_code == 200
+    body = response.json()
+    assessment = body["assessment"]
+    assert assessment["intent"] == "render"
+    assert assessment["source"] == "llm"
+    assert requests
+    assert requests[0].metadata is not None
+    assert requests[0].metadata["operation"] == "intent_assess"
+    assert "document.pdf.render" in requests[0].prompt
+
+
+def test_intent_clarify_endpoint_falls_back_when_llm_assessment_fails(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            del request
+            return LLMResponse(content="not-json")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "hybrid")
+    monkeypatch.setattr(main, "_intent_assess_provider", _Provider())
+    monkeypatch.setattr(main, "_intent_catalog_capability_entries", lambda: [])
+    monkeypatch.setattr(main, "_intent_catalog_capability_ids", lambda: set())
+    monkeypatch.setattr(main, "_semantic_goal_capability_hints", lambda **_kwargs: [])
+
+    response = client.post("/intent/clarify", json={"goal": "Render a PDF status report"})
+    assert response.status_code == 200
+    body = response.json()
+    assessment = body["assessment"]
+    assert assessment["intent"] == "render"
+    assert assessment["source"] in {"goal_text", "task_text", "explicit", "default"}
+
+
+def test_intent_clarify_endpoint_uses_vector_intent_for_fuzzy_goal(monkeypatch):
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 5, "chunk_ids": ["a", "b", "c"]}
+        if path == "/retrieve":
+            assert body is not None
+            assert body["query"] == "Polish this document spec for release readiness"
+            return {
+                "matches": [
+                    {
+                        "document_id": "transform",
+                        "score": 0.88,
+                        "metadata": {"intent_id": "transform"},
+                    },
+                    {
+                        "document_id": "generate",
+                        "score": 0.53,
+                        "metadata": {"intent_id": "generate"},
+                    },
+                ]
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "heuristic")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post(
+        "/intent/clarify",
+        json={"goal": "Polish this document spec for release readiness"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assessment = body["assessment"]
+    assert assessment["intent"] == "transform"
+    assert assessment["source"] == "vector"
+    assert assessment["needs_clarification"] is False
+
+
+def test_intent_clarify_endpoint_uses_vector_fallback_when_llm_assessment_fails(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            del request
+            return LLMResponse(content="not-json")
+
+    def _rag_request(path, *, method="GET", body=None, query=None, timeout_s=20.0):
+        del method, query, timeout_s
+        if path == "/index/upsert_texts":
+            return {"collection_name": "test", "upserted_count": 5, "chunk_ids": ["a", "b", "c"]}
+        if path == "/retrieve":
+            assert body is not None
+            assert body["query"] == "Polish this document spec for release readiness"
+            return {
+                "matches": [
+                    {
+                        "document_id": "transform",
+                        "score": 0.86,
+                        "metadata": {"intent_id": "transform"},
+                    },
+                    {
+                        "document_id": "generate",
+                        "score": 0.55,
+                        "metadata": {"intent_id": "generate"},
+                    },
+                ]
+            }
+        raise AssertionError(f"unexpected RAG path: {path}")
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "hybrid")
+    monkeypatch.setattr(main, "INTENT_VECTOR_SEARCH_ENABLED", True)
+    monkeypatch.setattr(main, "_intent_assess_provider", _Provider())
+    monkeypatch.setattr(main, "_intent_catalog_capability_entries", lambda: [])
+    monkeypatch.setattr(main, "_intent_catalog_capability_ids", lambda: set())
+    monkeypatch.setattr(main, "_semantic_goal_capability_hints", lambda **_kwargs: [])
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _rag_request)
+    monkeypatch.setattr(main, "_intent_vector_synced_namespace", None)
+
+    response = client.post(
+        "/intent/clarify",
+        json={"goal": "Polish this document spec for release readiness"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assessment = body["assessment"]
+    assert assessment["intent"] == "transform"
+    assert assessment["source"] == "vector"
+    assert assessment["needs_clarification"] is False
 
 
 def test_intent_decompose_endpoint_returns_graph():
@@ -266,11 +1103,90 @@ def test_intent_decompose_endpoint_returns_graph():
     assert response.status_code == 200
     body = response.json()
     graph = body["intent_graph"]
+    envelope = body["normalized_intent_envelope"]
+    assessment = body["assessment"]
     assert graph["summary"]["segment_count"] >= 2
     assert graph["segments"][0]["id"] == "s1"
     assert graph["summary"]["schema_version"] == "intent_v2"
     assert isinstance(graph["segments"][0].get("slots"), dict)
     assert "must_have_inputs" in graph["segments"][0]["slots"]
+    assert envelope["graph"] == graph
+    assert envelope["profile"] == assessment
+
+
+def test_intent_decompose_endpoint_uses_normalized_envelope_without_assessment_llm(monkeypatch):
+    class _AssessProvider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            raise AssertionError(f"assessment provider should not be called: {request.metadata}")
+
+    class _DecomposeProvider(LLMProvider):
+        def generate_request(self, request: LLMRequest):
+            return LLMResponse(
+                content=(
+                    '{"segments":[{"id":"s1","intent":"generate","objective":"Create summary",'
+                    '"confidence":0.92,"depends_on":[],"required_inputs":["instruction"],'
+                    '"suggested_capabilities":["llm.text.generate"],'
+                    '"slots":{"entity":"summary","artifact_type":"content","output_format":"txt",'
+                    '"risk_level":"read_only","must_have_inputs":["instruction"]}}]}'
+                )
+            )
+
+    monkeypatch.setattr(main, "INTENT_ASSESS_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_ASSESS_MODE", "hybrid")
+    monkeypatch.setattr(main, "_intent_assess_provider", _AssessProvider())
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_MODE", "llm")
+    monkeypatch.setattr(main, "_intent_decompose_provider", _DecomposeProvider())
+
+    response = client.post("/intent/decompose", json={"goal": "Create summary"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assessment"]["source"] in {"goal_text", "task_text", "explicit", "default"}
+    assert body["normalized_intent_envelope"]["profile"] == body["assessment"]
+    assert body["normalized_intent_envelope"]["graph"] == body["intent_graph"]
+
+
+def test_intent_clarify_endpoint_uses_intent_context_projection_for_slots(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_assess_goal_intent",
+        lambda goal_text, mode_override=None: workflow_contracts.GoalIntentProfile(
+            intent="generate",
+            source="test",
+            confidence=0.93,
+            risk_level="read_only",
+            threshold=0.7,
+            low_confidence=False,
+            needs_clarification=True,
+            requires_blocking_clarification=True,
+            questions=["What tone should I use?"],
+            blocking_slots=["tone"],
+            missing_slots=["tone"],
+            slot_values={"intent_action": "generate", "topic": "Deployment report"},
+        ),
+    )
+
+    response = client.post(
+        "/intent/clarify",
+        json={
+            "goal": "Generate a deployment report",
+            "context_json": {
+                "tone": "practical",
+                "clarification_normalization": {"fields": ["tone"]},
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assessment"]["needs_clarification"] is False
+    assert body["assessment"]["missing_slots"] == []
+    assert body["assessment"]["slot_values"]["tone"] == "practical"
+    assert body["normalized_intent_envelope"]["trace"]["context_projection"] == "intent"
+    assert (
+        body["normalized_intent_envelope"]["trace"]["context_slot_provenance"]["tone"]
+        == "clarification_normalized"
+    )
 
 
 def test_capabilities_search_returns_ranked_matches() -> None:
@@ -284,7 +1200,7 @@ def test_capabilities_search_returns_ranked_matches() -> None:
     assert body["intent"] == "render"
     assert len(body["items"]) >= 1
     ids = [item["id"] for item in body["items"]]
-    assert "document.pdf.generate" in ids
+    assert "document.pdf.render" in ids
     first = body["items"][0]
     assert isinstance(first["score"], float)
     assert isinstance(first["reason"], str) and first["reason"]
@@ -317,7 +1233,7 @@ def test_capabilities_search_emits_capability_search_event(monkeypatch) -> None:
     assert payload["correlation_id"] == "corr-search-1"
     assert payload["job_id"] == "job-search-1"
     assert payload["result_count"] >= 1
-    assert any(item["id"] == "document.pdf.generate" for item in payload["results"])
+    assert any(item["id"] == "document.pdf.render" for item in payload["results"])
 
 
 def test_capabilities_search_requires_query() -> None:
@@ -414,6 +1330,35 @@ def test_intent_decompose_endpoint_filters_unknown_llm_capabilities(monkeypatch)
     assert all(capability_id in catalog_ids for capability_id in suggested)
 
 
+def test_intent_decompose_endpoint_reconciles_legacy_render_capability_intent(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate(self, prompt: str):  # noqa: ARG002
+            return LLMResponse(
+                content=(
+                    '{"segments":[{"id":"s1","intent":"generate","objective":"Render PDF",'
+                    '"confidence":0.9,"depends_on":[],"required_inputs":["document_spec","path"],'
+                    '"suggested_capabilities":["document.pdf.generate"],'
+                    '"slots":{"entity":"artifact","artifact_type":"document","output_format":"pdf",'
+                    '"risk_level":"bounded_write","must_have_inputs":["document_spec","path"]}}]}'
+                )
+            )
+
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_MODE", "llm")
+    monkeypatch.setattr(main, "_intent_decompose_provider", _Provider())
+
+    response = client.post("/intent/decompose", json={"goal": "Render a PDF report"})
+
+    assert response.status_code == 200
+    graph = response.json()["intent_graph"]
+    segment = graph["segments"][0]
+    assert segment["intent"] == "render"
+    assert segment["suggested_capabilities"] == ["document.pdf.render"]
+    rankings = segment.get("suggested_capability_rankings")
+    assert isinstance(rankings, list)
+    assert rankings[0]["id"] == "document.pdf.render"
+
+
 def test_intent_decompose_endpoint_normalizes_capability_id_casing(monkeypatch):
     class _Provider(LLMProvider):
         def generate(self, prompt: str):  # noqa: ARG002
@@ -450,7 +1395,7 @@ def test_intent_decompose_endpoint_limits_capability_rankings_to_top_k(monkeypat
                     '{"segments":[{"id":"s1","intent":"generate","objective":"Create summary",'
                     '"confidence":0.9,"depends_on":[],"required_inputs":["instruction"],'
                     '"suggested_capabilities":["llm.text.generate","document.spec.generate",'
-                    '"document.spec.validate","document.pdf.generate"]}]}'
+                    '"document.spec.validate","document.pdf.render"]}]}'
                 )
             )
 
@@ -557,18 +1502,19 @@ def test_create_job_requires_intent_clarification_when_confidence_is_low():
     assert detail["goal_intent_profile"]["needs_clarification"] is True
 
 
-def test_create_job_clarification_gate_blocks_only_blocking_slots(monkeypatch):
+def test_create_job_clarification_gate_blocks_capability_required_path(monkeypatch):
     monkeypatch.setattr(main, "INTENT_MIN_CONFIDENCE", 0.99)
     monkeypatch.setattr(main, "INTENT_CLARIFICATION_BLOCKING_SLOTS", {"output_format"})
     response = client.post(
         "/jobs?require_clarification=true",
         json={"goal": "Render a PDF deployment report", "context_json": {}, "priority": 0},
     )
-    assert response.status_code == 200
-    profile = response.json()["metadata"]["goal_intent_profile"]
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    profile = detail["goal_intent_profile"]
     assert profile["low_confidence"] is True
-    assert profile["missing_slots"] == []
-    assert profile["requires_blocking_clarification"] is False
+    assert profile["missing_slots"] == ["path"]
+    assert profile["requires_blocking_clarification"] is True
 
 
 def test_create_job_rejects_invalid_interaction_summaries_in_context():
@@ -732,8 +1678,11 @@ def test_create_job_persists_goal_intent_graph():
     assert response.status_code == 200
     metadata = response.json()["metadata"]
     assert "goal_intent_graph" in metadata
+    assert "normalized_intent_envelope" in metadata
     graph = metadata["goal_intent_graph"]
+    envelope = metadata["normalized_intent_envelope"]
     assert graph["summary"]["segment_count"] >= 2
+    assert envelope["graph"]["summary"]["segment_count"] == graph["summary"]["segment_count"]
 
 
 def test_intent_decompose_uses_semantic_workflow_hints_in_llm_prompt(monkeypatch):
@@ -772,7 +1721,7 @@ def test_intent_decompose_uses_semantic_workflow_hints_in_llm_prompt(monkeypatch
             "goal": "Render monthly pdf report",
             "outcome": "succeeded",
             "intent_order": ["generate", "render"],
-            "capabilities": ["document.spec.generate", "document.pdf.generate"],
+            "capabilities": ["document.spec.generate", "document.pdf.render"],
             "confidence": 0.9,
             "threshold": 0.7,
         }
@@ -828,7 +1777,7 @@ def test_intent_decompose_uses_semantic_capability_hints_in_llm_prompt(monkeypat
                 content=(
                     '{"segments":[{"id":"s1","intent":"render","objective":"Render pdf report",'
                     '"confidence":0.9,"depends_on":[],"required_inputs":["document_spec","path"],'
-                    '"suggested_capabilities":["document.pdf.generate"]}]}'
+                    '"suggested_capabilities":["document.pdf.render"]}]}'
                 )
             )
 
@@ -845,7 +1794,7 @@ def test_intent_decompose_uses_semantic_capability_hints_in_llm_prompt(monkeypat
     assert graph["summary"]["semantic_capability_hints_used"] >= 1
     assert prompts
     assert "Most relevant capabilities for this goal from local semantic search" in prompts[0]
-    assert "document.pdf.generate" in prompts[0]
+    assert "document.pdf.render" in prompts[0]
 
 
 def test_intent_decompose_emits_capability_search_event_for_semantic_hints(monkeypatch):
@@ -1277,13 +2226,54 @@ def test_job_details():
         db.add(
             JobRecord(
                 id=job_id,
-                goal="details",
+                goal="Render the detail report",
                 context_json={},
                 status=models.JobStatus.queued.value,
                 created_at=now,
                 updated_at=now,
                 priority=0,
-                metadata_json={},
+                metadata_json={
+                    "normalized_intent_envelope": {
+                        "goal": "Render the detail report",
+                        "profile": {
+                            "intent": "render",
+                            "source": "llm",
+                            "needs_clarification": True,
+                            "requires_blocking_clarification": True,
+                            "missing_slots": ["path"],
+                            "blocking_slots": ["path"],
+                            "questions": ["What output path or filename should be used?"],
+                            "slot_values": {"intent_action": "render", "output_format": "pdf"},
+                            "clarification_mode": "capability_required_inputs",
+                        },
+                        "graph": {
+                            "segments": [
+                                {
+                                    "id": "s1",
+                                    "intent": "render",
+                                    "objective": "Render the final PDF",
+                                    "suggested_capabilities": ["document.pdf.render"],
+                                }
+                            ]
+                        },
+                        "candidate_capabilities": {"s1": ["document.pdf.render"]},
+                        "clarification": {
+                            "needs_clarification": True,
+                            "requires_blocking_clarification": True,
+                            "missing_inputs": ["path"],
+                            "questions": ["What output path or filename should be used?"],
+                            "blocking_slots": ["path"],
+                            "slot_values": {"intent_action": "render", "output_format": "pdf"},
+                            "clarification_mode": "capability_required_inputs",
+                        },
+                        "trace": {
+                            "assessment_source": "llm",
+                            "assessment_mode": "hybrid",
+                            "decomposition_source": "llm",
+                            "decomposition_mode": "llm",
+                        },
+                    }
+                },
             )
         )
         db.add(
@@ -1332,9 +2322,15 @@ def test_job_details():
     assert len(data["tasks"]) == 1
     assert data["tasks"][0]["id"] == task_id
     assert task_id in data["task_results"]
+    assert data["normalized_intent_envelope"]["goal"] == "Render the detail report"
+    assert data["goal_intent_profile"]["intent"] == "render"
+    assert data["goal_intent_graph"]["segments"][0]["id"] == "s1"
+    assert data["normalization_trace"]["assessment_source"] == "llm"
+    assert data["normalization_clarification"]["missing_inputs"] == ["path"]
+    assert data["normalization_candidate_capabilities"] == {"s1": ["document.pdf.render"]}
 
 
-def test_job_debugger_returns_timeline_and_error_classification(monkeypatch):
+def test_job_debugger_returns_timeline_and_error_classification():
     job_id = f"job-debug-{uuid.uuid4()}"
     plan_id = f"plan-debug-{uuid.uuid4()}"
     task_id = f"task-debug-{uuid.uuid4()}"
@@ -1349,7 +2345,29 @@ def test_job_debugger_returns_timeline_and_error_classification(monkeypatch):
                 created_at=now,
                 updated_at=now,
                 priority=0,
-                metadata_json={},
+                metadata_json={
+                    "goal_intent_profile": {
+                        "intent": "io",
+                        "source": "heuristic",
+                        "needs_clarification": True,
+                        "requires_blocking_clarification": True,
+                        "missing_slots": ["target_system"],
+                        "blocking_slots": ["target_system"],
+                        "questions": ["Which target system should this use?"],
+                        "slot_values": {"intent_action": "io"},
+                        "clarification_mode": "targeted_slot_filling",
+                    },
+                    "goal_intent_graph": {
+                        "segments": [
+                            {
+                                "id": "s1",
+                                "intent": "io",
+                                "objective": "List repositories",
+                                "suggested_capabilities": ["github.repo.list"],
+                            }
+                        ]
+                    },
+                },
             )
         )
         db.add(
@@ -1390,45 +2408,135 @@ def test_job_debugger_returns_timeline_and_error_classification(monkeypatch):
         )
         db.commit()
 
-    monkeypatch.setattr(
-        main,
-        "_load_task_result",
-        lambda _task_id: {"task_id": _task_id, "error": "contract.input_missing:job"},
-    )
-    monkeypatch.setattr(
-        main,
-        "_read_task_events_for_job",
-        lambda _job_id, _limit: [
-            {
-                "stream_id": "1-0",
-                "type": "task.started",
-                "occurred_at": now.isoformat(),
-                "job_id": _job_id,
-                "task_id": task_id,
-                "status": "running",
-                "attempts": 2,
-                "max_attempts": 3,
-                "worker_consumer": "worker-a",
-                "run_id": "run-1",
-                "error": "",
-            }
-        ],
-    )
+    started_envelope = models.EventEnvelope(
+        type="task.started",
+        version="1",
+        occurred_at=now,
+        correlation_id=f"corr-start-{uuid.uuid4()}",
+        job_id=job_id,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "attempts": 2,
+            "max_attempts": 3,
+            "worker_consumer": "worker-a",
+            "run_id": "run-1",
+        },
+    ).model_dump(mode="json")
+    failed_envelope = models.EventEnvelope(
+        type="task.failed",
+        version="1",
+        occurred_at=now + timedelta(seconds=1),
+        correlation_id=f"corr-fail-{uuid.uuid4()}",
+        job_id=job_id,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "status": models.TaskStatus.failed.value,
+            "outputs": {
+                "tool_error": {
+                    "error": "contract.input_missing:job",
+                    "error_code": "contract.input_missing",
+                }
+            },
+            "artifacts": [
+                {
+                    "type": "run_scorecard",
+                    "summary": {"total_latency_ms": 125, "failure_stage": "task_execution"},
+                }
+            ],
+            "tool_calls": [
+                models.ToolCall(
+                    tool_name="document.spec.generate",
+                    input={"job": {"topic": "latency"}},
+                    idempotency_key="debug-call-1",
+                    trace_id="trace-debug-1",
+                    request_id="document.spec.generate",
+                    capability_id="document.spec.generate",
+                    adapter_id="local_tool:document.spec.generate",
+                    started_at=now,
+                    finished_at=now + timedelta(milliseconds=125),
+                    status="failed",
+                    output_or_error={
+                        "error": "contract.input_missing:job",
+                        "error_code": "contract.input_missing",
+                    },
+                ).model_dump(mode="json")
+            ],
+            "started_at": now.isoformat(),
+            "finished_at": (now + timedelta(seconds=1)).isoformat(),
+            "error": "contract.input_missing:job",
+            "attempts": 2,
+            "max_attempts": 3,
+            "worker_consumer": "worker-a",
+            "run_id": "run-1",
+        },
+    ).model_dump(mode="json")
+
+    main._handle_event(events.TASK_STREAM, {"data": json.dumps(started_envelope)})
+    main._handle_event(events.TASK_STREAM, {"data": json.dumps(failed_envelope)})
+
+    with SessionLocal() as db:
+        step_attempt_rows = db.query(StepAttemptRecord).filter(StepAttemptRecord.job_id == job_id).all()
+        invocation_rows = db.query(InvocationRecord).filter(InvocationRecord.job_id == job_id).all()
+        run_event_rows = (
+            db.query(RunEventRecord)
+            .filter(RunEventRecord.job_id == job_id)
+            .order_by(RunEventRecord.occurred_at.asc())
+            .all()
+        )
+    assert len(step_attempt_rows) == 1
+    assert step_attempt_rows[0].attempt_number == 2
+    assert step_attempt_rows[0].status == models.TaskStatus.failed.value
+    assert step_attempt_rows[0].retry_classification == "terminal_contract"
+    assert len(invocation_rows) == 1
+    assert invocation_rows[0].capability_id == "document.spec.generate"
+    assert len(run_event_rows) == 2
+    assert [row.event_type for row in run_event_rows] == ["task.started", "task.failed"]
+
+    attempts_response = client.get(f"/jobs/{job_id}/debugger/attempts")
+    assert attempts_response.status_code == 200
+    attempts_payload = attempts_response.json()
+    assert len(attempts_payload) == 1
+    assert attempts_payload[0]["attempt_number"] == 2
+
+    invocations_response = client.get(f"/jobs/{job_id}/debugger/invocations")
+    assert invocations_response.status_code == 200
+    invocations_payload = invocations_response.json()
+    assert len(invocations_payload) == 1
+    assert invocations_payload[0]["request_id"] == "document.spec.generate"
+
+    events_response = client.get(f"/jobs/{job_id}/debugger/events")
+    assert events_response.status_code == 200
+    events_payload = events_response.json()
+    assert len(events_payload) == 2
+    assert [entry["event_type"] for entry in events_payload] == ["task.started", "task.failed"]
 
     response = client.get(f"/jobs/{job_id}/debugger")
     assert response.status_code == 200
     payload = response.json()
     assert payload["job_id"] == job_id
-    assert payload["job_status"] == "running"
+    assert payload["job_status"] == "failed"
     assert payload["plan_id"] == plan_id
-    assert payload["timeline_events_scanned"] == 1
+    assert payload["timeline_events_scanned"] == 2
+    assert payload["goal_intent_profile"]["intent"] == "io"
+    assert payload["goal_intent_graph"]["segments"][0]["id"] == "s1"
+    assert payload["normalized_intent_envelope"]["goal"] == "debug"
+    assert payload["normalization_trace"] == {}
+    assert payload["normalization_clarification"]["missing_inputs"] == ["target_system"]
+    assert payload["normalization_candidate_capabilities"] == {"s1": ["github.repo.list"]}
     assert len(payload["tasks"]) == 1
     task_payload = payload["tasks"][0]
     assert task_payload["task"]["id"] == task_id
     assert task_payload["tool_inputs_resolved"] is True
     assert task_payload["error"]["category"] == "contract"
     assert task_payload["error"]["retryable"] is False
-    assert len(task_payload["timeline"]) == 1
+    assert len(task_payload["timeline"]) == 2
+    assert len(task_payload["attempts"]) == 1
+    assert task_payload["attempts"][0]["attempt_number"] == 2
+    assert task_payload["attempts"][0]["status"] == "failed"
+    assert len(task_payload["attempts"][0]["invocations"]) == 1
+    assert task_payload["attempts"][0]["invocations"][0]["capability_id"] == "document.spec.generate"
 
 
 def test_plan_created_enqueues_ready_tasks():
@@ -1459,7 +2567,7 @@ def test_plan_created_enqueues_ready_tasks():
                 acceptance_criteria=["ok"],
                 expected_output_schema_ref="TaskResult",
                 deps=[],
-                tool_requests=[],
+                tool_requests=["filesystem.workspace.list"],
                 critic_required=False,
             ),
             models.TaskCreate(
@@ -1469,7 +2577,7 @@ def test_plan_created_enqueues_ready_tasks():
                 acceptance_criteria=["ok"],
                 expected_output_schema_ref="TaskResult",
                 deps=["t1"],
-                tool_requests=[],
+                tool_requests=["filesystem.workspace.list"],
                 critic_required=False,
             ),
         ],
@@ -1499,7 +2607,196 @@ def test_plan_created_enqueues_ready_tasks():
     assert any(event_type == "task.ready" for event_type, _ in events)
 
 
-def test_handle_plan_created_persists_embedded_capability_bindings() -> None:
+def test_plan_created_with_run_spec_uses_postgres_scheduler_for_planner_jobs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main, "PLANNER_RUN_SCHEDULER_ENABLED", True)
+    job_id = f"job-test-planner-run-spec-{uuid.uuid4()}"
+    now = _utcnow()
+    with SessionLocal() as db:
+        db.add(
+            JobRecord(
+                id=job_id,
+                goal="demo",
+                context_json={},
+                status=models.JobStatus.queued.value,
+                created_at=now,
+                updated_at=now,
+                priority=0,
+                metadata_json={},
+            )
+        )
+        db.commit()
+    plan = models.PlanCreate(
+        planner_version="test",
+        tasks_summary="t1 then t2",
+        dag_edges=[["t1", "t2"]],
+        tasks=[
+            models.TaskCreate(
+                name="t1",
+                description="first",
+                instruction="do first",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="TaskResult",
+                deps=[],
+                tool_requests=["filesystem.workspace.list"],
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="t2",
+                description="second",
+                instruction="do second",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="TaskResult",
+                deps=["t1"],
+                tool_requests=["filesystem.workspace.list"],
+                critic_required=False,
+            ),
+        ],
+    )
+    run_spec = run_specs.plan_to_run_spec(plan, kind=models.RunKind.planner)
+    envelope = {
+        "type": "plan.created",
+        "payload": {"job_id": job_id, "run_spec": run_spec.model_dump(mode="json")},
+        "job_id": job_id,
+        "correlation_id": "corr-planner",
+    }
+    events: list[tuple[str, dict]] = []
+    original_emit = main._emit_event
+    try:
+        main._emit_event = lambda event_type, event_payload: events.append(
+            (event_type, event_payload)
+        )
+        main._handle_plan_created(envelope)
+    finally:
+        main._emit_event = original_emit
+
+    with SessionLocal() as db:
+        job = db.query(JobRecord).filter(JobRecord.id == job_id).one()
+        tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        by_name = {task.name: task for task in tasks}
+        assert by_name["t1"].status == models.TaskStatus.ready.value
+        assert by_name["t2"].status == models.TaskStatus.pending.value
+        assert job.metadata_json["scheduler_mode"] == main.POSTGRES_RUN_SPEC_SCHEDULER_MODE
+        stored_run_spec = run_specs.parse_run_spec(job.metadata_json.get("run_spec"))
+        assert stored_run_spec is not None
+        assert stored_run_spec.kind == models.RunKind.planner
+    assert any(event_type == "task.ready" for event_type, _ in events)
+
+
+def test_planner_scheduler_advances_dependency_from_durable_step_state(monkeypatch) -> None:
+    monkeypatch.setattr(main, "PLANNER_RUN_SCHEDULER_ENABLED", True)
+    job_id = f"job-test-planner-durable-{uuid.uuid4()}"
+    now = _utcnow()
+    with SessionLocal() as db:
+        db.add(
+            JobRecord(
+                id=job_id,
+                goal="demo",
+                context_json={},
+                status=models.JobStatus.queued.value,
+                created_at=now,
+                updated_at=now,
+                priority=0,
+                metadata_json={},
+            )
+        )
+        db.commit()
+    plan = models.PlanCreate(
+        planner_version="test",
+        tasks_summary="t1 then t2",
+        dag_edges=[["t1", "t2"]],
+        tasks=[
+            models.TaskCreate(
+                name="t1",
+                description="first",
+                instruction="do first",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="TaskResult",
+                deps=[],
+                tool_requests=["filesystem.workspace.list"],
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="t2",
+                description="second",
+                instruction="do second",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="TaskResult",
+                deps=["t1"],
+                tool_requests=["filesystem.workspace.list"],
+                critic_required=False,
+            ),
+        ],
+    )
+    run_spec = run_specs.plan_to_run_spec(plan, kind=models.RunKind.planner)
+    main._handle_plan_created(
+        {
+            "type": "plan.created",
+            "payload": {"job_id": job_id, "run_spec": run_spec.model_dump(mode="json")},
+            "job_id": job_id,
+            "correlation_id": "corr-initial",
+        }
+    )
+
+    with SessionLocal() as db:
+        plan_record = db.query(PlanRecord).filter(PlanRecord.job_id == job_id).one()
+        plan_id = plan_record.id
+        tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        tasks_by_name = {task.name: task for task in tasks}
+        source_task = tasks_by_name["t1"]
+        target_task = tasks_by_name["t2"]
+        assert source_task.status == models.TaskStatus.ready.value
+        assert target_task.status == models.TaskStatus.pending.value
+        source_task.status = models.TaskStatus.pending.value
+        source_task.updated_at = now
+        db.add(
+            StepAttemptRecord(
+                id=main._step_attempt_record_id(source_task.id, 1),
+                run_id=job_id,
+                job_id=job_id,
+                step_id=source_task.id,
+                attempt_number=1,
+                status=models.TaskStatus.completed.value,
+                worker_id="worker-a",
+                started_at=now,
+                finished_at=now,
+                error_code=None,
+                error_message=None,
+                retry_classification="succeeded",
+                result_summary_json={},
+            )
+        )
+        for row in db.query(EventOutboxRecord).all():
+            if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id:
+                db.delete(row)
+        db.commit()
+
+    main._dispatch_ready_work_for_job(job_id, plan_id, "corr-durable-planner")
+
+    with SessionLocal() as db:
+        tasks = db.query(TaskRecord).filter(TaskRecord.job_id == job_id).all()
+        tasks_by_name = {task.name: task for task in tasks}
+        assert tasks_by_name["t1"].status == models.TaskStatus.completed.value
+        assert tasks_by_name["t2"].status == models.TaskStatus.ready.value
+        assert tasks_by_name["t2"].attempts == 1
+        event_records = db.query(EventOutboxRecord).all()
+    matching_events = [
+        row
+        for row in event_records
+        if isinstance(row.envelope_json, dict) and row.envelope_json.get("job_id") == job_id
+    ]
+    ready_payloads = [
+        row.envelope_json.get("payload", {})
+        for row in matching_events
+        if row.event_type == "task.ready"
+    ]
+    assert len(ready_payloads) == 1
+    assert ready_payloads[0]["name"] == "t2"
+
+
+def test_handle_plan_created_persists_embedded_capability_bindings(monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     job_id = f"job-test-bindings-{uuid.uuid4()}"
     now = _utcnow()
     with SessionLocal() as db:
@@ -1772,6 +3069,12 @@ def test_list_capabilities_returns_required_inputs(monkeypatch):
     assert item["required_inputs"] == ["query"]
 
 
+def test_capability_required_inputs_uses_repo_local_schema_fallback(monkeypatch):
+    monkeypatch.setattr(main, "SCHEMA_REGISTRY_PATH", "/tmp/missing-schemas")
+    required = main._capability_required_inputs_for_intent_normalization("github.issue.search")
+    assert required == ["query"]
+
+
 def test_composer_recommend_capabilities_heuristic(monkeypatch):
     spec_generate = cap_registry.CapabilitySpec(
         capability_id="document.spec.generate",
@@ -1783,12 +3086,12 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
         adapters=(),
         enabled=True,
     )
-    spec_derive = cap_registry.CapabilitySpec(
-        capability_id="document.output.derive",
-        description="Derive output path",
-        risk_tier="read_only",
+    spec_render = cap_registry.CapabilitySpec(
+        capability_id="document.pdf.render",
+        description="Render a PDF",
+        risk_tier="bounded_write",
         idempotency="read",
-        input_schema_ref="schema_derive",
+        input_schema_ref="schema_render",
         output_schema_ref=None,
         adapters=(),
         enabled=True,
@@ -1796,7 +3099,7 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
     registry = cap_registry.CapabilityRegistry(
         capabilities={
             "document.spec.generate": spec_generate,
-            "document.output.derive": spec_derive,
+            "document.pdf.render": spec_render,
         }
     )
     monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
@@ -1808,11 +3111,14 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
                 "required": ["topic"],
                 "properties": {"topic": {"type": "string"}},
             }
-        if schema_ref == "schema_derive":
+        if schema_ref == "schema_render":
             return {
                 "type": "object",
-                "required": ["topic"],
-                "properties": {"topic": {"type": "string"}},
+                "required": ["document_spec", "path"],
+                "properties": {
+                    "document_spec": {"type": "object"},
+                    "path": {"type": "string"},
+                },
             }
         return None
 
@@ -1820,8 +3126,8 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
     response = client.post(
         "/composer/recommend_capabilities",
         json={
-            "goal": "Use document.output.derive for output path",
-            "context_json": {"topic": "Latency"},
+            "goal": "Render the generated document to a PDF",
+            "context_json": {"topic": "Latency", "path": "documents/latency.pdf"},
             "draft": {"nodes": [{"id": "n1", "capabilityId": "document.spec.generate"}]},
             "use_llm": False,
             "max_results": 3,
@@ -1832,7 +3138,7 @@ def test_composer_recommend_capabilities_heuristic(monkeypatch):
     assert body["source"] == "heuristic"
     assert isinstance(body["recommendations"], list)
     assert len(body["recommendations"]) >= 1
-    assert body["recommendations"][0]["id"] == "document.output.derive"
+    assert body["recommendations"][0]["id"] == "document.pdf.render"
 
 
 def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
@@ -1846,12 +3152,12 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
         adapters=(),
         enabled=True,
     )
-    spec_derive = cap_registry.CapabilitySpec(
-        capability_id="document.output.derive",
-        description="Derive output path",
-        risk_tier="read_only",
+    spec_render = cap_registry.CapabilitySpec(
+        capability_id="document.pdf.render",
+        description="Render a PDF",
+        risk_tier="bounded_write",
         idempotency="read",
-        input_schema_ref="schema_derive",
+        input_schema_ref="schema_render",
         output_schema_ref=None,
         adapters=(),
         enabled=True,
@@ -1859,15 +3165,11 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
     registry = cap_registry.CapabilityRegistry(
         capabilities={
             "document.spec.generate": spec_generate,
-            "document.output.derive": spec_derive,
+            "document.pdf.render": spec_render,
         }
     )
     monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
-    monkeypatch.setattr(
-        main,
-        "_load_schema_from_ref",
-        lambda _ref: {"type": "object", "required": ["topic"], "properties": {"topic": {"type": "string"}}},
-    )
+    monkeypatch.setattr(main, "_load_schema_from_ref", lambda _ref: {"type": "object"})
 
     requests: list[LLMRequest] = []
 
@@ -1875,7 +3177,7 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
         def generate_request(self, request: LLMRequest):
             requests.append(request)
             return LLMResponse(
-                content='{"recommendations":[{"id":"document.output.derive","reason":"next step","confidence":0.91}]}'
+                content='{"recommendations":[{"id":"document.pdf.render","reason":"next step","confidence":0.91}]}'
             )
 
     monkeypatch.setattr(main, "_composer_recommender_provider", _Provider())
@@ -1893,13 +3195,42 @@ def test_composer_recommend_capabilities_uses_llm_when_available(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["source"] == "llm"
-    assert body["recommendations"][0]["id"] == "document.output.derive"
+    assert body["recommendations"][0]["id"] == "document.pdf.render"
     assert requests
     assert requests[0].metadata is not None
     assert requests[0].metadata["operation"] == "capability_recommendations"
 
 
 def test_preflight_plan_endpoint_returns_valid_true_for_simple_plan():
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "simple",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "TransformData",
+                    "description": "transform",
+                    "instruction": "transform",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "deps": [],
+                    "tool_requests": ["utility.json.transform"],
+                    "tool_inputs": {"utility.json.transform": {"input": {"name": "demo"}}},
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {},
+    }
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
+
+
+def test_preflight_plan_endpoint_rejects_raw_runtime_tool_name() -> None:
     payload = {
         "plan": {
             "planner_version": "ui_chaining_composer_v1",
@@ -1921,7 +3252,182 @@ def test_preflight_plan_endpoint_returns_valid_true_for_simple_plan():
         },
         "job_context": {},
     }
+
     response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["TransformData"] == (
+        "planner_request_language_invalid:json_transform:"
+        "use_capability_id:utility.json.transform"
+    )
+    assert body["diagnostics"][0]["code"] == "planner_request_language_invalid"
+
+
+def test_preflight_plan_endpoint_rejects_render_task_without_explicit_path() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": [],
+                    "tool_requests": ["document.docx.render"],
+                    "tool_inputs": {"document.docx.render": {"document_spec": {"blocks": []}}},
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["RenderDocx"] == "render_path_explicit_required:document.docx.render"
+    assert body["diagnostics"][0]["code"] == "render_path_explicit_required"
+
+
+def test_preflight_plan_endpoint_rejects_dependency_derived_render_path() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [["DeriveOutputPath", "RenderDocx"]],
+            "tasks": [
+                {
+                    "name": "DeriveOutputPath",
+                    "description": "Derive output path",
+                    "instruction": "derive",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "transform",
+                    "deps": [],
+                    "tool_requests": ["derive_output_filename"],
+                    "tool_inputs": {
+                        "derive_output_filename": {
+                            "document_type": "document",
+                            "output_extension": "docx",
+                            "target_role_name": "deployment_report",
+                        }
+                    },
+                    "critic_required": False,
+                },
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": ["DeriveOutputPath"],
+                    "tool_requests": ["document.docx.render"],
+                    "tool_inputs": {
+                        "document.docx.render": {
+                            "document_spec": {"blocks": []},
+                            "path": {
+                                "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
+                            },
+                        }
+                    },
+                    "critic_required": False,
+                },
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["RenderDocx"] == "render_path_derived_not_allowed:document.docx.render"
+    assert any(
+        diagnostic["code"] == "render_path_derived_not_allowed"
+        and diagnostic["field"] == "RenderDocx"
+        for diagnostic in body["diagnostics"]
+    )
+
+
+def test_preflight_plan_endpoint_accepts_render_output_path_alias_literal() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": [],
+                    "tool_requests": ["document.docx.render"],
+                    "tool_inputs": {
+                        "document.docx.render": {
+                            "document_spec": {"blocks": []},
+                            "output_path": "documents/report.docx",
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
+
+
+def test_preflight_plan_endpoint_accepts_render_path_from_job_context_reference() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "render",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "RenderDocx",
+                    "description": "Render document",
+                    "instruction": "Render the document",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "render",
+                    "deps": [],
+                    "tool_requests": ["document.docx.render"],
+                    "tool_inputs": {
+                        "document.docx.render": {
+                            "document_spec": {"blocks": []},
+                            "path": {"$from": "job_context.path"},
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {"path": "documents/report.docx"},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+
     assert response.status_code == 200
     body = response.json()
     assert body["valid"] is True
@@ -1995,8 +3501,8 @@ def test_preflight_plan_endpoint_rejects_tool_intent_mismatch():
                     "expected_output_schema_ref": "",
                     "intent": "io",
                     "deps": [],
-                    "tool_requests": ["llm_generate"],
-                    "tool_inputs": {"llm_generate": {"text": "hello"}},
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "hello"}},
                     "critic_required": False,
                 }
             ],
@@ -2008,7 +3514,46 @@ def test_preflight_plan_endpoint_rejects_tool_intent_mismatch():
     body = response.json()
     assert body["valid"] is False
     assert "IoTask" in body["errors"]
-    assert body["errors"]["IoTask"].startswith("tool_intent_mismatch:llm_generate")
+    assert body["errors"]["IoTask"].startswith("task_intent_mismatch:llm.text.generate")
+
+
+def test_preflight_plan_endpoint_rejects_unknown_memory_read_name() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v2",
+            "tasks_summary": "Workflow Studio draft",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "MemoryRead",
+                    "description": "Read memory entries for pointer resolution and context hydration.",
+                    "instruction": "Use capability memory.read.",
+                    "acceptance_criteria": ["Completed capability memory.read"],
+                    "expected_output_schema_ref": "",
+                    "intent": "io",
+                    "deps": [],
+                    "tool_requests": ["memory.read"],
+                    "tool_inputs": {
+                        "memory.read": {
+                            "name": "profile",
+                            "scope": "user",
+                            "key": "profile",
+                            "user_id": "narendersurabhi",
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "job_context": {},
+    }
+
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["MemoryRead"].startswith("memory.read:unknown_memory:profile")
+    assert "user_profile" in body["errors"]["MemoryRead"]
 
 
 def test_preflight_plan_endpoint_rejects_capability_intent_mismatch(monkeypatch):
@@ -2078,8 +3623,8 @@ def test_preflight_plan_endpoint_returns_intent_segment_slot_diagnostics() -> No
                     "expected_output_schema_ref": "",
                     "intent": "generate",
                     "deps": [],
-                    "tool_requests": ["llm_generate"],
-                    "tool_inputs": {"llm_generate": {"text": "hello"}},
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "hello"}},
                     "critic_required": False,
                 }
             ],
@@ -2108,7 +3653,63 @@ def test_preflight_plan_endpoint_returns_intent_segment_slot_diagnostics() -> No
     assert response.status_code == 200
     body = response.json()
     assert body["valid"] is False
-    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm_generate")
+    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm.text.generate")
+    diagnostics = body.get("diagnostics", [])
+    assert isinstance(diagnostics, list) and diagnostics
+    assert diagnostics[0]["code"] == "intent_segment.must_have_inputs_missing"
+    assert diagnostics[0]["field"] == "GenerateText"
+
+
+def test_preflight_plan_endpoint_accepts_normalized_envelope_without_legacy_graph() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "segment contract",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "GenerateText",
+                    "description": "Generate text",
+                    "instruction": "Generate the content",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "generate",
+                    "deps": [],
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "hello"}},
+                    "critic_required": False,
+                }
+            ],
+        },
+        "normalized_intent_envelope": {
+            "goal": "Generate report text",
+            "profile": {"intent": "generate", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "s1",
+                        "intent": "generate",
+                        "objective": "Generate report text",
+                        "required_inputs": ["instruction"],
+                        "suggested_capabilities": ["llm.text.generate"],
+                        "slots": {
+                            "entity": "report",
+                            "artifact_type": "content",
+                            "output_format": "txt",
+                            "risk_level": "read_only",
+                            "must_have_inputs": ["path"],
+                        },
+                    }
+                ]
+            },
+        },
+        "job_context": {},
+    }
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["errors"]["GenerateText"].startswith("intent_segment_invalid:llm.text.generate")
     diagnostics = body.get("diagnostics", [])
     assert isinstance(diagnostics, list) and diagnostics
     assert diagnostics[0]["code"] == "intent_segment.must_have_inputs_missing"
@@ -2130,8 +3731,8 @@ def test_preflight_plan_endpoint_accepts_intent_segment_tool_inputs_requirement(
                     "expected_output_schema_ref": "",
                     "intent": "generate",
                     "deps": [],
-                    "tool_requests": ["llm_generate"],
-                    "tool_inputs": {"llm_generate": {"text": "implement it"}},
+                    "tool_requests": ["llm.text.generate"],
+                    "tool_inputs": {"llm.text.generate": {"text": "implement it"}},
                     "critic_required": False,
                 }
             ],
@@ -2153,6 +3754,65 @@ def test_preflight_plan_endpoint_accepts_intent_segment_tool_inputs_requirement(
                     },
                 }
             ]
+        },
+        "job_context": {},
+    }
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
+
+
+def test_preflight_plan_endpoint_accepts_document_segment_main_topic_alias() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "document generation",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "Generate DocumentSpec",
+                    "description": "Generate a DocumentSpec",
+                    "instruction": "Generate a 2-page DOCX cheatsheet for advanced AI engineers.",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "generate",
+                    "deps": [],
+                    "tool_requests": ["document.spec.generate"],
+                    "tool_inputs": {
+                        "document.spec.generate": {
+                            "instruction": "Generate a 2-page DOCX cheatsheet for advanced AI engineers.",
+                            "topic": "AI lifecycle using Kubernetes, Kubeflow, RAG retrieval, and RAG indexing",
+                            "audience": "Advanced AI engineers",
+                            "tone": "concise",
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "normalized_intent_envelope": {
+            "goal": "Create a word cheatsheet document",
+            "profile": {"intent": "generate", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {
+                        "id": "s1",
+                        "intent": "generate",
+                        "objective": "Generate a DocumentSpec for AI lifecycle cheat sheet",
+                        "required_inputs": ["main_topic", "length", "audience"],
+                        "suggested_capabilities": ["document.spec.generate"],
+                        "slots": {
+                            "entity": "document_spec",
+                            "artifact_type": "document_spec",
+                            "output_format": "docx",
+                            "risk_level": "read_only",
+                            "must_have_inputs": ["main_topic", "length", "audience"],
+                        },
+                    }
+                ]
+            },
         },
         "job_context": {},
     }
@@ -2208,6 +3868,154 @@ def test_build_plan_from_composer_draft_derives_intent_from_goal(monkeypatch) ->
     assert not errors
     assert plan is not None
     assert plan.tasks[0].intent == models.ToolIntent.render
+
+
+def test_composer_compile_emits_run_spec(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    response = client.post(
+        "/composer/compile",
+        json={
+            "draft": {
+                "summary": "Compile a gated chain",
+                "nodes": [
+                    {"id": "source", "capabilityId": "json_transform", "taskName": "LoadData"},
+                    {
+                        "id": "gate",
+                        "taskName": "OnlyIfApproved",
+                        "nodeKind": "control",
+                        "controlKind": "if",
+                        "capabilityId": "studio.control.if",
+                        "controlConfig": {"expression": "context.approved == true"},
+                    },
+                    {
+                        "id": "target",
+                        "capabilityId": "json_transform",
+                        "taskName": "TransformData",
+                        "bindings": {
+                            "source": {
+                                "kind": "step_output",
+                                "sourceNodeId": "source",
+                                "sourcePath": "items",
+                            }
+                        },
+                    },
+                ],
+                "edges": [
+                    {"fromNodeId": "source", "toNodeId": "gate"},
+                    {"fromNodeId": "gate", "toNodeId": "target"},
+                ],
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["plan"] is not None
+    assert "LoadData" in body["preflight_errors"]
+    assert body["run_spec"]["kind"] == "studio"
+    assert [step["name"] for step in body["run_spec"]["steps"]] == ["LoadData", "TransformData"]
+    assert body["run_spec"]["steps"][1]["execution_gate"] == {
+        "expression": "context.approved == true"
+    }
+    assert body["run_spec"]["steps"][1]["input_bindings"] == {
+        "source": {
+            "$from": ["dependencies_by_name", "LoadData", "json_transform", "items"]
+        }
+    }
+    assert body["run_spec"]["dag_edges"] == [
+        [
+            body["run_spec"]["steps"][0]["step_id"],
+            body["run_spec"]["steps"][1]["step_id"],
+        ]
+    ]
+
+
+def test_composer_compile_allows_derived_render_paths_in_studio_mode(monkeypatch) -> None:
+    registry = _document_render_registry()
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+    monkeypatch.setattr(main.capability_registry, "resolve_capability_mode", lambda: "enabled")
+
+    response = client.post(
+        "/composer/compile",
+        json={
+            "draft": {
+                "summary": "Render a DOCX from a generated spec",
+                "nodes": [
+                    {
+                        "id": "spec",
+                        "taskName": "GenerateDocumentSpec",
+                        "capabilityId": "document.spec.generate",
+                        "bindings": {
+                            "instruction": {
+                                "kind": "literal",
+                                "value": "Create a deployment report document.",
+                            },
+                            "topic": {"kind": "literal", "value": "Deployment report"},
+                            "audience": {"kind": "literal", "value": "Engineers"},
+                        },
+                    },
+                    {
+                        "id": "path",
+                        "taskName": "DeriveOutputPath",
+                        "capabilityId": "derive_output_filename",
+                        "bindings": {
+                            "document_type": {"kind": "literal", "value": "document"},
+                            "output_extension": {"kind": "literal", "value": "docx"},
+                            "target_role_name": {
+                                "kind": "literal",
+                                "value": "deployment_report",
+                            },
+                        },
+                    },
+                    {
+                        "id": "render",
+                        "taskName": "RenderDocument",
+                        "capabilityId": "document.docx.render",
+                        "bindings": {
+                            "document_spec": {
+                                "kind": "step_output",
+                                "sourceNodeId": "spec",
+                                "sourcePath": "document_spec",
+                            },
+                            "path": {
+                                "kind": "step_output",
+                                "sourceNodeId": "path",
+                                "sourcePath": "path",
+                            },
+                        },
+                    },
+                ],
+                "edges": [
+                    {"fromNodeId": "spec", "toNodeId": "render"},
+                    {"fromNodeId": "path", "toNodeId": "render"},
+                ],
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["preflight_errors"] == {}
 
 
 def test_build_plan_from_composer_draft_flags_control_flow_nodes() -> None:
@@ -2313,6 +4121,134 @@ def test_build_plan_from_composer_draft_lowers_if_control_to_execution_gate(monk
     assert plan.tasks[1].tool_inputs[main.execution_contracts.EXECUTION_GATE_KEY] == {
         "json_transform": {"expression": "context.approved == true"}
     }
+
+
+def test_build_plan_from_composer_draft_allows_workflow_variable_expression(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "workflowInterface": {
+                "variables": [
+                    {
+                        "key": "should_publish",
+                        "valueType": "boolean",
+                        "binding": {"kind": "literal", "value": True},
+                    }
+                ]
+            },
+            "nodes": [
+                {
+                    "id": "source",
+                    "capabilityId": "json_transform",
+                    "taskName": "LoadData",
+                },
+                {
+                    "id": "gate",
+                    "taskName": "OnlyIfPublishRequested",
+                    "nodeKind": "control",
+                    "controlKind": "if",
+                    "capabilityId": "studio.control.if",
+                    "controlConfig": {"expression": "workflow.variable.should_publish == true"},
+                },
+                {
+                    "id": "target",
+                    "capabilityId": "json_transform",
+                    "taskName": "PublishData",
+                },
+            ],
+            "edges": [
+                {"fromNodeId": "source", "toNodeId": "gate"},
+                {"fromNodeId": "gate", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert errors == []
+    assert plan is not None
+    assert plan.tasks[1].tool_inputs[main.execution_contracts.EXECUTION_GATE_KEY] == {
+        "json_transform": {"expression": "workflow.variable.should_publish == true"}
+    }
+
+
+def test_build_plan_from_composer_draft_rejects_undefined_workflow_expression_key(monkeypatch) -> None:
+    capability = cap_registry.CapabilitySpec(
+        capability_id="json_transform",
+        description="Transform JSON",
+        enabled=True,
+        risk_tier="read_only",
+        idempotency="read",
+        output_schema_ref="schemas/json_object",
+        planner_hints={"task_intents": ["transform"]},
+        adapters=(
+            cap_registry.CapabilityAdapterSpec(
+                type="local_tool",
+                server_id="local_worker",
+                tool_name="json_transform",
+            ),
+        ),
+    )
+    registry = cap_registry.CapabilityRegistry(capabilities={"json_transform": capability})
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", lambda: registry)
+
+    plan, errors, _warnings = main._build_plan_from_composer_draft(
+        {
+            "workflowInterface": {
+                "variables": [
+                    {
+                        "key": "should_publish",
+                        "valueType": "boolean",
+                        "binding": {"kind": "literal", "value": True},
+                    }
+                ]
+            },
+            "nodes": [
+                {
+                    "id": "source",
+                    "capabilityId": "json_transform",
+                    "taskName": "LoadData",
+                },
+                {
+                    "id": "gate",
+                    "taskName": "OnlyIfApproved",
+                    "nodeKind": "control",
+                    "controlKind": "if",
+                    "capabilityId": "studio.control.if",
+                    "controlConfig": {"expression": "workflow.variable.missing_flag == true"},
+                },
+                {
+                    "id": "target",
+                    "capabilityId": "json_transform",
+                    "taskName": "PublishData",
+                },
+            ],
+            "edges": [
+                {"fromNodeId": "source", "toNodeId": "gate"},
+                {"fromNodeId": "gate", "toNodeId": "target"},
+            ],
+        }
+    )
+
+    assert plan is None
+    codes = {entry["code"] for entry in errors}
+    assert "draft.control_expression_unsupported" in codes
 
 
 def test_build_plan_from_composer_draft_lowers_if_else_to_branch_gates(monkeypatch) -> None:
@@ -2764,9 +4700,99 @@ def test_workflow_version_run_accepts_explicit_inputs(monkeypatch) -> None:
     with SessionLocal() as db:
         task_record = db.query(TaskRecord).filter(TaskRecord.job_id == run_body["job"]["id"]).first()
         assert task_record is not None
-        assert task_record.tool_inputs["json_transform"]["input"] == {
-            "$from": ["job_context", "workflow", "variables", "topic_alias"]
-        }
+    assert task_record.tool_inputs["json_transform"]["input"] == {
+        "$from": ["job_context", "workflow", "variables", "topic_alias"]
+    }
+
+
+def test_publish_workflow_definition_rejects_unknown_memory_read_name() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Broken profile read",
+            "goal": "Read profile memory",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Broken profile read",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ReadProfile",
+                        "capabilityId": "memory.read",
+                        "bindings": {
+                            "name": {"kind": "literal", "value": "profile"},
+                            "scope": {"kind": "literal", "value": "user"},
+                            "key": {"kind": "literal", "value": "profile"},
+                            "user_id": {"kind": "literal", "value": "narendersurabhi"},
+                        },
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 400
+    detail = publish_response.json()["detail"]
+    assert detail["error"] == "workflow_preflight_failed"
+    assert detail["preflight_errors"]["ReadProfile"].startswith("memory.read:unknown_memory:profile")
+    assert "user_profile" in detail["preflight_errors"]["ReadProfile"]
+
+
+def test_workflow_run_uses_published_run_spec_when_compiled_plan_missing() -> None:
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": "Workspace listing",
+            "goal": "List workspace files",
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Workspace listing",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+
+    assert create_response.status_code == 200
+    definition = create_response.json()
+
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+    parsed_run_spec = run_specs.parse_run_spec(version.get("run_spec"))
+    assert parsed_run_spec is not None
+
+    with SessionLocal() as db:
+        version_record = (
+            db.query(WorkflowVersionRecord)
+            .filter(WorkflowVersionRecord.id == version["id"])
+            .first()
+        )
+        assert version_record is not None
+        version_record.compiled_plan_json = {}
+        db.commit()
+
+    run_response = client.post(
+        f"/workflows/versions/{version['id']}/run",
+        json={"priority": 2},
+    )
+    assert run_response.status_code == 200
+    run_body = run_response.json()
+    assert run_body["workflow_run"]["version_id"] == version["id"]
+    assert run_body["plan"]["job_id"] == run_body["job"]["id"]
 
 
 def test_task_payload_from_record_flags_unresolved_reference_inputs() -> None:
@@ -2788,9 +4814,9 @@ def test_task_payload_from_record_flags_unresolved_reference_inputs() -> None:
         max_reworks=0,
         assigned_to=None,
         intent="render",
-        tool_requests=["docx_generate_from_spec"],
+        tool_requests=["docx_render_from_spec"],
         tool_inputs={
-            "docx_generate_from_spec": {
+            "docx_render_from_spec": {
                 "path": "documents/out.docx",
                 "document_spec": {
                     "$from": "dependencies_by_name.GenerateDocumentSpec.llm_generate_document_spec.document_spec"
@@ -2803,8 +4829,8 @@ def test_task_payload_from_record_flags_unresolved_reference_inputs() -> None:
     )
     payload = main._task_payload_from_record(record, correlation_id="corr", context={})
     validation = payload.get("tool_inputs_validation", {})
-    assert "docx_generate_from_spec" in validation
-    assert "input reference resolution failed" in validation["docx_generate_from_spec"]
+    assert "docx_render_from_spec" in validation
+    assert "input reference resolution failed" in validation["docx_render_from_spec"]
 
 
 def test_task_payload_from_record_resolves_validation_report_alias_reference() -> None:
@@ -2935,9 +4961,9 @@ def test_task_payload_from_record_resolves_output_path_alias_reference() -> None
         max_reworks=0,
         assigned_to=None,
         intent="render",
-        tool_requests=["docx_generate_from_spec"],
+        tool_requests=["docx_render_from_spec"],
         tool_inputs={
-            "docx_generate_from_spec": {
+            "docx_render_from_spec": {
                 "document_spec": {"blocks": []},
                 "output_path": {
                     "$from": "dependencies_by_name.Derive Output Filename.derive_output_filename.output_path"
@@ -2959,7 +4985,7 @@ def test_task_payload_from_record_resolves_output_path_alias_reference() -> None
 
     payload = main._task_payload_from_record(record, correlation_id="corr", context=context)
     assert "tool_inputs_validation" not in payload
-    resolved = payload["tool_inputs"]["docx_generate_from_spec"]
+    resolved = payload["tool_inputs"]["docx_render_from_spec"]
     assert resolved["output_path"] == "artifacts/output.docx"
 
 
@@ -2982,9 +5008,9 @@ def test_task_payload_from_record_resolves_task_level_path_reference() -> None:
         max_reworks=0,
         assigned_to=None,
         intent="render",
-        tool_requests=["docx_generate_from_spec"],
+        tool_requests=["docx_render_from_spec"],
         tool_inputs={
-            "docx_generate_from_spec": {
+            "docx_render_from_spec": {
                 "document_spec": {"blocks": []},
                 "output_path": {
                     "$from": "dependencies_by_name.DeriveResumeOutputPath.path"
@@ -3006,7 +5032,7 @@ def test_task_payload_from_record_resolves_task_level_path_reference() -> None:
 
     payload = main._task_payload_from_record(record, correlation_id="corr", context=context)
     assert "tool_inputs_validation" not in payload
-    resolved = payload["tool_inputs"]["docx_generate_from_spec"]
+    resolved = payload["tool_inputs"]["docx_render_from_spec"]
     assert resolved["output_path"] == "artifacts/output.docx"
 
 
@@ -3029,8 +5055,8 @@ def test_task_payload_from_record_includes_intent_segment_profile() -> None:
         max_reworks=0,
         assigned_to=None,
         intent=None,
-        tool_requests=["document.pdf.generate"],
-        tool_inputs={"document.pdf.generate": {"path": "artifacts/report.pdf"}},
+        tool_requests=["document.pdf.render"],
+        tool_inputs={"document.pdf.render": {"path": "artifacts/report.pdf"}},
         created_at=now,
         updated_at=now,
         critic_required=0,
@@ -3044,7 +5070,7 @@ def test_task_payload_from_record_includes_intent_segment_profile() -> None:
             "intent": "render",
             "objective": "Render final PDF report",
             "required_inputs": ["document_spec", "path"],
-            "suggested_capabilities": ["document.pdf.generate"],
+            "suggested_capabilities": ["document.pdf.render"],
             "slots": {
                 "entity": "report",
                 "artifact_type": "document",
@@ -3118,10 +5144,14 @@ def test_task_payload_from_record_uses_typed_dispatch_contract() -> None:
     assert dispatch.trace_id == "corr"
     assert dispatch.attempts == 1
     assert dispatch.max_attempts == 1
-    assert dispatch.tool_requests == ["document.spec.generate"]
+    assert dispatch.capability_requests == ["document.spec.generate"]
+    assert dispatch.tool_requests == ["llm_generate_document_spec"]
     assert main.execution_contracts.EXECUTION_BINDINGS_KEY not in payload["tool_inputs"]
-    assert dispatch.capability_bindings["document.spec.generate"].capability_id == (
+    assert dispatch.capability_bindings["llm_generate_document_spec"].capability_id == (
         "document.spec.generate"
+    )
+    assert dispatch.capability_bindings["llm_generate_document_spec"].tool_name == (
+        "llm_generate_document_spec"
     )
     assert dispatch.tool_inputs_resolved is True
 
@@ -3138,9 +5168,10 @@ def test_plan_preflight_compiler_accepts_valid_dependency_chain() -> None:
                 instruction="Build",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["json_transform"],
-                tool_inputs={"json_transform": {"input": {"name": "demo"}}},
+                tool_requests=["utility.json.transform"],
+                tool_inputs={"utility.json.transform": {"input": {"name": "demo"}}},
                 critic_required=False,
             ),
             models.TaskCreate(
@@ -3149,11 +5180,14 @@ def test_plan_preflight_compiler_accepts_valid_dependency_chain() -> None:
                 instruction="Reuse",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=["MakeJson"],
-                tool_requests=["json_transform"],
+                tool_requests=["utility.json.transform"],
                 tool_inputs={
-                    "json_transform": {
-                        "input": {"$from": "dependencies_by_name.MakeJson.json_transform.result"}
+                    "utility.json.transform": {
+                        "input": {
+                            "$from": "dependencies_by_name.MakeJson.utility.json.transform.result"
+                        }
                     }
                 },
                 critic_required=False,
@@ -3176,9 +5210,10 @@ def test_plan_preflight_compiler_flags_broken_reference_path() -> None:
                 instruction="Build",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["json_transform"],
-                tool_inputs={"json_transform": {"input": {"name": "demo"}}},
+                tool_requests=["utility.json.transform"],
+                tool_inputs={"utility.json.transform": {"input": {"name": "demo"}}},
                 critic_required=False,
             ),
             models.TaskCreate(
@@ -3187,10 +5222,11 @@ def test_plan_preflight_compiler_flags_broken_reference_path() -> None:
                 instruction="Reuse",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/json_object",
+                intent=models.ToolIntent.transform,
                 deps=["MakeJson"],
-                tool_requests=["json_transform"],
+                tool_requests=["utility.json.transform"],
                 tool_inputs={
-                    "json_transform": {
+                    "utility.json.transform": {
                         "input": {"$from": "dependencies_by_name.MakeJson.missing_tool.result"}
                     }
                 },
@@ -3227,11 +5263,11 @@ def test_plan_preflight_accepts_reference_path_with_dotted_tool_name() -> None:
                 instruction="Use repository check output",
                 acceptance_criteria=["done"],
                 expected_output_schema_ref="schemas/validation_report",
-                intent=models.ToolIntent.validate,
+                intent=models.ToolIntent.transform,
                 deps=["Verify repository exists"],
-                tool_requests=["json_transform"],
+                tool_requests=["utility.json.transform"],
                 tool_inputs={
-                    "json_transform": {
+                    "utility.json.transform": {
                         "input": {
                             "$from": "dependencies_by_name.Verify repository exists.github.repo.list"
                         }
@@ -3282,7 +5318,7 @@ def test_plan_preflight_ignores_non_matching_intent_segments_when_suggested_capa
                 "intent": "render",
                 "objective": "Render docx",
                 "required_inputs": ["document_spec", "output_path"],
-                "suggested_capabilities": ["document.docx.generate"],
+                "suggested_capabilities": ["document.docx.render"],
             }
         ]
     }
@@ -3327,7 +5363,7 @@ def test_plan_preflight_uses_task_instruction_for_intent_segment_contract() -> N
                 expected_output_schema_ref="schemas/validation_report",
                 intent=models.ToolIntent.generate,
                 deps=["VerifyRepoExists"],
-                tool_requests=["llm_generate"],
+                tool_requests=["llm.text.generate"],
                 tool_inputs={},
                 critic_required=True,
             ),
@@ -3558,3 +5594,170 @@ def test_retry_task_from_dlq_requires_failed_status():
     response = client.post(f"/jobs/{job_id}/tasks/{task_id}/retry", json={"stream_id": "100-0"})
     assert response.status_code == 400
     assert response.json()["detail"] == "Task is not failed"
+
+
+def test_list_rag_documents_proxies_to_retriever(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_rag_request(path: str, **kwargs: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(kwargs)
+        return {
+            "collection_name": "rag_default",
+            "truncated": False,
+            "scanned_point_count": 2,
+            "documents": [
+                {
+                    "document_id": "docs/user-guide.md",
+                    "source_uri": "docs/user-guide.md",
+                    "namespace": "docs",
+                    "user_id": "narendersurabhi",
+                    "chunk_count": 4,
+                    "metadata": {},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _fake_rag_request)
+
+    response = client.get(
+        "/rag/documents",
+        params={
+            "namespace": "docs",
+            "user_id": "narendersurabhi",
+            "query": "guide",
+            "limit": 25,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["documents"][0]["document_id"] == "docs/user-guide.md"
+    assert captured["path"] == "/documents/list"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {
+        "collection_name": None,
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+        "query": "guide",
+        "limit": 25,
+    }
+
+
+def test_index_rag_text_mode_builds_single_entry_upsert(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_rag_request(path: str, **kwargs: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(kwargs)
+        return {
+            "collection_name": "rag_default",
+            "upserted_count": 1,
+            "chunk_ids": ["chunk-1"],
+        }
+
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _fake_rag_request)
+
+    response = client.post(
+        "/rag/index",
+        json={
+            "mode": "text",
+            "collection_name": "rag_default",
+            "namespace": "docs",
+            "user_id": "narendersurabhi",
+            "document_id": "manual/doc-1",
+            "source_uri": "manual/doc-1",
+            "text": "Agentic Workflow Studio ships a visual DAG editor.",
+            "metadata": {"doc_type": "note"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["upserted_count"] == 1
+    assert captured["path"] == "/index/upsert_texts"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {
+        "collection_name": "rag_default",
+        "ensure_collection": True,
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+        "entries": [
+            {
+                "document_id": "manual/doc-1",
+                "text": "Agentic Workflow Studio ships a visual DAG editor.",
+                "source_uri": "manual/doc-1",
+                "metadata": {"doc_type": "note"},
+            }
+        ],
+    }
+
+
+def test_replace_rag_document_deletes_then_reindexes(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_rag_request(path: str, **kwargs: object) -> dict[str, object]:
+        calls.append((path, dict(kwargs)))
+        if path == "/documents/delete":
+            return {
+                "collection_name": "rag_default",
+                "document_id": "docs/user-guide.md",
+                "deleted_chunk_count": 3,
+            }
+        if path == "/index/markdown":
+            return {
+                "collection_name": "rag_default",
+                "document_id": "docs/user-guide.md",
+                "source_uri": "docs/user-guide.md",
+                "section_count": 2,
+                "chunk_count": 3,
+                "upserted_count": 3,
+                "chunk_ids": ["c1", "c2", "c3"],
+            }
+        raise AssertionError(f"Unexpected path: {path}")
+
+    monkeypatch.setattr(main, "_rag_retriever_request_json", _fake_rag_request)
+
+    response = client.put(
+        "/rag/documents",
+        params={"document_id": "docs/user-guide.md"},
+        json={
+            "mode": "markdown",
+            "collection_name": "rag_default",
+            "namespace": "docs",
+            "user_id": "narendersurabhi",
+            "markdown_text": "# User Guide\n\nUpdated content.",
+            "metadata": {"doc_type": "markdown"},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"]["deleted_chunk_count"] == 3
+    assert body["indexed"]["upserted_count"] == 3
+    assert [path for path, _kwargs in calls] == ["/documents/delete", "/index/markdown"]
+    assert calls[0][1]["body"] == {
+        "document_id": "docs/user-guide.md",
+        "collection_name": "rag_default",
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+    }
+    assert calls[1][1]["body"] == {
+        "markdown_text": "# User Guide\n\nUpdated content.",
+        "collection_name": "rag_default",
+        "ensure_collection": True,
+        "document_id": "docs/user-guide.md",
+        "source_uri": "docs/user-guide.md",
+        "namespace": "docs",
+        "tenant_id": None,
+        "user_id": "narendersurabhi",
+        "workspace_id": None,
+        "chunk_size_chars": None,
+        "chunk_overlap_chars": None,
+        "max_chunks": None,
+        "metadata": {"doc_type": "markdown"},
+    }

@@ -10,6 +10,7 @@ __all__ = [
     "llm_provider",
     "chat_contracts",
     "execution_contracts",
+    "run_specs",
     "planner_contracts",
     "workflow_contracts",
     "tracing",

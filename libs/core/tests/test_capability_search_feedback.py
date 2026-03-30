@@ -11,8 +11,8 @@ def test_build_feedback_rows_joins_search_selection_and_execution() -> None:
                 "payload": {
                     "query": "render a pdf report",
                     "results": [
-                        {"id": "document.pdf.generate"},
-                        {"id": "document.output.derive"},
+                        {"id": "document.spec.generate"},
+                        {"id": "document.pdf.render"},
                         {"id": "llm.text.generate"},
                     ],
                 },
@@ -22,10 +22,7 @@ def test_build_feedback_rows_joins_search_selection_and_execution() -> None:
                 "job_id": "job-1",
                 "correlation_id": "corr-1",
                 "payload": {
-                    "selected_capabilities": [
-                        "document.output.derive",
-                        "document.pdf.generate",
-                    ]
+                    "selected_capabilities": ["document.spec.generate", "document.pdf.render"]
                 },
             },
             {
@@ -34,8 +31,8 @@ def test_build_feedback_rows_joins_search_selection_and_execution() -> None:
                 "correlation_id": "corr-1",
                 "payload": {
                     "tool_calls": [
-                        {"tool_name": "document.output.derive"},
-                        {"tool_name": "document.pdf.generate"},
+                        {"tool_name": "document.spec.generate"},
+                        {"tool_name": "document.pdf.render"},
                     ]
                 },
             },
@@ -44,8 +41,8 @@ def test_build_feedback_rows_joins_search_selection_and_execution() -> None:
 
     assert len(rows) == 1
     row = rows[0]
-    assert row["retrieved_selected"] == ["document.output.derive", "document.pdf.generate"]
-    assert row["retrieved_executed"] == ["document.output.derive", "document.pdf.generate"]
+    assert row["retrieved_selected"] == ["document.spec.generate", "document.pdf.render"]
+    assert row["retrieved_executed"] == ["document.spec.generate", "document.pdf.render"]
     assert row["planner_override"] == []
     assert row["hard_negative_ids"] == ["llm.text.generate"]
     assert row["execution_succeeded"] is True
