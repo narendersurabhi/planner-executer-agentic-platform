@@ -4,6 +4,7 @@ TASK_STREAM = "tasks.events"
 TASK_DLQ_STREAM = "tasks.dlq"
 CRITIC_STREAM = "critic.events"
 POLICY_STREAM = "policy.events"
+FEEDBACK_STREAM = "feedback.events"
 
 JOB_EVENTS = ["job.created", "job.canceled"]
 PLAN_EVENTS = [
@@ -26,3 +27,4 @@ TASK_EVENTS = [
 ]
 CRITIC_EVENTS = ["task.accepted", "task.rework_requested"]
 POLICY_EVENTS = ["policy.decision_made"]
+FEEDBACK_EVENTS = ["feedback.submitted"]

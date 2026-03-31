@@ -40,5 +40,9 @@ jobs:
         run: PYTHONPATH=. pytest
       - name: Intent Eval Gate
         run: make eval-intent-gate
+      - name: Chat Boundary Eval Gate
+        run: make eval-chat-boundary-gate
+      - name: Chat Clarification Eval Gate
+        run: make eval-chat-clarification-gate
       - name: Docker build
         run: docker compose build

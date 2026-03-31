@@ -53,6 +53,28 @@ def test_assess_goal_intent_only_blocks_safety_constraints_for_high_risk_write()
     assert "safety_constraints" in profile.missing_slots
 
 
+def test_assess_goal_intent_infers_docx_for_word_document_request() -> None:
+    profile = intent_service.assess_goal_intent(
+        "Create a Word document about deploying ML workflows to Kubernetes.",
+        config=intent_service.GoalIntentConfig(
+            min_confidence=0.7,
+            min_confidence_by_intent={},
+            min_confidence_by_risk={},
+            clarification_blocking_slots={"output_format"},
+        ),
+        runtime=intent_service.GoalIntentRuntime(
+            infer_task_intent=lambda _goal: type(
+                "_Inference",
+                (),
+                {"intent": "generate", "source": "test", "confidence": 0.91},
+            )(),
+        ),
+    )
+
+    assert profile.slot_values["output_format"] == "docx"
+    assert profile.missing_slots == []
+
+
 def test_decompose_goal_intent_returns_llm_graph_with_summary_fields() -> None:
     failures: list[Exception] = []
     recorded: list[tuple[str, bool]] = []
@@ -136,3 +158,161 @@ def test_decompose_goal_intent_falls_back_when_llm_fails() -> None:
 
     assert graph.segments[0].id == "fallback"
     assert failures
+
+
+def test_normalize_goal_intent_returns_envelope() -> None:
+    envelope = intent_service.normalize_goal_intent(
+        "Create a report",
+        config=intent_service.IntentNormalizeConfig(
+            include_decomposition=True,
+            assessment_mode="hybrid",
+            assessment_model="gpt-test",
+            decomposition_mode="hybrid",
+            decomposition_model="gpt-test",
+        ),
+        runtime=intent_service.IntentNormalizeRuntime(
+            assess_goal_intent=lambda _goal: workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="heuristic",
+                confidence=0.81,
+                risk_level="bounded_write",
+                needs_clarification=False,
+                requires_blocking_clarification=False,
+                questions=[],
+                blocking_slots=[],
+                missing_slots=[],
+                slot_values={"intent_action": "generate"},
+                clarification_mode="targeted_slot_filling",
+            ),
+            decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(
+                segments=[
+                    workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        suggested_capabilities=["document.spec.generate", "document.spec.generate"],
+                    )
+                ],
+                source="llm",
+            ),
+            capability_required_inputs=lambda capability_id: (
+                ["topic"] if capability_id == "document.spec.generate" else []
+            ),
+        ),
+    )
+
+    assert envelope.goal == "Create a report"
+    assert envelope.profile.intent == "generate"
+    assert envelope.graph.source == "llm"
+    assert envelope.candidate_capabilities == {"s1": ["document.spec.generate"]}
+    assert envelope.clarification.needs_clarification is False
+    assert envelope.trace.assessment_mode == "hybrid"
+    assert envelope.trace.assessment_fallback_used is True
+    assert envelope.trace.decomposition_fallback_used is False
+
+
+def test_normalize_goal_intent_uses_local_slot_question_for_context_merged_missing_slots() -> None:
+    envelope = intent_service.normalize_goal_intent(
+        "Create a report",
+        intent_context={
+            "intent_slot_values": {"output_format": "docx"},
+            "intent_slot_provenance": {"output_format": "context"},
+        },
+        config=intent_service.IntentNormalizeConfig(
+            include_decomposition=False,
+            assessment_mode="heuristic",
+            assessment_model="",
+            decomposition_mode="disabled",
+            decomposition_model="",
+        ),
+        runtime=intent_service.IntentNormalizeRuntime(
+            assess_goal_intent=lambda _goal: workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="heuristic",
+                confidence=0.88,
+                risk_level="bounded_write",
+                low_confidence=False,
+                needs_clarification=True,
+                requires_blocking_clarification=True,
+                questions=["placeholder"],
+                blocking_slots=["output_format", "target_system"],
+                missing_slots=["output_format", "target_system"],
+                slot_values={"intent_action": "generate"},
+                clarification_mode="targeted_slot_filling",
+            ),
+            decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(),
+            capability_required_inputs=lambda _capability_id: [],
+            assess_goal_intent_heuristic=lambda _goal: workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="heuristic",
+                confidence=0.88,
+                risk_level="bounded_write",
+                low_confidence=False,
+                needs_clarification=True,
+                requires_blocking_clarification=True,
+                questions=["placeholder"],
+                blocking_slots=["output_format", "target_system"],
+                missing_slots=["output_format", "target_system"],
+                slot_values={"intent_action": "generate"},
+                clarification_mode="targeted_slot_filling",
+            ),
+        ),
+    )
+
+    assert "target_system" in envelope.profile.missing_slots
+    assert (
+        "Which target system should this use (for example GitHub, Jira, Slack, filesystem)?"
+        in envelope.profile.questions
+    )
+
+
+def test_normalize_goal_intent_uses_capability_required_inputs_for_clarification() -> None:
+    envelope = intent_service.normalize_goal_intent(
+        "Render the approved document spec as a PDF.",
+        config=intent_service.IntentNormalizeConfig(
+            include_decomposition=True,
+            assessment_mode="hybrid",
+            assessment_model="gpt-test",
+            decomposition_mode="hybrid",
+            decomposition_model="gpt-test",
+        ),
+        runtime=intent_service.IntentNormalizeRuntime(
+            assess_goal_intent=lambda _goal: workflow_contracts.GoalIntentProfile(
+                intent="render",
+                source="heuristic",
+                confidence=0.88,
+                risk_level="bounded_write",
+                low_confidence=False,
+                needs_clarification=False,
+                requires_blocking_clarification=False,
+                questions=[],
+                blocking_slots=["output_format"],
+                missing_slots=[],
+                slot_values={"intent_action": "render"},
+                clarification_mode="targeted_slot_filling",
+            ),
+            decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(
+                segments=[
+                    workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="render",
+                        objective="Render final artifact",
+                        required_inputs=["input_data", "path_or_format"],
+                        suggested_capabilities=["document.pdf.render"],
+                        slots=workflow_contracts.IntentGraphSlots(
+                            output_format="pdf",
+                            risk_level="bounded_write",
+                            must_have_inputs=["path"],
+                        ),
+                    )
+                ],
+                source="llm",
+            ),
+            capability_required_inputs=lambda capability_id: (
+                ["document_spec", "path"] if capability_id == "document.pdf.render" else []
+            ),
+        ),
+    )
+
+    assert envelope.profile.missing_slots == ["path"]
+    assert envelope.profile.requires_blocking_clarification is True
+    assert envelope.clarification.questions == ["What output path or filename should be used?"]

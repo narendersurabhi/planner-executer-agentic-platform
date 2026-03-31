@@ -9,10 +9,22 @@ from prometheus_client import make_asgi_app
 from app.mcp import create_mcp_asgi_app
 from libs.core import logging as core_logging
 from rag_retriever_core import (
+    DeleteDocumentRequest,
+    DeleteDocumentResponse,
+    DocumentChunksRequest,
+    DocumentChunksResponse,
+    DocumentListRequest,
+    DocumentListResponse,
     EnsureCollectionRequest,
     EnsureCollectionResponse,
+    IndexMarkdownRequest,
+    IndexMarkdownResponse,
+    IndexWorkspaceDirectoryRequest,
+    IndexWorkspaceDirectoryResponse,
     IndexWorkspaceFileRequest,
     IndexWorkspaceFileResponse,
+    RerankRequest,
+    RerankResponse,
     RetrieverError,
     RetrieveRequest,
     RetrieveResponse,
@@ -42,7 +54,7 @@ async def _optional_bearer_auth(request: Request, call_next):
     if not expected:
         return await call_next(request)
     path = request.url.path
-    protected = path.startswith("/mcp") or path == "/retrieve"
+    protected = path.startswith("/mcp") or path.startswith("/retrieve")
     if not protected:
         return await call_next(request)
     actual = request.headers.get("Authorization", "").strip()
@@ -91,6 +103,38 @@ def retrieve_endpoint(request: RetrieveRequest) -> RetrieveResponse:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
+@app.post("/retrieve/rerank", response_model=RerankResponse)
+def rerank_endpoint(request: RerankRequest) -> RerankResponse:
+    try:
+        return RETRIEVER_SERVICE.rerank(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/documents/list", response_model=DocumentListResponse)
+def list_documents_endpoint(request: DocumentListRequest) -> DocumentListResponse:
+    try:
+        return RETRIEVER_SERVICE.list_documents(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/documents/chunks", response_model=DocumentChunksResponse)
+def document_chunks_endpoint(request: DocumentChunksRequest) -> DocumentChunksResponse:
+    try:
+        return RETRIEVER_SERVICE.get_document_chunks(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/documents/delete", response_model=DeleteDocumentResponse)
+def delete_document_endpoint(request: DeleteDocumentRequest) -> DeleteDocumentResponse:
+    try:
+        return RETRIEVER_SERVICE.delete_document(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
 @app.post("/collections/ensure", response_model=EnsureCollectionResponse)
 def ensure_collection_endpoint(request: EnsureCollectionRequest) -> EnsureCollectionResponse:
     try:
@@ -111,5 +155,23 @@ def upsert_texts_endpoint(request: UpsertTextsRequest) -> UpsertTextsResponse:
 def index_workspace_file_endpoint(request: IndexWorkspaceFileRequest) -> IndexWorkspaceFileResponse:
     try:
         return RETRIEVER_SERVICE.index_workspace_file(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/index/markdown", response_model=IndexMarkdownResponse)
+def index_markdown_endpoint(request: IndexMarkdownRequest) -> IndexMarkdownResponse:
+    try:
+        return RETRIEVER_SERVICE.index_markdown(request)
+    except RetrieverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/index/workspace_directory", response_model=IndexWorkspaceDirectoryResponse)
+def index_workspace_directory_endpoint(
+    request: IndexWorkspaceDirectoryRequest,
+) -> IndexWorkspaceDirectoryResponse:
+    try:
+        return RETRIEVER_SERVICE.index_workspace_directory(request)
     except RetrieverError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

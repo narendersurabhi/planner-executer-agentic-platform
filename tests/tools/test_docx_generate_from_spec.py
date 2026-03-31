@@ -32,7 +32,7 @@ def test_generates_docx_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     registry = _make_registry()
     spec = _load_fixture("resume_ats_single_column_spec.json")
     payload = {"document_spec": spec, "path": "tests/resume.docx"}
-    call = registry.execute("docx_generate_from_spec", payload, "id", "trace")
+    call = registry.execute("docx_render_from_spec", payload, "id", "trace")
     assert call.status == "completed"
     output_path = Path(call.output_or_error["path"])
     assert output_path.exists()
@@ -44,7 +44,7 @@ def test_path_traversal_blocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     registry = _make_registry()
     spec = _load_fixture("resume_ats_single_column_spec.json")
     with pytest.raises(ToolExecutionError):
-        registry.get("docx_generate_from_spec").handler(
+        registry.get("docx_render_from_spec").handler(
             {"document_spec": spec, "path": "../evil.docx"}
         )
 
@@ -56,7 +56,7 @@ def test_invalid_validation_report_blocks_render(
     registry = _make_registry()
     spec = _load_fixture("resume_ats_single_column_spec.json")
     with pytest.raises(ToolExecutionError, match="document_spec validation failed"):
-        registry.get("docx_generate_from_spec").handler(
+        registry.get("docx_render_from_spec").handler(
             {
                 "document_spec": spec,
                 "path": "tests/blocked.docx",
@@ -73,7 +73,7 @@ def test_invalid_validation_report_blocks_render(
         )
 
 
-def test_missing_path_auto_derives_output_path() -> None:
+def test_missing_path_is_rejected() -> None:
     import tempfile
 
     from pytest import MonkeyPatch
@@ -83,9 +83,9 @@ def test_missing_path_auto_derives_output_path() -> None:
     registry = _make_registry()
     spec = _load_fixture("resume_ats_single_column_spec.json")
     try:
-        call = registry.execute("docx_generate_from_spec", {"document_spec": spec}, "id", "trace")
-        assert call.status == "completed"
-        assert call.output_or_error["path"].endswith(".docx")
+        call = registry.execute("docx_render_from_spec", {"document_spec": spec}, "id", "trace")
+        assert call.status == "failed"
+        assert "input schema validation failed" in call.output_or_error["error"]
     finally:
         monkeypatch.undo()
 
@@ -100,7 +100,7 @@ def test_strict_unresolved_placeholder_raises(
         "blocks": [{"type": "paragraph", "text": "{{missing}}"}],
     }
     with pytest.raises(ToolExecutionError):
-        registry.get("docx_generate_from_spec").handler(
+        registry.get("docx_render_from_spec").handler(
             {"document_spec": spec, "path": "tests/strict.docx", "strict": True}
         )
 
@@ -127,7 +127,7 @@ def test_repeat_expansion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
         ],
     }
     call = registry.execute(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {"document_spec": spec, "path": "tests/repeat.docx"},
         "id",
         "trace",
@@ -153,7 +153,7 @@ def test_inline_emphasis_markers_render_as_bold_and_italic(
         ]
     }
     call = registry.execute(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {"document_spec": spec, "path": "tests/inline_emphasis.docx"},
         "id",
         "trace",
@@ -180,7 +180,7 @@ def test_cover_letter_style_spacing(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         ],
     }
     call = registry.execute(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {"document_spec": spec, "path": "tests/coverletter_spacing.docx"},
         "id",
         "trace",
@@ -228,7 +228,7 @@ def test_experience_heading_and_group_spacing(
         ],
     }
     call = registry.execute(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {"document_spec": spec, "path": "tests/experience_spacing.docx"},
         "id",
         "trace",

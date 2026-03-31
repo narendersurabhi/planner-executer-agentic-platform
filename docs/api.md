@@ -154,7 +154,36 @@ Important response behavior:
 - chat may return a conversational assistant response only
 - chat may return a direct `tool_call` action for safe read-only capabilities
 - chat may ask for clarification
+- chat may return a `run_workflow` action and start a published Studio workflow directly
 - chat may create and attach to a durable job
+
+When chat targets a published workflow and required workflow-interface inputs are
+missing, the assistant returns `ask_clarification` first. The follow-up turn can
+provide those values through `context_json.workflow_inputs`, matching top-level
+context keys, or a plain-text answer when only one workflow input is pending. If
+chat is waiting on a workflow input and the user replies with `use default`,
+`leave blank`, or `skip it`, chat leaves that input unset so the workflow can
+fall back to its own defaults or optional behavior when possible.
+
+When a chat-started workflow reaches a terminal state, the chat session also
+receives a follow-up assistant message. On success, chat prefers declared
+workflow-interface outputs and otherwise falls back to the last task output that
+looks displayable (for example generated text). On failure, chat posts a short
+failure summary.
+
+To run a published Studio workflow from chat, provide a workflow reference in
+`context_json` using one of:
+
+- `workflow_trigger_id`
+- `workflow_version_id`
+- `workflow_definition_id`
+
+Optional chat workflow fields:
+
+- `workflow_inputs`: workflow interface inputs for the run
+- `workflow_context_json`: explicit workflow context overrides
+- `workflow_run_metadata`: metadata attached to the workflow run record
+- `workflow_idempotency_key`: idempotency key forwarded to job creation
 
 ## 5. Workflow Studio API
 
@@ -326,6 +355,23 @@ Use this family to:
 - validate workflow-interface bindings
 - preflight a candidate plan before execution
 - create plans directly when needed
+
+### Capability-backed RAG service endpoints
+
+The Qdrant retriever is exposed as a separate internal service and is usually
+reached through capability adapters rather than through the main control-plane
+API. Its current endpoint surface includes:
+
+- `POST /retrieve`
+- `POST /retrieve/rerank`
+- `POST /collections/ensure`
+- `POST /index/upsert_texts`
+- `POST /index/workspace_file`
+- `POST /index/markdown`
+- `POST /index/workspace_directory`
+
+These endpoints are implemented by the retriever service in
+[main.py](/Users/narendersurabhi/planner-executer-agentic-platform/services/rag_retriever/app/main.py).
 
 ## 8. Downloads and Event Streaming
 

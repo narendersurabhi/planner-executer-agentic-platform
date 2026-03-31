@@ -54,3 +54,26 @@ def test_capability_allowlist_dry_run_does_not_block(monkeypatch):
     assert decision.mode == "dry_run"
     assert decision.violated is True
     assert decision.reason == "dry_run:not_in_global_enabled"
+
+
+def test_capability_registry_resolves_legacy_render_aliases(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+
+    assert registry.require("document.docx.generate").capability_id == "document.docx.render"
+    assert registry.require("document.pdf.generate").capability_id == "document.pdf.render"
+
+
+def test_capability_allowlist_canonicalizes_legacy_render_aliases(monkeypatch):
+    monkeypatch.setenv("CAPABILITY_GOVERNANCE_ENABLED", "true")
+    monkeypatch.setenv("CAPABILITY_GOVERNANCE_MODE", "enforce")
+    monkeypatch.setenv("ENABLED_CAPABILITIES", "document.pdf.render")
+    monkeypatch.delenv("DISABLED_CAPABILITIES", raising=False)
+    monkeypatch.delenv("WORKER_ENABLED_CAPABILITIES", raising=False)
+    monkeypatch.delenv("WORKER_DISABLED_CAPABILITIES", raising=False)
+
+    decision = capability_registry.evaluate_capability_allowlist("document.pdf.generate", "worker")
+
+    assert decision.allowed is True
+    assert decision.reason == "allowed"

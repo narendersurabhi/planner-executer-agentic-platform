@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RagIndexWorkspaceDirectoryCapabilityOutput",
+  "type": "object",
+  "properties": {
+    "collection_name": {
+      "type": "string"
+    },
+    "directory_path": {
+      "type": "string"
+    },
+    "indexed_file_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "skipped_file_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_chunk_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_upserted_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "document_id": { "type": "string" },
+          "strategy": { "type": "string" },
+          "chunk_count": { "type": "integer", "minimum": 0 },
+          "upserted_count": { "type": "integer", "minimum": 0 },
+          "chunk_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": [
+          "path",
+          "document_id",
+          "strategy",
+          "chunk_count",
+          "upserted_count",
+          "chunk_ids"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "reason": { "type": "string" }
+        },
+        "required": ["path", "reason"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "collection_name",
+    "directory_path",
+    "indexed_file_count",
+    "skipped_file_count",
+    "total_chunk_count",
+    "total_upserted_count",
+    "files",
+    "skipped"
+  ],
+  "additionalProperties": false
+}

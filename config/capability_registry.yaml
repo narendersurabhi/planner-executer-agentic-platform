@@ -10,6 +10,10 @@ capabilities:
     tags:
       - github
       - repository
+    planner_hints:
+      chat_collectible_fields: [query]
+      chat_field_descriptions:
+        query: Search text describing the repositories to list or search for.
     enabled: true
     adapters:
       - type: mcp
@@ -63,6 +67,10 @@ capabilities:
       - issues
       - pull-requests
       - search
+    planner_hints:
+      chat_collectible_fields: [query]
+      chat_field_descriptions:
+        query: Search text describing the issues or pull requests to find.
     enabled: true
     adapters:
       - type: mcp
@@ -687,6 +695,34 @@ capabilities:
         retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
+  - id: rag.retrieve.rerank
+    description: Rerank retrieved RAG matches with deterministic lexical and metadata-aware scoring.
+    risk_tier: read_only
+    idempotency: read
+    group: rag
+    subgroup: retrieval
+    input_schema_ref: rag_rerank_capability_input
+    output_schema_ref: rag_rerank_capability_output
+    tags:
+      - rag
+      - retrieval
+      - rerank
+      - grounding
+      - citations
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: rerank
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 20
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
   - id: rag.collection.ensure
     description: Ensure a Qdrant collection exists with the configured vector shape and payload indexes.
     risk_tier: bounded_write
@@ -771,25 +807,61 @@ capabilities:
         retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
-  - id: document.output.derive
-    description: Derive a generic safe relative output path for generated document artifacts (set output_extension for pdf/md/etc.).
-    risk_tier: read_only
-    idempotency: read
-    group: documents
-    subgroup: output
-    input_schema_ref: document_derive_output_path_capability_input
-    output_schema_ref: ""
+  - id: rag.index.markdown
+    description: Section-chunk markdown text by headings, embed it, and upsert it into Qdrant.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_markdown_capability_input
+    output_schema_ref: rag_index_markdown_capability_output
     tags:
-      - documents
-      - path
-      - artifacts
-    planner_hints:
-      derives_output_path: true
+      - rag
+      - markdown
+      - qdrant
+      - indexing
+      - embeddings
     enabled: true
     adapters:
-      - type: tool
-        server_id: local_worker
-        tool_name: derive_output_path
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: index_markdown
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 90
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: rag.index.workspace_directory
+    description: Walk a bounded shared-workspace directory, chunk eligible files, and upsert them into Qdrant.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_workspace_directory_capability_input
+    output_schema_ref: rag_index_workspace_directory_capability_output
+    tags:
+      - rag
+      - workspace
+      - directory
+      - qdrant
+      - indexing
+      - embeddings
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: index_workspace_directory
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 120
+        max_retries: 1
+        retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
   - id: document.spec.generate
@@ -805,6 +877,10 @@ capabilities:
       - spec
       - generation
       - llm
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -826,6 +902,10 @@ capabilities:
       - generation
       - markdown
       - llm
+    planner_hints:
+      chat_collectible_fields: [markdown_text, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -886,6 +966,10 @@ capabilities:
       - spec
       - iterative
       - llm
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -906,6 +990,10 @@ capabilities:
       - runbook
       - iterative
       - llm
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -925,6 +1013,8 @@ capabilities:
       - documents
       - spec
       - validation
+    planner_hints:
+      task_intents: [validate]
     enabled: true
     adapters:
       - type: tool
@@ -932,8 +1022,35 @@ capabilities:
         tool_name: document_spec_validate
         arg_map: {}
         enabled: true
-  - id: document.docx.generate
-    description: Generate a DOCX artifact directly from a DocumentSpec.
+  - id: derive_output_filename
+    description: Derive a safe output path for a rendered document artifact.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: paths
+    input_schema_ref: document_derive_output_path_capability_input
+    output_schema_ref: ""
+    tags:
+      - documents
+      - path
+      - filename
+      - transform
+    planner_hints:
+      task_intents: [io, transform]
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or destination path for the rendered document artifact.
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.docx", "workspace/Kubernetes AI Deployments.docx", "artifacts/report.docx"]
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: derive_output_filename
+        arg_map: {}
+        enabled: true
+  - id: document.docx.render
+    description: Render a DOCX artifact directly from a DocumentSpec.
     risk_tier: bounded_write
     idempotency: safe_write
     group: documents
@@ -944,13 +1061,21 @@ capabilities:
       - documents
       - docx
       - render
+    aliases:
+      - document.docx.generate
     planner_hints:
+      task_intents: [render]
       required_output_extension: docx
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or path where the rendered DOCX should be saved.
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.docx", "workspace/Kubernetes AI Deployments.docx", "artifacts/report.docx"]
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
-        tool_name: docx_generate_from_spec
+        tool_name: docx_render_from_spec
         arg_map: {}
         enabled: true
   - id: document.docx.render_template
@@ -973,8 +1098,8 @@ capabilities:
         tool_name: docx_render
         arg_map: {}
         enabled: true
-  - id: document.pdf.generate
-    description: Generate a PDF artifact directly from a DocumentSpec.
+  - id: document.pdf.render
+    description: Render a PDF artifact directly from a DocumentSpec.
     risk_tier: bounded_write
     idempotency: safe_write
     group: documents
@@ -985,13 +1110,21 @@ capabilities:
       - documents
       - pdf
       - render
+    aliases:
+      - document.pdf.generate
     planner_hints:
+      task_intents: [render]
       required_output_extension: pdf
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or path where the rendered PDF should be saved.
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.pdf", "workspace/Kubernetes AI Deployments.pdf", "artifacts/report.pdf"]
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
-        tool_name: pdf_generate_from_spec
+        tool_name: pdf_render_from_spec
         arg_map: {}
         enabled: true
   - id: openapi.spec.generate_iterative
@@ -1046,6 +1179,8 @@ capabilities:
       - utility
       - json
       - transform
+    planner_hints:
+      task_intents: [transform]
     enabled: true
     adapters:
       - type: tool
@@ -1066,11 +1201,34 @@ capabilities:
       - text
       - generation
       - high_cost
+    planner_hints:
+      task_intents: [generate]
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
         tool_name: llm_generate
+        arg_map: {}
+        enabled: true
+  - id: llm.prompt.generate
+    description: Generate free-form text from an explicit prompt and context payload.
+    risk_tier: read_only
+    idempotency: read
+    group: llm
+    subgroup: prompt
+    input_schema_ref: llm_prompt_generate_capability_input
+    output_schema_ref: llm_prompt_generate_capability_output
+    tags:
+      - llm
+      - prompt
+      - context
+      - generation
+      - high_cost
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: llm_generate_with_context
         arg_map: {}
         enabled: true
   - id: codegen.generate

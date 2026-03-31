@@ -3,7 +3,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 
-export type ScreenHeaderScreen = "home" | "compose" | "chat" | "studio" | "memory";
+export type ScreenHeaderScreen = "home" | "compose" | "chat" | "studio" | "memory" | "rag";
 
 type ScreenHeaderProps = {
   eyebrow: string;
@@ -19,7 +19,8 @@ const NAV_ITEMS: Array<{ id: ScreenHeaderScreen; label: string; href: string }> 
   { id: "compose", label: "Compose", href: "/compose" },
   { id: "chat", label: "Chat", href: "/chat" },
   { id: "studio", label: "Studio", href: "/studio" },
-  { id: "memory", label: "Memory", href: "/memory" }
+  { id: "memory", label: "Memory", href: "/memory" },
+  { id: "rag", label: "RAG", href: "/rag" }
 ];
 
 export const screenHeaderSecondaryActionClassName =

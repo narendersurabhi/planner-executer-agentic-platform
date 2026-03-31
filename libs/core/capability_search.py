@@ -76,6 +76,7 @@ def build_capability_search_entry(
     subgroup = str(spec.subgroup or "").strip()
     description = str(spec.description or "").strip()
     tags = _coerce_tags(spec.tags)
+    aliases = _coerce_tags(spec.aliases)
     required_inputs = tuple(
         str(item).strip()
         for item in (
@@ -93,6 +94,7 @@ def build_capability_search_entry(
             group,
             subgroup,
             " ".join(tags),
+            " ".join(aliases),
             " ".join(required_inputs),
         )
         if part
@@ -103,6 +105,7 @@ def build_capability_search_entry(
         "group": group,
         "subgroup": subgroup,
         "tags": list(tags),
+        "aliases": list(aliases),
         "required_inputs": list(required_inputs),
         "search_blob": field_blob.lower(),
         "tokens": sorted(set(_tokenize(field_blob))),

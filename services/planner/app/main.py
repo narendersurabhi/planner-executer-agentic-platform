@@ -125,12 +125,16 @@ def rule_based_plan(job: models.Job, tools: List[models.ToolSpec]) -> models.Pla
 
 @_log_entry_exit("llm_plan")
 def llm_plan(
-    job: models.Job, tools: List[models.ToolSpec], provider: llm_provider.LLMProvider
+    job: models.Job,
+    tools: List[models.ToolSpec],
+    planner_tools: List[models.ToolSpec],
+    provider: llm_provider.LLMProvider,
 ) -> models.PlanCreate:
     config = _planner_service_config()
     request = planner_service.build_plan_request(
         job,
         tools,
+        planner_tools=planner_tools,
         config=config,
         runtime=_planner_service_runtime(),
         include_semantic_hints=True,
@@ -149,6 +153,7 @@ def plan_job(job: models.Job) -> models.PlanCreate:
     return planner_service.plan_job(
         job,
         execution.tool_specs,
+        planner_tools=execution.planner_tool_specs,
         provider=execution.provider,
         config=_planner_service_config(),
         runtime=_planner_service_runtime(),
@@ -250,9 +255,11 @@ def _parse_datetime(value: object, fallback: datetime) -> datetime:
 
 
 def _llm_prompt(job: models.Job, tools: List[models.ToolSpec]) -> str:
+    execution = runtime_service.resolve_execution_context(_planner_runtime_config())
     request = planner_service.build_plan_request(
         job,
         tools,
+        planner_tools=execution.planner_tool_specs,
         config=_planner_service_config(),
         runtime=_planner_service_runtime(),
         include_semantic_hints=True,
@@ -324,10 +331,44 @@ def _parse_llm_plan(content: str) -> models.PlanCreate | None:
 def _ensure_llm_tool(plan: models.PlanCreate) -> models.PlanCreate:
     updated_tasks = []
     for task in plan.tasks:
-        if not task.tool_requests:
-            updated_tasks.append(task.model_copy(update={"tool_requests": ["llm_generate"]}))
+        capability_requests = [
+            str(request_id).strip()
+            for request_id in (getattr(task, "capability_requests", None) or [])
+            if str(request_id).strip()
+        ]
+        tool_requests = [
+            str(request_id).strip()
+            for request_id in (task.tool_requests or [])
+            if str(request_id).strip()
+        ]
+        if capability_requests:
+            if tool_requests != capability_requests:
+                updated_tasks.append(
+                    task.model_copy(
+                        update={
+                            "capability_requests": capability_requests,
+                            "tool_requests": capability_requests,
+                        }
+                    )
+                )
+                continue
+        elif tool_requests:
+            updated_tasks.append(
+                task.model_copy(update={"capability_requests": tool_requests})
+            )
+            continue
         else:
-            updated_tasks.append(task)
+            default_request = "llm.text.generate"
+            updated_tasks.append(
+                task.model_copy(
+                    update={
+                        "capability_requests": [default_request],
+                        "tool_requests": [default_request],
+                    }
+                )
+            )
+            continue
+        updated_tasks.append(task)
     return plan.model_copy(update={"tasks": updated_tasks})
 
 
@@ -336,9 +377,12 @@ def _ensure_task_intents(
     tools: List[models.ToolSpec],
     goal_text: str = "",
     goal_intent_sequence: list[str] | None = None,
+    goal_intent_segments: list[dict[str, Any]] | None = None,
+    capabilities: Mapping[str, Any] | None = None,
 ) -> models.PlanCreate:
     logger = core_logging.get_logger("planner")
     tool_map = {tool.name: tool for tool in tools}
+    total_tasks = len(plan.tasks)
     updated_tasks: list[models.TaskCreate] = []
     changed = False
     for index, task in enumerate(plan.tasks):
@@ -347,6 +391,20 @@ def _ensure_task_intents(
             for tool_name in (task.tool_requests or [])
             if tool_name in tool_map
         }
+        goal_segment_intent = None
+        if goal_intent_segments:
+            matched_segment = planner_service.select_goal_intent_segment_for_task(
+                task=task,
+                task_index=index,
+                task_intent="",
+                goal_intent_segments=list(goal_intent_segments),
+                total_tasks=total_tasks,
+                capabilities=capabilities,
+            )
+            if matched_segment is not None:
+                goal_segment_intent = intent_contract.normalize_task_intent(
+                    matched_segment.get("intent")
+                )
         inference = intent_contract.infer_task_intent_for_task_with_metadata(
             explicit_intent=task.intent,
             description=task.description,
@@ -357,8 +415,12 @@ def _ensure_task_intents(
         inferred = inference.intent
         intent_source = inference.source
         intent_confidence = float(inference.confidence)
+        if goal_segment_intent and not task.intent:
+            inferred = goal_segment_intent
+            intent_source = "normalized_envelope"
+            intent_confidence = max(intent_confidence, 0.92)
         # If text inference falls back to generate, prefer known tool intent where unambiguous.
-        if inferred == models.ToolIntent.generate.value and not task.intent:
+        if inferred == models.ToolIntent.generate.value and not task.intent and not goal_segment_intent:
             if len(unique_tool_intents) == 1:
                 inferred = next(iter(unique_tool_intents)).value
                 intent_source = "tool_intent"
@@ -418,14 +480,23 @@ def _ensure_task_intents_for_request(
         request.tools,
         goal_text=request.goal,
         goal_intent_sequence=planner_contracts.goal_intent_sequence(request),
+        goal_intent_segments=planner_contracts.goal_intent_segments(request),
+        capabilities=planner_contracts.capability_map(request),
     )
 
 
+def _job_normalized_intent_envelope(
+    job: models.Job,
+) -> workflow_contracts.NormalizedIntentEnvelope | None:
+    return planner_contracts.normalized_intent_envelope_for_job(job)
+
+
 def _job_goal_intent_graph(job: models.Job) -> workflow_contracts.IntentGraph | None:
-    if not isinstance(job.metadata, dict):
+    envelope = _job_normalized_intent_envelope(job)
+    if envelope is None:
         return None
-    graph = workflow_contracts.parse_intent_graph(job.metadata.get("goal_intent_graph"))
-    if graph is None or not graph.segments:
+    graph = envelope.graph
+    if not graph.segments:
         return None
     return graph
 
@@ -710,18 +781,26 @@ def _ensure_execution_bindings(plan: models.PlanCreate) -> models.PlanCreate:
     updated_tasks: list[models.TaskCreate] = []
     changed = False
     for task in plan.tasks:
-        normalized_bindings = execution_contracts.normalize_capability_bindings(
-            task.capability_bindings,
-            request_ids=task.tool_requests,
+        normalized_task = planner_service.canonicalize_task_request_ids(
+            task,
             capabilities=capabilities,
         )
-        if normalized_bindings != (task.capability_bindings or {}):
+        normalized_bindings = execution_contracts.normalize_capability_bindings(
+            normalized_task.capability_bindings,
+            request_ids=normalized_task.tool_requests,
+            capabilities=capabilities,
+        )
+        if (
+            normalized_task.tool_requests != list(task.tool_requests or [])
+            or normalized_task.tool_inputs != (task.tool_inputs or {})
+            or normalized_bindings != (normalized_task.capability_bindings or {})
+        ):
             updated_tasks.append(
-                task.model_copy(update={"capability_bindings": normalized_bindings})
+                normalized_task.model_copy(update={"capability_bindings": normalized_bindings})
             )
             changed = True
         else:
-            updated_tasks.append(task)
+            updated_tasks.append(normalized_task)
     if not changed:
         return plan
     return plan.model_copy(update={"tasks": updated_tasks})
@@ -863,9 +942,13 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
     task_by_name = {task.name: task for task in tasks}
     changed = False
     renderer_requests = {
+        "docx_render_from_spec",
         "docx_generate_from_spec",
+        "pdf_render_from_spec",
         "pdf_generate_from_spec",
+        "document.docx.render",
         "document.docx.generate",
+        "document.pdf.render",
         "document.pdf.generate",
     }
     document_spec_consumer_requests = {
@@ -1226,8 +1309,10 @@ def _build_capability_validation_payload_for_request(
     raw_tool_inputs: dict[str, Any],
     request: planner_contracts.PlanRequest,
 ) -> dict[str, Any]:
+    request_id = next((str(item).strip() for item in task.tool_requests or [] if str(item).strip()), "")
     return planner_service.build_capability_validation_payload(
         task,
+        request_id,
         raw_tool_inputs,
         request,
     )

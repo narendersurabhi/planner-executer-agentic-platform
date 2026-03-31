@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from libs.core import workflow_contracts
+from libs.core import intent_contract, workflow_contracts
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,175 @@ class GoalIntentConfig:
 class GoalIntentRuntime:
     infer_task_intent: Callable[[str], Any]
     record_metrics: Callable[[workflow_contracts.GoalIntentProfile], None] | None = None
+
+
+@dataclass(frozen=True)
+class IntentNormalizeConfig:
+    include_decomposition: bool
+    assessment_mode: str
+    assessment_model: str
+    decomposition_mode: str
+    decomposition_model: str
+
+
+@dataclass(frozen=True)
+class IntentNormalizeRuntime:
+    assess_goal_intent: Callable[[str], workflow_contracts.GoalIntentProfile]
+    decompose_goal_intent: Callable[..., workflow_contracts.IntentGraph]
+    capability_required_inputs: Callable[[str], list[str]]
+    assess_goal_intent_heuristic: Callable[[str], workflow_contracts.GoalIntentProfile] | None = None
+
+
+def normalize_goal_intent(
+    goal: str,
+    *,
+    db: Session | None = None,
+    user_id: str | None = None,
+    interaction_summaries: list[dict[str, Any]] | None = None,
+    intent_context: dict[str, Any] | None = None,
+    config: IntentNormalizeConfig,
+    runtime: IntentNormalizeRuntime,
+) -> workflow_contracts.NormalizedIntentEnvelope:
+    normalized_intent_context = dict(intent_context or {})
+    context_interaction_summaries = normalized_intent_context.get("interaction_summaries")
+    if interaction_summaries is None and isinstance(context_interaction_summaries, list):
+        interaction_summaries = [
+            dict(item) for item in context_interaction_summaries if isinstance(item, dict)
+        ]
+    initial_profile = runtime.assess_goal_intent(goal)
+    heuristic_profile = (
+        runtime.assess_goal_intent_heuristic(goal)
+        if runtime.assess_goal_intent_heuristic is not None
+        else initial_profile
+    )
+    context_slot_values = (
+        dict(normalized_intent_context.get("intent_slot_values"))
+        if isinstance(normalized_intent_context.get("intent_slot_values"), dict)
+        else {}
+    )
+    context_slot_provenance = (
+        dict(normalized_intent_context.get("intent_slot_provenance"))
+        if isinstance(normalized_intent_context.get("intent_slot_provenance"), dict)
+        else {}
+    )
+    if context_slot_values:
+        merged_slot_values = dict(initial_profile.slot_values or {})
+        updated = False
+        for key, value in context_slot_values.items():
+            if key in merged_slot_values and str(merged_slot_values.get(key) or "").strip():
+                continue
+            if isinstance(value, str):
+                if not value.strip():
+                    continue
+                merged_slot_values[key] = value.strip()
+            elif value is not None:
+                merged_slot_values[key] = value
+            updated = True
+        if updated:
+            blocking_slots = list(initial_profile.blocking_slots or [])
+            missing_slots = [
+                slot_name
+                for slot_name in blocking_slots
+                if not str(merged_slot_values.get(slot_name) or "").strip()
+            ]
+            if (
+                initial_profile.low_confidence
+                and "intent_action" in blocking_slots
+                and "intent_action" not in missing_slots
+            ):
+                missing_slots.append("intent_action")
+            initial_profile = initial_profile.model_copy(
+                update={
+                    "slot_values": merged_slot_values,
+                    "missing_slots": missing_slots,
+                    "needs_clarification": bool(missing_slots),
+                    "requires_blocking_clarification": bool(missing_slots),
+                    "questions": [slot_question(slot_name, goal) for slot_name in missing_slots],
+                }
+            )
+    graph = workflow_contracts.IntentGraph()
+    if config.include_decomposition:
+        graph = runtime.decompose_goal_intent(
+            goal,
+            db=db,
+            user_id=user_id,
+            interaction_summaries=interaction_summaries,
+        )
+    candidate_capabilities = _candidate_capabilities_by_segment(graph)
+    clarification = intent_contract.derive_envelope_clarification(
+        goal=goal,
+        profile=initial_profile.model_dump(mode="json", exclude_none=True),
+        heuristic_profile=heuristic_profile.model_dump(mode="json", exclude_none=True),
+        graph=graph.model_dump(mode="json", exclude_none=True),
+        context_capability_candidates=(
+            normalized_intent_context.get("capability_candidates")
+            if isinstance(normalized_intent_context.get("capability_candidates"), list)
+            else []
+        ),
+        candidate_required_inputs_by_segment={
+            segment_id: _segment_required_inputs_for_candidates(
+                capability_ids,
+                required_input_lookup=runtime.capability_required_inputs,
+            )
+            for segment_id, capability_ids in candidate_capabilities.items()
+        },
+    )
+    profile = initial_profile.model_copy(
+        update={
+            "needs_clarification": bool(clarification.get("needs_clarification")),
+            "requires_blocking_clarification": bool(
+                clarification.get("requires_blocking_clarification")
+            ),
+            "questions": list(clarification.get("questions") or []),
+            "blocking_slots": list(clarification.get("blocking_slots") or []),
+            "missing_slots": list(clarification.get("missing_inputs") or []),
+            "slot_values": dict(clarification.get("slot_values") or dict(initial_profile.slot_values)),
+            "clarification_mode": str(
+                clarification.get("clarification_mode") or initial_profile.clarification_mode or ""
+            )
+            or None,
+        }
+    )
+    return workflow_contracts.NormalizedIntentEnvelope(
+        goal=goal,
+        profile=profile,
+        graph=graph,
+        candidate_capabilities=candidate_capabilities,
+        clarification=workflow_contracts.ClarificationState(
+            needs_clarification=bool(clarification.get("needs_clarification")),
+            requires_blocking_clarification=bool(
+                clarification.get("requires_blocking_clarification")
+            ),
+            missing_inputs=list(clarification.get("missing_inputs") or []),
+            questions=list(clarification.get("questions") or []),
+            blocking_slots=list(clarification.get("blocking_slots") or []),
+            slot_values=dict(clarification.get("slot_values") or {}),
+            clarification_mode=str(clarification.get("clarification_mode") or "") or None,
+        ),
+        trace=workflow_contracts.NormalizationTrace(
+            assessment_source=str(profile.source or "").strip() or None,
+            assessment_mode=config.assessment_mode or None,
+            assessment_model=config.assessment_model or None,
+            assessment_fallback_used=_fallback_used(
+                config.assessment_mode,
+                profile.source,
+            ),
+            decomposition_source=str(graph.source or "").strip() or None,
+            decomposition_mode=config.decomposition_mode or None,
+            decomposition_model=config.decomposition_model or None,
+            decomposition_fallback_used=(
+                _fallback_used(config.decomposition_mode, graph.source)
+                if config.include_decomposition
+                else False
+            ),
+            heuristic_assessment_source=str(heuristic_profile.source or "").strip() or None,
+            heuristic_assessment_intent=str(heuristic_profile.intent or "").strip() or None,
+            context_projection="intent",
+            context_slot_keys=sorted(context_slot_values.keys()),
+            context_slot_provenance=context_slot_provenance,
+            disagreement=dict(clarification.get("disagreement") or {}),
+        ),
+    )
 
 
 def decompose_goal_intent(
@@ -259,10 +428,49 @@ def _infer_goal_risk_level(goal: str, intent: str) -> str:
     return "read_only"
 
 
+def _candidate_capabilities_by_segment(
+    graph: workflow_contracts.IntentGraph,
+) -> dict[str, list[str]]:
+    candidates: dict[str, list[str]] = {}
+    for segment in graph.segments:
+        deduped: list[str] = []
+        for capability_id in segment.suggested_capabilities:
+            normalized = str(capability_id or "").strip()
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+        if deduped:
+            candidates[segment.id] = deduped
+    return candidates
+
+
+def _segment_required_inputs_for_candidates(
+    capability_ids: list[str],
+    *,
+    required_input_lookup: Callable[[str], list[str]],
+) -> list[str]:
+    required_inputs: list[str] = []
+    for capability_id in capability_ids:
+        for raw_input in required_input_lookup(capability_id):
+            normalized = intent_contract.normalize_required_input_key(raw_input)
+            if normalized and normalized not in required_inputs:
+                required_inputs.append(normalized)
+    return required_inputs
+
+
+def _fallback_used(mode: str, source: str | None) -> bool:
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode in {"", "heuristic", "disabled"}:
+        return False
+    return str(source or "").strip().lower() != "llm"
+
+
 def _extract_goal_slot_signals(goal: str, intent: str, risk_level: str) -> dict[str, Any]:
     lowered = str(goal or "").lower()
     output_format = ""
     for token, normalized in (
+        ("word document", "docx"),
+        ("microsoft word", "docx"),
+        ("word doc", "docx"),
         ("pdf", "pdf"),
         ("docx", "docx"),
         ("markdown", "md"),

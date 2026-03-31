@@ -1,4 +1,4 @@
-# docx_generate_from_spec
+# docx_render_from_spec
 
 Generate an ATS-friendly single-column `.docx` document from a `DocumentSpec` JSON and write it under `/shared/artifacts`.
 `document_spec` may be omitted when it is available in memory as `document_spec:latest` (preferred).

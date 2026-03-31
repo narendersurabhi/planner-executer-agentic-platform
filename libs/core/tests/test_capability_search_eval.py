@@ -8,7 +8,7 @@ def test_load_capability_search_eval_cases_reads_jsonl(tmp_path: Path) -> None:
     gold.write_text(
         "\n".join(
             [
-                '{"id":"pdf_render","query":"render a pdf report","intent":"render","expected_capability_ids":["document.pdf.generate"]}',
+                '{"id":"pdf_render","query":"render a pdf report","intent":"render","expected_capability_ids":["document.pdf.render"]}',
                 '{"id":"memory","query":"search semantic memory","intent":"io","expected_capability_ids":["memory.semantic.search"]}',
             ]
         ),
@@ -18,7 +18,7 @@ def test_load_capability_search_eval_cases_reads_jsonl(tmp_path: Path) -> None:
     cases = capability_search_eval.load_capability_search_eval_cases(gold)
 
     assert [case.case_id for case in cases] == ["pdf_render", "memory"]
-    assert cases[0].expected_capability_ids == ("document.pdf.generate",)
+    assert cases[0].expected_capability_ids == ("document.pdf.render",)
 
 
 def test_evaluate_capability_search_cases_reports_hits() -> None:
@@ -30,9 +30,9 @@ def test_evaluate_capability_search_cases_reports_hits() -> None:
             query="render a pdf report from a document spec",
             intent="render",
             segment_text=None,
-            expected_capability_ids=("document.pdf.generate",),
+            expected_capability_ids=("document.pdf.render",),
             acceptable_alternates=(),
-            must_have=("document.pdf.generate",),
+            must_have=("document.pdf.render",),
             risk_tier="read_only",
             notes=None,
         ),

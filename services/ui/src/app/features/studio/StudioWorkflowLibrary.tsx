@@ -23,8 +23,10 @@ type StudioWorkflowLibraryProps = {
   workflowRunsError: string | null;
   activeWorkflowDefinitionId: string | null;
   activeWorkflowVersionId: string | null;
+  deletingWorkflowDefinitionId: string | null;
   onRefresh: () => void;
   onOpenDefinition: (definition: WorkflowDefinition) => void;
+  onDeleteDefinition: (definition: WorkflowDefinition) => void;
   onOpenVersion: (version: WorkflowVersion) => void;
   onCreateManualTrigger: () => void;
   onInvokeTrigger: (trigger: WorkflowTrigger) => void;
@@ -45,8 +47,10 @@ export default function StudioWorkflowLibrary({
   workflowRunsError,
   activeWorkflowDefinitionId,
   activeWorkflowVersionId,
+  deletingWorkflowDefinitionId,
   onRefresh,
   onOpenDefinition,
+  onDeleteDefinition,
   onOpenVersion,
   onCreateManualTrigger,
   onInvokeTrigger,
@@ -133,6 +137,13 @@ export default function StudioWorkflowLibrary({
                       onClick={() => onOpenDefinition(definition)}
                     >
                       Open Draft
+                    </button>
+                    <button
+                      className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:border-rose-400 hover:text-rose-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={() => onDeleteDefinition(definition)}
+                      disabled={deletingWorkflowDefinitionId === definition.id}
+                    >
+                      {deletingWorkflowDefinitionId === definition.id ? "Deleting..." : "Delete"}
                     </button>
                   </div>
                 </article>
@@ -342,6 +353,24 @@ export default function StudioWorkflowLibrary({
                     </span>
                   ) : null}
                 </div>
+                {run.latest_task_error ? (
+                  <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-3 py-3 text-xs leading-5 text-rose-700">
+                    <div className="font-semibold uppercase tracking-[0.14em] text-rose-800">
+                      Latest Task Error
+                    </div>
+                    <div className="mt-1 text-rose-900">
+                      {run.latest_task_name ? `${run.latest_task_name}: ` : null}
+                      {run.latest_task_error}
+                    </div>
+                  </div>
+                ) : run.job_error ? (
+                  <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs leading-5 text-amber-800">
+                    <div className="font-semibold uppercase tracking-[0.14em] text-amber-900">
+                      Run Error
+                    </div>
+                    <div className="mt-1">{run.job_error}</div>
+                  </div>
+                ) : null}
               </article>
             ))}
           </div>

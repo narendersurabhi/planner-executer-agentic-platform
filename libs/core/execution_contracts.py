@@ -97,6 +97,20 @@ class TaskExecutionRequest(BaseModel):
         return [request.request_id for request in self.requests]
 
     @property
+    def capability_requests(self) -> list[str]:
+        items: list[str] = []
+        for request in self.requests:
+            capability_id = (
+                request.capability_binding.capability_id
+                if request.capability_binding and request.capability_binding.capability_id
+                else request.request_id
+            )
+            normalized = _string_value(capability_id)
+            if normalized:
+                items.append(normalized)
+        return items
+
+    @property
     def tool_inputs(self) -> dict[str, dict[str, Any]]:
         return {
             request.request_id: dict(request.resolved_inputs)
@@ -123,6 +137,7 @@ class TaskDispatchPayload(BaseModel):
     rework_count: int = 0
     max_reworks: int = 0
     assigned_to: str | None = None
+    capability_requests: list[str] = Field(default_factory=list)
     tool_requests: list[str] = Field(default_factory=list)
     tool_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     capability_bindings: dict[str, CapabilityBinding] = Field(default_factory=dict)
@@ -251,6 +266,7 @@ def build_task_dispatch_payload(
             "rework_count": _int_or_default(payload.get("rework_count"), 0),
             "max_reworks": _int_or_default(payload.get("max_reworks"), 0),
             "assigned_to": _string_value(payload.get("assigned_to")) or None,
+            "capability_requests": execution_request.capability_requests,
             "tool_requests": execution_request.tool_requests,
             "tool_inputs": execution_request.tool_inputs,
             "capability_bindings": capability_bindings,
