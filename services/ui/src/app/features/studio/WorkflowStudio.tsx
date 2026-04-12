@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import ComposerDagCanvas from "../../components/composer/ComposerDagCanvas";
@@ -15,7 +15,6 @@ import StudioCompilePanel from "./StudioCompilePanel";
 import StudioWorkbenchIcon from "./StudioWorkbenchIcon";
 import StudioWorkflowInterfacePanel from "./StudioWorkflowInterfacePanel";
 import StudioNodeInspector from "./StudioNodeInspector";
-import StudioWorkflowLibrary from "./StudioWorkflowLibrary";
 import type {
   CanvasPoint,
   CapabilityCatalog,
@@ -941,13 +940,17 @@ const createInitialFloatingStudioPanelLayouts = (
   const paletteWidth = Math.min(296, Math.max(260, stageWidth * 0.24));
   const rightRailWidth = Math.min(344, Math.max(304, stageWidth * 0.25));
   const interfaceWidth = Math.min(446, Math.max(360, stageWidth * 0.34));
-  const libraryWidth = Math.min(430, Math.max(360, stageWidth * 0.32));
+  const libraryWidth = Math.min(360, Math.max(320, stageWidth * 0.27));
   const inspectorWidth = Math.min(390, Math.max(340, stageWidth * 0.29));
   const topY = 58;
   const lowerY = Math.max(440, stageHeight - 430 - padding);
   const lowerYRight = Math.max(400, stageHeight - 500 - padding);
   const rightRailX = Math.max(padding, stageWidth - rightRailWidth - 140);
   const inspectorX = Math.max(padding, stageWidth - inspectorWidth - 140);
+  const libraryY = Math.min(
+    Math.max(152, Math.round(stageHeight * 0.2)),
+    stageHeight - 336 - padding
+  );
   const centerLibraryX = Math.max(
     padding,
     Math.min((stageWidth - libraryWidth) / 2, stageWidth - libraryWidth - padding)
@@ -987,9 +990,9 @@ const createInitialFloatingStudioPanelLayouts = (
     },
     library: {
       x: centerLibraryX,
-      y: Math.max(470, stageHeight - 460 - padding),
+      y: libraryY,
       width: libraryWidth,
-      height: 454,
+      height: 336,
       zIndex: 2,
       minimized: false,
     },
@@ -1039,9 +1042,8 @@ export default function WorkflowStudio() {
   const [workflowRunsLoading, setWorkflowRunsLoading] = useState(false);
   const [workflowRunsError, setWorkflowRunsError] = useState<string | null>(null);
   const [workflowActionLoading, setWorkflowActionLoading] = useState<
-    "save" | "publish" | "run" | "delete" | null
+    "save" | "publish" | "run" | null
   >(null);
-  const [workflowDefinitionDeleteId, setWorkflowDefinitionDeleteId] = useState<string | null>(null);
   const [activeComposerIssueFocus, setActiveComposerIssueFocus] = useState<ComposerIssueFocus | null>(
     null
   );
@@ -1081,6 +1083,8 @@ export default function WorkflowStudio() {
     inspector: null,
   });
   const floatingStudioPanelsInitializedRef = useRef(false);
+  const router = useRouter();
+  const pathname = usePathname() || "/studio";
   const searchParams = useSearchParams();
   const requestedWorkflowDefinitionId = String(searchParams.get("definition") || "").trim();
   const requestedWorkflowVersionId = String(searchParams.get("version") || "").trim();
@@ -3310,46 +3314,6 @@ export default function WorkflowStudio() {
     setStudioNotice(`Opened saved draft ${definition.title}.`);
   };
 
-  const deleteWorkflowDefinition = async (definition: WorkflowDefinition) => {
-    if (typeof window !== "undefined") {
-      const confirmed = window.confirm(
-        `Delete saved draft "${definition.title}" and its published versions, triggers, and run history?`
-      );
-      if (!confirmed) {
-        return;
-      }
-    }
-    setWorkflowActionLoading("delete");
-    setWorkflowDefinitionDeleteId(definition.id);
-    try {
-      const response = await fetch(
-        `${apiUrl}/workflows/definitions/${encodeURIComponent(definition.id)}`,
-        { method: "DELETE" }
-      );
-      const body = response.status === 204 ? null : ((await response.json()) as { detail?: unknown } | null);
-      if (!response.ok) {
-        const detail = body && typeof body.detail === "string" ? body.detail : null;
-        throw new Error(detail || `Delete draft failed (${response.status}).`);
-      }
-      setWorkflowDefinitions((prev) => prev.filter((item) => item.id !== definition.id));
-      if (savedWorkflowDefinition?.id === definition.id) {
-        setSavedWorkflowDefinition(null);
-        setPublishedWorkflowVersion(null);
-        setLoadedWorkflowVersionId(null);
-        setWorkflowVersions([]);
-        setWorkflowTriggers([]);
-        setWorkflowRuns([]);
-      }
-      void refreshWorkflowDefinitions();
-      setStudioNotice(`Deleted saved draft ${definition.title}.`);
-    } catch (error) {
-      setStudioNotice(error instanceof Error ? error.message : "Failed to delete saved draft.");
-    } finally {
-      setWorkflowDefinitionDeleteId(null);
-      setWorkflowActionLoading(null);
-    }
-  };
-
   const restoreWorkflowVersion = async (version: WorkflowVersion) => {
     let definition = savedWorkflowDefinition;
     if (!definition || definition.id !== version.definition_id) {
@@ -3507,6 +3471,42 @@ export default function WorkflowStudio() {
     workflowDefinitions,
   ]);
 
+  useEffect(() => {
+    const routeKey = `${requestedWorkflowDefinitionId}::${requestedWorkflowVersionId}`;
+    const routeSelectionPending =
+      (requestedWorkflowDefinitionId || requestedWorkflowVersionId) &&
+      handledStudioRouteSelectionRef.current !== routeKey;
+    if (routeSelectionPending) {
+      return;
+    }
+
+    const nextDefinitionId = activeWorkflowDefinitionId || "";
+    const nextVersionId = activeWorkflowVersionId || "";
+    if (
+      nextDefinitionId === requestedWorkflowDefinitionId &&
+      nextVersionId === requestedWorkflowVersionId
+    ) {
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (nextDefinitionId) {
+      params.set("definition", nextDefinitionId);
+    }
+    if (nextVersionId) {
+      params.set("version", nextVersionId);
+    }
+    const nextUrl = params.size > 0 ? `${pathname}?${params.toString()}` : pathname;
+    router.replace(nextUrl, { scroll: false });
+  }, [
+    activeWorkflowDefinitionId,
+    activeWorkflowVersionId,
+    pathname,
+    requestedWorkflowDefinitionId,
+    requestedWorkflowVersionId,
+    router,
+  ]);
+
   const saveWorkflowDefinition = async () => {
     if (contextState.invalid) {
       setStudioNotice("Workflow drafts can only be saved when Context JSON is valid.");
@@ -3541,6 +3541,8 @@ export default function WorkflowStudio() {
       }
       const definition = body as WorkflowDefinition;
       setSavedWorkflowDefinition(definition);
+      setPublishedWorkflowVersion(null);
+      setLoadedWorkflowVersionId(null);
       void refreshWorkflowDefinitions();
       void refreshWorkflowTriggers(definition.id);
       void refreshWorkflowRuns(definition.id);
@@ -3623,78 +3625,6 @@ export default function WorkflowStudio() {
       );
     } catch (error) {
       setStudioNotice(error instanceof Error ? error.message : "Failed to run workflow version.");
-    } finally {
-      setWorkflowActionLoading(null);
-    }
-  };
-
-  const createManualWorkflowTrigger = async () => {
-    if (!activeWorkflowDefinitionId || !savedWorkflowDefinition) {
-      setStudioNotice("Save or open a workflow definition before creating a trigger.");
-      return;
-    }
-    setWorkflowActionLoading("save");
-    try {
-      const response = await fetch(
-        `${apiUrl}/workflows/definitions/${encodeURIComponent(activeWorkflowDefinitionId)}/triggers`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: `${savedWorkflowDefinition.title} manual trigger`,
-            trigger_type: "manual",
-            enabled: true,
-            config: { version_mode: "latest_published" },
-            user_id: workspaceUserId.trim() || undefined,
-            metadata: { source: "workflow_studio" },
-          }),
-        }
-      );
-      const body = (await response.json()) as WorkflowTrigger | { detail?: unknown };
-      if (!response.ok) {
-        const detail = (body as { detail?: unknown }).detail;
-        throw new Error(
-          typeof detail === "string"
-            ? detail
-            : `Create trigger failed (${response.status}).`
-        );
-      }
-      void refreshWorkflowTriggers(activeWorkflowDefinitionId);
-      setStudioNotice(`Created manual trigger ${(body as WorkflowTrigger).title}.`);
-    } catch (error) {
-      setStudioNotice(error instanceof Error ? error.message : "Failed to create workflow trigger.");
-    } finally {
-      setWorkflowActionLoading(null);
-    }
-  };
-
-  const invokeWorkflowTrigger = async (trigger: WorkflowTrigger) => {
-    setWorkflowActionLoading("run");
-    try {
-      const response = await fetch(
-        `${apiUrl}/workflows/triggers/${encodeURIComponent(trigger.id)}/invoke`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ priority: 0 }),
-        }
-      );
-      const body = (await response.json()) as WorkflowRunResult | { detail?: unknown };
-      if (!response.ok) {
-        const detail = (body as { detail?: unknown }).detail;
-        throw new Error(
-          typeof detail === "string"
-            ? detail
-            : `Trigger invoke failed (${response.status}).`
-        );
-      }
-      const result = body as WorkflowRunResult;
-      setPublishedWorkflowVersion(result.workflow_version);
-      setLoadedWorkflowVersionId(result.workflow_version.id);
-      void refreshWorkflowRuns(result.workflow_definition.id);
-      setStudioNotice(`Triggered job ${result.job.id} via ${trigger.title}.`);
-    } catch (error) {
-      setStudioNotice(error instanceof Error ? error.message : "Failed to invoke workflow trigger.");
     } finally {
       setWorkflowActionLoading(null);
     }
@@ -4297,6 +4227,150 @@ export default function WorkflowStudio() {
     />
   );
 
+  const workflowLibraryLauncherPanel = (
+    <section className="flex h-full flex-col rounded-[28px] border border-[#22304a] bg-[linear-gradient(180deg,rgba(15,23,42,0.98),rgba(9,17,27,0.96))] px-4 py-4 text-slate-100 shadow-[0_24px_60px_rgba(2,8,23,0.24)]">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-100/68">
+            Workflow Browser
+          </div>
+          <h3 className="mt-1 text-2xl text-white">Studio Launcher</h3>
+        </div>
+        <button
+          className="rounded-full border border-white/12 bg-white/[0.05] px-3 py-1.5 text-xs font-semibold text-slate-100 transition hover:border-sky-300/40 hover:bg-white/[0.08]"
+          onClick={() => {
+            void refreshWorkflowDefinitions();
+            if (activeWorkflowDefinitionId) {
+              void refreshWorkflowVersions(activeWorkflowDefinitionId);
+              void refreshWorkflowTriggers(activeWorkflowDefinitionId);
+              void refreshWorkflowRuns(activeWorkflowDefinitionId);
+            }
+          }}
+        >
+          Refresh
+        </button>
+      </div>
+
+      <p className="mt-3 text-sm leading-6 text-slate-300/82">
+        Keep Studio focused on editing. Use the full Workflows page for version history, triggers,
+        run history, and draft management.
+      </p>
+
+      <div className="mt-4 flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.14em]">
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          drafts {workflowDefinitions.length}
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          versions {workflowVersions.length}
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          runs {workflowRuns.length}
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          {activeWorkflowVersionId ? "version linked" : "draft only"}
+        </span>
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300/60">
+          Current Workflow
+        </div>
+        {savedWorkflowDefinition ? (
+          <>
+            <div className="mt-2 truncate text-sm font-semibold text-white">
+              {savedWorkflowDefinition.title}
+            </div>
+            <div className="mt-1 text-xs leading-5 text-slate-300/76">
+              {savedWorkflowDefinition.goal || "No goal recorded for this workflow."}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-400">
+              <span className="rounded-full bg-white/[0.06] px-2.5 py-1">
+                updated {formatTimestamp(savedWorkflowDefinition.updated_at)}
+              </span>
+              <span className="rounded-full bg-white/[0.06] px-2.5 py-1">
+                {activeWorkflowVersionId ? `version ${activeWorkflowVersionId.slice(0, 8)}` : "draft"}
+              </span>
+            </div>
+          </>
+        ) : (
+          <div className="mt-2 text-sm leading-6 text-slate-300/72">
+            Save a draft or open one from Workflows to make this Studio session shareable.
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 flex items-center justify-between gap-3">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300/75">
+          Recent Drafts
+        </div>
+        <Link
+          href="/workflows"
+          className="rounded-full border border-white/12 bg-white/[0.05] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
+        >
+          Open Workflows
+        </Link>
+      </div>
+
+      <div className="mt-3 flex-1 space-y-2 overflow-auto pr-1">
+        {workflowDefinitionsLoading ? (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3 text-sm text-slate-300/72">
+            Loading saved workflows...
+          </div>
+        ) : workflowDefinitionsError ? (
+          <div className="rounded-2xl border border-rose-300/24 bg-rose-400/10 px-3 py-3 text-sm text-rose-100">
+            {workflowDefinitionsError}
+          </div>
+        ) : workflowDefinitions.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-white/12 bg-white/[0.03] px-3 py-4 text-sm text-slate-300/72">
+            No saved workflows yet. Save this draft, then use Workflows for deeper history and
+            management.
+          </div>
+        ) : (
+          workflowDefinitions.slice(0, 4).map((definition) => {
+            const isActive = definition.id === activeWorkflowDefinitionId;
+            return (
+              <article
+                key={definition.id}
+                className={`rounded-2xl border px-3 py-3 ${
+                  isActive
+                    ? "border-sky-300/24 bg-sky-400/10"
+                    : "border-white/10 bg-white/[0.04]"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-white">
+                      {definition.title}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-300/70">
+                      updated {formatTimestamp(definition.updated_at)}
+                    </div>
+                  </div>
+                  {isActive ? (
+                    <span className="rounded-full border border-sky-300/24 bg-sky-400/12 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-sky-100">
+                      Active
+                    </span>
+                  ) : null}
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <div className="line-clamp-2 text-xs leading-5 text-slate-300/76">
+                    {definition.goal || "No goal recorded for this workflow."}
+                  </div>
+                  <button
+                    className="rounded-full border border-white/12 bg-white/[0.05] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
+                    onClick={() => restoreWorkflowDefinition(definition)}
+                  >
+                    Open
+                  </button>
+                </div>
+              </article>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+
   useEffect(() => {
     if (!selectedDagNodeId) {
       return;
@@ -4790,45 +4864,12 @@ export default function WorkflowStudio() {
 
                   {renderFloatingStudioPanel(
                     "library",
-                    "Workflow Library",
-                    <StudioWorkflowLibrary
-                      workflowDefinitions={workflowDefinitions}
-                      workflowDefinitionsLoading={workflowDefinitionsLoading}
-                      workflowDefinitionsError={workflowDefinitionsError}
-                      workflowVersions={workflowVersions}
-                      workflowVersionsLoading={workflowVersionsLoading}
-                      workflowVersionsError={workflowVersionsError}
-                      workflowTriggers={workflowTriggers}
-                      workflowTriggersLoading={workflowTriggersLoading}
-                      workflowTriggersError={workflowTriggersError}
-                      workflowRuns={workflowRuns}
-                      workflowRunsLoading={workflowRunsLoading}
-                      workflowRunsError={workflowRunsError}
-                      activeWorkflowDefinitionId={activeWorkflowDefinitionId}
-                      activeWorkflowVersionId={activeWorkflowVersionId}
-                      deletingWorkflowDefinitionId={workflowDefinitionDeleteId}
-                      onRefresh={() => {
-                        void refreshWorkflowDefinitions();
-                        if (activeWorkflowDefinitionId) {
-                          void refreshWorkflowVersions(activeWorkflowDefinitionId);
-                          void refreshWorkflowTriggers(activeWorkflowDefinitionId);
-                          void refreshWorkflowRuns(activeWorkflowDefinitionId);
-                        }
-                      }}
-                      onOpenDefinition={restoreWorkflowDefinition}
-                      onDeleteDefinition={(definition) => {
-                        void deleteWorkflowDefinition(definition);
-                      }}
-                      onOpenVersion={(version) => {
-                        void restoreWorkflowVersion(version);
-                      }}
-                      onCreateManualTrigger={createManualWorkflowTrigger}
-                      onInvokeTrigger={(trigger) => {
-                        void invokeWorkflowTrigger(trigger);
-                      }}
-                    />,
+                    "Workflow Browser",
+                    workflowLibraryLauncherPanel,
                     {
                       panelDomId: "studio-library-section",
+                      bodyClassName: "overflow-hidden p-0",
+                      badge: savedWorkflowDefinition ? "linked" : "browse",
                     }
                   )}
 
