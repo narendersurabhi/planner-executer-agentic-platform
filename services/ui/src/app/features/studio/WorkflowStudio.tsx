@@ -4034,7 +4034,7 @@ export default function WorkflowStudio() {
   };
 
   const workflowSetupPanel = (
-    <section className="rounded-[18px] border border-white/8 bg-[linear-gradient(180deg,rgba(48,60,74,0.54),rgba(41,52,65,0.68))] p-3 shadow-[0_16px_34px_rgba(15,23,42,0.12)]">
+    <section className="px-3 py-3 text-slate-100">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100/68">
@@ -4228,7 +4228,7 @@ export default function WorkflowStudio() {
   );
 
   const workflowLibraryLauncherPanel = (
-    <section className="flex h-full flex-col rounded-[28px] border border-[#22304a] bg-[linear-gradient(180deg,rgba(15,23,42,0.98),rgba(9,17,27,0.96))] px-4 py-4 text-slate-100 shadow-[0_24px_60px_rgba(2,8,23,0.24)]">
+    <section className="flex h-full flex-col px-3 py-3 text-slate-100">
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-100/68">
@@ -4557,7 +4557,7 @@ export default function WorkflowStudio() {
           </div>
         </div>
         {!isMinimized ? (
-          <div className={`min-h-0 flex-1 overflow-auto p-1.5 ${options.bodyClassName || ""}`.trim()}>
+          <div className={`min-h-0 flex-1 overflow-auto ${options.bodyClassName || ""}`.trim()}>
             {content}
           </div>
         ) : null}
@@ -4744,9 +4744,9 @@ export default function WorkflowStudio() {
                 <div
                   ref={studioWorkspaceStageRef}
                   id="studio-graph-section"
-                  className="relative mt-4 h-[calc(100vh-184px)] min-h-[980px] overflow-hidden rounded-[34px] border border-white/12 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]"
+                  className="relative mt-4 h-[calc(100vh-184px)] min-h-[980px] overflow-hidden rounded-[30px] bg-[linear-gradient(180deg,rgba(75,92,109,0.58),rgba(45,57,71,0.72))] ring-1 ring-white/10 shadow-[0_22px_56px_rgba(15,23,42,0.16)]"
                 >
-                  <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-full border border-white/10 bg-slate-950/26 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100">
+                  <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-100/58">
                     Drag panel headers to rearrange the workspace
                   </div>
 

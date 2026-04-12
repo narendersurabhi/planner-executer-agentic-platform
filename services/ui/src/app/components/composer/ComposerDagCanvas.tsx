@@ -480,7 +480,7 @@ export default function ComposerDagCanvas({
     <div className="relative h-full">
       {showToolbar ? (
         <div className="pointer-events-none absolute right-4 top-4 z-20 flex justify-end">
-          <div className="pointer-events-auto flex items-center gap-1.5 rounded-[14px] border border-black/15 bg-[rgba(53,67,83,0.88)] p-1.5 shadow-[0_10px_24px_rgba(15,23,42,0.18)] backdrop-blur">
+          <div className="pointer-events-auto flex items-center gap-1.5">
             <button
               className={toolbarButtonClassName}
               onClick={onZoomIn}

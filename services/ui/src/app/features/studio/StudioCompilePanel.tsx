@@ -17,7 +17,7 @@ type StudioCompilePanelProps = {
 };
 
 const compilePanelClassName =
-  "rounded-[18px] border border-white/8 bg-[linear-gradient(180deg,rgba(42,53,67,0.84),rgba(34,44,57,0.92))] p-3.5 text-slate-100 shadow-[0_14px_32px_rgba(15,23,42,0.14)] [&_.border-slate-200]:border-white/10 [&_.border-amber-200]:border-amber-300/25 [&_.border-rose-200]:border-rose-300/25 [&_.bg-slate-50]:bg-white/[0.04] [&_.bg-white]:bg-white/[0.05] [&_.bg-amber-50]:bg-amber-400/10 [&_.bg-rose-50]:bg-rose-400/10 [&_.text-slate-900]:text-white [&_.text-slate-800]:text-slate-100 [&_.text-slate-700]:text-slate-200 [&_.text-slate-600]:text-slate-300/82 [&_.text-slate-500]:text-slate-400 [&_.text-amber-800]:text-amber-100 [&_.text-rose-800]:text-rose-100 [&_details]:border-white/10 [&_details]:bg-white/[0.04] [&_summary]:text-slate-100";
+  "h-full px-3 py-3 text-slate-100 [&_.border-slate-200]:border-white/10 [&_.border-amber-200]:border-amber-300/25 [&_.border-rose-200]:border-rose-300/25 [&_.bg-slate-50]:bg-white/[0.04] [&_.bg-white]:bg-white/[0.05] [&_.bg-amber-50]:bg-amber-400/10 [&_.bg-rose-50]:bg-rose-400/10 [&_.text-slate-900]:text-white [&_.text-slate-800]:text-slate-100 [&_.text-slate-700]:text-slate-200 [&_.text-slate-600]:text-slate-300/82 [&_.text-slate-500]:text-slate-400 [&_.text-amber-800]:text-amber-100 [&_.text-rose-800]:text-rose-100 [&_details]:border [&_details]:border-white/10 [&_details]:bg-white/[0.04] [&_summary]:text-slate-100";
 
 export default function StudioCompilePanel({
   compileLoading,
