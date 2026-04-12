@@ -6,6 +6,57 @@ body {
   @apply bg-slate-50 text-slate-900;
 }
 
+.app-shell-dark {
+  background-color: #4f6274;
+  color: rgb(248 250 252);
+}
+
+.app-shell-dark [class*="text-slate-300/"] {
+  color: rgb(226 232 240 / 0.9);
+}
+
+.app-shell-dark [class*="text-slate-200/"] {
+  color: rgb(241 245 249 / 0.94);
+}
+
+.app-shell-dark [class*="text-slate-100/"] {
+  color: rgb(248 250 252 / 0.98);
+}
+
+.app-shell-dark [class*="text-sky-100/"] {
+  color: rgb(224 242 254 / 0.92);
+}
+
+.app-shell-dark [class*="text-sky-200/"] {
+  color: rgb(186 230 253 / 0.94);
+}
+
+.app-shell-dark [class*="placeholder:text-slate-400/"]::placeholder,
+.app-shell-dark [class*="placeholder:text-slate-300/"]::placeholder,
+.app-shell-dark [class*="placeholder:text-white/"]::placeholder {
+  color: rgb(226 232 240 / 0.76);
+}
+
+.app-shell-dark [class*="bg-white/[0.03]"],
+.app-shell-dark [class*="bg-white/[0.04]"],
+.app-shell-dark [class*="bg-white/[0.05]"],
+.app-shell-dark [class*="bg-white/[0.06]"] {
+  background-color: rgb(255 255 255 / 0.08);
+}
+
+.app-shell-dark [class*="bg-slate-950/14"],
+.app-shell-dark [class*="bg-slate-950/16"],
+.app-shell-dark [class*="bg-slate-950/18"],
+.app-shell-dark [class*="bg-slate-950/20"],
+.app-shell-dark [class*="bg-slate-950/25"] {
+  background-color: rgb(15 23 42 / 0.32);
+}
+
+.app-shell-dark [class*="border-white/10"],
+.app-shell-dark [class*="border-white/12"] {
+  border-color: rgb(255 255 255 / 0.16);
+}
+
 .font-body {
   font-family: var(--font-body), "Helvetica Neue", sans-serif;
 }

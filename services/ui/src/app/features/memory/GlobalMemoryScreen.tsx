@@ -302,13 +302,14 @@ export default function GlobalMemoryScreen() {
         </>
       }
     >
-      <div className="space-y-6">
+      <div className="space-y-5">
       <ScreenHeader
         eyebrow="Global Memory"
         title="Manage user-scoped memory."
         description="View, create, update, and delete stable user memory entries without going through a workflow run."
         activeScreen="memory"
         theme="studio"
+        compact
       />
 
       {notice ? (
@@ -322,7 +323,7 @@ export default function GlobalMemoryScreen() {
         </div>
       ) : null}
 
-      <div className="grid gap-6 xl:grid-cols-[320px_minmax(0,1fr)]">
+      <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
         <section className="rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-5 shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]">
           <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
             Browser + Scope
@@ -416,7 +417,7 @@ export default function GlobalMemoryScreen() {
               <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100/68">
                 Editor
               </div>
-              <h2 className="mt-1 font-display text-2xl text-white">
+              <h2 className="mt-1 text-[26px] font-semibold tracking-[-0.03em] text-white">
                 {selectedEntry ? "Update Memory Entry" : "Create Memory Entry"}
               </h2>
             </div>

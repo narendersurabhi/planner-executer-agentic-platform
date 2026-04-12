@@ -86,6 +86,12 @@ const INDEX_MODES: Array<{ id: IndexMode; label: string; description: string }> 
   },
 ];
 
+const fieldGroupClassName = "space-y-2 text-sm text-slate-200";
+const fieldLabelClassName =
+  "text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-100";
+const fieldInputClassName =
+  "w-full rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-slate-50 caret-white placeholder:text-slate-400/70 focus:border-sky-300/40 focus:bg-slate-950/28 focus:outline-none";
+
 const prettyJson = (value: unknown) => JSON.stringify(value ?? {}, null, 2);
 
 const formatTimestamp = (value?: string | null) => {
@@ -123,8 +129,8 @@ function RagModeButton({
           : "border-white/10 bg-slate-950/18 text-slate-200 hover:border-white/18 hover:bg-slate-950/26"
       }`}
     >
-      <div className="text-sm font-semibold">{label}</div>
-      <div className={`mt-1 text-xs leading-5 ${active ? "text-sky-100/78" : "text-slate-300/68"}`}>
+      <div className="text-base font-semibold tracking-[-0.02em]">{label}</div>
+      <div className={`mt-1 text-sm leading-6 ${active ? "text-sky-100/78" : "text-slate-300/68"}`}>
         {description}
       </div>
     </button>
@@ -515,60 +521,61 @@ export default function RagKnowledgeScreen() {
           description="Index markdown, text, workspace files, and directories into the vector store. Browse indexed documents, inspect stored chunks, replace stale content, and remove documents cleanly."
           activeScreen="rag"
           theme="studio"
+          compact
         >
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
-            <label className="space-y-2 text-sm text-slate-200">
-              <span className="font-semibold text-white">Collection</span>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+            <label className={fieldGroupClassName}>
+              <span className={fieldLabelClassName}>Collection</span>
               <input
                 value={collectionName}
                 onChange={(event) => setCollectionName(event.target.value)}
-                className="w-full rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-white placeholder:text-slate-400/70 focus:border-sky-300/40 focus:outline-none"
+                className={fieldInputClassName}
                 placeholder="rag_default"
               />
             </label>
-            <label className="space-y-2 text-sm text-slate-200">
-              <span className="font-semibold text-white">Namespace</span>
+            <label className={fieldGroupClassName}>
+              <span className={fieldLabelClassName}>Namespace</span>
               <input
                 value={namespace}
                 onChange={(event) => setNamespace(event.target.value)}
-                className="w-full rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-white placeholder:text-slate-400/70 focus:border-sky-300/40 focus:outline-none"
+                className={fieldInputClassName}
                 placeholder="docs"
               />
             </label>
-            <label className="space-y-2 text-sm text-slate-200">
-              <span className="font-semibold text-white">Memory User ID</span>
+            <label className={fieldGroupClassName}>
+              <span className={fieldLabelClassName}>Memory User ID</span>
               <input
                 value={userId}
                 onChange={(event) => setUserId(event.target.value)}
-                className="w-full rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-white placeholder:text-slate-400/70 focus:border-sky-300/40 focus:outline-none"
+                className={fieldInputClassName}
                 placeholder="default-user"
               />
             </label>
-            <label className="space-y-2 text-sm text-slate-200">
-              <span className="font-semibold text-white">Workspace ID</span>
+            <label className={fieldGroupClassName}>
+              <span className={fieldLabelClassName}>Workspace ID</span>
               <input
                 value={workspaceId}
                 onChange={(event) => setWorkspaceId(event.target.value)}
-                className="w-full rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-white placeholder:text-slate-400/70 focus:border-sky-300/40 focus:outline-none"
+                className={fieldInputClassName}
                 placeholder="optional"
               />
             </label>
-            <label className="space-y-2 text-sm text-slate-200">
-              <span className="font-semibold text-white">Tenant ID</span>
+            <label className={fieldGroupClassName}>
+              <span className={fieldLabelClassName}>Tenant ID</span>
               <input
                 value={tenantId}
                 onChange={(event) => setTenantId(event.target.value)}
-                className="w-full rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-white placeholder:text-slate-400/70 focus:border-sky-300/40 focus:outline-none"
+                className={fieldInputClassName}
                 placeholder="optional"
               />
             </label>
-            <label className="space-y-2 text-sm text-slate-200">
-              <span className="font-semibold text-white">Search</span>
+            <label className={fieldGroupClassName}>
+              <span className={fieldLabelClassName}>Search</span>
               <div className="flex gap-2">
                 <input
                   value={searchQuery}
                   onChange={(event) => setSearchQuery(event.target.value)}
-                  className="w-full rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-white placeholder:text-slate-400/70 focus:border-sky-300/40 focus:outline-none"
+                  className={fieldInputClassName}
                   placeholder="document, source, metadata..."
                 />
                 <button
@@ -581,11 +588,11 @@ export default function RagKnowledgeScreen() {
               </div>
             </label>
           </div>
-          <div className="mt-4 flex flex-wrap gap-2">
+          <div className="mt-3 flex flex-wrap gap-2">
             {scopeSummary.map((item) => (
               <div
                 key={item}
-                className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-xs font-semibold text-slate-100"
+                className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100"
               >
                 {item}
               </div>
@@ -593,14 +600,14 @@ export default function RagKnowledgeScreen() {
           </div>
         </ScreenHeader>
 
-        <div className="mt-8 grid gap-6 xl:grid-cols-[1.2fr,1fr,1fr]">
-          <section className="rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-6 shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]">
+        <div className="mt-5 grid gap-4 xl:grid-cols-[1.2fr,1fr,1fr]">
+          <section className="rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-5 shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-[0.24em] text-sky-100/68">
                   Index New
                 </div>
-                <h2 className="mt-2 font-display text-3xl text-white">Manual Indexing</h2>
+                <h2 className="mt-2 text-[26px] font-semibold tracking-[-0.03em] text-white">Manual Indexing</h2>
                 <p className="mt-2 text-sm leading-6 text-slate-300/78">
                   Choose a source mode, attach scope, then index new content or replace the currently
                   selected document.
@@ -628,8 +635,8 @@ export default function RagKnowledgeScreen() {
             </div>
 
             <div className="mt-6 grid gap-4 md:grid-cols-2">
-              <label className="space-y-2 text-sm text-slate-200">
-                <span className="font-semibold text-white">Document ID</span>
+              <label className={fieldGroupClassName}>
+                <span className={fieldLabelClassName}>Document ID</span>
                 <input
                   value={documentIdInput}
                   onChange={(event) => setDocumentIdInput(event.target.value)}
@@ -637,8 +644,8 @@ export default function RagKnowledgeScreen() {
                   placeholder="docs/user-guide.md"
                 />
               </label>
-              <label className="space-y-2 text-sm text-slate-200">
-                <span className="font-semibold text-white">Source URI</span>
+              <label className={fieldGroupClassName}>
+                <span className={fieldLabelClassName}>Source URI</span>
                 <input
                   value={sourceUriInput}
                   onChange={(event) => setSourceUriInput(event.target.value)}
@@ -649,8 +656,8 @@ export default function RagKnowledgeScreen() {
             </div>
 
             {indexMode === "markdown" ? (
-              <label className="mt-4 block space-y-2 text-sm text-slate-200">
-                <span className="font-semibold text-white">Markdown Content</span>
+              <label className={`mt-4 block ${fieldGroupClassName}`}>
+                <span className={fieldLabelClassName}>Markdown Content</span>
                 <textarea
                   value={markdownText}
                   onChange={(event) => setMarkdownText(event.target.value)}
@@ -661,8 +668,8 @@ export default function RagKnowledgeScreen() {
             ) : null}
 
             {indexMode === "text" ? (
-              <label className="mt-4 block space-y-2 text-sm text-slate-200">
-                <span className="font-semibold text-white">Plain Text</span>
+              <label className={`mt-4 block ${fieldGroupClassName}`}>
+                <span className={fieldLabelClassName}>Plain Text</span>
                 <textarea
                   value={plainText}
                   onChange={(event) => setPlainText(event.target.value)}
@@ -673,8 +680,8 @@ export default function RagKnowledgeScreen() {
             ) : null}
 
             {indexMode === "workspace_file" ? (
-              <label className="mt-4 block space-y-2 text-sm text-slate-200">
-                <span className="font-semibold text-white">Workspace File Path</span>
+              <label className={`mt-4 block ${fieldGroupClassName}`}>
+                <span className={fieldLabelClassName}>Workspace File Path</span>
                 <input
                   value={workspacePath}
                   onChange={(event) => setWorkspacePath(event.target.value)}
@@ -686,8 +693,8 @@ export default function RagKnowledgeScreen() {
 
             {indexMode === "workspace_directory" ? (
               <div className="mt-4 grid gap-4 md:grid-cols-[1fr,auto]">
-                <label className="space-y-2 text-sm text-slate-200">
-                  <span className="font-semibold text-white">Workspace Directory</span>
+                <label className={fieldGroupClassName}>
+                  <span className={fieldLabelClassName}>Workspace Directory</span>
                   <input
                     value={directoryPath}
                     onChange={(event) => setDirectoryPath(event.target.value)}
@@ -695,7 +702,7 @@ export default function RagKnowledgeScreen() {
                     placeholder="docs"
                   />
                 </label>
-                <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-sm font-semibold text-slate-100">
+                <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/18 px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-100">
                   <input
                     type="checkbox"
                     checked={recursiveDirectory}
@@ -707,8 +714,8 @@ export default function RagKnowledgeScreen() {
               </div>
             ) : null}
 
-            <label className="mt-4 block space-y-2 text-sm text-slate-200">
-              <span className="font-semibold text-white">Metadata JSON</span>
+            <label className={`mt-4 block ${fieldGroupClassName}`}>
+              <span className={fieldLabelClassName}>Metadata JSON</span>
               <textarea
                 value={metadataText}
                 onChange={(event) => setMetadataText(event.target.value)}
@@ -747,13 +754,13 @@ export default function RagKnowledgeScreen() {
             </div>
           </section>
 
-          <section className="rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-6 shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]">
+          <section className="rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-5 shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-[0.24em] text-sky-100/68">
                   Documents
                 </div>
-                <h2 className="mt-2 font-display text-3xl text-white">Indexed Inventory</h2>
+                <h2 className="mt-2 text-[26px] font-semibold tracking-[-0.03em] text-white">Indexed Inventory</h2>
                 <p className="mt-2 text-sm leading-6 text-slate-300/78">
                   Review indexed documents in the active scope, then open one to inspect its stored
                   chunks.
@@ -763,7 +770,9 @@ export default function RagKnowledgeScreen() {
                 <div className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-300/68">
                   Loaded
                 </div>
-                <div className="mt-1 text-xl font-semibold text-white">{documents.length}</div>
+                <div className="mt-1 text-[26px] font-semibold tracking-[-0.03em] text-white">
+                  {documents.length}
+                </div>
               </div>
             </div>
 
@@ -801,11 +810,11 @@ export default function RagKnowledgeScreen() {
                     >
                       <div className="flex items-start justify-between gap-4">
                         <div className="min-w-0">
-                          <div className="truncate text-base font-semibold">
+                          <div className="truncate text-lg font-semibold tracking-[-0.02em]">
                             {document.filename || document.document_id}
                           </div>
                           <div
-                            className={`mt-1 truncate text-sm ${
+                            className={`mt-1 truncate text-xs uppercase tracking-[0.14em] ${
                               selected ? "text-sky-100/78" : "text-slate-300/68"
                             }`}
                           >
@@ -813,7 +822,7 @@ export default function RagKnowledgeScreen() {
                           </div>
                         </div>
                         <div
-                          className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                          className={`rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
                             selected
                               ? "bg-white/15 text-white"
                               : "bg-white/[0.05] text-slate-200"
@@ -825,7 +834,7 @@ export default function RagKnowledgeScreen() {
                       <div className="mt-4 flex flex-wrap gap-2">
                         {document.namespace ? (
                           <div
-                            className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                            className={`rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
                               selected
                                 ? "bg-white/10 text-slate-100"
                                 : "bg-white/[0.05] text-slate-200"
@@ -836,7 +845,7 @@ export default function RagKnowledgeScreen() {
                         ) : null}
                         {document.chunking_strategy ? (
                           <div
-                            className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                            className={`rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
                               selected
                                 ? "bg-white/10 text-slate-100"
                                 : "bg-white/[0.05] text-slate-200"
@@ -847,7 +856,7 @@ export default function RagKnowledgeScreen() {
                         ) : null}
                         {document.content_type ? (
                           <div
-                            className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                            className={`rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
                               selected
                                 ? "bg-white/10 text-slate-100"
                                 : "bg-white/[0.05] text-slate-200"
@@ -858,7 +867,7 @@ export default function RagKnowledgeScreen() {
                         ) : null}
                       </div>
                       <div
-                        className={`mt-4 text-xs ${
+                        className={`mt-4 text-[11px] font-medium uppercase tracking-[0.14em] ${
                           selected ? "text-sky-100/78" : "text-slate-300/68"
                         }`}
                       >
@@ -871,13 +880,13 @@ export default function RagKnowledgeScreen() {
             </div>
           </section>
 
-          <section className="rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-6 shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]">
+          <section className="rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-5 shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-[0.24em] text-sky-100/68">
                   Inspector
                 </div>
-                <h2 className="mt-2 font-display text-3xl text-white">Document Details</h2>
+                <h2 className="mt-2 text-[26px] font-semibold tracking-[-0.03em] text-white">Document Details</h2>
                 <p className="mt-2 text-sm leading-6 text-slate-300/78">
                   Inspect document metadata and chunk payloads before you rerank or generate against
                   them.
@@ -906,31 +915,31 @@ export default function RagKnowledgeScreen() {
             ) : (
               <>
                 <div className="mt-6 rounded-3xl border border-white/10 bg-slate-950/18 p-4">
-                  <div className="text-lg font-semibold text-white">
+                  <div className="text-[26px] font-semibold tracking-[-0.03em] text-white">
                     {selectedDocument.filename || selectedDocument.document_id}
                   </div>
-                  <div className="mt-2 break-all text-sm text-slate-300/74">
+                  <div className="mt-2 break-all text-xs uppercase tracking-[0.14em] text-slate-300/74">
                     {selectedDocument.source_uri}
                   </div>
                   <dl className="mt-4 grid gap-3 text-sm md:grid-cols-2">
                     <div>
-                      <dt className="font-semibold text-white">Document ID</dt>
+                      <dt className={fieldLabelClassName}>Document ID</dt>
                       <dd className="mt-1 break-all text-slate-300/74">
                         {selectedDocument.document_id}
                       </dd>
                     </div>
                     <div>
-                      <dt className="font-semibold text-white">Indexed</dt>
+                      <dt className={fieldLabelClassName}>Indexed</dt>
                       <dd className="mt-1 text-slate-300/74">
                         {formatTimestamp(selectedDocument.indexed_at)}
                       </dd>
                     </div>
                     <div>
-                      <dt className="font-semibold text-white">Namespace</dt>
+                      <dt className={fieldLabelClassName}>Namespace</dt>
                       <dd className="mt-1 text-slate-300/74">{selectedDocument.namespace || "—"}</dd>
                     </div>
                     <div>
-                      <dt className="font-semibold text-white">Chunk Count</dt>
+                      <dt className={fieldLabelClassName}>Chunk Count</dt>
                       <dd className="mt-1 text-slate-300/74">{selectedDocument.chunk_count}</dd>
                     </div>
                   </dl>
@@ -956,7 +965,7 @@ export default function RagKnowledgeScreen() {
 
                 <div className="mt-6">
                   <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-semibold text-white">Stored Chunks</div>
+                    <div className="text-[22px] font-semibold tracking-[-0.03em] text-white">Stored Chunks</div>
                     <div className="text-xs uppercase tracking-[0.24em] text-slate-300/68">
                       {chunkResponse?.chunks.length ?? 0} loaded
                     </div>
@@ -973,10 +982,12 @@ export default function RagKnowledgeScreen() {
                           className="rounded-3xl border border-white/10 bg-slate-950/18 p-4"
                         >
                           <div className="flex items-center justify-between gap-3">
-                            <div className="text-sm font-semibold text-white">
+                            <div className="text-base font-semibold tracking-[-0.02em] text-white">
                               Chunk {chunk.chunk_index ?? "—"}
                             </div>
-                            <div className="truncate text-xs text-slate-300/68">{chunk.chunk_id}</div>
+                            <div className="truncate text-[11px] uppercase tracking-[0.14em] text-slate-300/68">
+                              {chunk.chunk_id}
+                            </div>
                           </div>
                           <div className="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-200">
                             {chunk.text}

@@ -59,8 +59,14 @@ export default function ScreenHeader({
               {eyebrow}
             </div>
             <h1
-              className={`mt-2 font-display tracking-tight ${
-                compact ? "text-3xl md:text-4xl" : "text-4xl md:text-5xl"
+              className={`mt-2 ${
+                isStudioTheme
+                  ? compact
+                    ? "text-[30px] font-semibold tracking-[-0.03em] md:text-[34px]"
+                    : "text-[34px] font-semibold tracking-[-0.03em] md:text-[42px]"
+                  : compact
+                    ? "font-display text-3xl tracking-tight md:text-4xl"
+                    : "font-display text-4xl tracking-tight md:text-5xl"
               }`}
             >
               {title}

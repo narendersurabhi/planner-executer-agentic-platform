@@ -29,7 +29,7 @@ export default function AppShell({
   contentClassName = "px-4 py-4",
 }: AppShellProps) {
   return (
-    <div className="-mx-6 -my-8 min-h-screen bg-[#56697c] text-white">
+    <div className="app-shell-dark -mx-6 -my-8 min-h-screen bg-[#4f6274] text-slate-50">
       <div className="min-h-screen bg-[linear-gradient(180deg,#435365_0px,#435365_78px,#55697c_78px,#55697c_100%)]">
         <header className="border-b border-white/10 bg-[linear-gradient(180deg,rgba(67,83,101,0.98),rgba(60,74,90,0.98))] px-6 py-3 shadow-[inset_0_-1px_0_rgba(255,255,255,0.08)]">
           <div className="flex flex-wrap items-center justify-between gap-4">

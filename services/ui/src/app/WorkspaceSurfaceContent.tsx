@@ -6973,7 +6973,7 @@ const openTemplateModal = (template: Template) => {
             useStudioSurfaceTheme ? "border-b border-white/10" : "border-b border-slate-100"
           }`}
         >
-          <div className={`font-display text-lg ${useStudioSurfaceTheme ? "text-white" : "text-slate-900"}`}>
+          <div className={`text-lg font-semibold tracking-[-0.02em] ${useStudioSurfaceTheme ? "text-white" : "text-slate-900"}`}>
             Template Vault
           </div>
           <div className="flex items-center gap-2">
@@ -7347,7 +7347,7 @@ const openTemplateModal = (template: Template) => {
             useStudioSurfaceTheme ? "border-b border-white/10" : "border-b border-slate-100"
           }`}
         >
-          <div className={`font-display text-lg ${useStudioSurfaceTheme ? "text-white" : "text-slate-900"}`}>
+          <div className={`text-lg font-semibold tracking-[-0.02em] ${useStudioSurfaceTheme ? "text-white" : "text-slate-900"}`}>
             Capability Catalog
           </div>
           <div className="flex items-center gap-2">
@@ -8492,7 +8492,7 @@ const openTemplateModal = (template: Template) => {
           <div className="w-full max-w-2xl max-h-[85vh] overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-6 py-4">
               <div>
-                <h3 className="font-display text-xl">{activeTemplate.name}</h3>
+                <h3 className="text-xl font-semibold tracking-[-0.03em]">{activeTemplate.name}</h3>
                 {activeTemplate.description ? (
                   <p className="mt-1 text-sm text-slate-600">
                     {activeTemplate.description}
@@ -8582,6 +8582,7 @@ const openTemplateModal = (template: Template) => {
           }
           activeScreen={showComposeScreen ? "compose" : "chat"}
           theme={useStudioSurfaceTheme ? "studio" : "default"}
+          compact={useStudioSurfaceTheme}
           actions={
             <>
               {showComposeScreen ? (
@@ -8628,7 +8629,7 @@ const openTemplateModal = (template: Template) => {
           }
         >
             <div
-              className={`mt-6 px-4 py-4 ${
+              className={`mt-4 px-4 py-3 ${
                 useStudioSurfaceTheme
                   ? "rounded-[24px] border border-white/12 bg-[linear-gradient(180deg,rgba(37,49,61,0.86),rgba(16,24,34,0.9))] text-slate-100 shadow-[0_18px_36px_rgba(15,23,42,0.18)]"
                   : "rounded-2xl border border-white/15 bg-white/10 text-white/95"
@@ -8664,11 +8665,11 @@ const openTemplateModal = (template: Template) => {
                 </div>
               </div>
             </div>
-            <div className={`mt-6 grid gap-6 ${showComposeScreen && showChatScreen ? "xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]" : "xl:grid-cols-1"}`}>
+            <div className={`mt-4 grid gap-4 ${showComposeScreen && showChatScreen ? "xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]" : "xl:grid-cols-1"}`}>
               {showComposeScreen ? (
               <div className={composeModePrimarySectionClassName}>
                 <div className="flex items-center justify-between">
-                  <h2 className={`font-display text-xl ${showComposeScreen ? "text-white" : ""}`}>Compose Job</h2>
+                  <h2 className={`text-[22px] font-semibold tracking-[-0.03em] ${showComposeScreen ? "text-white" : ""}`}>Compose Job</h2>
                   <span className={`text-xs ${showComposeScreen ? "text-slate-300/68" : "text-slate-500"}`}>
                     Live orchestration
                   </span>
@@ -9393,7 +9394,7 @@ const openTemplateModal = (template: Template) => {
               {showChatScreen ? (
               <div className={studioSurfacePrimarySectionClassName}>
                 <div>
-                  <h2 className="font-display text-xl text-white">Chat Operator</h2>
+                  <h2 className="text-[22px] font-semibold tracking-[-0.03em] text-white">Chat Operator</h2>
                   <p className="mt-1 text-xs text-slate-300/78">
                     Chat submits normal jobs through the existing planner and worker pipeline.
                   </p>
@@ -9563,13 +9564,13 @@ const openTemplateModal = (template: Template) => {
         <section
           className={`animate-fade-up-delayed ${
             useStudioSurfaceTheme
-              ? "rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-6 text-white shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]"
+              ? "rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-5 text-white shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]"
               : "rounded-2xl border border-slate-100 bg-white p-6 shadow-sm"
           }`}
         >
         <div className="flex items-center justify-between gap-4">
           <div>
-            <h2 className={`font-display text-xl ${useStudioSurfaceTheme ? "text-white" : ""}`}>Jobs</h2>
+            <h2 className={`text-[22px] font-semibold tracking-[-0.03em] ${useStudioSurfaceTheme ? "text-white" : ""}`}>Jobs</h2>
             <p className={`mt-1 text-xs ${useStudioSurfaceTheme ? "text-slate-300/74" : "text-slate-500"}`}>
               Track submitted goals and manage their lifecycle.
             </p>
@@ -9730,13 +9731,13 @@ const openTemplateModal = (template: Template) => {
         <section
           className={`animate-fade-up-delayed-more ${
             useStudioSurfaceTheme
-              ? "rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-6 text-white shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]"
+              ? "rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(63,78,95,0.62),rgba(37,49,62,0.82))] p-5 text-white shadow-[0_24px_60px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.05)]"
               : "rounded-2xl border border-slate-100 bg-white p-6 shadow-sm"
           }`}
         >
         <div className="flex items-center justify-between gap-4">
           <div>
-            <h2 className={`font-display text-xl ${useStudioSurfaceTheme ? "text-white" : ""}`}>
+            <h2 className={`text-[22px] font-semibold tracking-[-0.03em] ${useStudioSurfaceTheme ? "text-white" : ""}`}>
               Job Details
             </h2>
             <p className={`mt-1 text-xs ${useStudioSurfaceTheme ? "text-slate-300/74" : "text-slate-500"}`}>
@@ -10953,7 +10954,7 @@ const openTemplateModal = (template: Template) => {
       <section className="animate-fade-up-delayed-more rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
         <div className="flex items-center justify-between gap-4">
           <div>
-            <h2 className="font-display text-xl">Recent Events</h2>
+            <h2 className="text-[22px] font-semibold tracking-[-0.03em]">Recent Events</h2>
             <p className="mt-1 text-xs text-slate-500">Live event stream snapshots.</p>
           </div>
           <div className="flex items-center gap-2">
