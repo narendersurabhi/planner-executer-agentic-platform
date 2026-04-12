@@ -42,6 +42,7 @@ type StudioNodeInspectorProps = {
   quickFixNodeBindings: (nodeId: string) => void;
   setSelectedDagNodeId: React.Dispatch<React.SetStateAction<string | null>>;
   capabilityIdOptionsId?: string;
+  compactMode?: boolean;
   onDeleteNode?: (nodeId: string) => void;
   updateNodeBasics: (
     nodeId: string,
@@ -163,6 +164,7 @@ export default function StudioNodeInspector({
   quickFixNodeBindings,
   setSelectedDagNodeId,
   capabilityIdOptionsId,
+  compactMode = false,
   onDeleteNode,
   updateNodeBasics,
   setVisualBindingMode,
@@ -209,7 +211,11 @@ export default function StudioNodeInspector({
   };
 
   return (
-    <section className={inspectorPanelClassName}>
+    <section
+      className={`${inspectorPanelClassName} ${
+        compactMode ? "px-2.5 py-2.5 [&_h2]:text-[20px]" : ""
+      }`.trim()}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-sky-100/68">

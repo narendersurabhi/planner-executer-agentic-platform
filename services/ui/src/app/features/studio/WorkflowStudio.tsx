@@ -72,8 +72,9 @@ import {
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
 const MEMORY_USER_ID_KEY = "ape.memory.user_id.v1";
-const STUDIO_WORKSPACE_LAYOUT_VERSION = 2;
-const FLOATING_STUDIO_LAYOUT_STORAGE_KEY = `ape.studio.workspace_layout.v${STUDIO_WORKSPACE_LAYOUT_VERSION}`;
+const STUDIO_WORKSPACE_LAYOUT_VERSION = 3;
+const STUDIO_WORKSPACE_LAYOUT_STORAGE_KEY = `ape.studio.workspace_layout.v${STUDIO_WORKSPACE_LAYOUT_VERSION}`;
+const LEGACY_FLOATING_STUDIO_LAYOUT_STORAGE_KEY = "ape.studio.workspace_layout.v2";
 const DEFAULT_WORKSPACE_USER_ID = "narendersurabhi";
 const DAG_CANVAS_ZOOM_MIN = 0.7;
 const DAG_CANVAS_ZOOM_MAX = 1.5;
@@ -135,6 +136,12 @@ const createWorkflowOutputDefinition = (): WorkflowOutputDefinition => ({
   label: "",
   description: "",
   binding: null,
+});
+
+const initialStudioBottomTrayState = (): StudioBottomTrayState => ({
+  activePanelId: "interface",
+  height: 300,
+  collapsed: false,
 });
 
 const defaultControlConfig = (kind: StudioControlKind): StudioControlConfig => {
@@ -798,6 +805,17 @@ type FloatingStudioPanelResizeState = {
   startHeight: number;
 };
 
+type StudioBottomTrayState = {
+  activePanelId: FloatingStudioPanelId;
+  height: number;
+  collapsed: boolean;
+};
+
+type StudioBottomTrayResizeState = {
+  startY: number;
+  startHeight: number;
+};
+
 type StudioWorkspaceRect = {
   x: number;
   y: number;
@@ -828,6 +846,9 @@ const FLOATING_STUDIO_PANEL_MIN_HEIGHT = 180;
 const FLOATING_STUDIO_PANEL_STAGE_PADDING = 18;
 const FLOATING_STUDIO_PANEL_SNAP_DISTANCE = 28;
 const STUDIO_MINIMIZED_SHELF_HEIGHT = 58;
+const STUDIO_BOTTOM_TRAY_MIN_HEIGHT = 240;
+const STUDIO_BOTTOM_TRAY_MAX_HEIGHT = 420;
+const STUDIO_BOTTOM_TRAY_COLLAPSED_HEIGHT = 56;
 const STUDIO_DOCK_PANEL_GAP = 14;
 
 const STUDIO_DOCK_ZONE_DEFAULTS: Record<
@@ -1223,7 +1244,143 @@ const snapFloatingStudioPanelLayout = (
   );
 };
 
+type PersistedStudioWorkspaceLayout = {
+  version: number;
+  workspaceMode?: StudioWorkspaceMode;
+  bottomTray?: {
+    activePanelId?: string;
+    height?: number;
+    collapsed?: boolean;
+  };
+  panels: Record<string, Partial<FloatingStudioPanelLayout>>;
+};
+
+const parsePersistedStudioPanelLayouts = (
+  parsed: unknown
+): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null => {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const candidatePanels = parsed as Record<string, Partial<FloatingStudioPanelLayout>>;
+  return FLOATING_STUDIO_PANEL_IDS.reduce<Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null>(
+    (acc, panelId) => {
+      if (!acc) {
+        return null;
+      }
+      const candidate = candidatePanels[panelId];
+      if (!candidate) {
+        return null;
+      }
+      const defaults = STUDIO_DOCK_ZONE_DEFAULTS[panelId];
+      const { x, y, width, height, zIndex, minimized, mode, dockZone } = candidate;
+      if (
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        !Number.isFinite(width) ||
+        !Number.isFinite(height) ||
+        !Number.isFinite(zIndex) ||
+        typeof minimized !== "boolean"
+      ) {
+        return null;
+      }
+      acc[panelId] = {
+        x: Number(x),
+        y: Number(y),
+        width: Number(width),
+        height: Number(height),
+        zIndex: Number(zIndex),
+        minimized,
+        mode: mode === "floating" || mode === "docked" ? mode : defaults.mode,
+        dockZone:
+          dockZone === "left" ||
+          dockZone === "right" ||
+          dockZone === "bottom" ||
+          dockZone === "overlay" ||
+          dockZone === "none"
+            ? dockZone
+            : defaults.dockZone,
+      };
+      return acc;
+    },
+    {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+  );
+};
+
+const readPersistedStudioWorkspaceLayout = (raw: string | null) => {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as PersistedStudioWorkspaceLayout | Record<string, unknown>;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "version" in parsed &&
+      Number((parsed as PersistedStudioWorkspaceLayout).version) === STUDIO_WORKSPACE_LAYOUT_VERSION &&
+      "panels" in parsed
+    ) {
+      const layout = parsed as PersistedStudioWorkspaceLayout;
+      const panels = parsePersistedStudioPanelLayouts(layout.panels);
+      if (!panels) {
+        return null;
+      }
+      const traySource = layout.bottomTray;
+      const trayHeight = Number(traySource?.height);
+      return {
+        panels,
+        workspaceMode: layout.workspaceMode === "focus_graph" ? "focus_graph" : "default",
+        bottomTray: {
+          activePanelId:
+            traySource?.activePanelId &&
+            FLOATING_STUDIO_PANEL_IDS.includes(traySource.activePanelId as FloatingStudioPanelId)
+              ? (traySource.activePanelId as FloatingStudioPanelId)
+              : initialStudioBottomTrayState().activePanelId,
+          height: Number.isFinite(trayHeight)
+            ? clampNumber(trayHeight, STUDIO_BOTTOM_TRAY_MIN_HEIGHT, STUDIO_BOTTOM_TRAY_MAX_HEIGHT)
+            : initialStudioBottomTrayState().height,
+          collapsed: Boolean(traySource?.collapsed),
+        } satisfies StudioBottomTrayState,
+      };
+    }
+    const panels = parsePersistedStudioPanelLayouts(parsed);
+    if (!panels) {
+      return null;
+    }
+    return {
+      panels,
+      workspaceMode: "default" as const,
+      bottomTray: initialStudioBottomTrayState(),
+    };
+  } catch {
+    return null;
+  }
+};
+
+const createPersistedStudioWorkspaceLayout = ({
+  panels,
+  bottomTray,
+}: {
+  panels: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>;
+  bottomTray: StudioBottomTrayState;
+}): PersistedStudioWorkspaceLayout => ({
+  version: STUDIO_WORKSPACE_LAYOUT_VERSION,
+  workspaceMode: "default",
+  bottomTray: {
+    activePanelId: bottomTray.activePanelId,
+    height: bottomTray.height,
+    collapsed: bottomTray.collapsed,
+  },
+  panels,
+});
+
 const readPersistedFloatingStudioPanelLayouts = (
+  raw: string | null
+): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null => {
+  const restored = readPersistedStudioWorkspaceLayout(raw);
+  return restored?.panels || null;
+};
+
+const readLegacyFloatingStudioPanelLayouts = (
   raw: string | null
 ): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null => {
   if (!raw) {
@@ -1285,7 +1442,12 @@ const resolveWorkspacePanelRects = (
   layouts: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>,
   stageWidth: number,
   stageHeight: number,
-  options: { showInspector: boolean; showMinimizedShelf: boolean }
+  options: {
+    showInspector: boolean;
+    showMinimizedShelf: boolean;
+    showBottomTray: boolean;
+    bottomTrayHeight: number;
+  }
 ): ResolvedStudioWorkspacePanelRects => {
   const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
   const gap = STUDIO_DOCK_PANEL_GAP;
@@ -1312,10 +1474,7 @@ const resolveWorkspacePanelRects = (
     (maxWidth, panelId) => Math.max(maxWidth, layouts[panelId].width),
     0
   );
-  const bottomDockHeight = dockedBottomPanelIds.reduce(
-    (maxHeight, panelId) => Math.max(maxHeight, getFloatingStudioPanelActiveHeight(layouts[panelId])),
-    0
-  );
+  const bottomDockHeight = options.showBottomTray ? options.bottomTrayHeight : 0;
   const minimizedShelfHeight = options.showMinimizedShelf ? STUDIO_MINIMIZED_SHELF_HEIGHT : 0;
 
   const graphX = padding + (leftDockWidth ? leftDockWidth + gap : 0);
@@ -1428,10 +1587,15 @@ export default function WorkflowStudio() {
   const [studioWorkspaceMode, setStudioWorkspaceMode] =
     useState<StudioWorkspaceMode>("default");
   const [workflowSetupExpanded, setWorkflowSetupExpanded] = useState(false);
+  const [studioBottomTray, setStudioBottomTray] = useState<StudioBottomTrayState>(
+    initialStudioBottomTrayState
+  );
   const [floatingStudioPanelDrag, setFloatingStudioPanelDrag] =
     useState<FloatingStudioPanelDragState | null>(null);
   const [floatingStudioPanelResize, setFloatingStudioPanelResize] =
     useState<FloatingStudioPanelResizeState | null>(null);
+  const [studioBottomTrayResize, setStudioBottomTrayResize] =
+    useState<StudioBottomTrayResizeState | null>(null);
   const [studioWorkspaceStageSize, setStudioWorkspaceStageSize] = useState({
     width: 0,
     height: 0,
@@ -1459,6 +1623,7 @@ export default function WorkflowStudio() {
   const persistedFloatingStudioPanelsRef = useRef<
     Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null
   >(null);
+  const persistedStudioBottomTrayRef = useRef<StudioBottomTrayState | null>(null);
   const focusGraphPanelSnapshotRef = useRef<
     Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null
   >(null);
@@ -1506,9 +1671,22 @@ export default function WorkflowStudio() {
     if (typeof window === "undefined") {
       return;
     }
-    persistedFloatingStudioPanelsRef.current = readPersistedFloatingStudioPanelLayouts(
-      window.localStorage.getItem(FLOATING_STUDIO_LAYOUT_STORAGE_KEY)
-    );
+    const restored =
+      readPersistedStudioWorkspaceLayout(
+        window.localStorage.getItem(STUDIO_WORKSPACE_LAYOUT_STORAGE_KEY)
+      ) ||
+      readPersistedStudioWorkspaceLayout(
+        window.localStorage.getItem(LEGACY_FLOATING_STUDIO_LAYOUT_STORAGE_KEY)
+      ) || {
+        panels: readLegacyFloatingStudioPanelLayouts(
+          window.localStorage.getItem(LEGACY_FLOATING_STUDIO_LAYOUT_STORAGE_KEY)
+        ),
+        workspaceMode: "default" as const,
+        bottomTray: initialStudioBottomTrayState(),
+      };
+    persistedFloatingStudioPanelsRef.current = restored?.panels || null;
+    persistedStudioBottomTrayRef.current = restored?.bottomTray || initialStudioBottomTrayState();
+    setStudioWorkspaceMode(restored?.workspaceMode === "focus_graph" ? "focus_graph" : "default");
   }, []);
   const contextPathSuggestions = useMemo(
     () => collectContextPathSuggestions(contextState.context),
@@ -1937,6 +2115,27 @@ export default function WorkflowStudio() {
         return acc;
       }, {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>);
     });
+    if (persistedStudioBottomTrayRef.current) {
+      setStudioBottomTray((prev) => ({
+        activePanelId: persistedStudioBottomTrayRef.current?.activePanelId || prev.activePanelId,
+        height: clampNumber(
+          persistedStudioBottomTrayRef.current?.height || prev.height,
+          STUDIO_BOTTOM_TRAY_MIN_HEIGHT,
+          Math.min(STUDIO_BOTTOM_TRAY_MAX_HEIGHT, studioWorkspaceStageSize.height - 220)
+        ),
+        collapsed: Boolean(persistedStudioBottomTrayRef.current?.collapsed),
+      }));
+      persistedStudioBottomTrayRef.current = null;
+    } else {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        height: clampNumber(
+          prev.height,
+          STUDIO_BOTTOM_TRAY_MIN_HEIGHT,
+          Math.min(STUDIO_BOTTOM_TRAY_MAX_HEIGHT, studioWorkspaceStageSize.height - 220)
+        ),
+      }));
+    }
   }, [studioWorkspaceStageSize.height, studioWorkspaceStageSize.width]);
 
   useEffect(() => {
@@ -1944,15 +2143,24 @@ export default function WorkflowStudio() {
       return;
     }
     const saveTimer = window.setTimeout(() => {
+      const panelsToPersist =
+        studioWorkspaceMode === "focus_graph" && focusGraphPanelSnapshotRef.current
+          ? focusGraphPanelSnapshotRef.current
+          : floatingStudioPanels;
       window.localStorage.setItem(
-        FLOATING_STUDIO_LAYOUT_STORAGE_KEY,
-        JSON.stringify(floatingStudioPanels)
+        STUDIO_WORKSPACE_LAYOUT_STORAGE_KEY,
+        JSON.stringify(
+          createPersistedStudioWorkspaceLayout({
+            panels: panelsToPersist,
+            bottomTray: studioBottomTray,
+          })
+        )
       );
     }, 120);
     return () => {
       window.clearTimeout(saveTimer);
     };
-  }, [floatingStudioPanels]);
+  }, [floatingStudioPanels, studioBottomTray, studioWorkspaceMode]);
 
   useEffect(() => {
     if (!activeStudioPanelMenuId) {
@@ -2071,6 +2279,39 @@ export default function WorkflowStudio() {
     };
   }, [floatingStudioPanelResize]);
 
+  useEffect(() => {
+    if (!studioBottomTrayResize) {
+      return;
+    }
+    const handleMove = (event: MouseEvent) => {
+      const stage = studioWorkspaceStageRef.current;
+      if (!stage) {
+        return;
+      }
+      const stageRect = stage.getBoundingClientRect();
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        collapsed: false,
+        height: clampNumber(
+          studioBottomTrayResize.startHeight + (studioBottomTrayResize.startY - event.clientY),
+          STUDIO_BOTTOM_TRAY_MIN_HEIGHT,
+          Math.min(STUDIO_BOTTOM_TRAY_MAX_HEIGHT, stageRect.height - 220)
+        ),
+      }));
+    };
+
+    const handleUp = () => {
+      setStudioBottomTrayResize(null);
+    };
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [studioBottomTrayResize]);
+
   const setVisualChainNodes = (
     next: ComposerDraftNode[] | ((prev: ComposerDraftNode[]) => ComposerDraftNode[])
   ) => {
@@ -2149,6 +2390,11 @@ export default function WorkflowStudio() {
     if (nextZoom !== dagCanvasZoom) {
       setStudioNotice(`Canvas zoom set to ${Math.round(nextZoom * 100)}%.`);
     }
+  };
+
+  const resetDagCanvasZoom = () => {
+    setDagCanvasZoomLevel(1);
+    setStudioNotice("Canvas zoom reset to 100%.");
   };
 
   const setVisualBindingFromSource = (
@@ -4656,6 +4902,7 @@ export default function WorkflowStudio() {
       quickFixNodeBindings={quickFixNodeBindings}
       setSelectedDagNodeId={setSelectedDagNodeId}
       capabilityIdOptionsId="studio-capability-id-options"
+      compactMode={studioWorkspaceMode === "focus_graph"}
       onDeleteNode={removeVisualChainNode}
       updateNodeBasics={updateVisualChainNode}
       setVisualBindingMode={setVisualBindingMode}
@@ -4918,6 +5165,7 @@ export default function WorkflowStudio() {
     const stageHeight = studioWorkspaceStageSize.height || 1040;
     setFloatingStudioPanels((prev) => {
       const inspector = prev.inspector;
+      const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
       if (studioWorkspaceMode === "focus_graph") {
         return {
           ...prev,
@@ -4928,43 +5176,33 @@ export default function WorkflowStudio() {
               dockZone: "right",
               minimized: false,
             },
-            createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight).inspector,
+            defaults.inspector,
             stageWidth,
             stageHeight
           ),
         };
       }
-      if (inspector.minimized) {
-        return prev;
-      }
       if (
-        inspector.mode !== "floating" ||
-        !studioWorkspaceStageSize.width ||
-        !studioWorkspaceStageSize.height
+        inspector.mode !== "docked" ||
+        inspector.dockZone !== "right" ||
+        inspector.minimized
       ) {
-        return prev;
+        return {
+          ...prev,
+          inspector: syncFloatingStudioPanelLayoutToStage(
+            {
+              ...inspector,
+              mode: "docked",
+              dockZone: "right",
+              minimized: false,
+            },
+            defaults.inspector,
+            stageWidth,
+            stageHeight
+          ),
+        };
       }
-      const nextInspector = clampFloatingStudioPanelLayout(
-        {
-          ...inspector,
-          zIndex: getNextFloatingStudioPanelZIndex(prev),
-        },
-        studioWorkspaceStageSize.width,
-        studioWorkspaceStageSize.height
-      );
-      if (
-        nextInspector.x === inspector.x &&
-        nextInspector.y === inspector.y &&
-        nextInspector.width === inspector.width &&
-        nextInspector.height === inspector.height &&
-        nextInspector.zIndex === inspector.zIndex
-      ) {
-        return prev;
-      }
-      return {
-        ...prev,
-        inspector: nextInspector,
-      };
+      return prev;
     });
   }, [
     selectedDagNodeId,
@@ -5010,6 +5248,13 @@ export default function WorkflowStudio() {
         stageHeight
       ),
     }));
+    if (dockZone === "bottom") {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        activePanelId: panelId,
+        collapsed: false,
+      }));
+    }
   };
 
   const setFloatingStudioPanelFloating = (panelId: FloatingStudioPanelId) => {
@@ -5035,6 +5280,24 @@ export default function WorkflowStudio() {
         ),
       };
     });
+  };
+
+  const revealStudioPanel = (
+    panelId: FloatingStudioPanelId,
+    dockZone?: Exclude<StudioDockZone, "overlay" | "none">
+  ) => {
+    if (dockZone) {
+      setFloatingStudioPanelDocked(panelId, dockZone);
+    } else {
+      setFloatingStudioPanelMinimized(panelId, false);
+    }
+    if (dockZone === "bottom" || floatingStudioPanels[panelId].dockZone === "bottom") {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        activePanelId: panelId,
+        collapsed: false,
+      }));
+    }
   };
 
   const setFloatingStudioPanelMinimized = (
@@ -5168,6 +5431,7 @@ export default function WorkflowStudio() {
     focusGraphPanelSnapshotRef.current = null;
     setStudioWorkspaceMode("default");
     setActiveStudioPanelMenuId(null);
+    setStudioBottomTray(initialStudioBottomTrayState());
     setFloatingStudioPanels(defaults);
     setStudioNotice("Workspace layout reset.");
   };
@@ -5220,20 +5484,69 @@ export default function WorkflowStudio() {
       if (event.metaKey || event.ctrlKey || event.altKey) {
         return;
       }
-      if (event.key.toLowerCase() !== "f") {
-        return;
-      }
       if (isTypingTarget(event.target)) {
         return;
       }
-      event.preventDefault();
-      toggleFocusGraphMode();
+      const normalizedKey = event.key.toLowerCase();
+      if (normalizedKey === "f") {
+        event.preventDefault();
+        toggleFocusGraphMode();
+        return;
+      }
+      if (normalizedKey === "escape") {
+        event.preventDefault();
+        setActiveStudioPanelMenuId(null);
+        setDagEdgeDraftSourceNodeId(null);
+        setDagConnectorDrag(null);
+        setDagCanvasDraggingNodeId(null);
+        setDagConnectorHoverTargetNodeId(null);
+        setSelectedDagNodeId(null);
+        setStudioNotice("Transient graph interactions cleared.");
+        return;
+      }
+      if (normalizedKey === "0") {
+        event.preventDefault();
+        resetDagCanvasZoom();
+        return;
+      }
+      if (!event.shiftKey) {
+        return;
+      }
+      if (event.code === "Digit1") {
+        event.preventDefault();
+        revealStudioPanel("palette", "left");
+        return;
+      }
+      if (event.code === "Digit2") {
+        if (!selectedDagNode) {
+          return;
+        }
+        event.preventDefault();
+        revealStudioPanel("inspector", "right");
+        return;
+      }
+      if (event.code === "Digit3") {
+        event.preventDefault();
+        revealStudioPanel("interface", "bottom");
+        setStudioBottomTray((prev) => ({
+          ...prev,
+          activePanelId: "interface",
+          collapsed: false,
+        }));
+      }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [studioWorkspaceMode, selectedDagNodeId, studioWorkspaceStageSize.height, studioWorkspaceStageSize.width]);
+  }, [
+    floatingStudioPanels,
+    selectedDagNode,
+    selectedDagNodeId,
+    studioWorkspaceMode,
+    studioWorkspaceStageSize.height,
+    studioWorkspaceStageSize.width,
+  ]);
 
   const beginFloatingStudioPanelDrag = (
     panelId: FloatingStudioPanelId,
@@ -5440,6 +5753,51 @@ export default function WorkflowStudio() {
 
   const workspaceStageWidth = studioWorkspaceStageSize.width || 1440;
   const workspaceStageHeight = studioWorkspaceStageSize.height || 1040;
+  const dockedRightPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "docked" &&
+      floatingStudioPanels[panelId].dockZone === "right" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const dockedLeftPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "docked" &&
+      floatingStudioPanels[panelId].dockZone === "left" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const dockedBottomPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "docked" &&
+      floatingStudioPanels[panelId].dockZone === "bottom" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const minimizedWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const floatingWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "floating" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+
+  useEffect(() => {
+    if (dockedBottomPanelIds.length === 0) {
+      return;
+    }
+    if (!dockedBottomPanelIds.includes(studioBottomTray.activePanelId)) {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        activePanelId: dockedBottomPanelIds[0],
+      }));
+    }
+  }, [dockedBottomPanelIds, studioBottomTray.activePanelId]);
+
   const workspacePanelRects = resolveWorkspacePanelRects(
     floatingStudioPanels,
     workspaceStageWidth,
@@ -5449,6 +5807,10 @@ export default function WorkflowStudio() {
       showMinimizedShelf: FLOATING_STUDIO_PANEL_IDS.some(
         (panelId) => floatingStudioPanels[panelId].minimized && (panelId !== "inspector" || Boolean(selectedDagNode))
       ),
+      showBottomTray: dockedBottomPanelIds.length > 0,
+      bottomTrayHeight: studioBottomTray.collapsed
+        ? STUDIO_BOTTOM_TRAY_COLLAPSED_HEIGHT
+        : studioBottomTray.height,
     }
   );
   const leftDockRect = workspacePanelRects.leftDock;
@@ -5557,127 +5919,137 @@ export default function WorkflowStudio() {
       </div>
     );
   };
-  const renderWorkspacePanel = (panelId: FloatingStudioPanelId) => {
+  const getWorkspacePanelDefinition = (panelId: FloatingStudioPanelId) => {
     if (panelId === "inspector" && !selectedDagNode) {
+      return null;
+    }
+
+    switch (panelId) {
+      case "palette":
+        return {
+          title: getWorkspacePanelTitle("palette"),
+          content: (
+            <div className="h-full">
+              <StudioCapabilityPalette
+                capabilities={paletteCapabilities}
+                groups={paletteGroups}
+                loading={capabilityLoading}
+                error={capabilityError}
+                query={paletteQuery}
+                selectedGroup={paletteGroup}
+                onQueryChange={setPaletteQuery}
+                onGroupChange={setPaletteGroup}
+                onAddCapability={addCapabilityNodeToStudio}
+                onAddControl={addControlNodeToStudio}
+              />
+            </div>
+          ),
+          panelDomId: "studio-palette-section",
+          bodyClassName: "overflow-hidden p-0",
+        } as const;
+      case "compile":
+        return {
+          title: getWorkspacePanelTitle("compile"),
+          content: (
+            <StudioCompilePanel
+              compileLoading={composerCompileLoading || chainPreflightLoading}
+              compileResult={composerCompileResult}
+              preflightResult={chainPreflightResult}
+              issues={composerIssues}
+              draftPayloadPreview={draftPayloadPreview}
+              onCompile={runChainPreflight}
+            />
+          ),
+          badge: getWorkspacePanelBadge("compile") || undefined,
+        } as const;
+      case "setup":
+        return {
+          title: getWorkspacePanelTitle("setup"),
+          content: workflowSetupPanel,
+        } as const;
+      case "interface":
+        return {
+          title: getWorkspacePanelTitle("interface"),
+          content: (
+            <StudioWorkflowInterfacePanel
+              workflowInterface={workflowInterface}
+              contextPathSuggestions={contextPathSuggestions}
+              visualChainNodes={visualChainNodes}
+              outputPathSuggestionsForNode={studioOutputPathSuggestionsForNode}
+              onAddInput={addWorkflowInputDefinition}
+              onUpdateInput={updateWorkflowInputDefinition}
+              onRemoveInput={removeWorkflowInputDefinition}
+              onAddVariable={addWorkflowVariableDefinition}
+              onUpdateVariable={updateWorkflowVariableDefinition}
+              onRemoveVariable={removeWorkflowVariableDefinition}
+              onAddOutput={addWorkflowOutputDefinition}
+              onUpdateOutput={updateWorkflowOutputDefinition}
+              onRemoveOutput={removeWorkflowOutputDefinition}
+            />
+          ),
+          badge: getWorkspacePanelBadge("interface") || undefined,
+        } as const;
+      case "library":
+        return {
+          title: getWorkspacePanelTitle("library"),
+          content: workflowLibraryLauncherPanel,
+          panelDomId: "studio-library-section",
+          bodyClassName: "overflow-hidden p-0",
+          badge: getWorkspacePanelBadge("library") || undefined,
+        } as const;
+      case "inspector":
+        return {
+          title: getWorkspacePanelTitle("inspector"),
+          content: nodeInspectorPanel,
+          panelDomId: "studio-inspector-section",
+          bodyClassName: "transition-opacity duration-200 motion-reduce:transition-none",
+        } as const;
+      default:
+        return null;
+    }
+  };
+
+  const renderWorkspacePanel = (panelId: FloatingStudioPanelId) => {
+    const definition = getWorkspacePanelDefinition(panelId);
+    if (!definition) {
       return null;
     }
     const renderer =
       floatingStudioPanels[panelId].mode === "floating"
         ? renderFloatingStudioPanel
         : renderDockedStudioPanel;
-
-    switch (panelId) {
-      case "palette":
-        return renderer(
-          "palette",
-          "Node Palette",
-          <div className="h-full">
-            <StudioCapabilityPalette
-              capabilities={paletteCapabilities}
-              groups={paletteGroups}
-              loading={capabilityLoading}
-              error={capabilityError}
-              query={paletteQuery}
-              selectedGroup={paletteGroup}
-              onQueryChange={setPaletteQuery}
-              onGroupChange={setPaletteGroup}
-              onAddCapability={addCapabilityNodeToStudio}
-              onAddControl={addControlNodeToStudio}
-            />
-          </div>,
-          {
-            panelDomId: "studio-palette-section",
-            bodyClassName: "overflow-hidden p-0",
-          }
-        );
-      case "compile":
-        return renderer(
-          "compile",
-          getWorkspacePanelTitle("compile"),
-          <StudioCompilePanel
-            compileLoading={composerCompileLoading || chainPreflightLoading}
-            compileResult={composerCompileResult}
-            preflightResult={chainPreflightResult}
-            issues={composerIssues}
-            draftPayloadPreview={draftPayloadPreview}
-            onCompile={runChainPreflight}
-          />,
-          {
-            badge: getWorkspacePanelBadge("compile") || undefined,
-          }
-        );
-      case "setup":
-        return renderer("setup", getWorkspacePanelTitle("setup"), workflowSetupPanel);
-      case "interface":
-        return renderer(
-          "interface",
-          getWorkspacePanelTitle("interface"),
-          <StudioWorkflowInterfacePanel
-            workflowInterface={workflowInterface}
-            contextPathSuggestions={contextPathSuggestions}
-            visualChainNodes={visualChainNodes}
-            outputPathSuggestionsForNode={studioOutputPathSuggestionsForNode}
-            onAddInput={addWorkflowInputDefinition}
-            onUpdateInput={updateWorkflowInputDefinition}
-            onRemoveInput={removeWorkflowInputDefinition}
-            onAddVariable={addWorkflowVariableDefinition}
-            onUpdateVariable={updateWorkflowVariableDefinition}
-            onRemoveVariable={removeWorkflowVariableDefinition}
-            onAddOutput={addWorkflowOutputDefinition}
-            onUpdateOutput={updateWorkflowOutputDefinition}
-            onRemoveOutput={removeWorkflowOutputDefinition}
-          />,
-          {
-            badge: getWorkspacePanelBadge("interface") || undefined,
-          }
-        );
-      case "library":
-        return renderer("library", getWorkspacePanelTitle("library"), workflowLibraryLauncherPanel, {
-          panelDomId: "studio-library-section",
-          bodyClassName: "overflow-hidden p-0",
-          badge: getWorkspacePanelBadge("library") || undefined,
-        });
-      case "inspector":
-        return renderer("inspector", getWorkspacePanelTitle("inspector"), nodeInspectorPanel, {
-          panelDomId: "studio-inspector-section",
-        });
-      default:
-        return null;
-    }
+    return renderer(panelId, definition.title, definition.content, {
+      badge: definition.badge,
+      panelDomId: definition.panelDomId,
+      bodyClassName: definition.bodyClassName,
+    });
   };
 
-  const dockedRightPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
-    (panelId) =>
-      floatingStudioPanels[panelId].mode === "docked" &&
-      floatingStudioPanels[panelId].dockZone === "right" &&
-      !floatingStudioPanels[panelId].minimized &&
-      (panelId !== "inspector" || Boolean(selectedDagNode))
-  );
-  const dockedLeftPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
-    (panelId) =>
-      floatingStudioPanels[panelId].mode === "docked" &&
-      floatingStudioPanels[panelId].dockZone === "left" &&
-      !floatingStudioPanels[panelId].minimized &&
-      (panelId !== "inspector" || Boolean(selectedDagNode))
-  );
-  const dockedBottomPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
-    (panelId) =>
-      floatingStudioPanels[panelId].mode === "docked" &&
-      floatingStudioPanels[panelId].dockZone === "bottom" &&
-      !floatingStudioPanels[panelId].minimized &&
-      (panelId !== "inspector" || Boolean(selectedDagNode))
-  );
-  const minimizedWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
-    (panelId) =>
-      floatingStudioPanels[panelId].minimized &&
-      (panelId !== "inspector" || Boolean(selectedDagNode))
-  );
-  const floatingWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
-    (panelId) =>
-      floatingStudioPanels[panelId].mode === "floating" &&
-      !floatingStudioPanels[panelId].minimized &&
-      (panelId !== "inspector" || Boolean(selectedDagNode))
-  );
+  const activeBottomTrayPanelId =
+    dockedBottomPanelIds.includes(studioBottomTray.activePanelId)
+      ? studioBottomTray.activePanelId
+      : dockedBottomPanelIds[0];
+  const activeBottomTrayDefinition = activeBottomTrayPanelId
+    ? getWorkspacePanelDefinition(activeBottomTrayPanelId)
+    : null;
+
+  const beginStudioBottomTrayResize = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!bottomDockRect || studioBottomTray.collapsed) {
+      return;
+    }
+    event.preventDefault();
+    setStudioBottomTrayResize({
+      startY: event.clientY,
+      startHeight: studioBottomTray.height,
+    });
+  };
+
+  const toggleStudioBottomTrayCollapsed = () => {
+    setStudioBottomTray((prev) => ({
+      ...prev,
+      collapsed: !prev.collapsed,
+    }));
+  };
 
   return (
     <div className="-mx-6 -my-8 min-h-screen bg-[#56697c] text-white">
@@ -5981,30 +6353,82 @@ export default function WorkflowStudio() {
 
                   {bottomDockRect && dockedBottomPanelIds.length > 0 ? (
                     <div
-                      className="pointer-events-auto absolute flex gap-3 overflow-x-auto pb-1"
+                      className="pointer-events-auto absolute"
                       style={{
                         left: bottomDockRect.x,
                         top: bottomDockRect.y,
                         width: bottomDockRect.width,
-                        height: bottomDockRect.height + 6,
+                        height: bottomDockRect.height,
                       }}
                     >
-                      {dockedBottomPanelIds.map((panelId) => (
+                      <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-[24px] border border-white/12 bg-[linear-gradient(180deg,rgba(37,49,61,0.88),rgba(16,24,34,0.92))] shadow-[0_18px_36px_rgba(15,23,42,0.24)] backdrop-blur-xl">
                         <div
-                          key={`docked-bottom-panel-${panelId}`}
-                          className="min-w-0 flex-1"
-                          style={{
-                            flexBasis: floatingStudioPanels[panelId].width,
-                            minWidth:
-                              panelId === "library"
-                                ? FLOATING_STUDIO_PANEL_MIN_WIDTH
-                                : Math.max(360, FLOATING_STUDIO_PANEL_MIN_WIDTH),
-                            height: bottomDockRect.height,
-                          }}
-                        >
-                          {renderWorkspacePanel(panelId)}
+                          className="h-2 cursor-ns-resize transition hover:bg-white/[0.08]"
+                          onMouseDown={beginStudioBottomTrayResize}
+                          title="Resize bottom tray"
+                        />
+                        <div className="flex items-center justify-between gap-3 border-b border-white/8 bg-[rgba(9,16,27,0.46)] px-3 py-2">
+                          <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
+                            {dockedBottomPanelIds.map((panelId) => {
+                              const badge = getWorkspacePanelBadge(panelId);
+                              const isActive = activeBottomTrayPanelId === panelId;
+                              return (
+                                <button
+                                  key={`studio-bottom-tray-tab-${panelId}`}
+                                  type="button"
+                                  className={`flex shrink-0 items-center gap-2 rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
+                                    isActive
+                                      ? "border-sky-300/35 bg-sky-400/18 text-sky-50"
+                                      : "border-white/10 bg-white/[0.05] text-slate-100 hover:border-white/16 hover:bg-white/[0.08]"
+                                  }`}
+                                  onClick={() =>
+                                    setStudioBottomTray((prev) => ({
+                                      ...prev,
+                                      activePanelId: panelId,
+                                      collapsed: false,
+                                    }))
+                                  }
+                                >
+                                  <span>{getWorkspacePanelTitle(panelId)}</span>
+                                  {badge ? (
+                                    <span className="rounded-full border border-white/10 bg-white/[0.08] px-2 py-0.5 text-[9px] tracking-[0.18em] text-slate-200">
+                                      {badge}
+                                    </span>
+                                  ) : null}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              className="rounded-full border border-white/10 bg-white/[0.06] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-white/16 hover:bg-white/[0.1]"
+                              onClick={toggleStudioBottomTrayCollapsed}
+                            >
+                              {studioBottomTray.collapsed ? "Expand" : "Collapse"}
+                            </button>
+                          </div>
                         </div>
-                      ))}
+                        {!studioBottomTray.collapsed && activeBottomTrayDefinition ? (
+                          <div
+                            id={activeBottomTrayDefinition.panelDomId}
+                            className={`min-h-0 flex-1 overflow-auto ${
+                              activeBottomTrayDefinition.bodyClassName || ""
+                            }`.trim()}
+                          >
+                            {activeBottomTrayDefinition.content}
+                          </div>
+                        ) : (
+                          <div className="flex h-full items-center justify-between px-4 py-3 text-xs uppercase tracking-[0.18em] text-slate-300/68">
+                            <span>
+                              {activeBottomTrayPanelId
+                                ? `${getWorkspacePanelTitle(activeBottomTrayPanelId)} ready`
+                                : "Bottom tray ready"}
+                            </span>
+                            <span>Shift+3</span>
+                          </div>
+                        )}
+                      </div>
                     </div>
                   ) : null}
 

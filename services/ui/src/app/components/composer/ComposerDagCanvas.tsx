@@ -510,6 +510,12 @@ export default function ComposerDagCanvas({
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !isEditableTarget(event.target)) {
+        setDagCanvasPanModifierPressed(false);
+        setDagCanvasPanState(null);
+        setSelectedDagNodeId(null);
+        return;
+      }
       if (event.code !== "Space" || isEditableTarget(event.target)) {
         return;
       }
