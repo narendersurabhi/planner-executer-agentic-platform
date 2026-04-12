@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
+import AppShell from "../../components/AppShell";
 import ComposerDagCanvas from "../../components/composer/ComposerDagCanvas";
 import ComposerValidationPanel from "../../components/composer/ComposerValidationPanel";
 import {
@@ -1661,6 +1662,7 @@ export default function WorkflowStudio() {
   const router = useRouter();
   const pathname = usePathname() || "/studio";
   const searchParams = useSearchParams();
+  const requestedStudioMode = String(searchParams.get("mode") || "").trim();
   const requestedWorkflowDefinitionId = String(searchParams.get("definition") || "").trim();
   const requestedWorkflowVersionId = String(searchParams.get("version") || "").trim();
   const handledStudioRouteSelectionRef = useRef("");
@@ -4059,6 +4061,17 @@ export default function WorkflowStudio() {
     setStudioNotice("Started a fresh studio draft.");
   };
 
+  useEffect(() => {
+    if (requestedStudioMode !== "new") {
+      return;
+    }
+    if (handledStudioRouteSelectionRef.current === "mode:new") {
+      return;
+    }
+    handledStudioRouteSelectionRef.current = "mode:new";
+    startFreshStudioDraft();
+  }, [requestedStudioMode]);
+
   const restoreWorkflowDefinition = (definition: WorkflowDefinition) => {
     const restored = restorePersistedWorkflowDraft(
       definition.draft,
@@ -4236,10 +4249,12 @@ export default function WorkflowStudio() {
 
   useEffect(() => {
     const routeKey = `${requestedWorkflowDefinitionId}::${requestedWorkflowVersionId}`;
-    const routeSelectionPending =
+    const definitionOrVersionPending =
       (requestedWorkflowDefinitionId || requestedWorkflowVersionId) &&
       handledStudioRouteSelectionRef.current !== routeKey;
-    if (routeSelectionPending) {
+    const newModePending =
+      requestedStudioMode === "new" && handledStudioRouteSelectionRef.current !== "mode:new";
+    if (definitionOrVersionPending || newModePending) {
       return;
     }
 
@@ -4247,7 +4262,8 @@ export default function WorkflowStudio() {
     const nextVersionId = activeWorkflowVersionId || "";
     if (
       nextDefinitionId === requestedWorkflowDefinitionId &&
-      nextVersionId === requestedWorkflowVersionId
+      nextVersionId === requestedWorkflowVersionId &&
+      !requestedStudioMode
     ) {
       return;
     }
@@ -4265,6 +4281,7 @@ export default function WorkflowStudio() {
     activeWorkflowDefinitionId,
     activeWorkflowVersionId,
     pathname,
+    requestedStudioMode,
     requestedWorkflowDefinitionId,
     requestedWorkflowVersionId,
     router,
@@ -6119,127 +6136,52 @@ export default function WorkflowStudio() {
   };
 
   return (
-    <div className="-mx-6 -my-8 min-h-screen bg-[#56697c] text-white">
-      <div className="min-h-screen bg-[linear-gradient(180deg,#435365_0px,#435365_78px,#55697c_78px,#55697c_100%)]">
-        <header className="border-b border-white/10 bg-[linear-gradient(180deg,rgba(67,83,101,0.98),rgba(60,74,90,0.98))] px-6 py-3 shadow-[inset_0_-1px_0_rgba(255,255,255,0.08)]">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="min-w-0">
-              <div className="truncate text-[22px] font-semibold tracking-[-0.03em] text-white">
-                Workflow Studio: {composerDraft.summary.trim() || "Pipeline Alpha"}
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-200/78">
-                <Link href="/project" className="transition hover:text-white">
-                  Project
-                </Link>
-                <span className="text-white/35">›</span>
-                <Link href="/workflows" className="transition hover:text-white">
-                  Workflows
-                </Link>
-                <span className="text-white/35">›</span>
-                <span className="text-white/95">
-                  {composerDraft.summary.trim() || "Workflow Studio draft"}
-                </span>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
-                onClick={startFreshStudioDraft}
-              >
-                New Draft
-              </button>
-              <button
-                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
-                onClick={saveWorkflowDefinition}
-                disabled={workflowActionLoading !== null}
-              >
-                {workflowActionLoading === "save" ? "Saving..." : "Save"}
-              </button>
-              <button
-                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
-                onClick={publishWorkflowVersion}
-                disabled={workflowActionLoading !== null}
-              >
-                {workflowActionLoading === "publish" ? "Publishing..." : "Publish"}
-              </button>
-              <button
-                className="rounded-xl border border-slate-200/18 bg-slate-950/25 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-white transition hover:border-white/30 hover:bg-slate-950/35 disabled:cursor-not-allowed disabled:opacity-50"
-                onClick={runWorkflowVersion}
-                disabled={workflowActionLoading !== null}
-              >
-                {workflowActionLoading === "run" ? "Starting..." : "Run Workflow"}
-              </button>
-            </div>
-          </div>
-        </header>
-
-        {studioNotice ? (
-          <div className="border-b border-white/8 bg-sky-400/10 px-6 py-3 text-sm text-sky-50">
-            {studioNotice}
-          </div>
-        ) : null}
-
-        <div className="grid min-h-[calc(100vh-78px)] grid-cols-[52px_minmax(0,1fr)]">
-          <aside className="border-r border-white/10 bg-[linear-gradient(180deg,rgba(49,61,74,0.96),rgba(44,56,69,0.98))] px-1.5 py-3">
-            <div className="flex h-full flex-col items-center justify-between">
-              <div className="space-y-3">
-                {[
-                  { href: "/project", label: "Project", icon: "menu" as const },
-                  { id: "studio-palette-section", label: "Palette", icon: "palette" as const },
-                  { id: "studio-graph-section", label: "Graph", icon: "graph" as const, active: true },
-                  { href: "/workflows", label: "Workflows", icon: "library" as const },
-                  { id: "studio-inspector-section", label: "Inspector", icon: "inspect" as const },
-                ].map((item) => (
-                  item.href ? (
-                    <Link
-                      key={item.label}
-                      href={item.href}
-                      title={item.label}
-                      aria-label={item.label}
-                      className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-slate-950/18 text-slate-200 transition hover:border-white/18 hover:bg-slate-950/26"
-                    >
-                      <StudioWorkbenchIcon kind={item.icon} className="h-5 w-5" />
-                    </Link>
-                  ) : (
-                    <button
-                      key={item.label}
-                      type="button"
-                      title={item.label}
-                      aria-label={item.label}
-                      className={`flex h-11 w-11 items-center justify-center rounded-xl border transition ${
-                        item.active
-                          ? "border-sky-300/35 bg-sky-400/18 text-sky-50 shadow-[0_8px_18px_rgba(14,165,233,0.16)]"
-                          : "border-white/10 bg-slate-950/18 text-slate-200 hover:border-white/18 hover:bg-slate-950/26"
-                      }`}
-                      onClick={() => {
-                        if (item.id) {
-                          document
-                            .getElementById(item.id)
-                            ?.scrollIntoView({ behavior: "smooth", block: "start" });
-                        }
-                      }}
-                    >
-                      <StudioWorkbenchIcon kind={item.icon} className="h-5 w-5" />
-                    </button>
-                  )
-                ))}
-              </div>
-
-              <button
-                type="button"
-                title="Run workflow"
-                aria-label="Run workflow"
-                className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-slate-950/18 text-slate-100 transition hover:border-white/18 hover:bg-slate-950/26"
-                onClick={runWorkflowVersion}
-              >
-                <StudioWorkbenchIcon kind="run" className="h-5 w-5" />
-              </button>
-            </div>
-          </aside>
-
-          <main className="min-w-0 overflow-auto px-4 py-4">
-            <section className="relative">
+    <AppShell
+      activeScreen="studio"
+      title={`Workflow Studio: ${composerDraft.summary.trim() || "Pipeline Alpha"}`}
+      breadcrumbs={[
+        { label: "Project", href: "/project" },
+        { label: "Workflows", href: "/workflows" },
+        { label: composerDraft.summary.trim() || "Workflow Studio draft" },
+      ]}
+      actions={
+        <>
+          <button
+            className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
+            onClick={startFreshStudioDraft}
+          >
+            New Draft
+          </button>
+          <button
+            className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={saveWorkflowDefinition}
+            disabled={workflowActionLoading !== null}
+          >
+            {workflowActionLoading === "save" ? "Saving..." : "Save"}
+          </button>
+          <button
+            className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={publishWorkflowVersion}
+            disabled={workflowActionLoading !== null}
+          >
+            {workflowActionLoading === "publish" ? "Publishing..." : "Publish"}
+          </button>
+          <button
+            className="rounded-xl border border-slate-200/18 bg-slate-950/25 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-white transition hover:border-white/30 hover:bg-slate-950/35 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={runWorkflowVersion}
+            disabled={workflowActionLoading !== null}
+          >
+            {workflowActionLoading === "run" ? "Starting..." : "Run Workflow"}
+          </button>
+        </>
+      }
+    >
+      {studioNotice ? (
+        <div className="mb-4 rounded-[24px] border border-sky-300/15 bg-sky-400/10 px-4 py-3 text-sm text-sky-50">
+          {studioNotice}
+        </div>
+      ) : null}
+      <section className="relative">
               <div className="relative">
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
@@ -6560,16 +6502,13 @@ export default function WorkflowStudio() {
                   {floatingWorkspacePanelIds.map((panelId) => renderWorkspacePanel(panelId))}
                 </div>
               </div>
-            </section>
-          </main>
+      </section>
 
-          <datalist id="studio-capability-id-options">
-            {availableCapabilities.map((item) => (
-              <option key={`studio-capability-id-option-${item.id}`} value={item.id} />
-            ))}
-          </datalist>
-        </div>
-      </div>
-    </div>
+      <datalist id="studio-capability-id-options">
+        {availableCapabilities.map((item) => (
+          <option key={`studio-capability-id-option-${item.id}`} value={item.id} />
+        ))}
+      </datalist>
+    </AppShell>
   );
 }

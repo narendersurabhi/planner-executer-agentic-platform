@@ -1,37 +1,17 @@
 "use client";
 
-import Link from "next/link";
 import type { ReactNode } from "react";
-
-export type ScreenHeaderScreen =
-  | "home"
-  | "compose"
-  | "chat"
-  | "studio"
-  | "components"
-  | "memory"
-  | "rag";
 
 type ScreenHeaderProps = {
   eyebrow: string;
   title: string;
   description: string;
-  activeScreen: ScreenHeaderScreen;
+  activeScreen?: string;
   actions?: ReactNode;
   children?: ReactNode;
   compact?: boolean;
   theme?: "default" | "studio";
 };
-
-const NAV_ITEMS: Array<{ id: ScreenHeaderScreen; label: string; href: string }> = [
-  { id: "home", label: "Home", href: "/" },
-  { id: "compose", label: "Compose", href: "/compose" },
-  { id: "chat", label: "Chat", href: "/chat" },
-  { id: "studio", label: "Studio", href: "/studio" },
-  { id: "components", label: "Components", href: "/components" },
-  { id: "memory", label: "Memory", href: "/memory" },
-  { id: "rag", label: "RAG", href: "/rag" }
-];
 
 export const screenHeaderSecondaryActionClassName =
   "rounded-full border border-white/20 bg-white/10 px-4 py-2 text-sm font-semibold text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50";
@@ -43,7 +23,7 @@ export default function ScreenHeader({
   eyebrow,
   title,
   description,
-  activeScreen,
+  activeScreen: _activeScreen,
   actions,
   children,
   compact = false,
@@ -94,36 +74,6 @@ export default function ScreenHeader({
             </p>
           </div>
           <div className="flex max-w-full flex-col items-start gap-3 md:items-end">
-            <div className={`flex flex-wrap items-center ${compact ? "gap-2" : "gap-3"}`}>
-              {NAV_ITEMS.map((item) =>
-                item.id === activeScreen ? (
-                  <div
-                    key={item.id}
-                    className={`rounded-full font-semibold ${
-                      isStudioTheme
-                        ? "border border-sky-300/35 bg-sky-400/18 text-sky-50 shadow-[0_8px_18px_rgba(14,165,233,0.16)]"
-                        : "border border-white/20 bg-white text-slate-900"
-                    } ${
-                      compact ? "px-3 py-1.5 text-xs" : "px-4 py-2 text-sm"
-                    }`}
-                  >
-                    {item.label}
-                  </div>
-                ) : (
-                  <Link
-                    key={item.id}
-                    href={item.href}
-                    className={`rounded-full font-semibold transition ${
-                      isStudioTheme
-                        ? "border border-white/10 bg-slate-950/18 text-slate-200 hover:border-white/18 hover:bg-slate-950/26"
-                        : "border border-white/20 bg-white/10 text-white hover:bg-white/15"
-                    } ${compact ? "px-3 py-1.5 text-xs" : "px-4 py-2 text-sm"}`}
-                  >
-                    {item.label}
-                  </Link>
-                )
-              )}
-            </div>
             {actions ? <div className="flex flex-wrap items-center gap-3">{actions}</div> : null}
           </div>
         </div>

@@ -1,8 +1,10 @@
 "use client";
 
 export type StudioWorkbenchIconKind =
+  | "home"
   | "menu"
   | "palette"
+  | "chat"
   | "graph"
   | "library"
   | "inspect"
@@ -24,6 +26,13 @@ export default function StudioWorkbenchIcon({
   };
 
   switch (kind) {
+    case "home":
+      return (
+        <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+          <path d="m4.5 11.5 7.5-6 7.5 6" {...sharedProps} />
+          <path d="M7 10.5v8h10v-8" {...sharedProps} />
+        </svg>
+      );
     case "menu":
       return (
         <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
@@ -35,6 +44,13 @@ export default function StudioWorkbenchIcon({
         <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
           <rect x="4" y="4" width="16" height="16" rx="3.5" {...sharedProps} />
           <path d="M7 8h10M7 12h10M7 16h7" {...sharedProps} />
+        </svg>
+      );
+    case "chat":
+      return (
+        <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+          <path d="M6 6.5h12a2.5 2.5 0 0 1 2.5 2.5v5a2.5 2.5 0 0 1-2.5 2.5H11l-4.5 3v-3H6A2.5 2.5 0 0 1 3.5 14V9A2.5 2.5 0 0 1 6 6.5Z" {...sharedProps} />
+          <path d="M8 10.5h8M8 13.5h5" {...sharedProps} />
         </svg>
       );
     case "graph":
