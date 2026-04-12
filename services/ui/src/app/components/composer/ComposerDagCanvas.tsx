@@ -119,6 +119,8 @@ type ComposerDagCanvasProps = {
   onZoomOut?: () => void;
   zoomInDisabled?: boolean;
   zoomOutDisabled?: boolean;
+  onToggleFocusGraph?: () => void;
+  focusGraphActive?: boolean;
   onRunWorkflow?: () => void;
   runWorkflowPending?: boolean;
   runWorkflowDisabled?: boolean;
@@ -468,6 +470,8 @@ export default function ComposerDagCanvas({
   onZoomOut,
   zoomInDisabled = false,
   zoomOutDisabled = false,
+  onToggleFocusGraph,
+  focusGraphActive = false,
   onRunWorkflow,
   runWorkflowPending = false,
   runWorkflowDisabled = false,
@@ -641,6 +645,17 @@ export default function ComposerDagCanvas({
               type="button"
             >
               Layout
+            </button>
+            <button
+              className={`${toolbarButtonClassName} ${
+                focusGraphActive
+                  ? "border-sky-300/35 bg-[rgba(46,91,128,0.96)] text-sky-50"
+                  : ""
+              }`.trim()}
+              onClick={onToggleFocusGraph}
+              type="button"
+            >
+              {focusGraphActive ? "Exit Focus" : "Focus Graph"}
             </button>
             <button
               className={`${toolbarButtonClassName} border-white/16 bg-[rgba(38,48,61,0.98)]`}
