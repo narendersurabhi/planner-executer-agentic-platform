@@ -16574,3 +16574,426 @@ def _create_plan_internal(
 @app.post("/plans", response_model=models.Plan)
 def create_plan(plan: models.PlanCreate, job_id: str, db: Session = Depends(get_db)) -> models.Plan:
     return _create_plan_internal(plan, job_id=job_id, db=db)
+
+
+# ---------------------------------------------------------------------------
+# Workbench endpoints
+# ---------------------------------------------------------------------------
+
+_WORKBENCH_SURFACE_TAG = "studio_workbench"
+
+
+def _workbench_validate_capability(
+    capability_id: str,
+) -> capability_registry.CapabilitySpec:
+    """Raise HTTPException if capability is unknown, disabled, or has no enabled adapter."""
+    normalized = str(capability_id or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="workbench_capability_id_required")
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail=f"workbench_capability_registry_load_failed:{exc}"
+        ) from exc
+    spec = registry.get(normalized)
+    if spec is None:
+        raise HTTPException(
+            status_code=404, detail=f"workbench_capability_not_found:{normalized}"
+        )
+    if not spec.enabled:
+        raise HTTPException(
+            status_code=422, detail=f"workbench_capability_disabled:{normalized}"
+        )
+    enabled_adapters = [a for a in spec.adapters if a.enabled]
+    if not enabled_adapters:
+        raise HTTPException(
+            status_code=422,
+            detail=f"workbench_capability_no_enabled_adapters:{normalized}",
+        )
+    return spec
+
+
+def _workbench_validate_inputs_against_schema(
+    inputs: dict[str, Any],
+    spec: capability_registry.CapabilitySpec,
+    capability_id: str,
+) -> None:
+    """Validate workbench inputs against the capability JSON schema."""
+    input_schema, _ = _resolve_capability_schemas(spec, include_schemas=True)
+    if not isinstance(input_schema, dict) or not input_schema:
+        return
+    validation_errors = payload_resolver.validate_tool_inputs(
+        {capability_id: inputs if isinstance(inputs, dict) else {}},
+        {capability_id: input_schema},
+    )
+    error = validation_errors.get(capability_id)
+    if error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "workbench_invalid_capability_inputs",
+                "capability_id": capability_id,
+                "message": error,
+            },
+        )
+
+
+def _workbench_build_single_step_run_spec(
+    capability_id: str,
+    inputs: dict[str, Any],
+    *,
+    retry_policy_override: dict[str, Any] | None = None,
+) -> models.RunSpec:
+    """Compile a single-step RunSpec for capability sandbox runs."""
+    slug = re.sub(r"[^a-z0-9]+", "_", capability_id.lower()).strip("_") or "capability_step"
+    retry_policy = models.StepRetryPolicy()
+    if isinstance(retry_policy_override, dict) and retry_policy_override:
+        try:
+            retry_policy = models.StepRetryPolicy.model_validate(retry_policy_override)
+        except Exception:  # noqa: BLE001
+            pass
+    cap_request = models.CapabilityRequestSpec(
+        request_id=capability_id,
+        capability_id=capability_id,
+        execution_request_id=capability_id,
+    )
+    step = models.StepSpec(
+        step_id=slug,
+        name=slug,
+        description=f"Capability sandbox run for {capability_id}",
+        instruction=f"Execute capability {capability_id}.",
+        capability_request=cap_request,
+        input_bindings=dict(inputs),
+        retry_policy=retry_policy,
+        acceptance_policy=models.StepAcceptancePolicy(
+            acceptance_criteria=[],
+            critic_required=False,
+        ),
+        depends_on=[],
+    )
+    return models.RunSpec(
+        kind=models.RunKind.api,
+        planner_version="workbench_v1",
+        tasks_summary=f"Workbench capability run: {capability_id}",
+        steps=[step],
+        dag_edges=[],
+        capability_requests=[cap_request],
+        metadata={
+            "surface": _WORKBENCH_SURFACE_TAG,
+            "workbench_mode": "capability",
+            "ephemeral": True,
+        },
+    )
+
+
+def _workbench_validate_agent_run_spec(
+    raw_run_spec: dict[str, Any],
+) -> models.RunSpec:
+    """Parse and validate the ephemeral RunSpec from an agent run request."""
+    try:
+        run_spec = models.RunSpec.model_validate(raw_run_spec)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "workbench_invalid_run_spec", "detail": str(exc)},
+        ) from exc
+    if not run_spec.steps:
+        raise HTTPException(
+            status_code=422, detail="workbench_agent_run_spec_must_have_at_least_one_step"
+        )
+    bad_refs: list[str] = []
+    capability_issues: dict[str, Any | None] = {}
+    for step in run_spec.steps:
+        cid = str(step.capability_request.capability_id or "").strip()
+        if not cid:
+            bad_refs.append(f"step '{step.step_id}' has no capability_id")
+            continue
+        if cid not in capability_issues:
+            try:
+                _workbench_validate_capability(cid)
+                capability_issues[cid] = None
+            except HTTPException as exc:
+                capability_issues[cid] = exc.detail
+        issue = capability_issues.get(cid)
+        if issue is not None:
+            if isinstance(issue, str):
+                bad_refs.append(f"step '{step.step_id}': {issue}")
+            else:
+                bad_refs.append(f"step '{step.step_id}': {json.dumps(issue, default=str)}")
+    if bad_refs:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "workbench_invalid_capability_references",
+                "issues": bad_refs,
+            },
+        )
+    # Stamp workbench metadata and normalize kind to api
+    run_spec = run_spec.model_copy(
+        update={
+            "kind": models.RunKind.api,
+            "metadata": {
+                **dict(run_spec.metadata or {}),
+                "surface": _WORKBENCH_SURFACE_TAG,
+                "workbench_mode": "agent",
+                "ephemeral": True,
+            },
+        }
+    )
+    return run_spec
+
+
+def _workbench_launch_run(
+    run_spec: models.RunSpec,
+    *,
+    title: str,
+    goal: str,
+    user_id: str | None,
+    context_json: dict[str, Any],
+    db: Session,
+) -> tuple[RunRecord, models.RunSpec]:
+    """Create a canonical job+plan+run from a validated RunSpec and return both."""
+    normalized_user_id = _semantic_normalize_text(user_id, max_len=120) or None
+    plan = run_specs.run_spec_to_plan(run_spec)
+    effective_goal = str(goal or "").strip() or plan.tasks_summary or title or "Workbench run"
+    effective_title = str(title or "").strip() or effective_goal
+    use_postgres_scheduler = STUDIO_RUN_SCHEDULER_ENABLED
+    serialized_run_spec = run_spec.model_dump(mode="json")
+
+    metadata_overrides: dict[str, Any] = {
+        "surface": _WORKBENCH_SURFACE_TAG,
+        "workbench_mode": run_spec.metadata.get("workbench_mode", "capability"),
+        "ephemeral": True,
+        "run_kind": models.RunKind.api.value,
+        "workflow_source": _WORKBENCH_SURFACE_TAG,
+        "run_spec": serialized_run_spec,
+    }
+    if use_postgres_scheduler:
+        metadata_overrides["scheduler_mode"] = POSTGRES_RUN_SPEC_SCHEDULER_MODE
+    if normalized_user_id:
+        metadata_overrides["semantic_user_id"] = normalized_user_id
+
+    job = _create_job_internal(
+        models.JobCreate(
+            goal=effective_goal,
+            context_json=context_json if isinstance(context_json, dict) else {},
+        ),
+        db,
+        emit_job_created_event=False,
+        metadata_overrides=metadata_overrides,
+    )
+    plan_record = _create_plan_internal(
+        plan,
+        job_id=job.id,
+        db=db,
+        emit_plan_created_event=not use_postgres_scheduler,
+    )
+
+    job_record = db.query(JobRecord).filter(JobRecord.id == job.id).first()
+    assert job_record is not None  # just created above
+
+    # Update run record title/goal and stamp the final run_spec
+    run_id = str((job_record.metadata_json or {}).get("canonical_run_id") or job.id)
+    run_record = db.query(RunRecord).filter(RunRecord.id == run_id).first()
+    if run_record is not None:
+        run_record.title = effective_title
+        run_record.goal = effective_goal
+        if normalized_user_id:
+            run_record.user_id = normalized_user_id
+        run_record.run_spec_json = serialized_run_spec
+        run_record.metadata_json = {
+            **(run_record.metadata_json or {}),
+            "surface": _WORKBENCH_SURFACE_TAG,
+            "workbench_mode": run_spec.metadata.get("workbench_mode", "capability"),
+            "ephemeral": True,
+        }
+        db.commit()
+        db.refresh(run_record)
+    else:
+        # Fallback: create the RunRecord directly if shadow-run wasn't created
+        now = _utcnow()
+        run_record = RunRecord(
+            id=run_id,
+            kind=models.RunKind.api.value,
+            title=effective_title,
+            goal=effective_goal,
+            requested_context_json=context_json if isinstance(context_json, dict) else {},
+            status=models.JobStatus.queued.value,
+            job_id=job.id,
+            plan_id=plan_record.id,
+            user_id=normalized_user_id,
+            run_spec_json=serialized_run_spec,
+            metadata_json={
+                "surface": _WORKBENCH_SURFACE_TAG,
+                "workbench_mode": run_spec.metadata.get("workbench_mode", "capability"),
+                "ephemeral": True,
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(run_record)
+        db.commit()
+        db.refresh(run_record)
+
+    correlation_id = str(uuid.uuid4())
+    _dispatch_ready_work_for_job(job.id, plan_record.id, correlation_id)
+    db.expire_all()
+    refreshed_run_record = db.query(RunRecord).filter(RunRecord.id == run_record.id).first()
+    if refreshed_run_record is not None:
+        run_record = refreshed_run_record
+    refreshed_job_record = db.query(JobRecord).filter(JobRecord.id == job.id).first()
+    if (
+        refreshed_job_record is not None
+        and _workbench_first_execution_request(run_record.id, db) is None
+    ):
+        _workbench_prepare_initial_execution_request(
+            job_record=refreshed_job_record,
+            plan_id=plan_record.id,
+            correlation_id=correlation_id,
+            db=db,
+        )
+        db.expire_all()
+        refreshed_run_record = db.query(RunRecord).filter(RunRecord.id == run_record.id).first()
+        if refreshed_run_record is not None:
+            run_record = refreshed_run_record
+
+    return run_record, run_spec
+
+
+def _workbench_first_execution_request(
+    run_id: str, db: Session
+) -> dict[str, Any] | None:
+    record = (
+        db.query(ExecutionRequestRecord)
+        .filter(ExecutionRequestRecord.run_id == run_id)
+        .order_by(ExecutionRequestRecord.created_at.asc())
+        .first()
+    )
+    if record is None:
+        return None
+    return _execution_request_from_record(record).model_dump(mode="json")
+
+
+def _workbench_prepare_initial_execution_request(
+    *,
+    job_record: JobRecord,
+    plan_id: str | None,
+    correlation_id: str,
+    db: Session,
+) -> None:
+    resolved_plan_id = str(plan_id or "").strip()
+    if not resolved_plan_id:
+        return
+    task_records = (
+        db.query(TaskRecord)
+        .filter(TaskRecord.plan_id == resolved_plan_id)
+        .order_by(TaskRecord.created_at.asc(), TaskRecord.name.asc())
+        .all()
+    )
+    if not task_records:
+        return
+    tasks = _resolve_task_deps(task_records)
+    task_map = {task.id: task for task in tasks}
+    id_to_name = {record.id: record.name for record in task_records}
+    job_context = _execution_job_context(
+        job_record.goal if isinstance(job_record.goal, str) else "",
+        job_record.context_json if isinstance(job_record.context_json, dict) else {},
+        job_record.metadata_json if isinstance(job_record.metadata_json, dict) else {},
+    )
+    task_intent_profiles = _coerce_task_intent_profiles(
+        job_record.metadata_json if isinstance(job_record.metadata_json, dict) else {}
+    )
+    for task_record in task_records:
+        if str(task_record.status or "").strip() not in {
+            models.TaskStatus.ready.value,
+            models.TaskStatus.pending.value,
+            models.TaskStatus.blocked.value,
+        }:
+            continue
+        context = _build_task_context(task_record.id, task_map, id_to_name, job_context)
+        _task_payload_from_record(
+            task_record,
+            correlation_id,
+            context,
+            goal_text=job_record.goal if isinstance(job_record.goal, str) else "",
+            intent_profile=task_intent_profiles.get(task_record.id),
+        )
+        return
+
+
+@app.post("/workbench/capability-runs")
+def workbench_capability_run(
+    payload: models.WorkbenchCapabilityRunRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Launch a single-capability workbench run through the canonical runtime.
+
+    Validates capability availability and input schema, compiles a one-step RunSpec,
+    creates a canonical job/plan/run, and returns the run record together with the
+    compiled RunSpec and the first prepared ExecutionRequest (if available).
+    """
+    capability_id = str(payload.capability_id or "").strip()
+    spec = _workbench_validate_capability(capability_id)
+    inputs = dict(payload.inputs) if isinstance(payload.inputs, dict) else {}
+    _workbench_validate_inputs_against_schema(inputs, spec, capability_id)
+
+    run_spec = _workbench_build_single_step_run_spec(
+        capability_id,
+        inputs,
+        retry_policy_override=payload.retry_policy,
+    )
+
+    run_record, final_run_spec = _workbench_launch_run(
+        run_spec,
+        title=str(payload.title or "").strip() or f"Capability run: {capability_id}",
+        goal=str(payload.goal or "").strip(),
+        user_id=payload.user_id,
+        context_json=payload.context_json,
+        db=db,
+    )
+
+    job_record = db.query(JobRecord).filter(JobRecord.id == run_record.job_id).first()
+    run = _run_from_record(run_record, job_record=job_record)
+    execution_request = _workbench_first_execution_request(run_record.id, db)
+
+    return models.WorkbenchRunLaunchResponse(
+        run=run,
+        run_spec=final_run_spec.model_dump(mode="json"),
+        execution_request=execution_request,
+    ).model_dump(mode="json")
+
+
+@app.post("/workbench/agent-runs")
+def workbench_agent_run(
+    payload: models.WorkbenchAgentRunRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Launch a multi-step agent workbench run through the canonical runtime.
+
+    Accepts an ephemeral RunSpec (from the structured builder or raw JSON editor),
+    validates all capability references, stamps workbench metadata, and creates a
+    canonical job/plan/run.  Returns the run and normalized RunSpec.
+    """
+    raw_run_spec = dict(payload.run_spec) if isinstance(payload.run_spec, dict) else {}
+    run_spec = _workbench_validate_agent_run_spec(raw_run_spec)
+
+    run_record, final_run_spec = _workbench_launch_run(
+        run_spec,
+        title=str(payload.title or "").strip() or "Agent workbench run",
+        goal=str(payload.goal or "").strip(),
+        user_id=payload.user_id,
+        context_json=payload.context_json,
+        db=db,
+    )
+
+    job_record = db.query(JobRecord).filter(JobRecord.id == run_record.job_id).first()
+    run = _run_from_record(run_record, job_record=job_record)
+
+    return models.WorkbenchRunLaunchResponse(
+        run=run,
+        run_spec=final_run_spec.model_dump(mode="json"),
+        execution_request=None,
+    ).model_dump(mode="json")

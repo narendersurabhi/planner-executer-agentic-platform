@@ -419,6 +419,44 @@ class RunSpec(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# Workbench request / response models
+# ---------------------------------------------------------------------------
+
+
+class WorkbenchCapabilityRunRequest(BaseModel):
+    """Request body for POST /workbench/capability-runs."""
+
+    title: str = ""
+    goal: str = ""
+    user_id: Optional[str] = None
+    context_json: Dict[str, Any] = Field(default_factory=dict)
+    capability_id: str
+    inputs: Dict[str, Any] = Field(default_factory=dict)
+    # Advanced overrides – optional; runtime defaults apply when omitted
+    retry_policy: Optional[Dict[str, Any]] = None
+
+
+class WorkbenchAgentRunRequest(BaseModel):
+    """Request body for POST /workbench/agent-runs."""
+
+    title: str = ""
+    goal: str = ""
+    user_id: Optional[str] = None
+    context_json: Dict[str, Any] = Field(default_factory=dict)
+    # Caller supplies an ephemeral RunSpec (structured builder output or raw JSON)
+    run_spec: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkbenchRunLaunchResponse(BaseModel):
+    """Response for both workbench launch endpoints."""
+
+    run: "Run"
+    run_spec: Dict[str, Any] = Field(default_factory=dict)
+    # First prepared execution_request, if available immediately
+    execution_request: Optional[Dict[str, Any]] = None
+
+
 class Run(BaseModel):
     id: str
     kind: RunKind

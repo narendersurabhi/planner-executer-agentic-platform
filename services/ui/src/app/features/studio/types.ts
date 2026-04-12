@@ -38,6 +38,8 @@ export type CapabilityCatalog = {
   items: CapabilityItem[];
 };
 
+export type StudioSurface = "workflow" | "workbench";
+
 export type ComposerInputBinding =
   | {
       kind: "step_output";

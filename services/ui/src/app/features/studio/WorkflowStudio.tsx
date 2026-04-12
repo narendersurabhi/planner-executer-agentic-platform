@@ -13,6 +13,7 @@ import {
 } from "../../components/workflow/WorkflowNodeIcon";
 import StudioCapabilityPalette from "./StudioCapabilityPalette";
 import StudioCompilePanel from "./StudioCompilePanel";
+import StudioWorkbenchSurface from "./StudioWorkbenchSurface";
 import StudioWorkbenchIcon from "./StudioWorkbenchIcon";
 import StudioWorkflowInterfacePanel from "./StudioWorkflowInterfacePanel";
 import StudioNodeInspector from "./StudioNodeInspector";
@@ -32,6 +33,7 @@ import type {
   StudioControlCase,
   StudioControlConfig,
   StudioControlKind,
+  StudioSurface,
   WorkflowBinding,
   WorkflowDefinition,
   WorkflowInputDefinition,
@@ -1663,9 +1665,17 @@ export default function WorkflowStudio() {
   const pathname = usePathname() || "/studio";
   const searchParams = useSearchParams();
   const requestedStudioMode = String(searchParams.get("mode") || "").trim();
+  const requestedStudioSurface = String(searchParams.get("surface") || "")
+    .trim()
+    .toLowerCase();
+  const activeStudioSurface: StudioSurface =
+    requestedStudioSurface === "workbench" ? "workbench" : "workflow";
   const requestedWorkflowDefinitionId = String(searchParams.get("definition") || "").trim();
   const requestedWorkflowVersionId = String(searchParams.get("version") || "").trim();
   const handledStudioRouteSelectionRef = useRef("");
+  const [workbenchSurfaceMounted, setWorkbenchSurfaceMounted] = useState(
+    activeStudioSurface === "workbench"
+  );
 
   const deferredPaletteQuery = useDeferredValue(paletteQuery);
   const visualChainNodes = composerDraft.nodes;
@@ -1682,6 +1692,12 @@ export default function WorkflowStudio() {
     }
     return { ...value, user_id: normalizedUserId };
   };
+
+  useEffect(() => {
+    if (activeStudioSurface === "workbench") {
+      setWorkbenchSurfaceMounted(true);
+    }
+  }, [activeStudioSurface]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -4269,6 +4285,9 @@ export default function WorkflowStudio() {
     }
 
     const params = new URLSearchParams();
+    if (activeStudioSurface === "workbench") {
+      params.set("surface", "workbench");
+    }
     if (nextDefinitionId) {
       params.set("definition", nextDefinitionId);
     }
@@ -4282,10 +4301,22 @@ export default function WorkflowStudio() {
     activeWorkflowVersionId,
     pathname,
     requestedStudioMode,
+    activeStudioSurface,
     requestedWorkflowDefinitionId,
     requestedWorkflowVersionId,
     router,
   ]);
+
+  const switchStudioSurface = (nextSurface: StudioSurface) => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (nextSurface === "workbench") {
+      params.set("surface", "workbench");
+    } else {
+      params.delete("surface");
+    }
+    const nextUrl = params.size > 0 ? `${pathname}?${params.toString()}` : pathname;
+    router.replace(nextUrl, { scroll: false });
+  };
 
   const saveWorkflowDefinition = async () => {
     if (contextState.invalid) {
@@ -6135,53 +6166,85 @@ export default function WorkflowStudio() {
     }));
   };
 
+  const studioShellTitle =
+    activeStudioSurface === "workbench"
+      ? "Studio Workbench"
+      : `Workflow Studio: ${composerDraft.summary.trim() || "Pipeline Alpha"}`;
+  const studioShellBreadcrumbLabel =
+    activeStudioSurface === "workbench"
+      ? "Studio Workbench"
+      : composerDraft.summary.trim() || "Workflow Studio draft";
+
   return (
     <AppShell
       activeScreen="studio"
-      title={`Workflow Studio: ${composerDraft.summary.trim() || "Pipeline Alpha"}`}
+      title={studioShellTitle}
       breadcrumbs={[
         { label: "Project", href: "/project" },
         { label: "Workflows", href: "/workflows" },
-        { label: composerDraft.summary.trim() || "Workflow Studio draft" },
+        { label: studioShellBreadcrumbLabel },
       ]}
       actions={
         <>
-          <button
-            className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
-            onClick={startFreshStudioDraft}
-          >
-            New Draft
-          </button>
-          <button
-            className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={saveWorkflowDefinition}
-            disabled={workflowActionLoading !== null}
-          >
-            {workflowActionLoading === "save" ? "Saving..." : "Save"}
-          </button>
-          <button
-            className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={publishWorkflowVersion}
-            disabled={workflowActionLoading !== null}
-          >
-            {workflowActionLoading === "publish" ? "Publishing..." : "Publish"}
-          </button>
-          <button
-            className="rounded-xl border border-slate-200/18 bg-slate-950/25 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-white transition hover:border-white/30 hover:bg-slate-950/35 disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={runWorkflowVersion}
-            disabled={workflowActionLoading !== null}
-          >
-            {workflowActionLoading === "run" ? "Starting..." : "Run Workflow"}
-          </button>
+          <div className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-white/[0.04] p-1">
+            {(["workflow", "workbench"] as StudioSurface[]).map((surface) => (
+              <button
+                key={surface}
+                type="button"
+                className={`rounded-lg px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+                  activeStudioSurface === surface
+                    ? "bg-sky-400/18 text-sky-50"
+                    : "text-slate-100 hover:bg-white/[0.08]"
+                }`}
+                onClick={() => switchStudioSurface(surface)}
+              >
+                {surface}
+              </button>
+            ))}
+          </div>
+          {activeStudioSurface === "workflow" ? (
+            <>
+              <button
+                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
+                onClick={startFreshStudioDraft}
+              >
+                New Draft
+              </button>
+              <button
+                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={saveWorkflowDefinition}
+                disabled={workflowActionLoading !== null}
+              >
+                {workflowActionLoading === "save" ? "Saving..." : "Save"}
+              </button>
+              <button
+                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={publishWorkflowVersion}
+                disabled={workflowActionLoading !== null}
+              >
+                {workflowActionLoading === "publish" ? "Publishing..." : "Publish"}
+              </button>
+              <button
+                className="rounded-xl border border-slate-200/18 bg-slate-950/25 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-white transition hover:border-white/30 hover:bg-slate-950/35 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={runWorkflowVersion}
+                disabled={workflowActionLoading !== null}
+              >
+                {workflowActionLoading === "run" ? "Starting..." : "Run Workflow"}
+              </button>
+            </>
+          ) : null}
         </>
       }
     >
-      {studioNotice ? (
+      {activeStudioSurface === "workflow" && studioNotice ? (
         <div className="mb-4 rounded-[24px] border border-sky-300/15 bg-sky-400/10 px-4 py-3 text-sm text-sky-50">
           {studioNotice}
         </div>
       ) : null}
-      <section className="relative">
+      <section
+        className={`relative ${activeStudioSurface === "workflow" ? "block" : "hidden"}`}
+        aria-hidden={activeStudioSurface !== "workflow"}
+      >
               <div className="relative">
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
@@ -6503,6 +6566,13 @@ export default function WorkflowStudio() {
                 </div>
               </div>
       </section>
+
+      {workbenchSurfaceMounted ? (
+        <StudioWorkbenchSurface
+          active={activeStudioSurface === "workbench"}
+          workspaceUserId={workspaceUserId}
+        />
+      ) : null}
 
       <datalist id="studio-capability-id-options">
         {availableCapabilities.map((item) => (

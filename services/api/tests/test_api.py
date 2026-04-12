@@ -104,6 +104,45 @@ def _document_render_registry() -> cap_registry.CapabilityRegistry:
     )
 
 
+def _workbench_registry() -> cap_registry.CapabilityRegistry:
+    return cap_registry.CapabilityRegistry(
+        capabilities={
+            "filesystem.workspace.list": cap_registry.CapabilitySpec(
+                capability_id="filesystem.workspace.list",
+                description="List files in the workspace.",
+                enabled=True,
+                risk_tier="read_only",
+                idempotency="read",
+                group="filesystem",
+                subgroup="workspace",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="filesystem.workspace.list",
+                    ),
+                ),
+            ),
+            "disabled.capability": cap_registry.CapabilitySpec(
+                capability_id="disabled.capability",
+                description="Disabled workbench capability.",
+                enabled=False,
+                risk_tier="read_only",
+                idempotency="read",
+                group="test",
+                subgroup="disabled",
+                adapters=(
+                    cap_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="filesystem.workspace.list",
+                    ),
+                ),
+            ),
+        }
+    )
+
+
 def test_create_job():
     response = client.post(
         "/jobs",
@@ -277,6 +316,161 @@ def test_workflow_run_uses_postgres_scheduler_when_flag_enabled(monkeypatch) -> 
     event_types = {row.event_type for row in matching_events}
     assert "task.ready" in event_types
     assert "plan.created" not in event_types
+
+
+def test_workbench_capability_run_creates_canonical_run_and_debugger_snapshot(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", _workbench_registry)
+
+    response = client.post(
+        "/workbench/capability-runs",
+        json={
+            "title": "Workspace capability run",
+            "goal": "Inspect the workspace",
+            "user_id": "workbench-user",
+            "context_json": {"workspace": "demo"},
+            "capability_id": "filesystem.workspace.list",
+            "inputs": {},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    run_id = body["run"]["id"]
+
+    assert body["run"]["kind"] == models.RunKind.api.value
+    assert body["run"]["metadata"]["surface"] == "studio_workbench"
+    assert body["run"]["metadata"]["workbench_mode"] == "capability"
+    assert body["run"]["metadata"]["ephemeral"] is True
+    assert body["run_spec"]["kind"] == models.RunKind.api.value
+    assert len(body["run_spec"]["steps"]) == 1
+    assert body["execution_request"] is not None
+    assert body["execution_request"]["run_id"] == run_id
+    assert body["execution_request"]["capability_id"] == "filesystem.workspace.list"
+
+    run_response = client.get(f"/runs/{run_id}")
+    assert run_response.status_code == 200
+    assert run_response.json()["metadata"]["surface"] == "studio_workbench"
+
+    debugger_response = client.get(f"/runs/{run_id}/debugger")
+    assert debugger_response.status_code == 200
+    debugger = debugger_response.json()
+    assert debugger["run"]["id"] == run_id
+    assert debugger["execution_requests"]
+    assert debugger["steps"]
+    assert debugger["steps"][0]["step"]["capability_id"] == "filesystem.workspace.list"
+    assert debugger["steps"][0]["execution_requests"]
+
+
+def test_workbench_capability_run_rejects_schema_invalid_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", _workbench_registry)
+    monkeypatch.setattr(
+        main,
+        "_resolve_capability_schemas",
+        lambda spec, *, include_schemas: (
+            {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+                "required": ["limit"],
+                "additionalProperties": False,
+            },
+            {"type": "object"},
+        )
+        if include_schemas and spec.capability_id == "filesystem.workspace.list"
+        else (None, None),
+    )
+
+    response = client.post(
+        "/workbench/capability-runs",
+        json={
+            "capability_id": "filesystem.workspace.list",
+            "inputs": {"limit": "not-an-integer"},
+        },
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["error"] == "workbench_invalid_capability_inputs"
+    assert detail["capability_id"] == "filesystem.workspace.list"
+    assert "input schema validation failed" in detail["message"]
+
+
+def test_workbench_agent_run_normalizes_run_spec_and_rejects_invalid_capabilities(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", _workbench_registry)
+
+    valid_response = client.post(
+        "/workbench/agent-runs",
+        json={
+            "title": "Agent workbench run",
+            "goal": "Inspect the workspace in two stages",
+            "user_id": "agent-user",
+            "context_json": {"workspace": "demo"},
+            "run_spec": {
+                "version": "1",
+                "kind": "studio",
+                "planner_version": "custom",
+                "tasks_summary": "Inspect the workspace",
+                "steps": [
+                    {
+                        "step_id": "list_workspace",
+                        "name": "ListWorkspace",
+                        "description": "List the workspace contents",
+                        "instruction": "List the workspace",
+                        "capability_request": {
+                            "request_id": "filesystem.workspace.list",
+                            "capability_id": "filesystem.workspace.list",
+                        },
+                        "input_bindings": {},
+                        "depends_on": [],
+                    }
+                ],
+                "dag_edges": [],
+                "capability_requests": [
+                    {
+                        "request_id": "filesystem.workspace.list",
+                        "capability_id": "filesystem.workspace.list",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert valid_response.status_code == 200
+    valid_body = valid_response.json()
+    assert valid_body["run"]["kind"] == models.RunKind.api.value
+    assert valid_body["run_spec"]["kind"] == models.RunKind.api.value
+    assert valid_body["run_spec"]["metadata"]["surface"] == "studio_workbench"
+    assert valid_body["run_spec"]["metadata"]["workbench_mode"] == "agent"
+    assert valid_body["run"]["metadata"]["workbench_mode"] == "agent"
+
+    invalid_response = client.post(
+        "/workbench/agent-runs",
+        json={
+            "run_spec": {
+                "version": "1",
+                "steps": [
+                    {
+                        "step_id": "bad_step",
+                        "name": "BadStep",
+                        "description": "Uses a missing capability",
+                        "capability_request": {
+                            "request_id": "missing.capability",
+                            "capability_id": "missing.capability",
+                        },
+                        "input_bindings": {},
+                    }
+                ],
+            }
+        },
+    )
+
+    assert invalid_response.status_code == 422
+    invalid_detail = invalid_response.json()["detail"]
+    assert invalid_detail["error"] == "workbench_invalid_capability_references"
+    assert any("missing.capability" in issue for issue in invalid_detail["issues"])
 
 
 def test_workflow_version_run_allows_derived_render_paths_in_studio_mode(monkeypatch) -> None:
