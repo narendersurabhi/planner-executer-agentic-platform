@@ -72,6 +72,7 @@ import {
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
 const MEMORY_USER_ID_KEY = "ape.memory.user_id.v1";
+const FLOATING_STUDIO_LAYOUT_STORAGE_KEY = "ape.studio.workspace_layout.v1";
 const DEFAULT_WORKSPACE_USER_ID = "narendersurabhi";
 const DAG_CANVAS_ZOOM_MIN = 0.7;
 const DAG_CANVAS_ZOOM_MAX = 1.5;
@@ -800,6 +801,7 @@ const FLOATING_STUDIO_PANEL_HEADER_HEIGHT = 44;
 const FLOATING_STUDIO_PANEL_MIN_WIDTH = 280;
 const FLOATING_STUDIO_PANEL_MIN_HEIGHT = 180;
 const FLOATING_STUDIO_PANEL_STAGE_PADDING = 18;
+const FLOATING_STUDIO_PANEL_SNAP_DISTANCE = 28;
 
 const FLOATING_STUDIO_PANEL_RESIZE_HANDLES: {
   direction: FloatingStudioPanelResizeDirection;
@@ -867,6 +869,26 @@ const clampFloatingStudioPanelLayout = (
     x: Math.min(maxX, Math.max(padding, layout.x)),
     y: Math.min(maxY, Math.max(padding, layout.y)),
   };
+};
+
+const getFloatingStudioPanelActiveHeight = (layout: FloatingStudioPanelLayout) =>
+  layout.minimized ? FLOATING_STUDIO_PANEL_HEADER_HEIGHT : layout.height;
+
+const pickFloatingStudioPanelSnapTarget = (
+  value: number,
+  targets: number[],
+  threshold: number
+) => {
+  let closest = value;
+  let closestDistance = threshold + 1;
+  targets.forEach((target) => {
+    const distance = Math.abs(value - target);
+    if (distance <= threshold && distance < closestDistance) {
+      closest = target;
+      closestDistance = distance;
+    }
+  });
+  return closest;
 };
 
 const resizeFloatingStudioPanelLayout = (
@@ -1007,6 +1029,90 @@ const createInitialFloatingStudioPanelLayouts = (
   };
 };
 
+const snapFloatingStudioPanelLayout = (
+  panelId: FloatingStudioPanelId,
+  layout: FloatingStudioPanelLayout,
+  stageWidth: number,
+  stageHeight: number
+) => {
+  const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+  const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const activeHeight = getFloatingStudioPanelActiveHeight(layout);
+  const rightDockX = Math.max(padding, stageWidth - layout.width - padding);
+  const bottomDockY = Math.max(padding, stageHeight - activeHeight - padding);
+  const centeredDockX = Math.max(
+    padding,
+    Math.min((stageWidth - layout.width) / 2, stageWidth - layout.width - padding)
+  );
+  const snappedX = pickFloatingStudioPanelSnapTarget(
+    layout.x,
+    [padding, defaults[panelId].x, centeredDockX, rightDockX],
+    FLOATING_STUDIO_PANEL_SNAP_DISTANCE
+  );
+  const snappedY = pickFloatingStudioPanelSnapTarget(
+    layout.y,
+    [padding, defaults[panelId].y, bottomDockY],
+    FLOATING_STUDIO_PANEL_SNAP_DISTANCE
+  );
+  return clampFloatingStudioPanelLayout(
+    {
+      ...layout,
+      x: snappedX,
+      y: snappedY,
+    },
+    stageWidth,
+    stageHeight
+  );
+};
+
+const readPersistedFloatingStudioPanelLayouts = (
+  raw: string | null
+): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null => {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, Partial<FloatingStudioPanelLayout>>;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return FLOATING_STUDIO_PANEL_IDS.reduce<Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null>(
+      (acc, panelId) => {
+        if (!acc) {
+          return null;
+        }
+        const candidate = parsed[panelId];
+        if (!candidate) {
+          return null;
+        }
+        const { x, y, width, height, zIndex, minimized } = candidate;
+        if (
+          !Number.isFinite(x) ||
+          !Number.isFinite(y) ||
+          !Number.isFinite(width) ||
+          !Number.isFinite(height) ||
+          !Number.isFinite(zIndex) ||
+          typeof minimized !== "boolean"
+        ) {
+          return null;
+        }
+        acc[panelId] = {
+          x: Number(x),
+          y: Number(y),
+          width: Number(width),
+          height: Number(height),
+          zIndex: Number(zIndex),
+          minimized,
+        };
+        return acc;
+      },
+      {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+    );
+  } catch {
+    return null;
+  }
+};
+
 export default function WorkflowStudio() {
   const [goal, setGoal] = useState("");
   const [contextJson, setContextJson] = useState(initialContextJson);
@@ -1083,6 +1189,9 @@ export default function WorkflowStudio() {
     inspector: null,
   });
   const floatingStudioPanelsInitializedRef = useRef(false);
+  const persistedFloatingStudioPanelsRef = useRef<
+    Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null
+  >(null);
   const router = useRouter();
   const pathname = usePathname() || "/studio";
   const searchParams = useSearchParams();
@@ -1122,6 +1231,15 @@ export default function WorkflowStudio() {
     }
     window.localStorage.setItem(MEMORY_USER_ID_KEY, workspaceUserId);
   }, [workspaceUserId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    persistedFloatingStudioPanelsRef.current = readPersistedFloatingStudioPanelLayouts(
+      window.localStorage.getItem(FLOATING_STUDIO_LAYOUT_STORAGE_KEY)
+    );
+  }, []);
   const contextPathSuggestions = useMemo(
     () => collectContextPathSuggestions(contextState.context),
     [contextState.context]
@@ -1513,7 +1631,8 @@ export default function WorkflowStudio() {
     setFloatingStudioPanels((prev) => {
       const seeded = floatingStudioPanelsInitializedRef.current
         ? prev
-        : createInitialFloatingStudioPanelLayouts(
+        : persistedFloatingStudioPanelsRef.current ||
+          createInitialFloatingStudioPanelLayouts(
             studioWorkspaceStageSize.width,
             studioWorkspaceStageSize.height
           );
@@ -1533,6 +1652,21 @@ export default function WorkflowStudio() {
       }, {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>);
     });
   }, [studioWorkspaceStageSize.height, studioWorkspaceStageSize.width]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !floatingStudioPanelsInitializedRef.current) {
+      return;
+    }
+    const saveTimer = window.setTimeout(() => {
+      window.localStorage.setItem(
+        FLOATING_STUDIO_LAYOUT_STORAGE_KEY,
+        JSON.stringify(floatingStudioPanels)
+      );
+    }, 120);
+    return () => {
+      window.clearTimeout(saveTimer);
+    };
+  }, [floatingStudioPanels]);
 
   useEffect(() => {
     if (!floatingStudioPanelDrag) {
@@ -1565,6 +1699,19 @@ export default function WorkflowStudio() {
     };
 
     const handleUp = () => {
+      const stage = studioWorkspaceStageRef.current;
+      if (stage) {
+        const stageRect = stage.getBoundingClientRect();
+        setFloatingStudioPanels((prev) => ({
+          ...prev,
+          [floatingStudioPanelDrag.id]: snapFloatingStudioPanelLayout(
+            floatingStudioPanelDrag.id,
+            prev[floatingStudioPanelDrag.id],
+            stageRect.width,
+            stageRect.height
+          ),
+        }));
+      }
       setFloatingStudioPanelDrag(null);
     };
 
@@ -4448,6 +4595,14 @@ export default function WorkflowStudio() {
     });
   };
 
+  const resetFloatingStudioWorkspaceLayout = () => {
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    setFloatingStudioPanels(defaults);
+    setStudioNotice("Workspace layout reset.");
+  };
+
   const beginFloatingStudioPanelDrag = (
     panelId: FloatingStudioPanelId,
     event: React.MouseEvent<HTMLDivElement>
@@ -4718,6 +4873,13 @@ export default function WorkflowStudio() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em]">
+                    <button
+                      type="button"
+                      className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-slate-100 transition hover:border-white/16 hover:bg-white/[0.08]"
+                      onClick={resetFloatingStudioWorkspaceLayout}
+                    >
+                      reset layout
+                    </button>
                     <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-slate-100">
                       steps {visualChainSummary.steps}
                     </span>
