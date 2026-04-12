@@ -809,6 +809,7 @@ type ResolvedStudioWorkspacePanelRects = {
   leftDock: StudioWorkspaceRect | null;
   rightDock: StudioWorkspaceRect | null;
   bottomDock: StudioWorkspaceRect | null;
+  minimizedShelf: StudioWorkspaceRect | null;
 };
 
 const FLOATING_STUDIO_PANEL_IDS: FloatingStudioPanelId[] = [
@@ -825,6 +826,7 @@ const FLOATING_STUDIO_PANEL_MIN_WIDTH = 280;
 const FLOATING_STUDIO_PANEL_MIN_HEIGHT = 180;
 const FLOATING_STUDIO_PANEL_STAGE_PADDING = 18;
 const FLOATING_STUDIO_PANEL_SNAP_DISTANCE = 28;
+const STUDIO_MINIMIZED_SHELF_HEIGHT = 58;
 const STUDIO_DOCK_PANEL_GAP = 14;
 
 const STUDIO_DOCK_ZONE_DEFAULTS: Record<
@@ -1214,12 +1216,13 @@ const resolveWorkspacePanelRects = (
   layouts: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>,
   stageWidth: number,
   stageHeight: number,
-  options: { showInspector: boolean }
+  options: { showInspector: boolean; showMinimizedShelf: boolean }
 ): ResolvedStudioWorkspacePanelRects => {
   const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
   const gap = STUDIO_DOCK_PANEL_GAP;
   const shouldShowDockedPanel = (panelId: FloatingStudioPanelId) =>
     layouts[panelId].mode === "docked" &&
+    !layouts[panelId].minimized &&
     (panelId !== "inspector" || options.showInspector);
 
   const leftDockWidth = shouldShowDockedPanel("palette") ? layouts.palette.width : 0;
@@ -1231,20 +1234,23 @@ const resolveWorkspacePanelRects = (
     (maxHeight, panelId) => Math.max(maxHeight, getFloatingStudioPanelActiveHeight(layouts[panelId])),
     0
   );
+  const minimizedShelfHeight = options.showMinimizedShelf ? STUDIO_MINIMIZED_SHELF_HEIGHT : 0;
 
   const graphX = padding + (leftDockWidth ? leftDockWidth + gap : 0);
   const graphY = padding;
+  const graphBottom =
+    stageHeight -
+    padding -
+    (minimizedShelfHeight ? minimizedShelfHeight + gap : 0) -
+    (bottomDockHeight ? bottomDockHeight + gap : 0);
   const graphWidth = Math.max(
     420,
-    stageWidth -
-      graphX -
-      padding -
-      (rightDockWidth ? rightDockWidth + gap : 0)
+    stageWidth - graphX - padding - (rightDockWidth ? rightDockWidth + gap : 0)
   );
-  const graphHeight = Math.max(
-    360,
-    stageHeight - graphY - padding - (bottomDockHeight ? bottomDockHeight + gap : 0)
-  );
+  const graphHeight = Math.max(360, graphBottom - graphY);
+  const bottomDockY = graphY + graphHeight + gap;
+  const minimizedShelfY =
+    stageHeight - padding - (minimizedShelfHeight || 0);
 
   return {
     graph: {
@@ -1272,9 +1278,17 @@ const resolveWorkspacePanelRects = (
     bottomDock: bottomDockHeight
       ? {
           x: padding,
-          y: graphY + graphHeight + gap,
+          y: bottomDockY,
           width: stageWidth - padding * 2,
           height: bottomDockHeight,
+        }
+      : null,
+    minimizedShelf: minimizedShelfHeight
+      ? {
+          x: padding,
+          y: minimizedShelfY,
+          width: stageWidth - padding * 2,
+          height: minimizedShelfHeight,
         }
       : null,
   };
@@ -4696,23 +4710,33 @@ export default function WorkflowStudio() {
     }
     setFloatingStudioPanels((prev) => {
       const inspector = prev.inspector;
-      const nextInspector =
-        inspector.mode === "floating" &&
-        studioWorkspaceStageSize.width &&
+      if (inspector.minimized) {
+        return prev;
+      }
+      if (
+        inspector.mode !== "floating" ||
+        !studioWorkspaceStageSize.width ||
+        !studioWorkspaceStageSize.height
+      ) {
+        return prev;
+      }
+      const nextInspector = clampFloatingStudioPanelLayout(
+        {
+          ...inspector,
+          zIndex: getNextFloatingStudioPanelZIndex(prev),
+        },
+        studioWorkspaceStageSize.width,
         studioWorkspaceStageSize.height
-          ? clampFloatingStudioPanelLayout(
-              {
-                ...inspector,
-                minimized: false,
-                zIndex: getNextFloatingStudioPanelZIndex(prev),
-              },
-              studioWorkspaceStageSize.width,
-              studioWorkspaceStageSize.height
-            )
-          : {
-              ...inspector,
-              minimized: false,
-            };
+      );
+      if (
+        nextInspector.x === inspector.x &&
+        nextInspector.y === inspector.y &&
+        nextInspector.width === inspector.width &&
+        nextInspector.height === inspector.height &&
+        nextInspector.zIndex === inspector.zIndex
+      ) {
+        return prev;
+      }
       return {
         ...prev,
         inspector: nextInspector,
@@ -4732,6 +4756,42 @@ export default function WorkflowStudio() {
           ...prev[panelId],
           zIndex: nextZIndex,
         },
+      };
+    });
+  };
+
+  const setFloatingStudioPanelMinimized = (
+    panelId: FloatingStudioPanelId,
+    minimized: boolean
+  ) => {
+    setFloatingStudioPanels((prev) => {
+      const current = prev[panelId];
+      if (current.minimized === minimized) {
+        return prev;
+      }
+      if (
+        !studioWorkspaceStageSize.width ||
+        !studioWorkspaceStageSize.height ||
+        current.mode !== "floating"
+      ) {
+        return {
+          ...prev,
+          [panelId]: {
+            ...current,
+            minimized,
+          },
+        };
+      }
+      return {
+        ...prev,
+        [panelId]: clampFloatingStudioPanelLayout(
+          {
+            ...current,
+            minimized,
+          },
+          studioWorkspaceStageSize.width,
+          studioWorkspaceStageSize.height
+        ),
       };
     });
   };
@@ -5065,11 +5125,47 @@ export default function WorkflowStudio() {
     floatingStudioPanels,
     workspaceStageWidth,
     workspaceStageHeight,
-    { showInspector: Boolean(selectedDagNode) }
+    {
+      showInspector: Boolean(selectedDagNode),
+      showMinimizedShelf: FLOATING_STUDIO_PANEL_IDS.some(
+        (panelId) => floatingStudioPanels[panelId].minimized && (panelId !== "inspector" || Boolean(selectedDagNode))
+      ),
+    }
   );
   const leftDockRect = workspacePanelRects.leftDock;
   const rightDockRect = workspacePanelRects.rightDock;
   const bottomDockRect = workspacePanelRects.bottomDock;
+  const minimizedShelfRect = workspacePanelRects.minimizedShelf;
+  const getWorkspacePanelTitle = (panelId: FloatingStudioPanelId) => {
+    switch (panelId) {
+      case "palette":
+        return "Node Palette";
+      case "compile":
+        return "Compile Preview";
+      case "setup":
+        return "Workflow Setup";
+      case "interface":
+        return "Workflow Interface";
+      case "library":
+        return "Workflow Browser";
+      case "inspector":
+        return "Node Inspector";
+      default:
+        return "Panel";
+    }
+  };
+  const getWorkspacePanelBadge = (panelId: FloatingStudioPanelId) => {
+    switch (panelId) {
+      case "compile":
+        return composerCompileLoading || chainPreflightLoading ? "busy" : "ready";
+      case "interface":
+        return `${workflowInterface.inputs.length}/${workflowInterface.outputs.length}`;
+      case "library":
+        return savedWorkflowDefinition ? "linked" : "browse";
+      default:
+        return null;
+    }
+  };
   const renderWorkspacePanel = (panelId: FloatingStudioPanelId) => {
     if (panelId === "inspector" && !selectedDagNode) {
       return null;
@@ -5106,7 +5202,7 @@ export default function WorkflowStudio() {
       case "compile":
         return renderer(
           "compile",
-          "Compile Preview",
+          getWorkspacePanelTitle("compile"),
           <StudioCompilePanel
             compileLoading={composerCompileLoading || chainPreflightLoading}
             compileResult={composerCompileResult}
@@ -5116,15 +5212,15 @@ export default function WorkflowStudio() {
             onCompile={runChainPreflight}
           />,
           {
-            badge: composerCompileLoading || chainPreflightLoading ? "busy" : "ready",
+            badge: getWorkspacePanelBadge("compile") || undefined,
           }
         );
       case "setup":
-        return renderer("setup", "Workflow Setup", workflowSetupPanel);
+        return renderer("setup", getWorkspacePanelTitle("setup"), workflowSetupPanel);
       case "interface":
         return renderer(
           "interface",
-          "Workflow Interface",
+          getWorkspacePanelTitle("interface"),
           <StudioWorkflowInterfacePanel
             workflowInterface={workflowInterface}
             contextPathSuggestions={contextPathSuggestions}
@@ -5141,17 +5237,17 @@ export default function WorkflowStudio() {
             onRemoveOutput={removeWorkflowOutputDefinition}
           />,
           {
-            badge: `${workflowInterface.inputs.length}/${workflowInterface.outputs.length}`,
+            badge: getWorkspacePanelBadge("interface") || undefined,
           }
         );
       case "library":
-        return renderer("library", "Workflow Browser", workflowLibraryLauncherPanel, {
+        return renderer("library", getWorkspacePanelTitle("library"), workflowLibraryLauncherPanel, {
           panelDomId: "studio-library-section",
           bodyClassName: "overflow-hidden p-0",
-          badge: savedWorkflowDefinition ? "linked" : "browse",
+          badge: getWorkspacePanelBadge("library") || undefined,
         });
       case "inspector":
-        return renderer("inspector", "Node Inspector", nodeInspectorPanel, {
+        return renderer("inspector", getWorkspacePanelTitle("inspector"), nodeInspectorPanel, {
           panelDomId: "studio-inspector-section",
         });
       default:
@@ -5162,14 +5258,21 @@ export default function WorkflowStudio() {
   const dockedRightPanelIds = STUDIO_DOCK_RIGHT_PANEL_ORDER.filter(
     (panelId) =>
       floatingStudioPanels[panelId].mode === "docked" &&
+      !floatingStudioPanels[panelId].minimized &&
       (panelId !== "inspector" || Boolean(selectedDagNode))
   );
   const dockedBottomPanelIds = STUDIO_DOCK_BOTTOM_PANEL_ORDER.filter(
-    (panelId) => floatingStudioPanels[panelId].mode === "docked"
+    (panelId) => floatingStudioPanels[panelId].mode === "docked" && !floatingStudioPanels[panelId].minimized
+  );
+  const minimizedWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
   );
   const floatingWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
     (panelId) =>
       floatingStudioPanels[panelId].mode === "floating" &&
+      !floatingStudioPanels[panelId].minimized &&
       (panelId !== "inspector" || Boolean(selectedDagNode))
   );
 
@@ -5347,7 +5450,7 @@ export default function WorkflowStudio() {
                   className="relative mt-4 h-[calc(100vh-184px)] min-h-[980px] overflow-hidden rounded-[30px] bg-[linear-gradient(180deg,rgba(75,92,109,0.58),rgba(45,57,71,0.72))] ring-1 ring-white/10 shadow-[0_22px_56px_rgba(15,23,42,0.16)]"
                 >
                   <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-100/58">
-                    Docked panels stay pinned until you float them
+                    Minimized panels collapse into the stage shelf so the graph stays clear
                   </div>
 
                   <div
@@ -5470,6 +5573,50 @@ export default function WorkflowStudio() {
                           {renderWorkspacePanel(panelId)}
                         </div>
                       ))}
+                    </div>
+                  ) : null}
+
+                  {minimizedShelfRect && minimizedWorkspacePanelIds.length > 0 ? (
+                    <div
+                      className="pointer-events-auto absolute"
+                      style={{
+                        left: minimizedShelfRect.x,
+                        top: minimizedShelfRect.y,
+                        width: minimizedShelfRect.width,
+                        height: minimizedShelfRect.height,
+                      }}
+                    >
+                      <div className="flex h-full items-center gap-3 overflow-x-auto rounded-[22px] border border-white/10 bg-[rgba(9,16,27,0.52)] px-3 shadow-[0_18px_40px_rgba(15,23,42,0.2)] backdrop-blur-xl">
+                        <div className="shrink-0 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-100/62">
+                          Minimized
+                        </div>
+                        <div className="flex min-w-0 items-center gap-2">
+                          {minimizedWorkspacePanelIds.map((panelId) => {
+                            const title = getWorkspacePanelTitle(panelId);
+                            const badge = getWorkspacePanelBadge(panelId);
+                            return (
+                              <button
+                                key={`minimized-panel-${panelId}`}
+                                type="button"
+                                className="flex shrink-0 items-center gap-2 rounded-full border border-white/10 bg-white/[0.06] px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-sky-300/30 hover:bg-white/[0.11]"
+                                aria-label={`Restore ${title}`}
+                                title={`Restore ${title}`}
+                                onClick={() => setFloatingStudioPanelMinimized(panelId, false)}
+                              >
+                                <span>{title}</span>
+                                {badge ? (
+                                  <span className="rounded-full border border-white/10 bg-white/[0.08] px-2 py-0.5 text-[9px] tracking-[0.18em] text-slate-200">
+                                    {badge}
+                                  </span>
+                                ) : null}
+                                <span className="text-[9px] tracking-[0.18em] text-sky-100/78">
+                                  Restore
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
                     </div>
                   ) : null}
 
