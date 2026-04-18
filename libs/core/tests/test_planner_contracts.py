@@ -148,6 +148,11 @@ def test_build_plan_request_extracts_revision_context_from_metadata() -> None:
             "revision_number": 2,
             "prior_plan_id": "plan-2",
             "trigger_reason": "retry_exhausted_auto_repair",
+            "checkpoint_lineage": {
+                "checkpoint_id": "checkpoint-1",
+                "checkpoint_key": "after-input",
+                "replay_count": 1,
+            },
             "completed_steps": [
                 {
                     "task_id": "task-1",
@@ -180,6 +185,7 @@ def test_build_plan_request_extracts_revision_context_from_metadata() -> None:
     assert request.revision_context is not None
     assert request.revision_context.revision_number == 2
     assert request.revision_context.prior_plan_id == "plan-2"
+    assert request.revision_context.checkpoint_lineage["checkpoint_id"] == "checkpoint-1"
     assert request.revision_context.completed_steps[0].task_id == "task-1"
     assert request.revision_context.failed_step is not None
     assert request.revision_context.failed_step.task_name == "CallService"

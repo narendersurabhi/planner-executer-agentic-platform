@@ -298,6 +298,7 @@ _REVISION_CONTEXT_EXCLUDED_KEYS = frozenset(
         "selected_strategy",
         "strategy_reason",
         "evaluator_signal",
+        "checkpoint_lineage",
         "excluded_completed_task_ids",
         "repair_target_task_id",
         "repair_target_task_name",
@@ -347,6 +348,9 @@ def parse_revision_context_from_metadata(
         strategy_reason=_non_empty_string(raw_context.get("strategy_reason")),
         evaluator_signal=dict(raw_context.get("evaluator_signal"))
         if isinstance(raw_context.get("evaluator_signal"), Mapping)
+        else {},
+        checkpoint_lineage=dict(raw_context.get("checkpoint_lineage"))
+        if isinstance(raw_context.get("checkpoint_lineage"), Mapping)
         else {},
         preserved_task_ids=[
             item for item in (_non_empty_string(entry) for entry in raw_context.get("preserved_task_ids", []))

@@ -87,6 +87,7 @@ class TaskExecutionRequest(BaseModel):
     intent_source: str | None = None
     intent_confidence: float | None = None
     intent_segment: workflow_contracts.IntentGraphSegment | None = None
+    replay_context: dict[str, Any] = Field(default_factory=dict)
     dependency_artifacts: dict[str, Any] = Field(default_factory=dict)
     retry_policy: dict[str, Any] = Field(default_factory=dict)
     source_payload: dict[str, Any] = Field(default_factory=dict, exclude=True)
@@ -147,6 +148,7 @@ class TaskDispatchPayload(BaseModel):
     intent_source: str | None = None
     intent_confidence: float | None = None
     intent_segment: workflow_contracts.IntentGraphSegment | None = None
+    replay_context: dict[str, Any] = Field(default_factory=dict)
     retry_policy: dict[str, Any] = Field(default_factory=dict)
     context: dict[str, Any] = Field(default_factory=dict)
     correlation_id: str = ""
@@ -190,6 +192,7 @@ def build_task_execution_request(
     )
     context_value = payload.get("context")
     dependency_artifacts_value = payload.get("dependency_artifacts")
+    replay_context_value = payload.get("replay_context")
     return TaskExecutionRequest(
         task_id=_string_value(payload.get("task_id")),
         job_id=_string_value(payload.get("job_id")),
@@ -205,6 +208,11 @@ def build_task_execution_request(
         intent_source=_string_value(payload.get("intent_source")) or None,
         intent_confidence=_intent_confidence(payload.get("intent_confidence")),
         intent_segment=_intent_segment(payload),
+        replay_context=(
+            dict(replay_context_value)
+            if isinstance(replay_context_value, Mapping)
+            else {}
+        ),
         dependency_artifacts=(
             dict(dependency_artifacts_value)
             if isinstance(dependency_artifacts_value, Mapping)
@@ -277,6 +285,7 @@ def build_task_dispatch_payload(
             "intent_source": execution_request.intent_source,
             "intent_confidence": execution_request.intent_confidence,
             "intent_segment": execution_request.intent_segment,
+            "replay_context": execution_request.replay_context,
             "retry_policy": execution_request.retry_policy,
             "context": execution_request.context,
             "correlation_id": correlation_id,

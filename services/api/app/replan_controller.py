@@ -38,6 +38,7 @@ def decide_task_failure_recovery(
     max_attempts: int,
     intent_mismatch_context: Mapping[str, Any] | None = None,
     retry_context: Mapping[str, Any] | None = None,
+    checkpoint_context: Mapping[str, Any] | None = None,
 ) -> RecoveryDecision:
     normalized_error = str(error_message or "").strip().lower()
     details = classification if isinstance(classification, Mapping) else {}
@@ -45,6 +46,30 @@ def decide_task_failure_recovery(
     retryable = bool(details.get("retryable"))
     adaptive_enabled = planning_mode == models.PlanningMode.adaptive
     exhausted = max_attempts > 0 and attempt_number >= max_attempts
+    checkpoint = dict(checkpoint_context) if isinstance(checkpoint_context, Mapping) else {}
+    checkpoint_lineage = (
+        dict(checkpoint.get("checkpoint_lineage"))
+        if isinstance(checkpoint.get("checkpoint_lineage"), Mapping)
+        else {}
+    )
+    checkpoint_available = bool(checkpoint_lineage.get("checkpoint_id")) or bool(
+        checkpoint_lineage.get("checkpoint_key")
+    )
+    resume_supported = bool(checkpoint.get("resume_supported", checkpoint_available))
+    try:
+        max_checkpoint_replays = max(0, int(checkpoint.get("max_checkpoint_replays", 0) or 0))
+    except (TypeError, ValueError):
+        max_checkpoint_replays = 0
+    try:
+        replay_count = max(0, int(checkpoint_lineage.get("replay_count", 0) or 0))
+    except (TypeError, ValueError):
+        replay_count = 0
+    checkpoint_budget_available = (
+        resume_supported
+        and checkpoint_available
+        and max_checkpoint_replays > 0
+        and replay_count < max_checkpoint_replays
+    )
 
     if has_pending_replan:
         return RecoveryDecision(
@@ -90,6 +115,17 @@ def decide_task_failure_recovery(
             strategy_reason="policy_blocked",
         )
 
+    if retryable and checkpoint_budget_available:
+        return RecoveryDecision(
+            strategy=models.ReplanStrategy.retry_same_step,
+            strategy_reason=(
+                "checkpoint_resume_after_retry_budget_exhausted"
+                if exhausted
+                else "checkpoint_resume_available"
+            ),
+            context=checkpoint,
+        )
+
     if retryable and max_attempts > 0 and attempt_number < max_attempts:
         return RecoveryDecision(
             strategy=models.ReplanStrategy.retry_same_step,
@@ -113,7 +149,14 @@ def decide_task_failure_recovery(
             should_replan=True,
             replan_reason="retry_exhausted_auto_repair",
             require_adaptive=True,
-            context=dict(retry_context or {}),
+            context={
+                **dict(retry_context or {}),
+                **(
+                    {"checkpoint_lineage": checkpoint_lineage}
+                    if checkpoint_lineage
+                    else {}
+                ),
+            },
         )
 
     return RecoveryDecision(

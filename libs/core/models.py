@@ -294,6 +294,7 @@ class PlanRevisionContext(BaseModel):
     selected_strategy: Optional[ReplanStrategy] = None
     strategy_reason: Optional[str] = None
     evaluator_signal: Dict[str, Any] = Field(default_factory=dict)
+    checkpoint_lineage: Dict[str, Any] = Field(default_factory=dict)
     preserved_task_ids: List[str] = Field(default_factory=list)
     preserved_task_names: List[str] = Field(default_factory=list)
     replacement_task_ids: List[str] = Field(default_factory=list)

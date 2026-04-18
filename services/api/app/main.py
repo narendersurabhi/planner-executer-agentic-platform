@@ -210,6 +210,10 @@ ADAPTIVE_REPLAN_MAX_DEFAULT = max(0, int(os.getenv("ADAPTIVE_REPLAN_MAX_DEFAULT"
 ADAPTIVE_EVALUATOR_MIN_CONFIDENCE_DEFAULT = 0.6
 ADAPTIVE_EVALUATOR_REPLAN_CONFIDENCE_FLOOR_DEFAULT = 0.35
 ADAPTIVE_SCHEMA_INVALID_STRATEGY_DEFAULT = "rework_step"
+ADAPTIVE_CHECKPOINT_REPLAY_MAX_DEFAULT = max(
+    0,
+    int(os.getenv("ADAPTIVE_CHECKPOINT_REPLAY_MAX_DEFAULT", "1")),
+)
 TOOL_INPUT_VALIDATION_ENABLED = os.getenv("TOOL_INPUT_VALIDATION_ENABLED", "true").lower() == "true"
 INTENT_CLARIFICATION_ON_CREATE = (
     os.getenv("INTENT_CLARIFICATION_ON_CREATE", "false").lower() == "true"
@@ -1191,6 +1195,18 @@ def _adaptive_policy_from_metadata(metadata: Mapping[str, Any] | None) -> dict[s
             ),
         )
     )
+    try:
+        raw_max_checkpoint_replays = policy.get(
+            "max_checkpoint_replays",
+            policy.get(
+                "maxCheckpointReplays",
+                ADAPTIVE_CHECKPOINT_REPLAY_MAX_DEFAULT,
+            ),
+        )
+        max_checkpoint_replays = int(raw_max_checkpoint_replays)
+    except (TypeError, ValueError):
+        max_checkpoint_replays = ADAPTIVE_CHECKPOINT_REPLAY_MAX_DEFAULT
+    policy["max_checkpoint_replays"] = max(0, min(10, max_checkpoint_replays))
     return policy
 
 
@@ -1447,6 +1463,42 @@ def _evaluator_signal_from_context(context: Mapping[str, Any] | None) -> dict[st
     return {}
 
 
+def _checkpoint_lineage_from_context(context: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(context, Mapping):
+        return {}
+    raw_lineage = context.get("checkpoint_lineage")
+    return dict(raw_lineage) if isinstance(raw_lineage, Mapping) else {}
+
+
+def _checkpoint_lineage_from_record(
+    checkpoint: StepCheckpointRecord | None,
+    *,
+    max_checkpoint_replays: int,
+) -> dict[str, Any]:
+    if checkpoint is None:
+        return {}
+    remaining_replays = max(
+        0,
+        max(0, int(max_checkpoint_replays)) - max(int(checkpoint.replay_count or 0), 0),
+    )
+    lineage: dict[str, Any] = {
+        "checkpoint_id": checkpoint.id,
+        "checkpoint_key": checkpoint.checkpoint_key,
+        "step_attempt_id": checkpoint.step_attempt_id,
+        "input_digest": checkpoint.input_digest,
+        "replay_count": max(int(checkpoint.replay_count or 0), 0),
+        "max_checkpoint_replays": max(0, int(max_checkpoint_replays)),
+        "remaining_replays": remaining_replays,
+        "source": checkpoint.source,
+        "outcome": checkpoint.outcome,
+    }
+    if isinstance(checkpoint.created_at, datetime):
+        lineage["created_at"] = checkpoint.created_at.isoformat()
+    if isinstance(checkpoint.updated_at, datetime):
+        lineage["updated_at"] = checkpoint.updated_at.isoformat()
+    return {key: value for key, value in lineage.items() if value is not None}
+
+
 def _excluded_completed_task_ids_from_context(context: Mapping[str, Any] | None) -> list[str]:
     if not isinstance(context, Mapping):
         return []
@@ -1522,6 +1574,33 @@ def _record_task_evaluator_state(
             history = _limited_history(metadata.get("repair_decision_history"))
             history.append(decision_payload)
             metadata["repair_decision_history"] = history[-10:]
+        step.metadata_json = metadata
+        step.updated_at = occurred_at
+
+
+def _record_task_checkpoint_replay_state(
+    db: Session,
+    *,
+    task: TaskRecord,
+    replay_payload: Mapping[str, Any] | None,
+    occurred_at: datetime,
+) -> None:
+    payload = dict(replay_payload) if isinstance(replay_payload, Mapping) and replay_payload else None
+    if payload is None:
+        return
+    attempt = _latest_step_attempt_record(db, task.id)
+    if attempt is not None:
+        summary = dict(attempt.result_summary_json or {})
+        summary["checkpoint_replay"] = payload
+        attempt.result_summary_json = summary
+        attempt.finished_at = attempt.finished_at or occurred_at
+    step = db.query(RunStepRecord).filter(RunStepRecord.id == task.id).first()
+    if step is not None:
+        metadata = dict(step.metadata_json or {})
+        metadata["latest_checkpoint_replay"] = payload
+        history = _limited_history(metadata.get("checkpoint_replay_history"))
+        history.append(payload)
+        metadata["checkpoint_replay_history"] = history[-10:]
         step.metadata_json = metadata
         step.updated_at = occurred_at
 
@@ -1661,6 +1740,7 @@ _REVISION_CONTEXT_CONSTRAINT_EXCLUDED_KEYS = frozenset(
         "selected_strategy",
         "strategy_reason",
         "evaluator_signal",
+        "checkpoint_lineage",
         "excluded_completed_task_ids",
         "repair_target_task_id",
         "repair_target_task_name",
@@ -1709,6 +1789,7 @@ def _build_plan_revision_context(
         selected_strategy=selected_strategy,
         strategy_reason=str(strategy_reason or "").strip() or None,
         evaluator_signal=_evaluator_signal_from_context(normalized_context),
+        checkpoint_lineage=_checkpoint_lineage_from_context(normalized_context),
         completed_steps=completed_steps,
         failed_step=_build_failed_step_context(normalized_context),
         remaining_goals=_remaining_goals_from_plan(
@@ -10681,6 +10762,12 @@ def _handle_task_failed(envelope: dict) -> None:
             "attempt_number": attempt.attempt_number,
             "max_attempts": int(task.max_attempts or 0),
         }
+        checkpoint_context = _task_checkpoint_recovery_context(
+            db,
+            task=task,
+            job=job,
+            metadata=metadata,
+        )
         decision = replan_controller.decide_task_failure_recovery(
             planning_mode=_planning_mode_from_metadata(metadata),
             has_pending_replan=isinstance(metadata.get("pending_replan"), Mapping),
@@ -10692,8 +10779,21 @@ def _handle_task_failed(envelope: dict) -> None:
             max_attempts=int(task.max_attempts or 0),
             intent_mismatch_context=mismatch,
             retry_context=retry_context,
+            checkpoint_context=checkpoint_context,
         )
         _store_adaptive_strategy_decision(job, decision, decided_at=now)
+        if decision.strategy == models.ReplanStrategy.retry_same_step:
+            if _schedule_task_retry_same_step(
+                db,
+                task=task,
+                job=job,
+                attempt=attempt,
+                occurred_at=now,
+                correlation_id=envelope.get("correlation_id"),
+                checkpoint_context=decision.context,
+                strategy_reason=decision.strategy_reason,
+            ):
+                return
         if decision.should_replan:
             replan_done = _request_job_replan(
                 db,
@@ -11271,6 +11371,150 @@ def _request_job_replan(
     _sync_shadow_run_status(db, job)
     db.commit()
     _emit_event("job.created", _job_from_record(job).model_dump())
+    return True
+
+
+def _task_checkpoint_recovery_context(
+    db: Session,
+    *,
+    task: TaskRecord,
+    job: JobRecord | None,
+    metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    policy = _adaptive_policy_from_metadata(metadata)
+    max_checkpoint_replays = max(0, int(policy.get("max_checkpoint_replays", 0) or 0))
+    run_id = _durable_run_id(job, task.job_id)
+    checkpoint = (
+        db.query(StepCheckpointRecord)
+        .filter(
+            StepCheckpointRecord.step_id == task.id,
+            StepCheckpointRecord.run_id == run_id,
+        )
+        .order_by(StepCheckpointRecord.updated_at.desc(), StepCheckpointRecord.created_at.desc())
+        .first()
+    )
+    lineage = _checkpoint_lineage_from_record(
+        checkpoint,
+        max_checkpoint_replays=max_checkpoint_replays,
+    )
+    if not lineage:
+        return {
+            "resume_supported": False,
+            "max_checkpoint_replays": max_checkpoint_replays,
+        }
+    return {
+        "resume_supported": True,
+        "max_checkpoint_replays": max_checkpoint_replays,
+        "checkpoint_lineage": lineage,
+    }
+
+
+def _schedule_task_retry_same_step(
+    db: Session,
+    *,
+    task: TaskRecord,
+    job: JobRecord | None,
+    attempt: StepAttemptRecord,
+    occurred_at: datetime,
+    correlation_id: str | None,
+    checkpoint_context: Mapping[str, Any] | None = None,
+    strategy_reason: str,
+) -> bool:
+    next_attempt = max(int(attempt.attempt_number or 0), int(task.attempts or 0), 0) + 1
+    metadata = job.metadata_json if job and isinstance(job.metadata_json, dict) else {}
+    checkpoint_payload: dict[str, Any] | None = None
+    checkpoint_lineage = _checkpoint_lineage_from_context(checkpoint_context)
+    if checkpoint_lineage:
+        checkpoint_id = str(checkpoint_lineage.get("checkpoint_id") or "").strip()
+        checkpoint_record = (
+            db.query(StepCheckpointRecord)
+            .filter(StepCheckpointRecord.id == checkpoint_id)
+            .first()
+            if checkpoint_id
+            else None
+        )
+        if checkpoint_record is not None:
+            max_checkpoint_replays = max(
+                0,
+                int((checkpoint_context or {}).get("max_checkpoint_replays", 0) or 0),
+            )
+            checkpoint_record.replay_count = max(int(checkpoint_record.replay_count or 0), 0) + 1
+            checkpoint_record.outcome = "scheduled_resume"
+            checkpoint_record.updated_at = occurred_at
+            checkpoint_payload = _checkpoint_lineage_from_record(
+                checkpoint_record,
+                max_checkpoint_replays=max_checkpoint_replays,
+            )
+        else:
+            checkpoint_payload = dict(checkpoint_lineage)
+        if checkpoint_payload is not None:
+            checkpoint_payload["strategy_reason"] = strategy_reason
+            checkpoint_payload["scheduled_at"] = occurred_at.isoformat()
+            checkpoint_payload["resumed_after_attempt_exhausted"] = (
+                strategy_reason == "checkpoint_resume_after_retry_budget_exhausted"
+            )
+            checkpoint_payload["resume_mode"] = "checkpoint_resume"
+    task.attempts = next_attempt
+    task.status = models.TaskStatus.ready.value
+    task.assigned_to = None
+    task.updated_at = occurred_at
+    step = db.query(RunStepRecord).filter(RunStepRecord.id == task.id).first()
+    if step is not None:
+        step.status = models.TaskStatus.ready.value
+        step.updated_at = occurred_at
+    if checkpoint_payload is not None:
+        _record_task_checkpoint_replay_state(
+            db,
+            task=task,
+            replay_payload=checkpoint_payload,
+            occurred_at=occurred_at,
+        )
+    task_records = db.query(TaskRecord).filter(TaskRecord.plan_id == task.plan_id).all()
+    tasks = _resolve_task_deps(task_records)
+    task_map = {entry.id: entry for entry in tasks}
+    id_to_name = {record.id: record.name for record in task_records}
+    job_goal = job.goal if job and isinstance(job.goal, str) else ""
+    job_context = _execution_job_context(
+        job_goal,
+        job.context_json if job and isinstance(job.context_json, dict) else {},
+        metadata,
+    )
+    task_intent_profiles = _coerce_task_intent_profiles(metadata)
+    context = _build_task_context(task.id, task_map, id_to_name, job_context)
+    event_correlation_id = correlation_id or str(uuid.uuid4())
+    payload = _task_payload_from_record(
+        task,
+        event_correlation_id,
+        context,
+        goal_text=job_goal,
+        intent_profile=task_intent_profiles.get(task.id),
+        replay_context=checkpoint_payload,
+        sync_execution_request=False,
+    )
+    if TOOL_INPUT_VALIDATION_ENABLED and payload.get("tool_inputs_validation"):
+        task.status = models.TaskStatus.failed.value
+        task.updated_at = occurred_at
+        if step is not None:
+            step.status = models.TaskStatus.failed.value
+            step.updated_at = occurred_at
+        if job is not None:
+            _set_job_status(job, models.JobStatus.failed)
+            job.updated_at = occurred_at
+            _sync_shadow_run_status(db, job)
+        db.commit()
+        failed_payload = dict(payload)
+        failed_payload["error"] = "tool_inputs_invalid"
+        _emit_event("task.failed", failed_payload)
+        _refresh_job_status(task.job_id)
+        return False
+    if job is not None:
+        _set_job_status(job, models.JobStatus.running)
+        job.updated_at = occurred_at
+        _sync_shadow_run_status(db, job)
+    db.commit()
+    _sync_execution_request_snapshot(payload)
+    _emit_event("task.ready", payload)
+    _refresh_job_status(task.job_id)
     return True
 
 
@@ -11858,6 +12102,8 @@ def _task_payload_from_record(
     *,
     goal_text: str = "",
     intent_profile: Mapping[str, Any] | None = None,
+    replay_context: Mapping[str, Any] | None = None,
+    sync_execution_request: bool = True,
 ) -> dict[str, Any]:
     payload = dispatch_service.task_payload_from_record(
         record,
@@ -11868,7 +12114,16 @@ def _task_payload_from_record(
         config=_dispatch_runtime().config,
         callbacks=_dispatch_callbacks(),
     )
-    if correlation_id:
+    if isinstance(replay_context, Mapping) and replay_context:
+        payload["replay_context"] = dict(replay_context)
+        try:
+            payload["max_attempts"] = max(
+                int(payload.get("max_attempts") or 0),
+                int(payload.get("attempts") or 0),
+            )
+        except (TypeError, ValueError):
+            pass
+    if correlation_id and sync_execution_request:
         _sync_execution_request_snapshot(payload)
     return payload
 
@@ -15911,6 +16166,18 @@ def get_job_debugger(
         attempt_payload = attempt.model_dump(mode="json")
         attempt_payload["invocations"] = invocations_by_attempt.get(attempt.id, [])
         attempts_by_task.setdefault(attempt.step_id, []).append(attempt_payload)
+    checkpoints_by_task: dict[str, list[dict[str, Any]]] = {}
+    if task_records:
+        checkpoints = (
+            db.query(StepCheckpointRecord)
+            .filter(StepCheckpointRecord.step_id.in_([record.id for record in task_records]))
+            .order_by(StepCheckpointRecord.created_at.asc())
+            .all()
+        )
+        for checkpoint in checkpoints:
+            checkpoints_by_task.setdefault(checkpoint.step_id, []).append(
+                _step_checkpoint_from_record(checkpoint).model_dump(mode="json")
+            )
 
     tasks_payload: list[dict[str, Any]] = []
     for record in task_records:
@@ -15946,9 +16213,16 @@ def get_job_debugger(
                 "repair_decision_history": _limited_history(
                     step_metadata_by_id.get(record.id, {}).get("repair_decision_history")
                 ),
+                "latest_checkpoint_replay": step_metadata_by_id.get(record.id, {}).get(
+                    "latest_checkpoint_replay"
+                ),
+                "checkpoint_replay_history": _limited_history(
+                    step_metadata_by_id.get(record.id, {}).get("checkpoint_replay_history")
+                ),
                 "resolved_tool_inputs": hydrated_payload.get("tool_inputs", {}),
                 "tool_inputs_validation": hydrated_payload.get("tool_inputs_validation", {}),
                 "tool_inputs_resolved": bool(hydrated_payload.get("tool_inputs_resolved")),
+                "checkpoints": checkpoints_by_task.get(record.id, []),
                 "context_keys": sorted(context.keys()),
                 "timeline": timeline_entries,
                 "attempts": attempts_by_task.get(record.id, []),
@@ -16182,6 +16456,12 @@ def _run_debugger_payload(
                 ),
                 "repair_decision_history": _limited_history(
                     dict(step_record.metadata_json or {}).get("repair_decision_history")
+                ),
+                "latest_checkpoint_replay": (
+                    dict(step_record.metadata_json or {}).get("latest_checkpoint_replay")
+                ),
+                "checkpoint_replay_history": _limited_history(
+                    dict(step_record.metadata_json or {}).get("checkpoint_replay_history")
                 ),
                 "execution_requests": execution_requests_by_step.get(step_record.id, []),
                 "checkpoints": checkpoints_by_step.get(step_record.id, []),

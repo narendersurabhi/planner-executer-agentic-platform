@@ -24,6 +24,67 @@ def test_decide_task_failure_recovery_returns_retry_same_step_when_retry_budget_
     assert decision.should_replan is False
 
 
+def test_decide_task_failure_recovery_prefers_checkpoint_resume_when_retry_budget_is_exhausted() -> None:
+    decision = replan_controller.decide_task_failure_recovery(
+        planning_mode=models.PlanningMode.adaptive,
+        has_pending_replan=False,
+        replans_used=0,
+        max_replans=2,
+        error_message="service unavailable: upstream temporary 503",
+        classification={
+            "category": "transient",
+            "retryable": True,
+        },
+        attempt_number=3,
+        max_attempts=3,
+        checkpoint_context={
+            "resume_supported": True,
+            "max_checkpoint_replays": 1,
+            "checkpoint_lineage": {
+                "checkpoint_id": "checkpoint-1",
+                "checkpoint_key": "after-input",
+                "replay_count": 0,
+            },
+        },
+    )
+
+    assert decision.strategy == models.ReplanStrategy.retry_same_step
+    assert decision.strategy_reason == "checkpoint_resume_after_retry_budget_exhausted"
+    assert decision.should_replan is False
+    assert decision.context["checkpoint_lineage"]["checkpoint_id"] == "checkpoint-1"
+
+
+def test_decide_task_failure_recovery_replans_when_checkpoint_budget_is_exhausted() -> None:
+    decision = replan_controller.decide_task_failure_recovery(
+        planning_mode=models.PlanningMode.adaptive,
+        has_pending_replan=False,
+        replans_used=0,
+        max_replans=2,
+        error_message="service unavailable: upstream temporary 503",
+        classification={
+            "category": "transient",
+            "retryable": True,
+        },
+        attempt_number=3,
+        max_attempts=3,
+        retry_context={"failed_task_id": "task-1"},
+        checkpoint_context={
+            "resume_supported": True,
+            "max_checkpoint_replays": 1,
+            "checkpoint_lineage": {
+                "checkpoint_id": "checkpoint-1",
+                "checkpoint_key": "after-input",
+                "replay_count": 1,
+            },
+        },
+    )
+
+    assert decision.strategy == models.ReplanStrategy.patch_suffix
+    assert decision.strategy_reason == "retry_budget_exhausted_with_reusable_prefix"
+    assert decision.should_replan is True
+    assert decision.context["checkpoint_lineage"]["checkpoint_id"] == "checkpoint-1"
+
+
 def test_decide_task_failure_recovery_returns_pause_for_human_for_missing_input() -> None:
     decision = replan_controller.decide_task_failure_recovery(
         planning_mode=models.PlanningMode.adaptive,

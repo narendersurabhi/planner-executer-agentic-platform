@@ -16,6 +16,7 @@ from services.api.app import main, memory_store  # noqa: E402
 from services.api.app.database import Base, engine
 from services.api.app.database import SessionLocal
 from services.api.app.models import (
+    ExecutionRequestRecord,
     EventOutboxRecord,
     InvocationRecord,
     JobRecord,
@@ -23,6 +24,7 @@ from services.api.app.models import (
     RunRecord,
     RunEventRecord,
     RunStepRecord,
+    StepCheckpointRecord,
     StepAttemptRecord,
     TaskRecord,
     TaskResultRecord,
@@ -2415,6 +2417,41 @@ def _seed_run_history_for_replan_fixture(fixture: dict[str, str]) -> str:
     return run_id
 
 
+def _seed_checkpoint_for_task(
+    fixture: dict[str, str],
+    *,
+    task_id: str,
+    checkpoint_key: str = "resume-point",
+    replay_count: int = 0,
+    input_digest: str = "digest-1",
+    source: str = "test",
+    outcome: str = "saved",
+) -> str:
+    now = _utcnow()
+    run_id = fixture["job_id"]
+    checkpoint_id = f"checkpoint-{uuid.uuid4()}"
+    with SessionLocal() as db:
+        db.add(
+            StepCheckpointRecord(
+                id=checkpoint_id,
+                run_id=run_id,
+                job_id=fixture["job_id"],
+                step_id=task_id,
+                step_attempt_id=None,
+                checkpoint_key=checkpoint_key,
+                payload_json={"stage": "prepared"},
+                input_digest=input_digest,
+                replay_count=replay_count,
+                source=source,
+                outcome=outcome,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.commit()
+    return checkpoint_id
+
+
 def _create_adaptive_evaluator_fixture(
     *,
     planning_mode: str = "adaptive",
@@ -2943,6 +2980,123 @@ def test_retry_exhausted_replan_multiple_revisions_keep_completed_prefix_stable(
         assert prior_replacement is not None
         assert prior_replacement.status == models.TaskStatus.canceled.value
 
+
+def test_retry_exhausted_failure_with_checkpoint_replays_same_step_and_records_resume_context():
+    fixture = _create_adaptive_replan_failure_fixture()
+    _seed_run_history_for_replan_fixture(fixture)
+    checkpoint_id = _seed_checkpoint_for_task(
+        fixture,
+        task_id=fixture["failed_task_id"],
+        checkpoint_key="after-input-validated",
+    )
+
+    main._handle_task_failed(
+        {
+            "task_id": fixture["failed_task_id"],
+            "payload": {
+                "task_id": fixture["failed_task_id"],
+                "attempts": 3,
+                "error": "service unavailable: upstream temporary 503",
+            },
+        }
+    )
+
+    response = client.get(f"/jobs/{fixture['job_id']}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == models.JobStatus.running.value
+    assert body["adaptive_status"]["pending_replan"] is False
+    assert body["adaptive_status"]["last_strategy"] == models.ReplanStrategy.retry_same_step.value
+    assert (
+        body["adaptive_status"]["last_strategy_reason"]
+        == "checkpoint_resume_after_retry_budget_exhausted"
+    )
+    assert "pending_replan" not in body["metadata"]
+
+    with SessionLocal() as db:
+        task = db.query(TaskRecord).filter(TaskRecord.id == fixture["failed_task_id"]).first()
+        checkpoint = db.query(StepCheckpointRecord).filter(StepCheckpointRecord.id == checkpoint_id).first()
+        execution_request = (
+            db.query(ExecutionRequestRecord)
+            .filter(
+                ExecutionRequestRecord.run_id == fixture["job_id"],
+                ExecutionRequestRecord.step_id == fixture["failed_task_id"],
+                ExecutionRequestRecord.attempt_number == 4,
+            )
+            .first()
+        )
+        step = db.query(RunStepRecord).filter(RunStepRecord.id == fixture["failed_task_id"]).first()
+        assert task is not None
+        assert task.status == models.TaskStatus.ready.value
+        assert task.attempts == 4
+        assert checkpoint is not None
+        assert checkpoint.replay_count == 1
+        assert checkpoint.outcome == "scheduled_resume"
+        assert execution_request is not None
+        assert execution_request.request_json["replay_context"]["checkpoint_id"] == checkpoint_id
+        assert (
+            execution_request.request_json["replay_context"]["strategy_reason"]
+            == "checkpoint_resume_after_retry_budget_exhausted"
+        )
+        assert step is not None
+        assert step.status == models.TaskStatus.ready.value
+        assert step.metadata_json["latest_checkpoint_replay"]["checkpoint_id"] == checkpoint_id
+
+    debugger_response = client.get(f"/jobs/{fixture['job_id']}/debugger")
+    assert debugger_response.status_code == 200
+    debugger = debugger_response.json()
+    debugger_tasks = {entry["task"]["name"]: entry for entry in debugger["tasks"]}
+    replay_task = debugger_tasks["CallService"]
+    assert replay_task["latest_checkpoint_replay"]["checkpoint_id"] == checkpoint_id
+    assert replay_task["checkpoints"][0]["checkpoint_key"] == "after-input-validated"
+
+    run_debugger_response = client.get(f"/runs/{fixture['job_id']}/debugger")
+    assert run_debugger_response.status_code == 200
+    run_debugger = run_debugger_response.json()
+    run_task_entries = {entry["step"]["name"]: entry for entry in run_debugger["steps"]}
+    assert run_task_entries["CallService"]["latest_checkpoint_replay"]["checkpoint_id"] == checkpoint_id
+    assert run_task_entries["CallService"]["checkpoints"][0]["replay_count"] == 1
+
+
+def test_retry_exhausted_replan_revision_context_includes_checkpoint_lineage_when_replay_budget_is_exhausted():
+    fixture = _create_adaptive_replan_failure_fixture()
+    _seed_run_history_for_replan_fixture(fixture)
+    checkpoint_id = _seed_checkpoint_for_task(
+        fixture,
+        task_id=fixture["failed_task_id"],
+        replay_count=1,
+        checkpoint_key="after-input-validated",
+    )
+
+    main._handle_task_failed(
+        {
+            "task_id": fixture["failed_task_id"],
+            "payload": {
+                "task_id": fixture["failed_task_id"],
+                "attempts": 3,
+                "error": "service unavailable: upstream temporary 503",
+            },
+        }
+    )
+
+    response = client.get(f"/jobs/{fixture['job_id']}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == models.JobStatus.planning.value
+    assert body["adaptive_status"]["pending_replan"] is True
+    assert body["adaptive_status"]["last_strategy"] == models.ReplanStrategy.patch_suffix.value
+    checkpoint_lineage = body["revision_context"]["checkpoint_lineage"]
+    assert checkpoint_lineage["checkpoint_id"] == checkpoint_id
+    assert checkpoint_lineage["replay_count"] == 1
+    assert checkpoint_lineage["remaining_replays"] == 0
+    assert body["metadata"]["pending_replan"]["checkpoint_lineage"]["checkpoint_key"] == (
+        "after-input-validated"
+    )
+
+    debugger_response = client.get(f"/jobs/{fixture['job_id']}/debugger")
+    assert debugger_response.status_code == 200
+    debugger = debugger_response.json()
+    assert debugger["revision_context"]["checkpoint_lineage"]["checkpoint_id"] == checkpoint_id
 
 def test_task_accepted_low_confidence_triggers_rework_and_records_evaluator_signal():
     fixture = _create_adaptive_evaluator_fixture()
