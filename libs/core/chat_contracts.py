@@ -233,6 +233,199 @@ class ChatBoundaryDecision(BaseModel):
     evidence: ChatBoundaryEvidence | None = None
 
 
+class ChatRouteType(str, Enum):
+    respond = "respond"
+    tool_call = "tool_call"
+    ask_clarification = "ask_clarification"
+    submit_job = "submit_job"
+    run_workflow = "run_workflow"
+
+
+class ChatRouteCandidateType(str, Enum):
+    direct_agent = "direct_agent"
+    workflow = "workflow"
+    generic_path = "generic_path"
+
+
+class ChatRouteCostClass(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
+class ChatRouteWorkflowContext(BaseModel):
+    target_available: bool = False
+    definition_id: str | None = None
+    version_id: str | None = None
+    trigger_id: str | None = None
+    input_keys: list[str] = Field(default_factory=list)
+
+
+class ChatRouteCandidateDescriptor(BaseModel):
+    candidate_id: str
+    candidate_type: ChatRouteCandidateType
+    family: str
+    risk_tier: str = "read_only"
+    preconditions: list[str] = Field(default_factory=list)
+    input_keys: list[str] = Field(default_factory=list)
+    cost_class: ChatRouteCostClass = ChatRouteCostClass.low
+    enabled: bool = True
+    score: float | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    description: str = ""
+    route: ChatRouteType | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("candidate_id", "family", "risk_tier", "description", mode="before")
+    @classmethod
+    def _normalize_string_fields(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @field_validator("preconditions", "input_keys", "reason_codes", mode="before")
+    @classmethod
+    def _normalize_string_list_fields(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            candidate = str(item or "").strip()
+            if candidate and candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+
+class ChatRouteEvidence(BaseModel):
+    boundary_features: dict[str, Any] = Field(default_factory=dict)
+    retrieved_candidates: list[ChatRouteCandidateDescriptor] = Field(default_factory=list)
+    workflow_target_available: bool = False
+    pending_clarification: bool = False
+    missing_inputs: list[str] = Field(default_factory=list)
+    historical_success_features: dict[str, Any] = Field(default_factory=dict)
+    policy_filters_applied: list[str] = Field(default_factory=list)
+
+    @field_validator("missing_inputs", "policy_filters_applied", mode="before")
+    @classmethod
+    def _normalize_string_list(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            candidate = str(item or "").strip()
+            if candidate and candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+
+class ChatRouteRequestMessage(BaseModel):
+    role: ChatRole
+    content: str = ""
+
+
+class ChatRouteRequest(BaseModel):
+    request_id: str = ""
+    session_id: str | None = None
+    message: str = ""
+    candidate_goal: str = ""
+    session_state: dict[str, Any] = Field(default_factory=dict)
+    context_json: dict[str, Any] = Field(default_factory=dict)
+    workflow_context: ChatRouteWorkflowContext = Field(default_factory=ChatRouteWorkflowContext)
+    user_context: dict[str, Any] = Field(default_factory=dict)
+    policy_context: dict[str, Any] = Field(default_factory=dict)
+    recent_messages: list[ChatRouteRequestMessage] = Field(default_factory=list)
+    routing_evidence: ChatRouteEvidence = Field(default_factory=ChatRouteEvidence)
+
+
+class ChatRouteDecision(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    route: str = ""
+    confidence: float | None = None
+    selected_candidate_id: str | None = None
+    top_k_candidates: list[str] = Field(default_factory=list)
+    missing_inputs: list[str] = Field(default_factory=list)
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    assistant_response: str = ""
+    intent: str = ""
+    risk_level: str = ""
+    output_format: str | None = None
+    target_system: str | None = None
+    safety_constraints: str | None = None
+    capability_id: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    clarification_questions: list[str] = Field(default_factory=list)
+
+    @field_validator("route", mode="before")
+    @classmethod
+    def _normalize_route(cls, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        aliases = {
+            "chat_reply": ChatRouteType.respond.value,
+            "direct_agent": ChatRouteType.tool_call.value,
+            "tool": ChatRouteType.tool_call.value,
+        }
+        return aliases.get(normalized, normalized)
+
+    @field_validator(
+        "selected_candidate_id",
+        "fallback_reason",
+        "intent",
+        "risk_level",
+        "output_format",
+        "target_system",
+        "safety_constraints",
+        "capability_id",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_optional_string(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        candidate = str(value or "").strip()
+        return candidate or None
+
+    @field_validator("assistant_response", mode="before")
+    @classmethod
+    def _normalize_assistant_response(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @field_validator("top_k_candidates", "missing_inputs", "reason_codes", "clarification_questions", mode="before")
+    @classmethod
+    def _normalize_decision_string_lists(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            candidate = str(item or "").strip()
+            if candidate and candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def _normalize_arguments(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return dict(value)
+
+    @model_validator(mode="after")
+    def _synchronize_selected_candidate(self) -> "ChatRouteDecision":
+        if (
+            self.route == ChatRouteType.tool_call.value
+            and not self.selected_candidate_id
+            and self.capability_id
+        ):
+            self.selected_candidate_id = self.capability_id
+        if (
+            self.route == ChatRouteType.tool_call.value
+            and not self.capability_id
+            and self.selected_candidate_id
+        ):
+            self.capability_id = self.selected_candidate_id
+        return self
+
+
 class ChatMessage(BaseModel):
     id: str
     session_id: str

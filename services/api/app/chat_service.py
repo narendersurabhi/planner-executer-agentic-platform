@@ -1162,6 +1162,11 @@ def handle_turn(
         if isinstance(turn_plan.get("boundary_decision"), Mapping)
         else None
     )
+    routing_decision = (
+        dict(turn_plan.get("routing_decision"))
+        if isinstance(turn_plan.get("routing_decision"), Mapping)
+        else None
+    )
     route_type = str(turn_plan.get("type") or "").strip().lower() or "respond"
     resolved_goal = str(turn_plan.get("resolved_goal") or candidate_goal or "").strip()
     if not resolved_goal:
@@ -1560,6 +1565,7 @@ def handle_turn(
             workflow_run,
             boundary_decision=boundary_decision,
             clarification_mapping=clarification_mapping,
+            routing_decision=routing_decision,
         ),
         action_json=assistant_action.model_dump(mode="json", exclude_none=True),
         job_id=created_job.id if created_job is not None else None,
@@ -1828,6 +1834,7 @@ def _assistant_metadata(
     *,
     boundary_decision: Mapping[str, Any] | None = None,
     clarification_mapping: Mapping[str, Any] | None = None,
+    routing_decision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = {
         "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(assessment) or {}
@@ -1840,6 +1847,8 @@ def _assistant_metadata(
         metadata["boundary_decision"] = dict(boundary_decision)
     if isinstance(clarification_mapping, Mapping):
         metadata["clarification_mapping"] = dict(clarification_mapping)
+    if isinstance(routing_decision, Mapping):
+        metadata["routing_decision"] = dict(routing_decision)
     return metadata
 
 

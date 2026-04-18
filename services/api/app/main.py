@@ -3906,6 +3906,15 @@ def _chat_boundary_failure_response(
     fallback["goal_intent_profile"] = (
         workflow_contracts.dump_goal_intent_profile(assessment) or assessment
     )
+    fallback["routing_decision"] = chat_contracts.ChatRouteDecision(
+        route=str(fallback.get("type") or "").strip().lower(),
+        fallback_used=True,
+        fallback_reason="boundary_decision_failed",
+        reason_codes=["boundary_decision_failed"],
+        assistant_response=str(fallback.get("assistant_content") or "").strip(),
+        missing_inputs=list(assessment.get("missing_slots") or []),
+        clarification_questions=list(fallback.get("clarification_questions") or []),
+    ).model_dump(mode="json", exclude_none=True)
     return fallback
 
 
@@ -3931,6 +3940,15 @@ def _chat_router_failure_response(
     fallback["goal_intent_profile"] = (
         workflow_contracts.dump_goal_intent_profile(assessment) or assessment
     )
+    fallback["routing_decision"] = chat_contracts.ChatRouteDecision(
+        route=str(fallback.get("type") or "").strip().lower(),
+        fallback_used=True,
+        fallback_reason="chat_router_failed",
+        reason_codes=["chat_router_failed"],
+        assistant_response=str(fallback.get("assistant_content") or "").strip(),
+        missing_inputs=list(assessment.get("missing_slots") or []),
+        clarification_questions=list(fallback.get("clarification_questions") or []),
+    ).model_dump(mode="json", exclude_none=True)
     return fallback
 
 
@@ -4410,12 +4428,15 @@ def _route_chat_turn_legacy(
             messages=messages,
         )
     try:
-        prompt = _build_chat_router_prompt(
+        route_request = _build_chat_route_request(
             content=content,
             candidate_goal=candidate_goal,
-            pending_clarification=pending_clarification,
+            session_metadata=session_metadata,
             merged_context=merged_context,
             messages=messages,
+        )
+        prompt = _build_chat_router_prompt(
+            route_request=route_request,
         )
         parsed = _chat_router_provider.generate_request_json_object(
             LLMRequest(
@@ -4433,6 +4454,7 @@ def _route_chat_turn_legacy(
                 metadata={
                     "component": "chat_router",
                     "pending_clarification": str(pending_clarification).lower(),
+                    "request_id": route_request.request_id,
                 },
             )
         )
@@ -4441,7 +4463,7 @@ def _route_chat_turn_legacy(
                 parsed,
                 content=content,
                 candidate_goal=candidate_goal,
-                workflow_invocation_available=workflow_invocation is not None,
+                route_request=route_request,
             ),
             content=content,
             candidate_goal=candidate_goal,
@@ -4480,12 +4502,15 @@ def _route_chat_turn_with_router(
             pending_clarification=pending_clarification,
         )
     try:
-        prompt = _build_chat_router_prompt(
+        route_request = _build_chat_route_request(
             content=content,
             candidate_goal=candidate_goal,
-            pending_clarification=pending_clarification,
+            session_metadata=session_metadata,
             merged_context=merged_context,
             messages=messages,
+        )
+        prompt = _build_chat_router_prompt(
+            route_request=route_request,
         )
         parsed = _chat_router_provider.generate_request_json_object(
             LLMRequest(
@@ -4503,6 +4528,7 @@ def _route_chat_turn_with_router(
                 metadata={
                     "component": "chat_router",
                     "pending_clarification": str(pending_clarification).lower(),
+                    "request_id": route_request.request_id,
                 },
             )
         )
@@ -4511,7 +4537,7 @@ def _route_chat_turn_with_router(
                 parsed,
                 content=content,
                 candidate_goal=candidate_goal,
-                workflow_invocation_available=workflow_invocation is not None,
+                route_request=route_request,
             ),
             content=content,
             candidate_goal=candidate_goal,
@@ -4633,135 +4659,368 @@ def _fallback_chat_turn_route(
     }
 
 
-def _build_chat_router_prompt(
+def _chat_route_request_id(*, content: str, candidate_goal: str, pending_clarification: bool) -> str:
+    payload = json.dumps(
+        {
+            "content": str(content or "").strip(),
+            "candidate_goal": str(candidate_goal or "").strip(),
+            "pending_clarification": bool(pending_clarification),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _chat_route_cost_class(risk_tier: str) -> chat_contracts.ChatRouteCostClass:
+    normalized = str(risk_tier or "").strip().lower()
+    if normalized == "high_risk_write":
+        return chat_contracts.ChatRouteCostClass.high
+    if normalized == "bounded_write":
+        return chat_contracts.ChatRouteCostClass.medium
+    return chat_contracts.ChatRouteCostClass.low
+
+
+def _chat_route_candidate_hints(
+    normalized: workflow_contracts.NormalizedIntentEnvelope,
+) -> set[str]:
+    hinted: set[str] = set()
+    for capability_ids in normalized.candidate_capabilities.values():
+        for capability_id in capability_ids:
+            canonical = capability_registry.canonicalize_capability_id(capability_id)
+            if canonical:
+                hinted.add(canonical)
+    return hinted
+
+
+def _workflow_route_candidate_id(
+    workflow_invocation: chat_service.ChatWorkflowInvocation,
+) -> str:
+    suffix = (
+        str(workflow_invocation.trigger_id or "").strip()
+        or str(workflow_invocation.version_id or "").strip()
+        or str(workflow_invocation.definition_id or "").strip()
+        or "target"
+    )
+    return f"workflow:{suffix}"
+
+
+def _build_chat_route_candidates(
     *,
     content: str,
     candidate_goal: str,
+    heuristic: workflow_contracts.GoalIntentProfile,
+    normalized: workflow_contracts.NormalizedIntentEnvelope,
+    workflow_invocation: chat_service.ChatWorkflowInvocation | None,
     pending_clarification: bool,
+) -> list[chat_contracts.ChatRouteCandidateDescriptor]:
+    candidates: list[chat_contracts.ChatRouteCandidateDescriptor] = []
+    visible_capabilities = [
+        (capability_id, spec)
+        for capability_id, spec in _chat_visible_capabilities()
+        if capability_id in CHAT_DIRECT_CAPABILITIES
+    ]
+    direct_candidate_hints = _chat_route_candidate_hints(normalized)
+    query = _chat_boundary_query_text(content, candidate_goal)
+    match_by_id: dict[str, dict[str, Any]] = {}
+    entry_by_id: dict[str, dict[str, Any]] = {}
+
+    if visible_capabilities:
+        entries = _chat_capability_search_entries(visible_capabilities)
+        entry_by_id = {
+            str(entry.get("id") or "").strip(): entry
+            for entry in entries
+            if str(entry.get("id") or "").strip()
+        }
+        lexical_matches = capability_search.search_capabilities(
+            query=query,
+            capability_entries=entries,
+            limit=max(1, len(entries)),
+            intent_hint=str(heuristic.intent or "").strip().lower() or None,
+            rerank_feedback_rows=[],
+        )
+        matches = _hybrid_chat_capability_matches(
+            query=query,
+            capabilities=visible_capabilities,
+            lexical_matches=lexical_matches,
+            entries=entries,
+        )
+        match_by_id = {
+            str(match.get("id") or "").strip(): dict(match)
+            for match in matches
+            if str(match.get("id") or "").strip()
+        }
+
+        def _sort_key(item: tuple[str, capability_registry.CapabilitySpec]) -> tuple[float, int, str]:
+            capability_id, _spec = item
+            match = match_by_id.get(capability_id, {})
+            raw_score = float(match.get("score") or 0.0)
+            hint_boost = 5.0 if capability_id in direct_candidate_hints else 0.0
+            hint_rank = 0 if capability_id in direct_candidate_hints else 1
+            return (-(raw_score + hint_boost), hint_rank, capability_id)
+
+        for capability_id, spec in sorted(visible_capabilities, key=_sort_key)[:8]:
+            match = match_by_id.get(capability_id, {})
+            raw_score = float(match.get("score") or 0.0)
+            if capability_id in direct_candidate_hints:
+                raw_score += 5.0
+            entry = entry_by_id.get(capability_id, {})
+            reason_codes: list[str] = []
+            source = str(match.get("source") or "").strip()
+            if source:
+                reason_codes.append(source)
+            if capability_id in direct_candidate_hints:
+                reason_codes.append("intent_graph_candidate")
+            candidates.append(
+                chat_contracts.ChatRouteCandidateDescriptor(
+                    candidate_id=capability_id,
+                    candidate_type=chat_contracts.ChatRouteCandidateType.direct_agent,
+                    family=_capability_family_for_id(capability_id) or "direct",
+                    risk_tier=str(spec.risk_tier or "read_only").strip() or "read_only",
+                    preconditions=["read_only_only", "allowlisted_for_api"],
+                    input_keys=[
+                        str(item).strip()
+                        for item in entry.get("required_inputs", [])
+                        if str(item).strip()
+                    ],
+                    cost_class=_chat_route_cost_class(str(spec.risk_tier or "read_only")),
+                    enabled=bool(getattr(spec, "enabled", True)),
+                    score=round(raw_score, 3),
+                    reason_codes=reason_codes,
+                    description=_chat_direct_capability_description(capability_id),
+                    route=chat_contracts.ChatRouteType.tool_call,
+                    metadata={
+                        "group": str(spec.group or "").strip(),
+                        "subgroup": str(spec.subgroup or "").strip(),
+                        "reason": str(match.get("reason") or "").strip(),
+                    },
+                )
+            )
+
+    conversational_turn = _looks_like_conversational_turn(content)
+    execution_oriented = bool(str(heuristic.intent or "").strip()) or not conversational_turn
+    if str(heuristic.risk_level or "").strip().lower() == "read_only":
+        generic_score = 20.0 if execution_oriented else 10.0
+    else:
+        generic_score = 55.0 if execution_oriented or pending_clarification else 20.0
+    candidates.append(
+        chat_contracts.ChatRouteCandidateDescriptor(
+            candidate_id="generic:submit_job",
+            candidate_type=chat_contracts.ChatRouteCandidateType.generic_path,
+            family="planning",
+            risk_tier=str(heuristic.risk_level or "bounded_write").strip() or "bounded_write",
+            preconditions=["planner_executor_available"],
+            input_keys=list(heuristic.blocking_slots or heuristic.missing_slots or []),
+            cost_class=_chat_route_cost_class(str(heuristic.risk_level or "bounded_write")),
+            enabled=True,
+            score=generic_score,
+            reason_codes=["generic_execution_fallback"],
+            description=(
+                "Use the planner/executor workflow when execution is needed and no tighter route is ready."
+            ),
+            route=chat_contracts.ChatRouteType.submit_job,
+        )
+    )
+
+    if workflow_invocation is not None and workflow_invocation.has_target():
+        candidates.append(
+            chat_contracts.ChatRouteCandidateDescriptor(
+                candidate_id=_workflow_route_candidate_id(workflow_invocation),
+                candidate_type=chat_contracts.ChatRouteCandidateType.workflow,
+                family="workflow",
+                risk_tier=str(heuristic.risk_level or "bounded_write").strip() or "bounded_write",
+                preconditions=["workflow_target_available"],
+                input_keys=sorted(str(key).strip() for key in workflow_invocation.inputs.keys()),
+                cost_class=_chat_route_cost_class(str(heuristic.risk_level or "bounded_write")),
+                enabled=True,
+                score=85.0,
+                reason_codes=["workflow_target_available"],
+                description="Invoke the referenced published workflow from the current chat context.",
+                route=chat_contracts.ChatRouteType.run_workflow,
+                metadata={
+                    "trigger_id": workflow_invocation.trigger_id,
+                    "version_id": workflow_invocation.version_id,
+                    "definition_id": workflow_invocation.definition_id,
+                },
+            )
+        )
+
+    candidates.sort(
+        key=lambda candidate: (
+            -float(candidate.score or 0.0),
+            candidate.candidate_type.value,
+            candidate.candidate_id,
+        )
+    )
+    return candidates
+
+
+def _build_chat_route_request(
+    *,
+    content: str,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any] | None,
     merged_context: Mapping[str, Any] | None,
     messages: Sequence[chat_contracts.ChatMessage] | None,
-) -> str:
-    heuristic = _chat_route_goal_intent_profile(
-        _normalize_goal_intent(candidate_goal).profile,
-        goal=candidate_goal,
+) -> chat_contracts.ChatRouteRequest:
+    pending_clarification = bool(
+        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
     )
+    normalized = _normalize_goal_intent(candidate_goal)
+    heuristic = _chat_route_goal_intent_profile(normalized.profile, goal=candidate_goal)
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
-    recent_messages: list[dict[str, str]] = []
-    for message in list(messages or [])[-6:]:
-        recent_messages.append(
-            {
-                "role": str(message.role),
-                "content": str(message.content or "")[:500],
-            }
+    pending_state = _pending_clarification_state_from_metadata(session_metadata)
+    recent_messages = [
+        chat_contracts.ChatRouteRequestMessage(
+            role=message.role,
+            content=str(message.content or "")[:500],
         )
-    direct_capabilities: list[dict[str, Any]] = []
-    registry = None
-    try:
-        registry = capability_registry.load_capability_registry()
-    except Exception:  # noqa: BLE001
-        registry = None
-    for capability_id in sorted(CHAT_DIRECT_CAPABILITIES):
-        spec = None
-        capabilities = getattr(registry, "capabilities", {}) if registry is not None else {}
-        if isinstance(capabilities, Mapping):
-            spec = capabilities.get(capability_id)
-        if spec is not None and not bool(getattr(spec, "enabled", True)):
-            continue
-        try:
-            allow_decision = capability_registry.evaluate_capability_allowlist(
-                capability_id,
-                "api",
-            )
-        except Exception:  # noqa: BLE001
-            allow_decision = None
-        if allow_decision is not None and not allow_decision.allowed:
-            continue
-        direct_capabilities.append(
-            {
-                "id": capability_id,
-                "description": _chat_direct_capability_description(capability_id),
-                "family": str(getattr(spec, "group", "") or "").strip(),
-                "subgroup": str(getattr(spec, "subgroup", "") or "").strip(),
-                "risk_tier": str(getattr(spec, "risk_tier", "read_only") or "read_only"),
-                "candidate_type": "direct_capability",
-            }
-        )
-    recommended_fallback_route = "respond"
-    if workflow_invocation is not None:
-        recommended_fallback_route = "run_workflow"
+        for message in list(messages or [])[-6:]
+    ]
+    candidates = _build_chat_route_candidates(
+        content=content,
+        candidate_goal=candidate_goal,
+        heuristic=heuristic,
+        normalized=normalized,
+        workflow_invocation=workflow_invocation,
+        pending_clarification=pending_clarification,
+    )
+    recommended_fallback_route = chat_contracts.ChatRouteType.respond.value
+    if workflow_invocation is not None and workflow_invocation.has_target():
+        recommended_fallback_route = chat_contracts.ChatRouteType.run_workflow.value
     elif bool(heuristic.requires_blocking_clarification):
-        recommended_fallback_route = "ask_clarification"
+        recommended_fallback_route = chat_contracts.ChatRouteType.ask_clarification.value
     elif not _looks_like_conversational_turn(content):
-        recommended_fallback_route = "submit_job"
-    payload = {
-        "current_user_message": content,
-        "candidate_goal": candidate_goal,
+        recommended_fallback_route = chat_contracts.ChatRouteType.submit_job.value
+    session_state = {
         "pending_clarification": pending_clarification,
-        "context_json": dict(merged_context or {}),
-        "recent_messages": recent_messages,
-        "routing_evidence": {
-            "intent": str(heuristic.intent or ""),
-            "risk_level": str(heuristic.risk_level or ""),
-            "needs_clarification": bool(heuristic.needs_clarification),
-            "missing_slots": list(heuristic.missing_slots or []),
-            "blocking_slots": list(heuristic.blocking_slots or []),
-            "workflow_target_available": workflow_invocation is not None,
-            "recommended_fallback_route": recommended_fallback_route,
+        "draft_goal": (
+            str(session_metadata.get("draft_goal") or "").strip()
+            if isinstance(session_metadata, Mapping)
+            else ""
+        ),
+        "active_job_id": (
+            str(session_metadata.get("active_job_id") or "").strip()
+            if isinstance(session_metadata, Mapping)
+            else ""
+        ),
+        "active_family": str(pending_state.active_family or "").strip()
+        if pending_state is not None
+        else "",
+        "active_capability_id": str(pending_state.active_capability_id or "").strip()
+        if pending_state is not None
+        else "",
+        "pending_fields": list(pending_state.pending_fields or pending_state.required_fields or [])
+        if pending_state is not None
+        else [],
+        "pending_questions": list(pending_state.pending_questions or pending_state.questions or [])
+        if pending_state is not None
+        else [],
+    }
+    return chat_contracts.ChatRouteRequest(
+        request_id=_chat_route_request_id(
+            content=content,
+            candidate_goal=candidate_goal,
+            pending_clarification=pending_clarification,
+        ),
+        message=content,
+        candidate_goal=candidate_goal,
+        session_state=session_state,
+        context_json=dict(merged_context or {}),
+        workflow_context=chat_contracts.ChatRouteWorkflowContext(
+            target_available=workflow_invocation is not None and workflow_invocation.has_target(),
+            definition_id=workflow_invocation.definition_id if workflow_invocation is not None else None,
+            version_id=workflow_invocation.version_id if workflow_invocation is not None else None,
+            trigger_id=workflow_invocation.trigger_id if workflow_invocation is not None else None,
+            input_keys=sorted(workflow_invocation.inputs.keys()) if workflow_invocation is not None else [],
+        ),
+        user_context={},
+        policy_context={
+            "service": "api",
+            "workflow_reference_required": True,
+            "direct_capability_count": len(
+                [
+                    candidate
+                    for candidate in candidates
+                    if candidate.candidate_type == chat_contracts.ChatRouteCandidateType.direct_agent
+                ]
+            ),
         },
-        "route_candidates": {
-            "direct_capabilities": direct_capabilities,
-            "generic_execution_path": {
-                "candidate_type": "generic_execution_path",
-                "route": "submit_job",
-                "description": "Use the planner/executor workflow when execution is needed but no published workflow target is available.",
+        recent_messages=recent_messages,
+        routing_evidence=chat_contracts.ChatRouteEvidence(
+            boundary_features={
+                "intent": str(heuristic.intent or "").strip(),
+                "risk_level": str(heuristic.risk_level or "").strip(),
+                "confidence": float(heuristic.confidence or 0.0),
+                "threshold": float(heuristic.threshold or 0.0)
+                if heuristic.threshold is not None
+                else None,
+                "low_confidence": bool(heuristic.low_confidence),
+                "needs_clarification": bool(heuristic.needs_clarification),
+                "missing_slots": list(heuristic.missing_slots or []),
+                "blocking_slots": list(heuristic.blocking_slots or []),
+                "questions": list(heuristic.questions or []),
+                "slot_values": dict(heuristic.slot_values or {}),
+                "workflow_target_available": workflow_invocation is not None
+                and workflow_invocation.has_target(),
+                "recommended_fallback_route": recommended_fallback_route,
+                "conversational_turn": _looks_like_conversational_turn(content),
             },
-            "published_workflow_path": {
-                "candidate_type": "published_workflow",
-                "route": "run_workflow",
-                "target_available": workflow_invocation is not None,
-            },
-        },
+            retrieved_candidates=candidates,
+            workflow_target_available=workflow_invocation is not None and workflow_invocation.has_target(),
+            pending_clarification=pending_clarification,
+            missing_inputs=list(heuristic.missing_slots or []),
+            historical_success_features={},
+            policy_filters_applied=[
+                "capability_allowlist:api",
+                "chat_direct_allowlist",
+                "workflow_target_required",
+            ],
+        ),
+    )
+
+
+def _build_chat_router_prompt(
+    *,
+    route_request: chat_contracts.ChatRouteRequest,
+) -> str:
+    payload = {
+        "route_request": route_request.model_dump(mode="json", exclude_none=True),
         "response_schema": {
             "route": "respond | tool_call | ask_clarification | submit_job | run_workflow",
             "assistant_response": "string",
             "intent": "generate | transform | validate | render | io | other",
             "risk_level": "read_only | bounded_write | high_risk_write",
             "confidence": "0..1",
+            "selected_candidate_id": "string",
+            "top_k_candidates": ["string"],
+            "reason_codes": ["string"],
             "output_format": "string",
             "target_system": "string",
             "safety_constraints": "string",
-            "workflow_reference": "use run_workflow only when workflow_context.target_available is true",
+            "workflow_reference": "use run_workflow only when route_request.workflow_context.target_available is true",
             "capability_id": "string",
             "arguments": {"any": "json object"},
             "clarification_questions": ["string"],
-        },
-        "workflow_context": {
-            "target_available": workflow_invocation is not None,
-            "trigger_id": workflow_invocation.trigger_id if workflow_invocation is not None else None,
-            "version_id": workflow_invocation.version_id if workflow_invocation is not None else None,
-            "definition_id": workflow_invocation.definition_id
-            if workflow_invocation is not None
-            else None,
-            "input_keys": sorted(workflow_invocation.inputs.keys())
-            if workflow_invocation is not None
-            else [],
         },
     }
     return (
         "Decide whether this turn should stay conversational or become a workflow request.\n"
         "Rules:\n"
         "- respond: answer normally, no workflow/job needed.\n"
-        "- tool_call: execute exactly one safe read-only capability from route_candidates.direct_capabilities as a synchronous one-step run.\n"
-        "- run_workflow: invoke the referenced published Studio workflow from workflow_context.\n"
+        "- tool_call: execute exactly one safe read-only direct candidate from route_request.routing_evidence.retrieved_candidates.\n"
+        "- run_workflow: invoke the referenced published Studio workflow from route_request.workflow_context.\n"
         "- ask_clarification: workflow is needed, but essential details are missing.\n"
         "- submit_job: workflow/job should be created now.\n"
-        "- If pending_clarification is true, treat the user message as an attempt to complete an existing workflow request.\n"
+        "- If route_request.session_state.pending_clarification is true, treat the user message as an attempt to complete an existing workflow request.\n"
         "- Ask for safety constraints only when a high-risk write workflow is actually being requested.\n"
         "- Use tool_call only when one direct capability is sufficient and a single synchronous run is enough.\n"
-        "- Use run_workflow only when workflow_context.target_available is true.\n"
+        "- Use run_workflow only when route_request.workflow_context.target_available is true.\n"
         "- Prefer run_workflow over submit_job when the user wants to run an already-published Studio workflow.\n"
+        "- Use route_request.routing_evidence.retrieved_candidates as the ranked candidate list.\n"
+        "- Include selected_candidate_id and top_k_candidates when possible.\n"
         "- If the request is execution-oriented and the exact target is uncertain, prefer ask_clarification or submit_job. Do not fall back to respond.\n"
-        "- If your preferred route is invalid, use routing_evidence.recommended_fallback_route.\n"
+        "- If your preferred route is invalid, use route_request.routing_evidence.boundary_features.recommended_fallback_route.\n"
         "- Return JSON only.\n\n"
         f"{json.dumps(payload, ensure_ascii=True)}"
     )
@@ -5467,51 +5726,66 @@ def _normalize_chat_route(
     *,
     content: str,
     candidate_goal: str,
-    workflow_invocation_available: bool,
+    route_request: chat_contracts.ChatRouteRequest,
 ) -> dict[str, Any]:
-    heuristic = _normalize_goal_intent(candidate_goal).profile
-    heuristic = _chat_route_goal_intent_profile(heuristic, goal=candidate_goal)
-    route = str(parsed.get("route") or parsed.get("type") or "").strip().lower()
+    decision = chat_contracts.ChatRouteDecision.model_validate(dict(parsed or {}))
+    boundary_features = dict(route_request.routing_evidence.boundary_features or {})
+    route = str(decision.route or "").strip().lower()
     route_recognized = route in {"respond", "tool_call", "ask_clarification", "submit_job", "run_workflow"}
     if not route_recognized:
         route = ""
-    capability_id = str(parsed.get("capability_id") or "").strip()
-    arguments = dict(parsed.get("arguments")) if isinstance(parsed.get("arguments"), Mapping) else {}
+    capability_id = str(decision.capability_id or "").strip()
+    arguments = dict(decision.arguments or {})
 
-    intent = str(parsed.get("intent") or heuristic.intent or "").strip().lower()
+    heuristic_intent = str(boundary_features.get("intent") or "").strip().lower()
+    heuristic_risk_level = str(boundary_features.get("risk_level") or "read_only").strip().lower()
+    heuristic_confidence = float(boundary_features.get("confidence") or 0.0)
+    heuristic_threshold_raw = boundary_features.get("threshold")
+
+    intent = str(decision.intent or heuristic_intent or "").strip().lower()
     if intent not in {"generate", "transform", "validate", "render", "io"}:
-        intent = str(heuristic.intent or "")
-    risk_level = str(parsed.get("risk_level") or heuristic.risk_level or "").strip().lower()
+        intent = heuristic_intent
+    risk_level = str(decision.risk_level or heuristic_risk_level or "").strip().lower()
     if risk_level not in {"read_only", "bounded_write", "high_risk_write"}:
-        risk_level = str(heuristic.risk_level or "read_only")
-    confidence_raw = parsed.get("confidence")
-    confidence = float(heuristic.confidence or 0.0)
-    if isinstance(confidence_raw, (int, float)):
-        confidence = max(0.0, min(1.0, float(confidence_raw)))
+        risk_level = heuristic_risk_level or "read_only"
+    confidence = heuristic_confidence
+    if isinstance(decision.confidence, (int, float)):
+        confidence = max(0.0, min(1.0, float(decision.confidence)))
     threshold = (
-        float(heuristic.threshold)
+        float(heuristic_threshold_raw)
         if (
-            intent == str(heuristic.intent or "").strip().lower()
-            and risk_level == str(heuristic.risk_level or "").strip().lower()
-            and heuristic.threshold is not None
+            intent == heuristic_intent
+            and risk_level == heuristic_risk_level
+            and isinstance(heuristic_threshold_raw, (int, float))
         )
         else _resolve_intent_confidence_threshold(intent, risk_level)
     )
 
-    slot_values = dict(heuristic.slot_values or {})
+    slot_values = (
+        dict(boundary_features.get("slot_values"))
+        if isinstance(boundary_features.get("slot_values"), Mapping)
+        else {}
+    )
     for key in ("output_format", "target_system", "safety_constraints"):
-        value = parsed.get(key)
+        value = getattr(decision, key, None)
         if isinstance(value, str) and value.strip():
             slot_values[key] = value.strip()
     slot_values["intent_action"] = intent
     slot_values["risk_level"] = risk_level
 
-    if (
-        intent == str(heuristic.intent or "").strip().lower()
-        and risk_level == str(heuristic.risk_level or "").strip().lower()
-    ):
-        blocking_slots = list(heuristic.blocking_slots)
-        missing_slots = list(heuristic.missing_slots)
+    heuristic_blocking_slots = [
+        intent_contract.normalize_required_input_key(slot_name)
+        for slot_name in boundary_features.get("blocking_slots", [])
+        if intent_contract.normalize_required_input_key(slot_name)
+    ]
+    heuristic_missing_slots = [
+        intent_contract.normalize_required_input_key(slot_name)
+        for slot_name in boundary_features.get("missing_slots", [])
+        if intent_contract.normalize_required_input_key(slot_name)
+    ]
+    if intent == heuristic_intent and risk_level == heuristic_risk_level:
+        blocking_slots = heuristic_blocking_slots
+        missing_slots = heuristic_missing_slots
     else:
         blocking_slots = _blocking_clarification_slots(intent, risk_level)
         missing_slots = [
@@ -5519,23 +5793,40 @@ def _normalize_chat_route(
             for slot_name in blocking_slots
             if not str(slot_values.get(slot_name) or "").strip()
         ]
-    parsed_missing_slots = parsed.get("missing_slots")
-    if isinstance(parsed_missing_slots, list):
-        for slot_name in parsed_missing_slots:
-            normalized = str(slot_name).strip()
+    if isinstance(decision.missing_inputs, list):
+        for slot_name in decision.missing_inputs:
+            normalized = intent_contract.normalize_required_input_key(slot_name)
             if normalized and normalized in blocking_slots and normalized not in missing_slots:
                 missing_slots.append(normalized)
     low_confidence = confidence < threshold
-    if route != "respond" and low_confidence and "intent_action" in blocking_slots and "intent_action" not in missing_slots:
+    if (
+        route != "respond"
+        and low_confidence
+        and "intent_action" in blocking_slots
+        and "intent_action" not in missing_slots
+    ):
         missing_slots.append("intent_action")
     conversational_turn = _looks_like_conversational_turn(content)
     execution_oriented = bool(intent and intent not in {"other", "inform", "clarify"}) or not conversational_turn
-    clarification_questions = [
-        str(question).strip()
-        for question in parsed.get("clarification_questions", [])
-        if isinstance(question, str) and question.strip()
+    clarification_questions = list(decision.clarification_questions or [])
+    assistant_response = str(decision.assistant_response or "").strip()
+    selected_candidate_id = str(decision.selected_candidate_id or "").strip()
+    top_k_candidates = list(decision.top_k_candidates or [])
+    reason_codes = list(decision.reason_codes or [])
+    fallback_used = bool(decision.fallback_used)
+    fallback_reason = str(decision.fallback_reason or "").strip() or None
+    workflow_invocation_available = bool(route_request.workflow_context.target_available)
+    retrieved_candidates = list(route_request.routing_evidence.retrieved_candidates or [])
+    workflow_candidate_ids = [
+        candidate.candidate_id
+        for candidate in retrieved_candidates
+        if candidate.candidate_type == chat_contracts.ChatRouteCandidateType.workflow
     ]
-    assistant_response = str(parsed.get("assistant_response") or "").strip()
+    generic_candidate_ids = [
+        candidate.candidate_id
+        for candidate in retrieved_candidates
+        if candidate.candidate_type == chat_contracts.ChatRouteCandidateType.generic_path
+    ]
     if not route:
         if missing_slots:
             route = "ask_clarification"
@@ -5543,19 +5834,33 @@ def _normalize_chat_route(
             route = "submit_job"
         else:
             route = "respond"
+        fallback_used = True
+        fallback_reason = fallback_reason or "invalid_or_missing_route"
     if route == "tool_call" and capability_id not in CHAT_DIRECT_CAPABILITIES:
         route = "ask_clarification" if missing_slots else ("submit_job" if execution_oriented else "respond")
         capability_id = ""
+        fallback_used = True
+        fallback_reason = fallback_reason or "invalid_direct_capability"
     if route == "tool_call" and (missing_slots or risk_level != "read_only"):
         route = "ask_clarification" if missing_slots else ("submit_job" if execution_oriented else "respond")
+        fallback_used = True
+        fallback_reason = fallback_reason or (
+            "missing_inputs_for_direct_capability"
+            if missing_slots
+            else "direct_capability_not_read_only"
+        )
     if route == "run_workflow" and not workflow_invocation_available:
         route = "ask_clarification"
         if not clarification_questions:
             clarification_questions = [
                 "Which published workflow should I run? Provide workflow_trigger_id, workflow_version_id, or workflow_definition_id."
             ]
+        fallback_used = True
+        fallback_reason = fallback_reason or "workflow_target_missing"
     if route == "submit_job" and missing_slots:
         route = "ask_clarification"
+        fallback_used = True
+        fallback_reason = fallback_reason or "missing_inputs_before_submit"
     if (
         route == "respond"
         and (
@@ -5567,12 +5872,16 @@ def _normalize_chat_route(
         )
     ):
         route = "ask_clarification"
+        fallback_used = True
+        fallback_reason = fallback_reason or "respond_requires_clarification"
     if route == "respond" and not assistant_response and execution_oriented:
         route = "ask_clarification" if missing_slots else "submit_job"
+        fallback_used = True
+        fallback_reason = fallback_reason or "execution_request_cannot_end_in_empty_response"
     if route == "ask_clarification" and not clarification_questions:
         clarification_questions = [
             str(question).strip()
-            for question in heuristic.questions
+            for question in boundary_features.get("questions", [])
             if isinstance(question, str) and question.strip()
         ]
         if not clarification_questions:
@@ -5587,6 +5896,18 @@ def _normalize_chat_route(
         blocking_slots = []
         missing_slots = []
         clarification_questions = []
+    if not top_k_candidates:
+        top_k_candidates = [candidate.candidate_id for candidate in retrieved_candidates[:5]]
+    if route == "tool_call" and capability_id and not selected_candidate_id:
+        selected_candidate_id = capability_id
+    if route == "run_workflow" and not selected_candidate_id and workflow_candidate_ids:
+        selected_candidate_id = workflow_candidate_ids[0]
+    if route == "submit_job" and not selected_candidate_id and generic_candidate_ids:
+        selected_candidate_id = generic_candidate_ids[0]
+    if route == "tool_call" and selected_candidate_id and selected_candidate_id not in top_k_candidates:
+        top_k_candidates = [selected_candidate_id, *top_k_candidates]
+    if fallback_reason and fallback_reason not in reason_codes:
+        reason_codes.append(fallback_reason)
     assessment = {
         "intent": intent,
         "source": "llm_chat_router" if route_recognized else "chat_router_deterministic_fallback",
@@ -5611,6 +5932,25 @@ def _normalize_chat_route(
         "clarification_questions": clarification_questions,
         "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(assessment) or {},
         "resolved_goal": candidate_goal,
+        "routing_decision": chat_contracts.ChatRouteDecision(
+            route=route,
+            confidence=round(confidence, 3),
+            selected_candidate_id=selected_candidate_id or None,
+            top_k_candidates=top_k_candidates[:5],
+            missing_inputs=missing_slots,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            reason_codes=reason_codes,
+            assistant_response=assistant_response,
+            intent=intent,
+            risk_level=risk_level,
+            output_format=str(slot_values.get("output_format") or "").strip() or None,
+            target_system=str(slot_values.get("target_system") or "").strip() or None,
+            safety_constraints=str(slot_values.get("safety_constraints") or "").strip() or None,
+            capability_id=capability_id or None,
+            arguments=arguments,
+            clarification_questions=clarification_questions,
+        ).model_dump(mode="json", exclude_none=True),
     }
 
 

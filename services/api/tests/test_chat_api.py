@@ -2930,6 +2930,152 @@ def test_chat_turn_invalid_run_workflow_without_target_asks_for_reference(monkey
     assert "workflow_trigger_id" in body["assistant_message"]["content"]
 
 
+def test_build_chat_route_request_ranks_candidates_and_applies_policy_filters(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda goal, **_kwargs: main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="io",
+                confidence=0.81,
+                threshold=0.55,
+                risk_level="read_only",
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[main.workflow_contracts.IntentGraphSegment(id="s1", intent="io")]
+            ),
+            candidate_capabilities={"s1": ["github.repo.list"]},
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_chat_visible_capabilities",
+        lambda: [
+            (
+                "github.repo.list",
+                cap_registry.CapabilitySpec(
+                    capability_id="github.repo.list",
+                    description="List repositories.",
+                    risk_tier="read_only",
+                    idempotency="read",
+                    group="github",
+                    subgroup="repositories",
+                    enabled=True,
+                ),
+            ),
+            (
+                "filesystem.workspace.read_text",
+                cap_registry.CapabilitySpec(
+                    capability_id="filesystem.workspace.read_text",
+                    description="Read a text file from the workspace.",
+                    risk_tier="read_only",
+                    idempotency="read",
+                    group="filesystem",
+                    subgroup="workspace",
+                    enabled=True,
+                ),
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        main.capability_search,
+        "search_capabilities",
+        lambda **_kwargs: [
+            {
+                "id": "github.repo.list",
+                "score": 18.0,
+                "reason": "token overlap: repo",
+                "source": "lexical_search",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "_hybrid_chat_capability_matches",
+        lambda **_kwargs: [
+            {
+                "id": "github.repo.list",
+                "score": 42.0,
+                "reason": "token overlap: repo",
+                "source": "lexical_search",
+            }
+        ],
+    )
+
+    route_request = main._build_chat_route_request(
+        content="List repos in the org",
+        candidate_goal="List repos in the org",
+        session_metadata={},
+        merged_context={},
+        messages=[],
+    )
+
+    retrieved = route_request.routing_evidence.retrieved_candidates
+
+    assert route_request.routing_evidence.policy_filters_applied == [
+        "capability_allowlist:api",
+        "chat_direct_allowlist",
+        "workflow_target_required",
+    ]
+    assert retrieved[0].candidate_id == "github.repo.list"
+    assert retrieved[0].candidate_type == main.chat_contracts.ChatRouteCandidateType.direct_agent
+    assert "intent_graph_candidate" in retrieved[0].reason_codes
+    assert any(candidate.candidate_id == "generic:submit_job" for candidate in retrieved)
+
+
+def test_chat_turn_persists_routing_decision_metadata(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            return {
+                "route": "submit_job",
+                "selected_candidate_id": "generic:submit_job",
+                "top_k_candidates": ["generic:submit_job"],
+                "reason_codes": ["generic_execution_fallback"],
+                "confidence": 0.93,
+                "intent": "generate",
+                "risk_level": "bounded_write",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda goal, **_kwargs: main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                confidence=0.93,
+                threshold=0.55,
+                risk_level="bounded_write",
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[main.workflow_contracts.IntentGraphSegment(id="s1", intent="generate")]
+            ),
+        ),
+    )
+    monkeypatch.setattr(main, "_chat_visible_capabilities", lambda: [])
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["metadata"]["routing_decision"]["route"] == "submit_job"
+    assert (
+        body["assistant_message"]["metadata"]["routing_decision"]["selected_candidate_id"]
+        == "generic:submit_job"
+    )
+    assert body["assistant_message"]["metadata"]["routing_decision"]["top_k_candidates"] == [
+        "generic:submit_job"
+    ]
+
+
 def test_chat_boundary_uses_semantic_capability_evidence_and_persists_decision(
     monkeypatch,
 ) -> None:

@@ -64,3 +64,40 @@ def test_clarification_state_syncs_execution_frame_and_slot_ledger() -> None:
     assert dumped["current_question"] == "What output path or filename should be used?"
     assert dumped["current_question_field"] == "path"
     assert dumped["questions"] == ["What output path or filename should be used?"]
+
+
+def test_chat_route_decision_normalizes_doc_route_aliases() -> None:
+    direct = chat_contracts.ChatRouteDecision.model_validate(
+        {
+            "route": "direct_agent",
+            "selected_candidate_id": "github.repo.list",
+        }
+    )
+    chat_reply = chat_contracts.ChatRouteDecision.model_validate({"route": "chat_reply"})
+
+    assert direct.route == "tool_call"
+    assert direct.capability_id == "github.repo.list"
+    assert chat_reply.route == "respond"
+
+
+def test_chat_route_candidate_descriptor_normalizes_lists_and_strings() -> None:
+    candidate = chat_contracts.ChatRouteCandidateDescriptor.model_validate(
+        {
+            "candidate_id": " github.repo.list ",
+            "candidate_type": "direct_agent",
+            "family": " github ",
+            "risk_tier": " read_only ",
+            "preconditions": [" allowed ", "allowed", ""],
+            "input_keys": [" query ", "query"],
+            "reason_codes": ["token_overlap", "token_overlap"],
+            "cost_class": "low",
+        }
+    )
+
+    dumped = candidate.model_dump(mode="json")
+
+    assert dumped["candidate_id"] == "github.repo.list"
+    assert dumped["family"] == "github"
+    assert dumped["preconditions"] == ["allowed"]
+    assert dumped["input_keys"] == ["query"]
+    assert dumped["reason_codes"] == ["token_overlap"]
