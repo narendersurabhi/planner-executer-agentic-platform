@@ -3016,12 +3016,198 @@ def test_build_chat_route_request_ranks_candidates_and_applies_policy_filters(mo
     assert route_request.routing_evidence.policy_filters_applied == [
         "capability_allowlist:api",
         "chat_direct_allowlist",
-        "workflow_target_required",
+        "published_workflow_retrieval",
     ]
     assert retrieved[0].candidate_id == "github.repo.list"
     assert retrieved[0].candidate_type == main.chat_contracts.ChatRouteCandidateType.direct_agent
     assert "intent_graph_candidate" in retrieved[0].reason_codes
     assert any(candidate.candidate_id == "generic:submit_job" for candidate in retrieved)
+
+
+def test_build_chat_route_request_includes_ranked_workflow_candidates() -> None:
+    workflow_title = f"Run release readiness workflow {datetime.now(UTC).timestamp()}"
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": workflow_title,
+            "goal": workflow_title,
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Release readiness workflow",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    route_request = main._build_chat_route_request(
+        content=workflow_title,
+        candidate_goal=workflow_title,
+        session_metadata={},
+        merged_context={},
+        messages=[],
+    )
+
+    workflow_candidates = [
+        candidate
+        for candidate in route_request.routing_evidence.retrieved_candidates
+        if candidate.candidate_type == main.chat_contracts.ChatRouteCandidateType.workflow
+    ]
+
+    assert workflow_candidates
+    assert workflow_candidates[0].candidate_id == f"workflow:{version['id']}"
+    assert workflow_candidates[0].metadata["version_id"] == version["id"]
+    assert route_request.routing_evidence.boundary_features["recommended_fallback_route"] == (
+        "run_workflow"
+    )
+
+
+def test_chat_turn_can_run_retrieved_workflow_candidate_without_explicit_reference(
+    monkeypatch,
+) -> None:
+    workflow_title = f"Run release readiness workflow {datetime.now(UTC).timestamp()}"
+    create_response = client.post(
+        "/workflows/definitions",
+        json={
+            "title": workflow_title,
+            "goal": workflow_title,
+            "user_id": "narendersurabhi",
+            "context_json": {"user_id": "narendersurabhi"},
+            "draft": {
+                "summary": "Release readiness workflow",
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "taskName": "ListWorkspace",
+                        "capabilityId": "filesystem.workspace.list",
+                        "bindings": {},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    definition = create_response.json()
+    publish_response = client.post(f"/workflows/definitions/{definition['id']}/publish", json={})
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            return {
+                "route": "run_workflow",
+                "selected_candidate_id": f"workflow:{version['id']}",
+                "top_k_candidates": [f"workflow:{version['id']}"],
+                "reason_codes": ["workflow_token_overlap"],
+                "confidence": 0.94,
+                "intent": "generate",
+                "risk_level": "bounded_write",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": workflow_title, "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "run_workflow"
+    assert body["assistant_message"]["action"]["workflow_version_id"] == version["id"]
+    assert body["workflow_run"]["version_id"] == version["id"]
+
+
+def test_chat_turn_asks_clarification_for_ambiguous_retrieved_workflow_candidates(
+    monkeypatch,
+) -> None:
+    ambiguous_candidates = [
+        main.chat_contracts.ChatRouteCandidateDescriptor(
+            candidate_id="workflow:alpha",
+            candidate_type=main.chat_contracts.ChatRouteCandidateType.workflow,
+            family="workflow",
+            risk_tier="bounded_write",
+            preconditions=["published_workflow_available"],
+            input_keys=[],
+            cost_class=main.chat_contracts.ChatRouteCostClass.medium,
+            enabled=True,
+            score=62.0,
+            reason_codes=["exact_title_match"],
+            description="Release validation workflow",
+            route=main.chat_contracts.ChatRouteType.run_workflow,
+            metadata={
+                "title": "Release validation workflow",
+                "definition_id": "def-alpha",
+                "version_id": "ver-alpha",
+            },
+        ),
+        main.chat_contracts.ChatRouteCandidateDescriptor(
+            candidate_id="workflow:beta",
+            candidate_type=main.chat_contracts.ChatRouteCandidateType.workflow,
+            family="workflow",
+            risk_tier="bounded_write",
+            preconditions=["published_workflow_available"],
+            input_keys=[],
+            cost_class=main.chat_contracts.ChatRouteCostClass.medium,
+            enabled=True,
+            score=58.0,
+            reason_codes=["exact_title_match"],
+            description="Release validation workflow v2",
+            route=main.chat_contracts.ChatRouteType.run_workflow,
+            metadata={
+                "title": "Release validation workflow v2",
+                "definition_id": "def-beta",
+                "version_id": "ver-beta",
+            },
+        ),
+    ]
+
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            return {
+                "route": "run_workflow",
+                "confidence": 0.91,
+                "intent": "generate",
+                "risk_level": "bounded_write",
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(
+        main,
+        "_retrieve_chat_workflow_candidates",
+        lambda **_kwargs: ambiguous_candidates,
+    )
+    monkeypatch.setattr(main, "_chat_visible_capabilities", lambda: [])
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Run the release validation workflow", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "Release validation workflow" in body["assistant_message"]["content"]
 
 
 def test_chat_turn_persists_routing_decision_metadata(monkeypatch) -> None:

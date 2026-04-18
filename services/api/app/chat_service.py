@@ -1171,6 +1171,18 @@ def handle_turn(
     resolved_goal = str(turn_plan.get("resolved_goal") or candidate_goal or "").strip()
     if not resolved_goal:
         resolved_goal = content
+    context_json_updates = (
+        dict(turn_plan.get("context_json_updates"))
+        if isinstance(turn_plan.get("context_json_updates"), Mapping)
+        else {}
+    )
+    if context_json_updates:
+        context_envelope = context_service.update_chat_context_envelope(
+            context_envelope,
+            goal=resolved_goal,
+            context_json=context_json_updates,
+        )
+        merged_context = context_service.chat_submit_context_view(context_envelope)
     assistant_content = str(turn_plan.get("assistant_content") or "").strip()
 
     assistant_action: chat_contracts.AssistantAction
