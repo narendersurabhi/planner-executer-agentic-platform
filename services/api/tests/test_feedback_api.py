@@ -252,6 +252,61 @@ def _create_chat_message_with_boundary_decision(
     return session_id, message_id
 
 
+def _create_chat_message_with_routing_decision(
+    *,
+    content: str = "Started routing action.",
+    action_type: str = "submit_job",
+    routing_decision: dict[str, Any] | None = None,
+    message_metadata: dict[str, Any] | None = None,
+    job_status: str | None = None,
+    job_metadata: dict[str, Any] | None = None,
+) -> tuple[str, str, str | None]:
+    session_id = str(uuid.uuid4())
+    message_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4()) if job_status is not None else None
+    now = _utcnow()
+    with SessionLocal() as db:
+        db.add(
+            ChatSessionRecord(
+                id=session_id,
+                title="Routing feedback session",
+                metadata_json={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        if job_id is not None:
+            db.add(
+                JobRecord(
+                    id=job_id,
+                    goal="Routing feedback job",
+                    context_json={},
+                    status=job_status or "queued",
+                    priority=0,
+                    metadata_json=dict(job_metadata or {}),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        db.add(
+            ChatMessageRecord(
+                id=message_id,
+                session_id=session_id,
+                role="assistant",
+                content=content,
+                metadata_json={
+                    "routing_decision": dict(routing_decision or {}),
+                    **dict(message_metadata or {}),
+                },
+                action_json={"type": action_type},
+                job_id=job_id,
+                created_at=now,
+            )
+        )
+        db.commit()
+    return session_id, message_id, job_id
+
+
 def _metric_value(metrics_text: str, metric_name: str, labels: dict[str, str] | None = None) -> float:
     for line in metrics_text.splitlines():
         if not line or line.startswith("#"):
@@ -470,6 +525,165 @@ def test_chat_boundary_review_queue_orders_likely_misroutes() -> None:
     assert filtered_body["total"] >= 1
     assert all(item["dimensions"]["boundary_decision"] == "chat_reply" for item in filtered_body["items"])
     assert all(item["review_label"] == "likely_false_chat_reply" for item in filtered_body["items"])
+
+
+def test_chat_message_feedback_carries_routing_dimensions_into_summary_review_and_metrics() -> None:
+    before_metrics = client.get("/metrics")
+    assert before_metrics.status_code == 200
+    routing_feedback_before = _metric_value(
+        before_metrics.text,
+        "chat_routing_feedback_total",
+        {
+            "route": "submit_job",
+            "candidate_type": "generic_path",
+            "fallback_used": "yes",
+            "sentiment": "negative",
+        },
+    )
+
+    session_id, message_id, _job_id = _create_chat_message_with_routing_decision(
+        action_type="submit_job",
+        routing_decision={
+            "route": "submit_job",
+            "selected_candidate_id": "generic:submit_job",
+            "top_k_candidates": ["generic:submit_job", "workflow:release"],
+            "missing_inputs": [],
+            "fallback_used": True,
+            "fallback_reason": "workflow_target_missing",
+        },
+        job_status="failed",
+    )
+
+    feedback_response = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": "tester-routing"},
+        json={
+            "target_type": "chat_message",
+            "target_id": message_id,
+            "sentiment": "negative",
+            "reason_codes": ["missed_request"],
+            "comment": "The router fell back to the generic path instead of the right target.",
+        },
+    )
+    assert feedback_response.status_code == 200
+    body = feedback_response.json()
+    dimensions = body["metadata"]["dimensions"]
+    assert body["session_id"] == session_id
+    assert dimensions["routing_decision_route"] == "submit_job"
+    assert dimensions["routing_selected_candidate_id"] == "generic:submit_job"
+    assert dimensions["routing_selected_candidate_type"] == "generic_path"
+    assert dimensions["routing_top_candidate_count"] == 2
+    assert dimensions["routing_fallback_used"] == "yes"
+    assert dimensions["routing_fallback_reason"] == "workflow_target_missing"
+    assert dimensions["routing_execution_started"] == "yes"
+    assert dimensions["routing_execution_succeeded"] == "no"
+
+    summary_response = client.get(
+        "/feedback/summary",
+        params={"target_type": "chat_message"},
+    )
+    assert summary_response.status_code == 200
+    summary = summary_response.json()
+    assert any(
+        bucket["key"] == "submit_job" and bucket["total"] >= 1
+        for bucket in summary["routing_decision_routes"]
+    )
+    assert any(
+        bucket["key"] == "generic_path" and bucket["total"] >= 1
+        for bucket in summary["routing_selected_candidate_types"]
+    )
+    assert any(
+        bucket["key"] == "yes" and bucket["total"] >= 1
+        for bucket in summary["routing_fallback_states"]
+    )
+    assert any(
+        bucket["key"] == "workflow_target_missing" and bucket["total"] >= 1
+        for bucket in summary["routing_fallback_reasons"]
+    )
+    assert any(
+        bucket["key"] == "no" and bucket["total"] >= 1
+        for bucket in summary["routing_execution_succeeded_states"]
+    )
+    assert summary["metrics"]["routing_fallback_feedback_rate"] > 0.0
+    assert summary["metrics"]["routing_execution_failure_feedback_rate"] > 0.0
+
+    review_response = client.get(
+        "/feedback/chat-routing/review",
+        params={"review_label": "likely_bad_routing_fallback", "fallback_used": "yes"},
+    )
+    assert review_response.status_code == 200
+    review_body = review_response.json()
+    assert review_body["total"] >= 1
+    assert review_body["items"][0]["review_label"] == "likely_bad_routing_fallback"
+    assert review_body["items"][0]["dimensions"]["routing_decision_route"] == "submit_job"
+
+    after_metrics = client.get("/metrics")
+    assert after_metrics.status_code == 200
+    assert (
+        _metric_value(
+            after_metrics.text,
+            "chat_routing_feedback_total",
+            {
+                "route": "submit_job",
+                "candidate_type": "generic_path",
+                "fallback_used": "yes",
+                "sentiment": "negative",
+            },
+        )
+        >= routing_feedback_before + 1
+    )
+
+
+def test_chat_routing_review_queue_returns_route_errors_and_filters() -> None:
+    _session_id, message_id, _job_id = _create_chat_message_with_routing_decision(
+        action_type="tool_call",
+        routing_decision={
+            "route": "tool_call",
+            "selected_candidate_id": "github.repo.list",
+            "top_k_candidates": ["github.repo.list"],
+            "fallback_used": False,
+        },
+        job_status="succeeded",
+    )
+
+    created = client.post(
+        "/feedback",
+        headers={"X-Feedback-Actor-Id": "tester-routing-review"},
+        json={
+            "target_type": "chat_message",
+            "target_id": message_id,
+            "sentiment": "negative",
+            "reason_codes": ["incorrect"],
+            "comment": "This direct route picked the wrong target.",
+        },
+    )
+    assert created.status_code == 200
+
+    response = client.get("/feedback/chat-routing/review")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] >= 1
+    assert any(item["review_label"] == "likely_wrong_direct_candidate" for item in body["items"])
+
+    filtered = client.get(
+        "/feedback/chat-routing/review",
+        params={
+            "review_label": "likely_wrong_direct_candidate",
+            "route": "tool_call",
+            "candidate_type": "direct_agent",
+            "fallback_used": "no",
+        },
+    )
+    assert filtered.status_code == 200
+    filtered_body = filtered.json()
+    assert filtered_body["total"] >= 1
+    assert all(item["review_label"] == "likely_wrong_direct_candidate" for item in filtered_body["items"])
+    assert all(item["dimensions"]["routing_decision_route"] == "tool_call" for item in filtered_body["items"])
+    assert all(
+        item["dimensions"]["routing_selected_candidate_type"] == "direct_agent"
+        for item in filtered_body["items"]
+    )
+    assert all(item["dimensions"]["routing_fallback_used"] == "no" for item in filtered_body["items"])
 
 
 def test_chat_clarification_feedback_captures_slot_loss_and_family_drift() -> None:

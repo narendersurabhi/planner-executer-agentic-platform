@@ -794,6 +794,12 @@ class FeedbackSummaryResponse(BaseModel):
     clarification_mapping_resolved_active_field_states: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     clarification_mapping_queue_advancement_states: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     clarification_mapping_restart_states: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    routing_decision_routes: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    routing_selected_candidate_types: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    routing_fallback_states: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    routing_fallback_reasons: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    routing_execution_started_states: List[FeedbackBreakdownBucket] = Field(default_factory=list)
+    routing_execution_succeeded_states: List[FeedbackBreakdownBucket] = Field(default_factory=list)
     metrics: Dict[str, float] = Field(default_factory=dict)
     correlates: FeedbackCorrelationSummary = Field(default_factory=FeedbackCorrelationSummary)
 
@@ -836,6 +842,20 @@ class ChatClarificationReviewQueueItem(BaseModel):
 class ChatClarificationReviewQueueResponse(BaseModel):
     total: int = 0
     items: List[ChatClarificationReviewQueueItem] = Field(default_factory=list)
+
+
+class ChatRoutingReviewQueueItem(BaseModel):
+    feedback: Feedback
+    dimensions: Dict[str, Any] = Field(default_factory=dict)
+    linked_ids: Dict[str, Optional[str]] = Field(default_factory=dict)
+    review_label: str
+    review_score: int = 0
+    excerpt: Optional[str] = None
+
+
+class ChatRoutingReviewQueueResponse(BaseModel):
+    total: int = 0
+    items: List[ChatRoutingReviewQueueItem] = Field(default_factory=list)
 
 
 class IntentReviewQueueItem(BaseModel):

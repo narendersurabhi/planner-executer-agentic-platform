@@ -67,6 +67,10 @@ def _boundary_decision_payload(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _routing_decision_payload(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
 def _boundary_decision_fields(boundary_payload: Mapping[str, Any] | None) -> dict[str, Any]:
     payload = dict(boundary_payload) if isinstance(boundary_payload, Mapping) else {}
     evidence = payload.get("evidence")
@@ -103,6 +107,106 @@ def _boundary_fields_from_message(
         if isinstance(snapshot_metadata, Mapping):
             boundary_payload = _boundary_decision_payload(snapshot_metadata.get("boundary_decision"))
     return _boundary_decision_fields(boundary_payload)
+
+
+def _routing_selected_candidate_type(
+    *,
+    route: str | None,
+    selected_candidate_id: str | None,
+) -> str | None:
+    candidate_id = _non_empty_string(selected_candidate_id)
+    if candidate_id is not None:
+        if candidate_id.startswith("workflow:"):
+            return "workflow"
+        if candidate_id.startswith("generic:"):
+            return "generic_path"
+        return "direct_agent"
+    normalized_route = _non_empty_string(route)
+    if normalized_route == "run_workflow":
+        return "workflow"
+    if normalized_route == "submit_job":
+        return "generic_path"
+    if normalized_route == "tool_call":
+        return "direct_agent"
+    return None
+
+
+def _routing_execution_started_state(assistant_action_type: str | None) -> str:
+    if assistant_action_type in {"submit_job", "run_workflow", "tool_call"}:
+        return "yes"
+    return "no"
+
+
+def _routing_execution_succeeded_state(
+    *,
+    execution_started: str,
+    job_status: str | None,
+) -> str:
+    if execution_started != "yes":
+        return "not_started"
+    normalized_job_status = _non_empty_string(job_status)
+    if normalized_job_status == "succeeded":
+        return "yes"
+    if normalized_job_status in {"failed", "canceled"}:
+        return "no"
+    return "unknown"
+
+
+def _routing_decision_fields(
+    routing_payload: Mapping[str, Any] | None,
+    *,
+    assistant_action_type: str | None,
+    job_status: str | None,
+) -> dict[str, Any]:
+    payload = dict(routing_payload) if isinstance(routing_payload, Mapping) else {}
+    if not payload:
+        return {}
+    top_k_candidates = _normalize_string_list(payload.get("top_k_candidates"))
+    missing_inputs = _normalize_string_list(payload.get("missing_inputs"))
+    route = _non_empty_string(payload.get("route"))
+    selected_candidate_id = _non_empty_string(payload.get("selected_candidate_id"))
+    fallback_used = "yes" if bool(payload.get("fallback_used")) else "no"
+    execution_started = _routing_execution_started_state(assistant_action_type)
+    execution_succeeded = _routing_execution_succeeded_state(
+        execution_started=execution_started,
+        job_status=job_status,
+    )
+    return {
+        "routing_decision_route": route,
+        "routing_selected_candidate_id": selected_candidate_id,
+        "routing_selected_candidate_type": _routing_selected_candidate_type(
+            route=route,
+            selected_candidate_id=selected_candidate_id,
+        ),
+        "routing_top_candidate_count": len(top_k_candidates),
+        "routing_missing_input_count": len(missing_inputs),
+        "routing_fallback_used": fallback_used,
+        "routing_fallback_reason": _non_empty_string(payload.get("fallback_reason")),
+        "routing_execution_started": execution_started,
+        "routing_execution_succeeded": execution_succeeded,
+    }
+
+
+def _routing_fields_from_message(
+    message: ChatMessageRecord | None,
+    snapshot: Mapping[str, Any] | None,
+    *,
+    assistant_action_type: str | None,
+    job_status: str | None,
+) -> dict[str, Any]:
+    message_metadata = (
+        dict(message.metadata_json or {}) if message is not None and isinstance(message.metadata_json, Mapping) else {}
+    )
+    routing_payload = _routing_decision_payload(message_metadata.get("routing_decision"))
+    if not routing_payload and isinstance(snapshot, Mapping):
+        snapshot_metadata = snapshot.get("metadata")
+        if isinstance(snapshot_metadata, Mapping):
+            routing_payload = _routing_decision_payload(snapshot_metadata.get("routing_decision"))
+    return _routing_decision_fields(
+        routing_payload,
+        assistant_action_type=assistant_action_type,
+        job_status=job_status,
+    )
 
 
 def _top_intent_capability(
@@ -586,6 +690,12 @@ def derive_feedback_dimensions(
         boundary_top_family=_non_empty_string(boundary_fields.get("boundary_top_family")),
     )
     clarification_mapping_fields = _clarification_mapping_fields_from_message(message, snapshot)
+    routing_fields = _routing_fields_from_message(
+        message,
+        snapshot,
+        assistant_action_type=assistant_action_type,
+        job_status=job_status,
+    )
     dimensions = {
         "target_type": request.target_type.value,
         "target_id": _non_empty_string(request.target_id),
@@ -604,6 +714,7 @@ def derive_feedback_dimensions(
     }
     dimensions.update(clarification_fields)
     dimensions.update(clarification_mapping_fields)
+    dimensions.update(routing_fields)
     if request.target_type == models.FeedbackTargetType.intent_assessment:
         dimensions.update(_intent_fields_from_snapshot(snapshot))
     return dimensions
@@ -647,6 +758,13 @@ def _feedback_dimensions(item: models.Feedback) -> dict[str, Any]:
         "clarification_mapping_resolved_active_field",
         "clarification_mapping_queue_advanced",
         "clarification_mapping_restarted",
+        "routing_decision_route",
+        "routing_selected_candidate_id",
+        "routing_selected_candidate_type",
+        "routing_fallback_used",
+        "routing_fallback_reason",
+        "routing_execution_started",
+        "routing_execution_succeeded",
     ):
         if key not in normalized:
             normalized[key] = None
@@ -656,6 +774,8 @@ def _feedback_dimensions(item: models.Feedback) -> dict[str, Any]:
         "clarification_question_count",
         "clarification_answer_count",
         "clarification_mapping_resolved_field_count",
+        "routing_top_candidate_count",
+        "routing_missing_input_count",
     ):
         if key not in normalized:
             normalized[key] = 0
@@ -937,6 +1057,15 @@ def summarize_feedback_rows(
             items,
             "clarification_mapping_restarted",
         ),
+        routing_decision_routes=dimension_breakdown(items, "routing_decision_route"),
+        routing_selected_candidate_types=dimension_breakdown(
+            items,
+            "routing_selected_candidate_type",
+        ),
+        routing_fallback_states=dimension_breakdown(items, "routing_fallback_used"),
+        routing_fallback_reasons=dimension_breakdown(items, "routing_fallback_reason"),
+        routing_execution_started_states=dimension_breakdown(items, "routing_execution_started"),
+        routing_execution_succeeded_states=dimension_breakdown(items, "routing_execution_succeeded"),
         metrics={
             "chat_helpfulness_rate": _positive_rate(
                 items,
@@ -987,6 +1116,18 @@ def summarize_feedback_rows(
                 target_type=models.FeedbackTargetType.chat_message,
                 dimension_key="clarification_mapping_restarted",
                 matches={"yes"},
+            ),
+            "routing_fallback_feedback_rate": _dimension_rate(
+                items,
+                target_type=models.FeedbackTargetType.chat_message,
+                dimension_key="routing_fallback_used",
+                matches={"yes"},
+            ),
+            "routing_execution_failure_feedback_rate": _dimension_rate(
+                items,
+                target_type=models.FeedbackTargetType.chat_message,
+                dimension_key="routing_execution_succeeded",
+                matches={"no"},
             ),
         },
         correlates=collect_job_feedback_correlates(db, items),
@@ -1315,6 +1456,60 @@ def _chat_clarification_review_score(item: models.Feedback, review_label: str) -
     dimensions = _feedback_dimensions(item)
     if _non_empty_string(dimensions.get("clarification_slot_loss_state")) not in {None, "none"}:
         score += 10
+    if _non_empty_string(item.comment):
+        score += 5
+    return score
+
+
+def _chat_routing_review_label(item: models.Feedback) -> str | None:
+    if item.target_type != models.FeedbackTargetType.chat_message:
+        return None
+    if item.sentiment not in {
+        models.FeedbackSentiment.negative,
+        models.FeedbackSentiment.partial,
+    }:
+        return None
+    dimensions = _feedback_dimensions(item)
+    fallback_used = _non_empty_string(dimensions.get("routing_fallback_used"))
+    route = _non_empty_string(dimensions.get("routing_decision_route"))
+    candidate_type = _non_empty_string(dimensions.get("routing_selected_candidate_type"))
+    execution_started = _non_empty_string(dimensions.get("routing_execution_started"))
+    execution_succeeded = _non_empty_string(dimensions.get("routing_execution_succeeded"))
+    if fallback_used == "yes":
+        return "likely_bad_routing_fallback"
+    if execution_started == "yes" and execution_succeeded == "no":
+        return "likely_failed_execution_route"
+    if route == "run_workflow" and candidate_type == "workflow":
+        return "likely_wrong_workflow_candidate"
+    if route == "tool_call" and candidate_type == "direct_agent":
+        return "likely_wrong_direct_candidate"
+    if route == "submit_job" and candidate_type == "generic_path":
+        return "likely_generic_path_overuse"
+    return None
+
+
+def _chat_routing_review_score(item: models.Feedback, review_label: str) -> int:
+    score = 0
+    if item.sentiment == models.FeedbackSentiment.negative:
+        score += 100
+    elif item.sentiment == models.FeedbackSentiment.partial:
+        score += 70
+    if review_label == "likely_bad_routing_fallback":
+        score += 40
+    elif review_label == "likely_failed_execution_route":
+        score += 35
+    elif review_label in {
+        "likely_wrong_workflow_candidate",
+        "likely_wrong_direct_candidate",
+    }:
+        score += 30
+    elif review_label == "likely_generic_path_overuse":
+        score += 20
+    reasons = set(_normalize_reason_codes(item.reason_codes))
+    if "missed_request" in reasons:
+        score += 25
+    if "incorrect" in reasons or "wrong_scope" in reasons:
+        score += 15
     if _non_empty_string(item.comment):
         score += 5
     return score
@@ -1686,6 +1881,80 @@ def chat_clarification_review_queue(
         key=lambda item: (-item.review_score, item.feedback.updated_at),
     )
     return models.ChatClarificationReviewQueueResponse(
+        total=len(ordered),
+        items=ordered[: max(1, min(limit, 500))],
+    )
+
+
+def chat_routing_review_queue(
+    db: Session,
+    *,
+    limit: int = 100,
+    review_label: str | None = None,
+    route: str | None = None,
+    candidate_type: str | None = None,
+    fallback_used: str | None = None,
+) -> models.ChatRoutingReviewQueueResponse:
+    rows = _feedback_records(
+        db,
+        target_type=models.FeedbackTargetType.chat_message,
+        limit=max(limit * 4, 200),
+    )
+    normalized_review_label = _non_empty_string(review_label)
+    normalized_route = _non_empty_string(route)
+    normalized_candidate_type = _non_empty_string(candidate_type)
+    normalized_fallback_used = _non_empty_string(fallback_used)
+    items: list[models.ChatRoutingReviewQueueItem] = []
+    for row in rows:
+        feedback = _feedback_from_record(row)
+        dimensions = _feedback_dimensions(feedback)
+        label = _chat_routing_review_label(feedback)
+        if label is None:
+            continue
+        if normalized_review_label is not None and label != normalized_review_label:
+            continue
+        if (
+            normalized_route is not None
+            and _non_empty_string(dimensions.get("routing_decision_route")) != normalized_route
+        ):
+            continue
+        if (
+            normalized_candidate_type is not None
+            and _non_empty_string(dimensions.get("routing_selected_candidate_type"))
+            != normalized_candidate_type
+        ):
+            continue
+        if (
+            normalized_fallback_used is not None
+            and _non_empty_string(dimensions.get("routing_fallback_used")) != normalized_fallback_used
+        ):
+            continue
+        excerpt = (
+            _non_empty_string(feedback.snapshot.get("content"))
+            if isinstance(feedback.snapshot, Mapping)
+            else None
+        )
+        items.append(
+            models.ChatRoutingReviewQueueItem(
+                feedback=feedback,
+                dimensions=dimensions,
+                linked_ids={
+                    "session_id": feedback.session_id,
+                    "job_id": feedback.job_id,
+                    "plan_id": feedback.plan_id,
+                    "message_id": feedback.message_id,
+                    "target_id": feedback.target_id,
+                },
+                review_label=label,
+                review_score=_chat_routing_review_score(feedback, label),
+                excerpt=excerpt,
+            )
+        )
+    ordered = sorted(
+        items,
+        key=lambda item: (-item.review_score, item.feedback.updated_at),
+    )
+    return models.ChatRoutingReviewQueueResponse(
         total=len(ordered),
         items=ordered[: max(1, min(limit, 500))],
     )

@@ -995,6 +995,11 @@ chat_clarification_mapping_feedback_total = Counter(
     "Explicit chat-message feedback grouped by clarification mapping outcomes",
     ["resolved_active_field", "queue_advanced", "restarted", "sentiment"],
 )
+chat_routing_feedback_total = Counter(
+    "chat_routing_feedback_total",
+    "Explicit chat-message feedback grouped by prior chat routing decision",
+    ["route", "candidate_type", "fallback_used", "sentiment"],
+)
 
 
 def _intent_source_label(source: Any) -> str:
@@ -16358,6 +16363,20 @@ def submit_feedback(
             ),
             sentiment=feedback.sentiment.value,
         ).inc()
+        routing_route = _metrics_label(dimensions.get("routing_decision_route"), default="none")
+        if routing_route != "none":
+            chat_routing_feedback_total.labels(
+                route=routing_route,
+                candidate_type=_metrics_label(
+                    dimensions.get("routing_selected_candidate_type"),
+                    default="unknown",
+                ),
+                fallback_used=_metrics_label(
+                    dimensions.get("routing_fallback_used"),
+                    default="unknown",
+                ),
+                sentiment=feedback.sentiment.value,
+            ).inc()
     _emit_event("feedback.submitted", feedback.model_dump(mode="json"))
     return feedback
 
@@ -16482,6 +16501,25 @@ def get_chat_clarification_review_queue(
         db,
         review_label=review_label,
         active_family=active_family,
+        limit=limit,
+    )
+
+
+@app.get("/feedback/chat-routing/review", response_model=models.ChatRoutingReviewQueueResponse)
+def get_chat_routing_review_queue(
+    review_label: str | None = Query(default=None),
+    route: str | None = Query(default=None),
+    candidate_type: str | None = Query(default=None),
+    fallback_used: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> models.ChatRoutingReviewQueueResponse:
+    return feedback_service.chat_routing_review_queue(
+        db,
+        review_label=review_label,
+        route=route,
+        candidate_type=candidate_type,
+        fallback_used=fallback_used,
         limit=limit,
     )
 
