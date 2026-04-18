@@ -462,12 +462,26 @@ def _job_error_from_metadata(metadata: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-def build_chat_message_snapshot(record: ChatMessageRecord) -> dict[str, Any]:
+def build_chat_message_snapshot(db: Session, record: ChatMessageRecord) -> dict[str, Any]:
+    preceding_user_message = (
+        db.query(ChatMessageRecord)
+        .filter(
+            ChatMessageRecord.session_id == record.session_id,
+            ChatMessageRecord.role == chat_contracts.ChatRole.user.value,
+            ChatMessageRecord.created_at <= record.created_at,
+        )
+        .order_by(ChatMessageRecord.created_at.desc())
+        .first()
+    )
     return {
         "message_id": record.id,
         "session_id": record.session_id,
         "role": record.role,
         "content": record.content,
+        "user_message_id": preceding_user_message.id if preceding_user_message is not None else None,
+        "user_message_content": (
+            preceding_user_message.content if preceding_user_message is not None else None
+        ),
         "metadata": dict(record.metadata_json or {}),
         "action": dict(record.action_json or {}) if isinstance(record.action_json, Mapping) else {},
         "job_id": record.job_id,
@@ -583,7 +597,7 @@ def _resolve_feedback_target(
             "job_id": message.job_id,
             "plan_id": plan.id if plan is not None else None,
             "message_id": message.id,
-            "snapshot": build_chat_message_snapshot(message),
+            "snapshot": build_chat_message_snapshot(db, message),
         }
     if target_type == models.FeedbackTargetType.intent_assessment:
         job = db.query(JobRecord).filter(JobRecord.id == target_id).first()

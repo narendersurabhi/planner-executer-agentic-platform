@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from libs.core import (
     capability_search,
     capability_registry,
+    chat_routing_reranker,
     chat_contracts,
     document_store,
     execution_contracts,
@@ -5066,6 +5067,31 @@ def _workflow_candidate_titles(
     return titles
 
 
+def _rerank_chat_route_candidates(
+    *,
+    content: str,
+    candidate_goal: str,
+    candidates: Sequence[chat_contracts.ChatRouteCandidateDescriptor],
+) -> list[chat_contracts.ChatRouteCandidateDescriptor]:
+    serialized = [candidate.model_dump(mode="json") for candidate in candidates]
+    reranked = chat_routing_reranker.rerank_route_candidates(
+        query=_chat_boundary_query_text(content, candidate_goal),
+        candidates=serialized,
+        limit=len(serialized),
+    )
+    if not reranked:
+        return list(candidates)
+    reranked_candidates: list[chat_contracts.ChatRouteCandidateDescriptor] = []
+    for payload in reranked:
+        try:
+            reranked_candidates.append(
+                chat_contracts.ChatRouteCandidateDescriptor.model_validate(payload)
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    return reranked_candidates or list(candidates)
+
+
 def _build_chat_route_candidates(
     *,
     content: str,
@@ -5216,6 +5242,11 @@ def _build_chat_route_candidates(
             )
         )
 
+    candidates = _rerank_chat_route_candidates(
+        content=content,
+        candidate_goal=candidate_goal,
+        candidates=candidates,
+    )
     candidates.sort(
         key=lambda candidate: (
             -float(candidate.score or 0.0),

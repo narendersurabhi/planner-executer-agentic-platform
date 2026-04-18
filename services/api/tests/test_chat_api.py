@@ -3075,6 +3075,98 @@ def test_build_chat_route_request_includes_ranked_workflow_candidates() -> None:
     )
 
 
+def test_build_chat_route_request_applies_feedback_reranking_to_workflow_candidates(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main, "_chat_visible_capabilities", lambda: [])
+    monkeypatch.setattr(
+        main,
+        "_normalize_goal_intent",
+        lambda goal, **_kwargs: main.workflow_contracts.NormalizedIntentEnvelope(
+            goal=goal,
+            profile=main.workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                confidence=0.92,
+                threshold=0.55,
+                risk_level="bounded_write",
+            ),
+            graph=main.workflow_contracts.IntentGraph(
+                segments=[main.workflow_contracts.IntentGraphSegment(id="s1", intent="generate")]
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_retrieve_chat_workflow_candidates",
+        lambda **_kwargs: [
+            main.chat_contracts.ChatRouteCandidateDescriptor(
+                candidate_id="workflow:preferred",
+                candidate_type=main.chat_contracts.ChatRouteCandidateType.workflow,
+                family="workflow",
+                risk_tier="bounded_write",
+                preconditions=["published_workflow_available"],
+                input_keys=[],
+                cost_class=main.chat_contracts.ChatRouteCostClass.medium,
+                enabled=True,
+                score=41.0,
+                reason_codes=["workflow_token_overlap"],
+                description="Release readiness workflow",
+                route=main.chat_contracts.ChatRouteType.run_workflow,
+                metadata={"title": "Release readiness workflow", "version_id": "preferred"},
+            ),
+            main.chat_contracts.ChatRouteCandidateDescriptor(
+                candidate_id="workflow:other",
+                candidate_type=main.chat_contracts.ChatRouteCandidateType.workflow,
+                family="workflow",
+                risk_tier="bounded_write",
+                preconditions=["published_workflow_available"],
+                input_keys=[],
+                cost_class=main.chat_contracts.ChatRouteCostClass.medium,
+                enabled=True,
+                score=47.0,
+                reason_codes=["workflow_token_overlap"],
+                description="Release workflow",
+                route=main.chat_contracts.ChatRouteType.run_workflow,
+                metadata={"title": "Release workflow", "version_id": "other"},
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        main.chat_routing_reranker,
+        "load_feedback_rows",
+        lambda path=None: [
+            {
+                "query": "Run release readiness workflow",
+                "selected_positive_ids": ["workflow:preferred"],
+                "selected_negative_ids": [],
+                "hard_negative_ids": ["workflow:other"],
+                "selected_candidate_type": "workflow",
+                "feedback_label": "positive",
+                "fallback_used": False,
+            }
+        ],
+    )
+
+    route_request = main._build_chat_route_request(
+        content="Run release readiness workflow",
+        candidate_goal="Run release readiness workflow",
+        session_metadata={},
+        merged_context={},
+        messages=[],
+    )
+
+    workflow_candidates = [
+        candidate
+        for candidate in route_request.routing_evidence.retrieved_candidates
+        if candidate.candidate_type == main.chat_contracts.ChatRouteCandidateType.workflow
+    ]
+
+    assert workflow_candidates[0].candidate_id == "workflow:preferred"
+    assert any(
+        code.startswith("routing_rerank_positive=") for code in workflow_candidates[0].reason_codes
+    )
+
+
 def test_chat_turn_can_run_retrieved_workflow_candidate_without_explicit_reference(
     monkeypatch,
 ) -> None:

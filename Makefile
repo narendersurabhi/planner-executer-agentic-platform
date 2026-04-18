@@ -3,8 +3,10 @@
 	eval-capability-search eval-capability-search-gate \
 	eval-chat-boundary-live \
 	build-capability-feedback \
+	build-chat-routing-feedback \
 	build-intent-tuning-candidates \
 	build-capability-reranker-dataset \
+	build-chat-routing-reranker-dataset \
 	eval-capability-feedback \
 	k8s-apply k8s-delete k8s-apply-local k8s-delete-local \
 	k8s-apply-observability k8s-delete-observability \
@@ -207,11 +209,17 @@ eval-chat-clarification-gate:
 build-capability-feedback:
 	PYTHONPATH=. python3 scripts/build_capability_search_feedback.py --source auto --output artifacts/evals/capability_search_feedback.jsonl
 
+build-chat-routing-feedback:
+	PYTHONPATH=. python3 scripts/build_chat_routing_feedback.py --output artifacts/evals/chat_routing_feedback.jsonl --training-output training/chat_routing_reranker_train.jsonl
+
 build-intent-tuning-candidates:
 	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/build_intent_tuning_candidates.py --jsonl-output artifacts/evals/intent_tuning_candidates.jsonl --yaml-output artifacts/evals/intent_tuning_candidates.yaml
 
 build-capability-reranker-dataset:
 	PYTHONPATH=. python3 training/build_capability_reranker_dataset.py --feedback artifacts/evals/capability_search_feedback.jsonl --output training/capability_reranker_train.jsonl
+
+build-chat-routing-reranker-dataset:
+	PYTHONPATH=. python3 training/build_chat_routing_reranker_dataset.py --feedback artifacts/evals/chat_routing_feedback.jsonl --output training/chat_routing_reranker_train.jsonl
 
 eval-capability-feedback:
 	PYTHONPATH=. python3 scripts/eval_capability_search_feedback.py --feedback artifacts/evals/capability_search_feedback.jsonl --output artifacts/evals/capability_search_feedback_report.json
