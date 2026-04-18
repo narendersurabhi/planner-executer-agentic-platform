@@ -213,7 +213,7 @@ class OpenAIChatCompletionsProvider(LLMProvider):
             payload["temperature"] = request.temperature
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
-        if request.metadata:
+        if request.metadata and "generativelanguage.googleapis.com" not in self.base_url:
             payload["metadata"] = {
                 str(key): str(value) for key, value in request.metadata.items()
             }

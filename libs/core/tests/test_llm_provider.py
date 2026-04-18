@@ -156,6 +156,36 @@ def test_openai_chat_completions_provider_builds_messages_payload() -> None:
         ],
         "temperature": 0.1,
         "max_tokens": 42,
+    }
+
+
+def test_openai_chat_completions_provider_keeps_metadata_for_non_gemini_base_url() -> None:
+    provider = OpenAIChatCompletionsProvider(
+        api_key="test-key",
+        model="gpt-4.1-mini",
+        base_url="https://api.openai.com/v1",
+        temperature=0.3,
+        max_output_tokens=128,
+    )
+
+    payload = provider._build_payload(  # type: ignore[attr-defined]
+        LLMRequest(
+            prompt="hello",
+            system_prompt="system message",
+            temperature=0.1,
+            max_output_tokens=42,
+            metadata={"component": "planner"},
+        )
+    )
+
+    assert payload == {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": "system message"},
+            {"role": "user", "content": "hello"},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 42,
         "metadata": {"component": "planner"},
     }
 

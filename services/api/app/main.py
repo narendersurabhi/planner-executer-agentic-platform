@@ -3887,48 +3887,51 @@ def _chat_clarification_turn_plan(
 def _chat_boundary_failure_response(
     *,
     content: str,
+    candidate_goal: str,
     session_metadata: Mapping[str, Any] | None = None,
+    merged_context: Mapping[str, Any] | None = None,
     pending_clarification: bool,
 ) -> dict[str, Any]:
-    if pending_clarification:
-        return _chat_clarification_turn_plan(
-            goal=content.strip(),
-            clarification_questions=[
-                "I can either continue the current workflow request or answer here in chat. Tell me which one you want."
-            ],
-            session_metadata=session_metadata,
-            source="chat_boundary_failure",
-        )
-    return _chat_response_turn_plan(
-        goal=content.strip(),
-        assistant_content=_fallback_chat_response(content),
-        source="chat_boundary_failure",
+    fallback = _fallback_chat_turn_route(
+        content=content,
+        candidate_goal=candidate_goal,
+        session_metadata=session_metadata,
+        merged_context=merged_context,
     )
+    assessment = dict(fallback.get("goal_intent_profile") or {})
+    assessment["source"] = "chat_boundary_fallback"
+    assessment["routing_fallback_reason"] = "boundary_decision_failed"
+    if pending_clarification:
+        assessment["pending_clarification"] = True
+    fallback["goal_intent_profile"] = (
+        workflow_contracts.dump_goal_intent_profile(assessment) or assessment
+    )
+    return fallback
 
 
 def _chat_router_failure_response(
     *,
     content: str,
+    candidate_goal: str,
     session_metadata: Mapping[str, Any] | None = None,
+    merged_context: Mapping[str, Any] | None = None,
     pending_clarification: bool,
 ) -> dict[str, Any]:
-    if pending_clarification:
-        return _chat_clarification_turn_plan(
-            goal=content.strip(),
-            clarification_questions=[
-                "I could not determine how to continue the current workflow request. Reply with the missing detail, or say you want the answer here in chat."
-            ],
-            session_metadata=session_metadata,
-            source="chat_router_failure",
-        )
-    return _chat_response_turn_plan(
-        goal=content.strip(),
-        assistant_content=(
-            "I could not determine a safe execution route for that request. "
-            "Rephrase the task, or ask me to answer here in chat instead."
-        ),
-        source="chat_router_failure",
+    fallback = _fallback_chat_turn_route(
+        content=content,
+        candidate_goal=candidate_goal,
+        session_metadata=session_metadata,
+        merged_context=merged_context,
     )
+    assessment = dict(fallback.get("goal_intent_profile") or {})
+    assessment["source"] = "chat_router_fallback"
+    assessment["routing_fallback_reason"] = "chat_router_failed"
+    if pending_clarification:
+        assessment["pending_clarification"] = True
+    fallback["goal_intent_profile"] = (
+        workflow_contracts.dump_goal_intent_profile(assessment) or assessment
+    )
+    return fallback
 
 
 def _goal_intent_segments_from_metadata(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
@@ -4209,7 +4212,9 @@ def _route_chat_turn(
     if boundary is None:
         return _chat_boundary_failure_response(
             content=content,
+            candidate_goal=candidate_goal,
             session_metadata=session_metadata,
+            merged_context=merged_context,
             pending_clarification=pending_clarification,
         )
     boundary = _postprocess_chat_boundary_decision(boundary, content=content)
@@ -4282,7 +4287,9 @@ def _route_chat_turn(
         )
     return _chat_boundary_failure_response(
         content=content,
+        candidate_goal=candidate_goal,
         session_metadata=session_metadata,
+        merged_context=merged_context,
         pending_clarification=pending_clarification,
     )
 
@@ -4467,7 +4474,9 @@ def _route_chat_turn_with_router(
     if _chat_router_provider is None:
         return _chat_router_failure_response(
             content=content,
+            candidate_goal=candidate_goal,
             session_metadata=session_metadata,
+            merged_context=merged_context,
             pending_clarification=pending_clarification,
         )
     try:
@@ -4513,7 +4522,9 @@ def _route_chat_turn_with_router(
         logger.exception("chat_router_failed")
         return _chat_router_failure_response(
             content=content,
+            candidate_goal=candidate_goal,
             session_metadata=session_metadata,
+            merged_context=merged_context,
             pending_clarification=pending_clarification,
         )
 
@@ -4630,6 +4641,10 @@ def _build_chat_router_prompt(
     merged_context: Mapping[str, Any] | None,
     messages: Sequence[chat_contracts.ChatMessage] | None,
 ) -> str:
+    heuristic = _chat_route_goal_intent_profile(
+        _normalize_goal_intent(candidate_goal).profile,
+        goal=candidate_goal,
+    )
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     recent_messages: list[dict[str, str]] = []
     for message in list(messages or [])[-6:]:
@@ -4639,20 +4654,73 @@ def _build_chat_router_prompt(
                 "content": str(message.content or "")[:500],
             }
         )
-    direct_capabilities = [
-        {
-            "id": capability_id,
-            "description": _chat_direct_capability_description(capability_id),
-        }
-        for capability_id in sorted(CHAT_DIRECT_CAPABILITIES)
-    ]
+    direct_capabilities: list[dict[str, Any]] = []
+    registry = None
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        registry = None
+    for capability_id in sorted(CHAT_DIRECT_CAPABILITIES):
+        spec = None
+        capabilities = getattr(registry, "capabilities", {}) if registry is not None else {}
+        if isinstance(capabilities, Mapping):
+            spec = capabilities.get(capability_id)
+        if spec is not None and not bool(getattr(spec, "enabled", True)):
+            continue
+        try:
+            allow_decision = capability_registry.evaluate_capability_allowlist(
+                capability_id,
+                "api",
+            )
+        except Exception:  # noqa: BLE001
+            allow_decision = None
+        if allow_decision is not None and not allow_decision.allowed:
+            continue
+        direct_capabilities.append(
+            {
+                "id": capability_id,
+                "description": _chat_direct_capability_description(capability_id),
+                "family": str(getattr(spec, "group", "") or "").strip(),
+                "subgroup": str(getattr(spec, "subgroup", "") or "").strip(),
+                "risk_tier": str(getattr(spec, "risk_tier", "read_only") or "read_only"),
+                "candidate_type": "direct_capability",
+            }
+        )
+    recommended_fallback_route = "respond"
+    if workflow_invocation is not None:
+        recommended_fallback_route = "run_workflow"
+    elif bool(heuristic.requires_blocking_clarification):
+        recommended_fallback_route = "ask_clarification"
+    elif not _looks_like_conversational_turn(content):
+        recommended_fallback_route = "submit_job"
     payload = {
         "current_user_message": content,
         "candidate_goal": candidate_goal,
         "pending_clarification": pending_clarification,
         "context_json": dict(merged_context or {}),
         "recent_messages": recent_messages,
-        "direct_capabilities": direct_capabilities,
+        "routing_evidence": {
+            "intent": str(heuristic.intent or ""),
+            "risk_level": str(heuristic.risk_level or ""),
+            "needs_clarification": bool(heuristic.needs_clarification),
+            "missing_slots": list(heuristic.missing_slots or []),
+            "blocking_slots": list(heuristic.blocking_slots or []),
+            "workflow_target_available": workflow_invocation is not None,
+            "recommended_fallback_route": recommended_fallback_route,
+        },
+        "route_candidates": {
+            "direct_capabilities": direct_capabilities,
+            "generic_execution_path": {
+                "candidate_type": "generic_execution_path",
+                "route": "submit_job",
+                "description": "Use the planner/executor workflow when execution is needed but no published workflow target is available.",
+            },
+            "published_workflow_path": {
+                "candidate_type": "published_workflow",
+                "route": "run_workflow",
+                "target_available": workflow_invocation is not None,
+            },
+        },
         "response_schema": {
             "route": "respond | tool_call | ask_clarification | submit_job | run_workflow",
             "assistant_response": "string",
@@ -4683,7 +4751,7 @@ def _build_chat_router_prompt(
         "Decide whether this turn should stay conversational or become a workflow request.\n"
         "Rules:\n"
         "- respond: answer normally, no workflow/job needed.\n"
-        "- tool_call: execute exactly one safe read-only capability from direct_capabilities as a synchronous one-step run.\n"
+        "- tool_call: execute exactly one safe read-only capability from route_candidates.direct_capabilities as a synchronous one-step run.\n"
         "- run_workflow: invoke the referenced published Studio workflow from workflow_context.\n"
         "- ask_clarification: workflow is needed, but essential details are missing.\n"
         "- submit_job: workflow/job should be created now.\n"
@@ -4692,6 +4760,8 @@ def _build_chat_router_prompt(
         "- Use tool_call only when one direct capability is sufficient and a single synchronous run is enough.\n"
         "- Use run_workflow only when workflow_context.target_available is true.\n"
         "- Prefer run_workflow over submit_job when the user wants to run an already-published Studio workflow.\n"
+        "- If the request is execution-oriented and the exact target is uncertain, prefer ask_clarification or submit_job. Do not fall back to respond.\n"
+        "- If your preferred route is invalid, use routing_evidence.recommended_fallback_route.\n"
         "- Return JSON only.\n\n"
         f"{json.dumps(payload, ensure_ascii=True)}"
     )
@@ -5402,14 +5472,10 @@ def _normalize_chat_route(
     heuristic = _normalize_goal_intent(candidate_goal).profile
     heuristic = _chat_route_goal_intent_profile(heuristic, goal=candidate_goal)
     route = str(parsed.get("route") or parsed.get("type") or "").strip().lower()
-    if route not in {"respond", "tool_call", "ask_clarification", "submit_job", "run_workflow"}:
-        route = "respond"
+    route_recognized = route in {"respond", "tool_call", "ask_clarification", "submit_job", "run_workflow"}
+    if not route_recognized:
+        route = ""
     capability_id = str(parsed.get("capability_id") or "").strip()
-    if route == "tool_call" and capability_id not in CHAT_DIRECT_CAPABILITIES:
-        route = "respond"
-        capability_id = ""
-    if route == "run_workflow" and not workflow_invocation_available:
-        route = "respond"
     arguments = dict(parsed.get("arguments")) if isinstance(parsed.get("arguments"), Mapping) else {}
 
     intent = str(parsed.get("intent") or heuristic.intent or "").strip().lower()
@@ -5462,27 +5528,47 @@ def _normalize_chat_route(
     low_confidence = confidence < threshold
     if route != "respond" and low_confidence and "intent_action" in blocking_slots and "intent_action" not in missing_slots:
         missing_slots.append("intent_action")
-    if route == "tool_call" and (missing_slots or risk_level != "read_only"):
-        route = "respond"
-    if route == "submit_job" and missing_slots:
-        route = "ask_clarification"
+    conversational_turn = _looks_like_conversational_turn(content)
+    execution_oriented = bool(intent and intent not in {"other", "inform", "clarify"}) or not conversational_turn
     clarification_questions = [
         str(question).strip()
         for question in parsed.get("clarification_questions", [])
         if isinstance(question, str) and question.strip()
     ]
     assistant_response = str(parsed.get("assistant_response") or "").strip()
+    if not route:
+        if missing_slots:
+            route = "ask_clarification"
+        elif execution_oriented:
+            route = "submit_job"
+        else:
+            route = "respond"
+    if route == "tool_call" and capability_id not in CHAT_DIRECT_CAPABILITIES:
+        route = "ask_clarification" if missing_slots else ("submit_job" if execution_oriented else "respond")
+        capability_id = ""
+    if route == "tool_call" and (missing_slots or risk_level != "read_only"):
+        route = "ask_clarification" if missing_slots else ("submit_job" if execution_oriented else "respond")
+    if route == "run_workflow" and not workflow_invocation_available:
+        route = "ask_clarification"
+        if not clarification_questions:
+            clarification_questions = [
+                "Which published workflow should I run? Provide workflow_trigger_id, workflow_version_id, or workflow_definition_id."
+            ]
+    if route == "submit_job" and missing_slots:
+        route = "ask_clarification"
     if (
         route == "respond"
         and (
             clarification_questions
             or (
                 missing_slots
-                and not _looks_like_conversational_turn(content)
+                and not conversational_turn
             )
         )
     ):
         route = "ask_clarification"
+    if route == "respond" and not assistant_response and execution_oriented:
+        route = "ask_clarification" if missing_slots else "submit_job"
     if route == "ask_clarification" and not clarification_questions:
         clarification_questions = [
             str(question).strip()
@@ -5503,7 +5589,7 @@ def _normalize_chat_route(
         clarification_questions = []
     assessment = {
         "intent": intent,
-        "source": "llm_chat_router",
+        "source": "llm_chat_router" if route_recognized else "chat_router_deterministic_fallback",
         "confidence": round(confidence, 3),
         "risk_level": risk_level,
         "threshold": threshold,
@@ -5515,6 +5601,7 @@ def _normalize_chat_route(
         "missing_slots": missing_slots,
         "slot_values": slot_values,
         "clarification_mode": "llm_targeted_slot_filling",
+        "routing_fallback_reason": None if route_recognized else "invalid_or_missing_route",
     }
     return {
         "type": route,

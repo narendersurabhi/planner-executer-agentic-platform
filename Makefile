@@ -1,6 +1,7 @@
 .PHONY: up up-workers down lint format typecheck test schemas eval-intent eval-intent-gate \
 	eval-chat-clarification eval-chat-clarification-gate \
 	eval-capability-search eval-capability-search-gate \
+	eval-chat-boundary-live \
 	build-capability-feedback \
 	build-intent-tuning-candidates \
 	build-capability-reranker-dataset \
@@ -110,12 +111,14 @@ k8s-up-local:
 	IMAGE_REGISTRY=localhost:5001 IMAGE_OWNER=localhost IMAGE_TAG=$(LOCAL_IMAGE_TAG) $(MAKE) images-push
 	$(MAKE) k8s-apply-local
 	IMAGE_TAG=$(LOCAL_IMAGE_TAG) $(MAKE) k8s-pin-local-images
+	kubectl rollout status deployment/postgres -n awe --timeout=180s
+	kubectl rollout status deployment/redis -n awe --timeout=180s
+	kubectl rollout status deployment/qdrant -n awe --timeout=180s
 	kubectl rollout status deployment/api -n awe --timeout=180s
 	kubectl rollout status deployment/planner -n awe --timeout=180s
 	kubectl rollout status deployment/policy -n awe --timeout=180s
 	kubectl rollout status deployment/worker -n awe --timeout=180s
 	kubectl rollout status deployment/coder -n awe --timeout=180s
-	kubectl rollout status deployment/qdrant -n awe --timeout=180s
 	kubectl rollout status deployment/rag-retriever-mcp -n awe --timeout=180s
 	kubectl rollout status deployment/ui -n awe --timeout=180s
 
@@ -127,12 +130,14 @@ clear-local-registry:
 
 k8s-restart-local:
 	kubectl rollout restart deployment -n awe api planner policy worker coder qdrant rag-retriever-mcp ui
+	kubectl rollout status deployment/postgres -n awe --timeout=180s
+	kubectl rollout status deployment/redis -n awe --timeout=180s
+	kubectl rollout status deployment/qdrant -n awe --timeout=180s
 	kubectl rollout status deployment/api -n awe --timeout=180s
 	kubectl rollout status deployment/planner -n awe --timeout=180s
 	kubectl rollout status deployment/policy -n awe --timeout=180s
 	kubectl rollout status deployment/worker -n awe --timeout=180s
 	kubectl rollout status deployment/coder -n awe --timeout=180s
-	kubectl rollout status deployment/qdrant -n awe --timeout=180s
 	kubectl rollout status deployment/rag-retriever-mcp -n awe --timeout=180s
 	kubectl rollout status deployment/ui -n awe --timeout=180s
 
@@ -186,6 +191,9 @@ eval-chat-boundary:
 
 eval-chat-boundary-gate:
 	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary.py --gold eval/chat_boundary_gold.yaml --min-accuracy 0.95 --max-false-chat-reply-rate 0.05 --min-pending-continuation-rate 0.95 --max-active-family-drift-rate 0.05
+
+eval-chat-boundary-live:
+	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_boundary_live.py --gold eval/chat_boundary_live_regression.yaml --verbose
 
 eval-chat-clarification:
 	PYTHONPATH=. uv run $(UV_EVAL_DEPS) python3 scripts/eval_chat_clarification.py --gold eval/chat_clarification_mapping_gold.yaml --verbose

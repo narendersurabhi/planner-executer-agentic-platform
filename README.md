@@ -303,6 +303,12 @@ Run locally:
 make eval-chat-boundary
 ```
 
+Run the live staging-style regression against an API environment:
+
+```bash
+make eval-chat-boundary-live
+```
+
 CI gate (thresholded):
 
 ```bash

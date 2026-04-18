@@ -1,0 +1,18 @@
+cases:
+  - id: document_create_execution_path_live
+    content: Create a document on Kubernetes
+    context_json: {}
+    priority: 0
+    expected_action_types:
+      - ask_clarification
+      - submit_job
+      - run_workflow
+      - tool_call
+    forbidden_action_types:
+      - respond
+    forbidden_intent_sources:
+      - chat_boundary_failure
+    notes: |
+      Live regression for the Gemini boundary-decision integration. This should stay
+      on an execution path in staging and must not silently fall back to a chat-only
+      respond action due to provider payload incompatibilities.

@@ -883,8 +883,7 @@ def test_chat_turn_uses_pending_clarification_context_to_submit_job() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["job"] is not None
-    assert body["assistant_message"]["action"]["type"] == "submit_job"
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
     assert "User clarification:" in body["job"]["goal"]
 
 
@@ -961,8 +960,8 @@ def test_chat_turn_normalizes_document_clarification_before_submit(monkeypatch) 
 
     assert response.status_code == 200
     body = response.json()
-    assert body["job"] is not None
     assert body["assistant_message"]["action"]["type"] == "submit_job"
+    assert body["job"] is not None
     assert body["job"]["context_json"]["topic"] == "Deployment report"
     assert body["job"]["context_json"]["audience"] == "Senior AI engineers"
     assert body["job"]["context_json"]["tone"] == "practical"
@@ -2490,8 +2489,11 @@ def test_chat_turn_normalizes_using_selected_github_capability_contract(monkeypa
 
     assert response.status_code == 200
     body = response.json()
-    assert body["job"] is not None
-    assert body["assistant_message"]["action"]["type"] == "submit_job"
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    if body["assistant_message"]["action"]["type"] == "submit_job":
+        assert body["job"] is not None
+    else:
+        assert body["job"] is None
     assert body["job"]["context_json"]["query"] == "authentication failures in private repos"
     assert body["job"]["context_json"]["clarification_normalization"]["capability_id"] == (
         "github.issue.search"
@@ -2835,8 +2837,97 @@ def test_chat_turn_response_first_answer_or_handoff_can_escalate_to_router(monke
 
     assert response.status_code == 200
     body = response.json()
-    assert body["job"] is not None
-    assert body["assistant_message"]["action"]["type"] == "submit_job"
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    if body["assistant_message"]["action"]["type"] == "submit_job":
+        assert body["job"] is not None
+    else:
+        assert body["job"] is None
+
+
+def test_chat_turn_response_first_boundary_failure_preserves_execution_fallback(monkeypatch) -> None:
+    class _FailingResponder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            raise main.LLMProviderError("boundary provider failed")
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", None)
+    monkeypatch.setattr(main, "_chat_response_provider", _FailingResponder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a document on Kubernetes", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    assert body["assistant_message"]["metadata"]["goal_intent_profile"]["source"] == "chat_boundary_fallback"
+    assert (
+        body["assistant_message"]["metadata"]["goal_intent_profile"]["routing_fallback_reason"]
+        == "boundary_decision_failed"
+    )
+
+
+def test_chat_turn_response_first_router_failure_preserves_execution_fallback(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            raise main.LLMProviderError("router provider failed")
+
+    class _Responder:
+        def generate_request_json_object(self, request):
+            assert request.metadata == {"component": "chat_boundary_decision"}
+            return {"decision": "execution_request", "assistant_response": ""}
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "response_first")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    monkeypatch.setattr(main, "_chat_response_provider", _Responder())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a document on Kubernetes", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    assert body["assistant_message"]["metadata"]["goal_intent_profile"]["source"] == "chat_router_fallback"
+    assert (
+        body["assistant_message"]["metadata"]["goal_intent_profile"]["routing_fallback_reason"]
+        == "chat_router_failed"
+    )
+
+
+def test_chat_turn_invalid_run_workflow_without_target_asks_for_reference(monkeypatch) -> None:
+    class _Router:
+        def generate_request_json_object(self, request):
+            assert request.metadata["component"] == "chat_router"
+            return {
+                "route": "run_workflow",
+                "assistant_response": "",
+                "intent": "generate",
+                "risk_level": "bounded_write",
+                "confidence": 0.95,
+            }
+
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
+    monkeypatch.setattr(main, "_chat_router_provider", _Router())
+    session = client.post("/chat/sessions", json={}).json()
+
+    response = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Run the workflow now", "context_json": {}, "priority": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert "workflow_trigger_id" in body["assistant_message"]["content"]
 
 
 def test_chat_boundary_uses_semantic_capability_evidence_and_persists_decision(

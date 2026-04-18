@@ -118,6 +118,7 @@ GITHUB_CLASSIC_TOKEN=$(grep -E '^GITHUB_CLASSIC_TOKEN=' .env | cut -d= -f2-)
 GITHUB_TOKEN=$(grep -E '^GITHUB_TOKEN=' .env | cut -d= -f2-)
 AWS_ACCESS_KEY_ID=$(grep -E '^AWS_ACCESS_KEY_ID=' .env | cut -d= -f2-)
 AWS_SECRET_ACCESS_KEY=$(grep -E '^AWS_SECRET_ACCESS_KEY=' .env | cut -d= -f2-)
+GEMINI_API_KEY=$(grep -E '^GEMINI_API_KEY=' .env | cut -d= -f2-)
 
 if [[ -n "$GITHUB_CLASSIC_TOKEN" ]]; then
   GITHUB_TOKEN="$GITHUB_CLASSIC_TOKEN"
@@ -133,4 +134,5 @@ kubectl create secret generic awe-secrets \
   --from-literal=GITHUB_TOKEN="$GITHUB_TOKEN" \
   --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   --from-literal=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+  --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
   --dry-run=client -o yaml | kubectl apply -n awe -f -
