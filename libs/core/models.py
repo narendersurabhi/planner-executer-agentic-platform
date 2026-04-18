@@ -292,6 +292,10 @@ class PlanRevisionContext(BaseModel):
     trigger_reason: Optional[str] = None
     selected_strategy: Optional[ReplanStrategy] = None
     strategy_reason: Optional[str] = None
+    preserved_task_ids: List[str] = Field(default_factory=list)
+    preserved_task_names: List[str] = Field(default_factory=list)
+    replacement_task_ids: List[str] = Field(default_factory=list)
+    replacement_task_names: List[str] = Field(default_factory=list)
     completed_steps: List[CompletedStepContext] = Field(default_factory=list)
     failed_step: Optional[FailedStepContext] = None
     remaining_goals: List[str] = Field(default_factory=list)
@@ -391,6 +395,7 @@ class JobDetails(BaseModel):
     revision_history: List[PlanRevisionSummary] = Field(default_factory=list)
     last_replan_reason: Optional[str] = None
     revision_context: Optional[PlanRevisionContext] = None
+    revision_task_annotations: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     recovery_metadata: Dict[str, Any] = Field(default_factory=dict)
     goal_intent_profile: Dict[str, Any] = Field(default_factory=dict)
     goal_intent_graph: Optional[Dict[str, Any]] = None

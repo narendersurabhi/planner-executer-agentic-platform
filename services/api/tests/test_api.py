@@ -20,7 +20,9 @@ from services.api.app.models import (
     InvocationRecord,
     JobRecord,
     PlanRecord,
+    RunRecord,
     RunEventRecord,
+    RunStepRecord,
     StepAttemptRecord,
     TaskRecord,
     TaskResultRecord,
@@ -2332,6 +2334,87 @@ def _create_adaptive_replan_failure_fixture(
     }
 
 
+def _seed_run_history_for_replan_fixture(fixture: dict[str, str]) -> str:
+    now = _utcnow()
+    run_id = fixture["job_id"]
+    with SessionLocal() as db:
+        job = db.query(JobRecord).filter(JobRecord.id == fixture["job_id"]).first()
+        assert job is not None
+        db.add(
+            RunRecord(
+                id=run_id,
+                kind=models.RunKind.planner.value,
+                title=job.goal,
+                goal=job.goal,
+                requested_context_json={},
+                status=job.status,
+                job_id=job.id,
+                workflow_run_id=None,
+                plan_id=fixture["plan_id"],
+                source_definition_id=None,
+                source_version_id=None,
+                source_trigger_id=None,
+                user_id=None,
+                run_spec_json={},
+                metadata_json={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.add(
+            RunStepRecord(
+                id=fixture["completed_task_id"],
+                run_id=run_id,
+                job_id=fixture["job_id"],
+                plan_id=fixture["plan_id"],
+                spec_step_id="collect-input",
+                name="CollectInput",
+                description="Collect input",
+                instruction="Collect input",
+                status=models.TaskStatus.completed.value,
+                intent="io",
+                capability_request_id="filesystem.workspace.list",
+                execution_request_id=None,
+                capability_id="filesystem.workspace.list",
+                input_bindings_json={},
+                execution_gate_json=None,
+                retry_policy_json={},
+                acceptance_policy_json={},
+                depends_on_json=[],
+                metadata_json={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.add(
+            RunStepRecord(
+                id=fixture["failed_task_id"],
+                run_id=run_id,
+                job_id=fixture["job_id"],
+                plan_id=fixture["plan_id"],
+                spec_step_id="call-service",
+                name="CallService",
+                description="Call service",
+                instruction="Call the transient service",
+                status=models.TaskStatus.running.value,
+                intent="io",
+                capability_request_id="filesystem.workspace.list",
+                execution_request_id=None,
+                capability_id="filesystem.workspace.list",
+                input_bindings_json={},
+                execution_gate_json=None,
+                retry_policy_json={},
+                acceptance_policy_json={},
+                depends_on_json=[fixture["completed_task_id"]],
+                metadata_json={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.commit()
+    return run_id
+
+
 def test_retry_exhausted_recoverable_failure_triggers_auto_replan_with_completed_context():
     fixture = _create_adaptive_replan_failure_fixture()
 
@@ -2445,6 +2528,206 @@ def test_adaptive_retry_exhausted_non_trigger_failures_do_not_replan():
             failed_task = db.query(TaskRecord).filter(TaskRecord.id == fixture["failed_task_id"]).first()
             assert failed_task is not None, label
             assert failed_task.status == models.TaskStatus.failed.value, label
+
+
+def test_retry_exhausted_replan_plan_created_preserves_completed_prefix_and_replaces_suffix():
+    fixture = _create_adaptive_replan_failure_fixture()
+    _seed_run_history_for_replan_fixture(fixture)
+
+    main._handle_task_failed(
+        {
+            "task_id": fixture["failed_task_id"],
+            "payload": {
+                "task_id": fixture["failed_task_id"],
+                "attempts": 3,
+                "error": "service unavailable: upstream temporary 503",
+            },
+        }
+    )
+
+    main._handle_plan_created(
+        {
+            "job_id": fixture["job_id"],
+            "payload": {
+                "job_id": fixture["job_id"],
+                "planner_version": "replan-v2",
+                "tasks_summary": "preserve input collection and replace the service call",
+                "dag_edges": [],
+                "tasks": [
+                    {
+                        "name": "CallServiceWithFallback",
+                        "description": "Call the service with a fallback path",
+                        "instruction": "Call the transient service with fallback handling.",
+                        "acceptance_criteria": ["service called"],
+                        "expected_output_schema_ref": "schemas/unknown",
+                        "deps": ["CollectInput"],
+                        "tool_requests": ["filesystem.workspace.list"],
+                        "tool_inputs": {"filesystem.workspace.list": {}},
+                        "critic_required": False,
+                    }
+                ],
+            },
+        }
+    )
+
+    details_response = client.get(f"/jobs/{fixture['job_id']}/details")
+    assert details_response.status_code == 200
+    details = details_response.json()
+    task_names = [task["name"] for task in details["tasks"]]
+    assert task_names == ["CollectInput", "CallServiceWithFallback"]
+    collect_input = next(task for task in details["tasks"] if task["name"] == "CollectInput")
+    replacement = next(task for task in details["tasks"] if task["name"] == "CallServiceWithFallback")
+    assert collect_input["id"] == fixture["completed_task_id"]
+    assert collect_input["status"] == models.TaskStatus.completed.value
+    assert replacement["status"] == models.TaskStatus.ready.value
+    assert details["plan"]["dag_edges"] == [["CollectInput", "CallServiceWithFallback"]]
+    assert details["revision_context"]["preserved_task_ids"] == [fixture["completed_task_id"]]
+    assert details["revision_context"]["preserved_task_names"] == ["CollectInput"]
+    assert details["revision_context"]["replacement_task_names"] == ["CallServiceWithFallback"]
+    assert details["revision_task_annotations"][fixture["completed_task_id"]]["merge_role"] == "preserved_prefix"
+    assert details["revision_task_annotations"][replacement["id"]]["merge_role"] == "replacement_suffix"
+
+    debugger_response = client.get(f"/jobs/{fixture['job_id']}/debugger")
+    assert debugger_response.status_code == 200
+    debugger = debugger_response.json()
+    debugger_tasks = {entry["task"]["name"]: entry for entry in debugger["tasks"]}
+    assert debugger_tasks["CollectInput"]["revision_merge"]["merge_role"] == "preserved_prefix"
+    assert debugger_tasks["CallServiceWithFallback"]["revision_merge"]["merge_role"] == "replacement_suffix"
+
+    with SessionLocal() as db:
+        preserved_step = db.query(RunStepRecord).filter(RunStepRecord.id == fixture["completed_task_id"]).first()
+        superseded_step = db.query(RunStepRecord).filter(RunStepRecord.id == fixture["failed_task_id"]).first()
+        assert preserved_step is not None
+        assert preserved_step.plan_id == details["plan"]["id"]
+        assert preserved_step.metadata_json["revision_merge"]["merge_role"] == "preserved_prefix"
+        assert "superseded_at" not in preserved_step.metadata_json
+        assert superseded_step is not None
+        assert superseded_step.plan_id == fixture["plan_id"]
+        assert superseded_step.status == models.TaskStatus.canceled.value
+        assert superseded_step.metadata_json["revision_merge"]["merge_role"] == "superseded_suffix"
+        assert superseded_step.metadata_json["superseded_reason"] == "retry_exhausted_auto_repair"
+
+
+def test_retry_exhausted_replan_multiple_revisions_keep_completed_prefix_stable():
+    fixture = _create_adaptive_replan_failure_fixture(max_replans=3)
+
+    main._handle_task_failed(
+        {
+            "task_id": fixture["failed_task_id"],
+            "payload": {
+                "task_id": fixture["failed_task_id"],
+                "attempts": 3,
+                "error": "service unavailable: upstream temporary 503",
+            },
+        }
+    )
+
+    main._handle_plan_created(
+        {
+            "job_id": fixture["job_id"],
+            "payload": {
+                "job_id": fixture["job_id"],
+                "planner_version": "replan-v2",
+                "tasks_summary": "replace the service call with a fallback",
+                "dag_edges": [],
+                "tasks": [
+                    {
+                        "name": "CallServiceWithFallback",
+                        "description": "Call the service with a fallback path",
+                        "instruction": "Call the transient service with fallback handling.",
+                        "acceptance_criteria": ["service called"],
+                        "expected_output_schema_ref": "schemas/unknown",
+                        "deps": ["CollectInput"],
+                        "tool_requests": ["filesystem.workspace.list"],
+                        "tool_inputs": {"filesystem.workspace.list": {}},
+                        "critic_required": False,
+                    }
+                ],
+            },
+        }
+    )
+
+    with SessionLocal() as db:
+        first_replacement = (
+            db.query(TaskRecord)
+            .filter(
+                TaskRecord.job_id == fixture["job_id"],
+                TaskRecord.name == "CallServiceWithFallback",
+            )
+            .first()
+        )
+        assert first_replacement is not None
+        first_replacement.status = models.TaskStatus.running.value
+        first_replacement.attempts = 3
+        db.commit()
+        first_replacement_id = first_replacement.id
+
+    main._handle_task_failed(
+        {
+            "task_id": first_replacement_id,
+            "payload": {
+                "task_id": first_replacement_id,
+                "attempts": 3,
+                "error": "service unavailable: upstream temporary 503",
+            },
+        }
+    )
+
+    main._handle_plan_created(
+        {
+            "job_id": fixture["job_id"],
+            "payload": {
+                "job_id": fixture["job_id"],
+                "planner_version": "replan-v3",
+                "tasks_summary": "replace the fallback service call again",
+                "dag_edges": [],
+                "tasks": [
+                    {
+                        "name": "CallServiceWithBackup",
+                        "description": "Call the service with a backup path",
+                        "instruction": "Call the transient service with a second backup path.",
+                        "acceptance_criteria": ["service called"],
+                        "expected_output_schema_ref": "schemas/unknown",
+                        "deps": ["CollectInput"],
+                        "tool_requests": ["filesystem.workspace.list"],
+                        "tool_inputs": {"filesystem.workspace.list": {}},
+                        "critic_required": False,
+                    }
+                ],
+            },
+        }
+    )
+
+    details_response = client.get(f"/jobs/{fixture['job_id']}/details")
+    assert details_response.status_code == 200
+    details = details_response.json()
+    task_names = [task["name"] for task in details["tasks"]]
+    assert task_names == ["CollectInput", "CallServiceWithBackup"]
+    collect_input = next(task for task in details["tasks"] if task["name"] == "CollectInput")
+    replacement = next(task for task in details["tasks"] if task["name"] == "CallServiceWithBackup")
+    assert collect_input["id"] == fixture["completed_task_id"]
+    assert collect_input["status"] == models.TaskStatus.completed.value
+    assert replacement["status"] == models.TaskStatus.ready.value
+    assert details["current_revision_number"] == 3
+    assert len(details["revision_history"]) == 3
+    assert details["revision_context"]["preserved_task_ids"] == [fixture["completed_task_id"]]
+    assert details["revision_context"]["replacement_task_names"] == ["CallServiceWithBackup"]
+    assert details["revision_task_annotations"][fixture["completed_task_id"]]["merge_role"] == "preserved_prefix"
+    assert details["revision_task_annotations"][replacement["id"]]["merge_role"] == "replacement_suffix"
+
+    with SessionLocal() as db:
+        assert (
+            db.query(TaskRecord)
+            .filter(
+                TaskRecord.job_id == fixture["job_id"],
+                TaskRecord.name == "CollectInput",
+            )
+            .count()
+            == 1
+        )
+        prior_replacement = db.query(TaskRecord).filter(TaskRecord.id == first_replacement_id).first()
+        assert prior_replacement is not None
+        assert prior_replacement.status == models.TaskStatus.canceled.value
 
 
 def test_manual_replan_creates_plan_revision_history_without_deleting_prior_records(

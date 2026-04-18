@@ -1274,6 +1274,22 @@ def _recovery_metadata_from_metadata(metadata: Mapping[str, Any] | None) -> dict
     return {}
 
 
+def _active_revision_task_annotations_from_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    normalized = metadata if isinstance(metadata, Mapping) else {}
+    raw = normalized.get("active_revision_task_annotations")
+    if not isinstance(raw, Mapping):
+        return {}
+    annotations: dict[str, dict[str, Any]] = {}
+    for task_id, value in raw.items():
+        key = str(task_id or "").strip()
+        if not key or not isinstance(value, Mapping):
+            continue
+        annotations[key] = dict(value)
+    return annotations
+
+
 def _adaptive_strategy_decision_payload(
     decision: replan_controller.RecoveryDecision,
     *,
@@ -2075,6 +2091,30 @@ def _task_from_record(
         capability_bindings=capability_bindings,
         created_at=record.created_at,
         updated_at=record.updated_at,
+        critic_required=bool(record.critic_required),
+    )
+
+
+def _task_create_from_record(record: TaskRecord) -> models.TaskCreate:
+    intent = None
+    if isinstance(record.intent, str) and record.intent.strip():
+        try:
+            intent = models.ToolIntent(record.intent)
+        except ValueError:
+            intent = None
+    raw_tool_inputs = record.tool_inputs if isinstance(record.tool_inputs, dict) else {}
+    return models.TaskCreate(
+        name=record.name,
+        description=record.description,
+        instruction=record.instruction,
+        acceptance_criteria=list(record.acceptance_criteria or []),
+        expected_output_schema_ref=record.expected_output_schema_ref,
+        intent=intent,
+        deps=list(record.deps or []),
+        capability_requests=list(record.tool_requests or []),
+        tool_requests=list(record.tool_requests or []),
+        tool_inputs=execution_contracts.strip_execution_metadata_from_tool_inputs(raw_tool_inputs),
+        capability_bindings=_task_capability_bindings(record.tool_requests or [], raw_tool_inputs),
         critic_required=bool(record.critic_required),
     )
 
@@ -10007,9 +10047,16 @@ def _handle_plan_created(envelope: dict) -> None:
         job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
         job_goal = job.goal if job and isinstance(job.goal, str) else ""
         job_metadata = job.metadata_json if job and isinstance(job.metadata_json, dict) else {}
+        existing = _active_plan_record_for_job(db, job)
         pending_replan = (
             job_metadata.get("pending_replan") if isinstance(job_metadata.get("pending_replan"), Mapping) else None
         )
+        preserved_prefix_candidates = (
+            _completed_task_records_for_plan(db, existing)
+            if _should_preserve_completed_prefix_for_replan(pending_replan)
+            else []
+        )
+        effective_plan = _plan_with_preserved_prefix(plan, preserved_prefix_candidates)
         job_context = _preflight_job_context(
             db=db,
             goal_text=job_goal,
@@ -10018,7 +10065,7 @@ def _handle_plan_created(envelope: dict) -> None:
             surface="plan_created_preflight",
         )
         preflight_errors = _compile_plan_preflight(
-            plan,
+            effective_plan,
             job_context,
             goal_text=job_goal,
             normalized_intent_envelope=_normalized_intent_envelope_from_metadata(
@@ -10032,7 +10079,7 @@ def _handle_plan_created(envelope: dict) -> None:
         )
         preflight_errors = _merge_preflight_errors(
             preflight_errors,
-            _compile_plan_runtime_conformance_errors(plan),
+            _compile_plan_runtime_conformance_errors(effective_plan),
         )
         if preflight_errors:
             if job:
@@ -10052,7 +10099,6 @@ def _handle_plan_created(envelope: dict) -> None:
                 },
             )
             return
-        existing = _active_plan_record_for_job(db, job)
         if existing:
             if pending_replan is None:
                 plan_id = existing.id
@@ -10080,7 +10126,7 @@ def _handle_plan_created(envelope: dict) -> None:
             planner_version=plan.planner_version,
             created_at=now,
             tasks_summary=plan.tasks_summary,
-            dag_edges=plan.dag_edges,
+            dag_edges=effective_plan.dag_edges,
             policy_decision={},
         )
         db.add(record)
@@ -10088,10 +10134,27 @@ def _handle_plan_created(envelope: dict) -> None:
         plan_record_id = record.id
         selected_capabilities: set[str] = set()
         task_intent_profiles: dict[str, dict[str, Any]] = {}
+        revision_task_annotations: dict[str, dict[str, Any]] = {}
+        selected_strategy = _replan_strategy_from_pending_context(pending_replan)
+        preserved_tasks, preserved_annotations = _preserve_completed_prefix_for_replan(
+            db,
+            prior_plan_record=existing,
+            new_plan_record=record,
+            pending_replan=pending_replan,
+            occurred_at=now,
+        )
+        revision_task_annotations.update(preserved_annotations)
+        preserved_task_names = {
+            str(task.name or "").strip()
+            for task in preserved_tasks
+            if str(task.name or "").strip()
+        }
         goal_intent_segments = _goal_intent_segments_from_metadata(
             job.metadata_json if job and isinstance(job.metadata_json, dict) else {}
         )
         for index, task in enumerate(plan.tasks):
+            if task.name in preserved_task_names:
+                continue
             task_id = str(uuid.uuid4())
             task_record = TaskRecord(
                 id=task_id,
@@ -10145,13 +10208,49 @@ def _handle_plan_created(envelope: dict) -> None:
                     total_tasks=len(plan.tasks),
                 ),
             )
+            if _should_preserve_completed_prefix_for_replan(pending_replan):
+                revision_task_annotations[task_id] = _replacement_suffix_annotation(
+                    source_plan_id=existing.id if existing is not None else None,
+                    selected_strategy=selected_strategy,
+                )
+        db.flush()
+        merged_task_records = (
+            db.query(TaskRecord)
+            .filter(TaskRecord.plan_id == plan_record_id)
+            .order_by(TaskRecord.created_at.asc(), TaskRecord.name.asc())
+            .all()
+        )
+        record.dag_edges = _dag_edges_from_task_records(merged_task_records)
         if job:
             _merge_task_intent_profiles_into_job_metadata(job, task_intent_profiles)
+            metadata = dict(job.metadata_json) if isinstance(job.metadata_json, dict) else {}
+            if revision_task_annotations:
+                metadata["active_revision_task_annotations"] = revision_task_annotations
+            else:
+                metadata.pop("active_revision_task_annotations", None)
+            revision_context = planner_contracts.parse_revision_context_from_metadata(metadata)
+            if revision_context is not None:
+                revision_context.preserved_task_ids = [task.id for task in preserved_tasks]
+                revision_context.preserved_task_names = [task.name for task in preserved_tasks]
+                revision_context.replacement_task_ids = [
+                    task_id
+                    for task_id, annotation in revision_task_annotations.items()
+                    if annotation.get("merge_role") == "replacement_suffix"
+                ]
+                revision_context.replacement_task_names = [
+                    task.name
+                    for task in merged_task_records
+                    if revision_task_annotations.get(task.id, {}).get("merge_role")
+                    == "replacement_suffix"
+                ]
+                metadata["revision_context"] = revision_context.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                )
             if use_postgres_scheduler:
-                metadata = dict(job.metadata_json) if isinstance(job.metadata_json, dict) else {}
                 metadata["scheduler_mode"] = POSTGRES_RUN_SPEC_SCHEDULER_MODE
                 metadata["run_spec"] = planner_run_spec.model_dump(mode="json")
-                job.metadata_json = metadata
+            job.metadata_json = metadata
             trigger_reason = (
                 str(pending_replan.get("reason") or "").strip()
                 if isinstance(pending_replan, Mapping)
@@ -10160,7 +10259,7 @@ def _handle_plan_created(envelope: dict) -> None:
             _mark_plan_revision_active(
                 job,
                 plan_record=record,
-                task_count=len(plan.tasks),
+                task_count=len(merged_task_records),
                 trigger_reason=trigger_reason,
             )
             _set_job_status(job, models.JobStatus.planning)
@@ -10169,8 +10268,14 @@ def _handle_plan_created(envelope: dict) -> None:
                 db,
                 job_record=job,
                 plan_record=record,
-                plan=plan,
+                plan=effective_plan,
                 run_spec=planner_run_spec,
+            )
+            _apply_revision_task_annotations_to_run_steps(
+                db,
+                plan_id=record.id,
+                annotations=revision_task_annotations,
+                occurred_at=now,
             )
             db.commit()
     for capability_id in selected_capabilities:
@@ -10427,12 +10532,260 @@ def _completed_step_snapshots_for_plan(
     return snapshots
 
 
+def _completed_task_records_for_plan(
+    db: Session,
+    plan_record: PlanRecord | None,
+) -> list[TaskRecord]:
+    if plan_record is None:
+        return []
+    return (
+        db.query(TaskRecord)
+        .filter(TaskRecord.plan_id == plan_record.id)
+        .filter(
+            TaskRecord.status.in_(
+                [
+                    models.TaskStatus.completed.value,
+                    models.TaskStatus.accepted.value,
+                ]
+            )
+        )
+        .order_by(TaskRecord.created_at.asc(), TaskRecord.name.asc())
+        .all()
+    )
+
+
+def _replan_strategy_from_pending_context(
+    pending_replan: Mapping[str, Any] | None,
+) -> models.ReplanStrategy | None:
+    if not isinstance(pending_replan, Mapping):
+        return None
+    raw = str(pending_replan.get("selected_strategy") or "").strip()
+    if raw:
+        try:
+            return models.ReplanStrategy(raw)
+        except ValueError:
+            pass
+    reason = str(pending_replan.get("reason") or "").strip()
+    if reason == "retry_exhausted_auto_repair":
+        return models.ReplanStrategy.patch_suffix
+    if reason == "intent_mismatch_auto_repair":
+        return models.ReplanStrategy.switch_capability
+    return None
+
+
+def _should_preserve_completed_prefix_for_replan(
+    pending_replan: Mapping[str, Any] | None,
+) -> bool:
+    strategy = _replan_strategy_from_pending_context(pending_replan)
+    return strategy in {
+        models.ReplanStrategy.patch_suffix,
+        models.ReplanStrategy.switch_capability,
+    }
+
+
+def _dag_edges_from_task_records(task_records: Sequence[TaskRecord]) -> list[list[str]]:
+    edges: list[list[str]] = []
+    seen: set[tuple[str, str]] = set()
+    known_names = {str(record.name or "").strip() for record in task_records if str(record.name or "").strip()}
+    for record in task_records:
+        target = str(record.name or "").strip()
+        if not target:
+            continue
+        for dep in record.deps or []:
+            source = str(dep or "").strip()
+            if not source or source not in known_names:
+                continue
+            edge = (source, target)
+            if edge in seen:
+                continue
+            seen.add(edge)
+            edges.append([source, target])
+    return edges
+
+
+def _plan_with_preserved_prefix(
+    plan: models.PlanCreate,
+    preserved_tasks: Sequence[TaskRecord],
+) -> models.PlanCreate:
+    if not preserved_tasks:
+        return plan
+    existing_names = {
+        str(task.name or "").strip()
+        for task in plan.tasks
+        if str(task.name or "").strip()
+    }
+    merged_tasks: list[models.TaskCreate] = [
+        _task_create_from_record(task)
+        for task in preserved_tasks
+        if str(task.name or "").strip() not in existing_names
+    ]
+    merged_tasks.extend(plan.tasks)
+    synthetic_records: list[TaskRecord] = []
+    now = _utcnow()
+    for index, task in enumerate(merged_tasks):
+        intent_value = task.intent.value if isinstance(task.intent, models.ToolIntent) else task.intent
+        synthetic_records.append(
+            TaskRecord(
+                id=f"synthetic-{index}",
+                job_id="synthetic",
+                plan_id="synthetic",
+                name=task.name,
+                description=task.description,
+                instruction=task.instruction,
+                acceptance_criteria=list(task.acceptance_criteria),
+                expected_output_schema_ref=task.expected_output_schema_ref,
+                status=models.TaskStatus.completed.value,
+                deps=list(task.deps or []),
+                attempts=0,
+                max_attempts=3,
+                rework_count=0,
+                max_reworks=0,
+                assigned_to=None,
+                intent=intent_value,
+                tool_requests=list(task.capability_requests or task.tool_requests or []),
+                tool_inputs=_task_record_tool_inputs(
+                    list(task.capability_requests or task.tool_requests or []),
+                    dict(task.tool_inputs or {}),
+                    dict(task.capability_bindings or {}),
+                ),
+                created_at=now,
+                updated_at=now,
+                critic_required=1 if task.critic_required else 0,
+            )
+        )
+    return models.PlanCreate(
+        planner_version=plan.planner_version,
+        tasks_summary=plan.tasks_summary,
+        dag_edges=_dag_edges_from_task_records(synthetic_records),
+        tasks=merged_tasks,
+    )
+
+
+def _preserved_prefix_annotation(
+    *,
+    source_plan_id: str,
+    source_revision_number: int,
+    selected_strategy: models.ReplanStrategy | None,
+) -> dict[str, Any]:
+    annotation: dict[str, Any] = {
+        "merge_role": "preserved_prefix",
+        "source_plan_id": source_plan_id,
+        "source_revision_number": max(0, int(source_revision_number)),
+    }
+    if selected_strategy is not None:
+        annotation["selected_strategy"] = selected_strategy.value
+    return annotation
+
+
+def _replacement_suffix_annotation(
+    *,
+    source_plan_id: str | None,
+    selected_strategy: models.ReplanStrategy | None,
+) -> dict[str, Any]:
+    annotation: dict[str, Any] = {
+        "merge_role": "replacement_suffix",
+    }
+    if source_plan_id:
+        annotation["source_plan_id"] = source_plan_id
+    if selected_strategy is not None:
+        annotation["selected_strategy"] = selected_strategy.value
+    return annotation
+
+
+def _superseded_suffix_annotation(
+    *,
+    source_plan_id: str | None,
+    selected_strategy: models.ReplanStrategy | None,
+    reason: str | None,
+) -> dict[str, Any]:
+    annotation: dict[str, Any] = {
+        "merge_role": "superseded_suffix",
+    }
+    if source_plan_id:
+        annotation["source_plan_id"] = source_plan_id
+    if selected_strategy is not None:
+        annotation["selected_strategy"] = selected_strategy.value
+    if isinstance(reason, str) and reason.strip():
+        annotation["reason"] = reason.strip()
+    return annotation
+
+
+def _preserve_completed_prefix_for_replan(
+    db: Session,
+    *,
+    prior_plan_record: PlanRecord | None,
+    new_plan_record: PlanRecord,
+    pending_replan: Mapping[str, Any] | None,
+    occurred_at: datetime,
+) -> tuple[list[TaskRecord], dict[str, dict[str, Any]]]:
+    if prior_plan_record is None or not _should_preserve_completed_prefix_for_replan(pending_replan):
+        return [], {}
+    preserved_tasks = _completed_task_records_for_plan(db, prior_plan_record)
+    if not preserved_tasks:
+        return [], {}
+    strategy = _replan_strategy_from_pending_context(pending_replan)
+    source_revision_number = 0
+    if isinstance(pending_replan, Mapping):
+        try:
+            source_revision_number = max(0, int(pending_replan.get("prior_revision_number", 0) or 0))
+        except (TypeError, ValueError):
+            source_revision_number = 0
+    annotations: dict[str, dict[str, Any]] = {}
+    for task in preserved_tasks:
+        task.plan_id = new_plan_record.id
+        task.updated_at = occurred_at
+        annotations[task.id] = _preserved_prefix_annotation(
+            source_plan_id=prior_plan_record.id,
+            source_revision_number=source_revision_number,
+            selected_strategy=strategy,
+        )
+    run_steps = (
+        db.query(RunStepRecord)
+        .filter(
+            RunStepRecord.plan_id == prior_plan_record.id,
+            RunStepRecord.id.in_([task.id for task in preserved_tasks]),
+        )
+        .all()
+    )
+    for step in run_steps:
+        step.plan_id = new_plan_record.id
+        metadata = dict(step.metadata_json or {})
+        metadata.pop("superseded_at", None)
+        metadata.pop("superseded_reason", None)
+        metadata["revision_merge"] = annotations.get(step.id, {})
+        step.metadata_json = metadata
+        step.updated_at = occurred_at
+    return preserved_tasks, annotations
+
+
+def _apply_revision_task_annotations_to_run_steps(
+    db: Session,
+    *,
+    plan_id: str,
+    annotations: Mapping[str, Mapping[str, Any]],
+    occurred_at: datetime,
+) -> None:
+    if not annotations:
+        return
+    rows = (
+        db.query(RunStepRecord)
+        .filter(RunStepRecord.plan_id == plan_id, RunStepRecord.id.in_(list(annotations.keys())))
+        .all()
+    )
+    for row in rows:
+        metadata = dict(row.metadata_json or {})
+        metadata["revision_merge"] = dict(annotations.get(row.id) or {})
+        row.metadata_json = metadata
+        row.updated_at = occurred_at
+
+
 def _supersede_unfinished_plan_tail(
     db: Session,
     plan_record: PlanRecord | None,
     *,
     reason: str,
     superseded_at: datetime,
+    selected_strategy: models.ReplanStrategy | None = None,
 ) -> None:
     if plan_record is None:
         return
@@ -10444,6 +10797,10 @@ def _supersede_unfinished_plan_tail(
         models.TaskStatus.rework_requested.value,
         models.TaskStatus.failed.value,
     }
+    preserved_statuses = {
+        models.TaskStatus.completed.value,
+        models.TaskStatus.accepted.value,
+    }
     tasks = db.query(TaskRecord).filter(TaskRecord.plan_id == plan_record.id).all()
     for task in tasks:
         if task.status in cancelable_statuses:
@@ -10451,9 +10808,16 @@ def _supersede_unfinished_plan_tail(
             task.updated_at = superseded_at
     run_steps = db.query(RunStepRecord).filter(RunStepRecord.plan_id == plan_record.id).all()
     for step in run_steps:
+        if step.status in preserved_statuses:
+            continue
         metadata = dict(step.metadata_json or {})
         metadata["superseded_at"] = superseded_at.isoformat()
         metadata["superseded_reason"] = reason
+        metadata["revision_merge"] = _superseded_suffix_annotation(
+            source_plan_id=plan_record.id,
+            selected_strategy=selected_strategy,
+            reason=reason,
+        )
         step.metadata_json = metadata
         if step.status not in {
             models.TaskStatus.completed.value,
@@ -10577,6 +10941,7 @@ def _request_job_replan(
         active_plan,
         reason=reason,
         superseded_at=now,
+        selected_strategy=selected_strategy,
     )
     metadata["replan_count"] = current_count + 1
     metadata["replan_reason"] = reason
@@ -13313,7 +13678,9 @@ def _sync_shadow_run_steps(
         record.depends_on_json = [
             spec_task_ids.get(dep_id, dep_id) for dep_id in step.depends_on
         ]
-        record.metadata_json = dict(step.routing_hints or {})
+        metadata = dict(record.metadata_json or {})
+        metadata.update(dict(step.routing_hints or {}))
+        record.metadata_json = metadata
         record.created_at = task.created_at
         record.updated_at = task.updated_at
     # Preserve prior revision run-step rows so adaptive replans can retain debugger history.
@@ -15007,6 +15374,7 @@ def get_job_details(job_id: str, db: Session = Depends(get_db)) -> models.JobDet
     profiles = _coerce_task_intent_profiles(metadata)
     normalization_fields = _normalization_response_fields(metadata, goal=job.goal or "")
     revision_context = planner_contracts.parse_revision_context_from_metadata(metadata)
+    revision_task_annotations = _active_revision_task_annotations_from_metadata(metadata)
     return models.JobDetails(
         job_id=job_id,
         run_id=_run_id_from_metadata(metadata, job_id),
@@ -15021,6 +15389,7 @@ def get_job_details(job_id: str, db: Session = Depends(get_db)) -> models.JobDet
         revision_history=_plan_revision_summaries_from_metadata(metadata),
         last_replan_reason=str(metadata.get("replan_reason") or "").strip() or None,
         revision_context=revision_context,
+        revision_task_annotations=revision_task_annotations,
         recovery_metadata=_recovery_metadata_from_metadata(metadata),
         goal_intent_profile=normalization_fields["goal_intent_profile"],
         goal_intent_graph=normalization_fields["goal_intent_graph"],
@@ -15057,6 +15426,7 @@ def get_job_debugger(
     task_intent_profiles = _coerce_task_intent_profiles(metadata)
     normalization_fields = _normalization_response_fields(metadata, goal=job.goal or "")
     revision_context = planner_contracts.parse_revision_context_from_metadata(metadata)
+    revision_task_annotations = _active_revision_task_annotations_from_metadata(metadata)
 
     timeline = _debugger_timeline_for_job(job_id, limit=limit, db=db)
     timeline_by_task: dict[str, list[dict[str, Any]]] = {}
@@ -15103,6 +15473,7 @@ def get_job_debugger(
                     record,
                     task_intent_profiles.get(record.id),
                 ).model_dump(mode="json"),
+                "revision_merge": revision_task_annotations.get(record.id),
                 "resolved_tool_inputs": hydrated_payload.get("tool_inputs", {}),
                 "tool_inputs_validation": hydrated_payload.get("tool_inputs_validation", {}),
                 "tool_inputs_resolved": bool(hydrated_payload.get("tool_inputs_resolved")),
@@ -15129,6 +15500,7 @@ def get_job_debugger(
         "revision_context": revision_context.model_dump(mode="json", exclude_none=True)
         if revision_context is not None
         else None,
+        "revision_task_annotations": revision_task_annotations,
         "recovery_metadata": _recovery_metadata_from_metadata(metadata),
         "generated_at": _utcnow().isoformat(),
         "timeline_events_scanned": len(timeline),
@@ -15305,6 +15677,9 @@ def _run_debugger_payload(
     revision_context = planner_contracts.parse_revision_context_from_metadata(
         job.metadata_json if isinstance(job.metadata_json, dict) else {}
     )
+    revision_task_annotations = _active_revision_task_annotations_from_metadata(
+        job.metadata_json if isinstance(job.metadata_json, dict) else {}
+    )
     steps_payload: list[dict[str, Any]] = []
     for step_record in step_records:
         task_record = task_by_id.get(step_record.id)
@@ -15323,6 +15698,7 @@ def _run_debugger_payload(
                     task_record=task_record,
                 ).model_dump(mode="json"),
                 "latest_result": latest_result,
+                "revision_merge": revision_task_annotations.get(step_record.id),
                 "execution_requests": execution_requests_by_step.get(step_record.id, []),
                 "checkpoints": checkpoints_by_step.get(step_record.id, []),
                 "attempts": attempts_by_task.get(step_record.id, []),
@@ -15362,6 +15738,7 @@ def _run_debugger_payload(
         "revision_context": revision_context.model_dump(mode="json", exclude_none=True)
         if revision_context is not None
         else None,
+        "revision_task_annotations": revision_task_annotations,
         "recovery_metadata": _recovery_metadata_from_metadata(
             job.metadata_json if isinstance(job.metadata_json, dict) else {}
         ),

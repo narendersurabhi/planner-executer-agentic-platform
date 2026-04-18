@@ -297,6 +297,10 @@ _REVISION_CONTEXT_EXCLUDED_KEYS = frozenset(
         "prior_plan_id",
         "selected_strategy",
         "strategy_reason",
+        "preserved_task_ids",
+        "preserved_task_names",
+        "replacement_task_ids",
+        "replacement_task_names",
         "completed_steps",
         "failed_task_id",
         "failed_task_name",
@@ -337,6 +341,30 @@ def parse_revision_context_from_metadata(
         trigger_reason=_non_empty_string(raw_context.get("reason")),
         selected_strategy=_non_empty_string(raw_context.get("selected_strategy")),
         strategy_reason=_non_empty_string(raw_context.get("strategy_reason")),
+        preserved_task_ids=[
+            item for item in (_non_empty_string(entry) for entry in raw_context.get("preserved_task_ids", []))
+            if item is not None
+        ]
+        if isinstance(raw_context.get("preserved_task_ids"), list)
+        else [],
+        preserved_task_names=[
+            item for item in (_non_empty_string(entry) for entry in raw_context.get("preserved_task_names", []))
+            if item is not None
+        ]
+        if isinstance(raw_context.get("preserved_task_names"), list)
+        else [],
+        replacement_task_ids=[
+            item for item in (_non_empty_string(entry) for entry in raw_context.get("replacement_task_ids", []))
+            if item is not None
+        ]
+        if isinstance(raw_context.get("replacement_task_ids"), list)
+        else [],
+        replacement_task_names=[
+            item for item in (_non_empty_string(entry) for entry in raw_context.get("replacement_task_names", []))
+            if item is not None
+        ]
+        if isinstance(raw_context.get("replacement_task_names"), list)
+        else [],
         completed_steps=_completed_step_contexts(raw_context.get("completed_steps")),
         failed_step=_failed_step_context(raw_context),
         constraints=constraints,
