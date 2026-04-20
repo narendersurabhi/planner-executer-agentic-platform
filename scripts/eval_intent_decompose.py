@@ -78,21 +78,14 @@ def _build_decomposer(
 
 def _load_required_inputs_lookup() -> Any:
     registry = capability_registry.load_capability_registry()
-    schema_dir = Path("schemas")
     required_inputs_by_capability: dict[str, list[str]] = {}
-    for capability_id, spec in registry.enabled_capabilities().items():
-        required_inputs: list[str] = []
-        if spec.input_schema_ref:
-            schema_path = schema_dir / f"{spec.input_schema_ref}.json"
-            if schema_path.exists():
-                try:
-                    schema = json.loads(schema_path.read_text(encoding="utf-8"))
-                except Exception:  # noqa: BLE001
-                    schema = {}
-                raw_required = schema.get("required") if isinstance(schema, Mapping) else None
-                if isinstance(raw_required, list):
-                    required_inputs = [entry for entry in raw_required if isinstance(entry, str)]
-        required_inputs_by_capability[capability_id] = required_inputs
+    for capability_id in registry.enabled_capabilities():
+        required_inputs_by_capability[capability_id] = (
+            capability_registry.planner_collectible_inputs_for_capability(
+                capability_id,
+                registry=registry,
+            )
+        )
 
     def _lookup(capability_id: str) -> list[str]:
         canonical = registry.canonicalize_id(capability_id) or str(capability_id or "").strip()

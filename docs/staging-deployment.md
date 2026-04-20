@@ -249,6 +249,8 @@ Promotion rule:
 3. any calibrator replay artifacts look acceptable
 4. only then promote the same image tag to production
 
+The end-to-end staging release workflow is `.github/workflows/release-staging.yml`. It builds and pushes immutable images, deploys the resolved tag to staging, and then calls the staging routing gate.
+
 ## Troubleshooting
 
 ### API crashes on startup with `could not translate host name "db"`

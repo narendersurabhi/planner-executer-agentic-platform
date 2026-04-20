@@ -103,6 +103,51 @@ class CapabilityRegistry:
         return {cap_id: spec for cap_id, spec in self.capabilities.items() if spec.enabled}
 
 
+def planner_collectible_inputs_for_capability(
+    capability_id: str,
+    *,
+    registry: CapabilityRegistry | None = None,
+    schema_dir: Path | None = None,
+) -> list[str]:
+    resolved_registry = registry or load_capability_registry()
+    spec = resolved_registry.get(capability_id)
+    if spec is None:
+        return []
+    planner_hints = spec.planner_hints if isinstance(spec.planner_hints, dict) else {}
+    collectible_fields = planner_hints.get("chat_collectible_fields")
+    if isinstance(collectible_fields, list):
+        deduped: list[str] = []
+        for entry in collectible_fields:
+            if not isinstance(entry, str):
+                continue
+            normalized = entry.strip()
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+        if deduped:
+            return deduped
+    if not spec.input_schema_ref:
+        return []
+    resolved_schema_dir = (schema_dir or Path("schemas")).expanduser()
+    schema_path = resolved_schema_dir / f"{spec.input_schema_ref}.json"
+    if not schema_path.exists():
+        return []
+    try:
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    raw_required = schema.get("required") if isinstance(schema, dict) else None
+    if not isinstance(raw_required, list):
+        return []
+    required_inputs: list[str] = []
+    for entry in raw_required:
+        if not isinstance(entry, str):
+            continue
+        normalized = entry.strip()
+        if normalized and normalized not in required_inputs:
+            required_inputs.append(normalized)
+    return required_inputs
+
+
 _CAPABILITY_CACHE_KEY: tuple[str, float] | None = None
 _CAPABILITY_CACHE_VALUE: CapabilityRegistry | None = None
 

@@ -2,6 +2,7 @@
 .gitignore
 .env
 .env.staging
+.env.production
 .DS_Store
 __pycache__/
 *.py[cod]

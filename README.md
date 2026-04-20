@@ -267,9 +267,22 @@ These Make targets now run through `uv`, so you do not need to preinstall `pytes
 - `make k8s-apply-local`
 - `make k8s-down-local`
 - `make k8s-restart-local`
+- `make k8s-up-staging`
+- `make k8s-up-production`
 - `make k8s-sync-workspace`
 - `make k8s-sync-artifacts`
 - `make k8s-sync-shared`
+
+## CI/CD
+
+The repo ships with a Docker plus Kubernetes GitHub Actions pipeline.
+
+- CI: `.github/workflows/ci.yml`
+- Staging release: `.github/workflows/release-staging.yml`
+- Production promotion: `.github/workflows/promote-production.yml`
+- Staging regression gate: `.github/workflows/staging-routing-gate.yml`
+
+Setup details and required secrets are documented in [docs/cicd-pipeline.md](/Users/narendersurabhi/planner-executer-agentic-platform/docs/cicd-pipeline.md).
 
 ## Intent Eval Harness
 

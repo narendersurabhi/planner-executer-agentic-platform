@@ -4527,6 +4527,12 @@ def test_capability_required_inputs_uses_repo_local_schema_fallback(monkeypatch)
     assert required == ["query"]
 
 
+def test_capability_required_inputs_prefer_planner_collectible_fields(monkeypatch):
+    monkeypatch.setattr(main, "SCHEMA_REGISTRY_PATH", "/tmp/missing-schemas")
+    required = main._capability_required_inputs_for_intent_normalization("document.pdf.render")
+    assert required == ["path"]
+
+
 def test_composer_recommend_capabilities_heuristic(monkeypatch):
     spec_generate = cap_registry.CapabilitySpec(
         capability_id="document.spec.generate",

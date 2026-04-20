@@ -16,6 +16,8 @@
 	k8s-apply k8s-delete k8s-apply-local k8s-delete-local \
 	setup-k8s-env-staging k8s-apply-staging k8s-delete-staging \
 	k8s-pin-staging-images k8s-up-staging k8s-restart-staging \
+	setup-k8s-env-production k8s-apply-production \
+	k8s-pin-production-images k8s-up-production k8s-restart-production \
 	k8s-apply-observability k8s-delete-observability \
 	k8s-apply-keda-worker k8s-delete-keda-worker \
 	k8s-up-local k8s-down-local k8s-restart-local \
@@ -34,6 +36,12 @@ STAGING_OVERLAY ?= deploy/k8s/overlays/staging
 STAGING_IMAGE_REGISTRY ?= ghcr.io
 STAGING_IMAGE_OWNER ?=
 STAGING_IMAGE_TAG ?= latest
+PRODUCTION_NAMESPACE ?= awe
+PRODUCTION_ENV_FILE ?= .env.production
+PRODUCTION_OVERLAY ?= deploy/k8s
+PRODUCTION_IMAGE_REGISTRY ?= ghcr.io
+PRODUCTION_IMAGE_OWNER ?=
+PRODUCTION_IMAGE_TAG ?= latest
 UV_EVAL_DEPS = \
 	--with typing-extensions \
 	--with pydantic \
@@ -91,6 +99,9 @@ setup-k8s-env:
 setup-k8s-env-staging:
 	K8S_NAMESPACE=$(STAGING_NAMESPACE) ENV_FILE=$(STAGING_ENV_FILE) DEFAULT_ENV_FILE=.env.example ./scripts/setup_k8s_env.sh
 
+setup-k8s-env-production:
+	K8S_NAMESPACE=$(PRODUCTION_NAMESPACE) ENV_FILE=$(PRODUCTION_ENV_FILE) DEFAULT_ENV_FILE=.env.example ./scripts/setup_k8s_env.sh
+
 k8s-apply:
 	kubectl apply -k deploy/k8s
 
@@ -115,6 +126,10 @@ k8s-apply-staging:
 	kubectl kustomize --load-restrictor LoadRestrictionsNone $(STAGING_OVERLAY) | kubectl apply -f -
 	$(MAKE) setup-k8s-env-staging
 
+k8s-apply-production:
+	kubectl kustomize --load-restrictor LoadRestrictionsNone $(PRODUCTION_OVERLAY) | kubectl apply -f -
+	$(MAKE) setup-k8s-env-production
+
 k8s-pin-staging-images:
 	@test -n "$(STAGING_IMAGE_OWNER)" || (echo "STAGING_IMAGE_OWNER is required" >&2; exit 1)
 	kubectl set image deployment/api -n $(STAGING_NAMESPACE) api=$(STAGING_IMAGE_REGISTRY)/$(STAGING_IMAGE_OWNER)/awe-api:$(STAGING_IMAGE_TAG)
@@ -124,6 +139,16 @@ k8s-pin-staging-images:
 	kubectl set image deployment/coder -n $(STAGING_NAMESPACE) coder=$(STAGING_IMAGE_REGISTRY)/$(STAGING_IMAGE_OWNER)/awe-coder:$(STAGING_IMAGE_TAG)
 	kubectl set image deployment/rag-retriever-mcp -n $(STAGING_NAMESPACE) rag-retriever-mcp=$(STAGING_IMAGE_REGISTRY)/$(STAGING_IMAGE_OWNER)/awe-rag-retriever-mcp:$(STAGING_IMAGE_TAG)
 	kubectl set image deployment/ui -n $(STAGING_NAMESPACE) ui=$(STAGING_IMAGE_REGISTRY)/$(STAGING_IMAGE_OWNER)/awe-ui:$(STAGING_IMAGE_TAG)
+
+k8s-pin-production-images:
+	@test -n "$(PRODUCTION_IMAGE_OWNER)" || (echo "PRODUCTION_IMAGE_OWNER is required" >&2; exit 1)
+	kubectl set image deployment/api -n $(PRODUCTION_NAMESPACE) api=$(PRODUCTION_IMAGE_REGISTRY)/$(PRODUCTION_IMAGE_OWNER)/awe-api:$(PRODUCTION_IMAGE_TAG)
+	kubectl set image deployment/planner -n $(PRODUCTION_NAMESPACE) planner=$(PRODUCTION_IMAGE_REGISTRY)/$(PRODUCTION_IMAGE_OWNER)/awe-planner:$(PRODUCTION_IMAGE_TAG)
+	kubectl set image deployment/policy -n $(PRODUCTION_NAMESPACE) policy=$(PRODUCTION_IMAGE_REGISTRY)/$(PRODUCTION_IMAGE_OWNER)/awe-policy:$(PRODUCTION_IMAGE_TAG)
+	kubectl set image deployment/worker -n $(PRODUCTION_NAMESPACE) worker=$(PRODUCTION_IMAGE_REGISTRY)/$(PRODUCTION_IMAGE_OWNER)/awe-worker:$(PRODUCTION_IMAGE_TAG)
+	kubectl set image deployment/coder -n $(PRODUCTION_NAMESPACE) coder=$(PRODUCTION_IMAGE_REGISTRY)/$(PRODUCTION_IMAGE_OWNER)/awe-coder:$(PRODUCTION_IMAGE_TAG)
+	kubectl set image deployment/rag-retriever-mcp -n $(PRODUCTION_NAMESPACE) rag-retriever-mcp=$(PRODUCTION_IMAGE_REGISTRY)/$(PRODUCTION_IMAGE_OWNER)/awe-rag-retriever-mcp:$(PRODUCTION_IMAGE_TAG)
+	kubectl set image deployment/ui -n $(PRODUCTION_NAMESPACE) ui=$(PRODUCTION_IMAGE_REGISTRY)/$(PRODUCTION_IMAGE_OWNER)/awe-ui:$(PRODUCTION_IMAGE_TAG)
 
 k8s-pin-local-images:
 	kubectl set image deployment/api -n awe api=localhost:5001/localhost/awe-api:$(IMAGE_TAG)
@@ -182,6 +207,20 @@ k8s-up-staging:
 	kubectl rollout status deployment/rag-retriever-mcp -n $(STAGING_NAMESPACE) --timeout=180s
 	kubectl rollout status deployment/ui -n $(STAGING_NAMESPACE) --timeout=180s
 
+k8s-up-production:
+	$(MAKE) k8s-apply-production
+	$(MAKE) k8s-pin-production-images
+	kubectl rollout status deployment/postgres -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/redis -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/qdrant -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/api -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/planner -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/policy -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/worker -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/coder -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/rag-retriever-mcp -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/ui -n $(PRODUCTION_NAMESPACE) --timeout=180s
+
 k8s-down-local:
 	$(MAKE) k8s-delete-local
 
@@ -213,6 +252,19 @@ k8s-restart-staging:
 	kubectl rollout status deployment/coder -n $(STAGING_NAMESPACE) --timeout=180s
 	kubectl rollout status deployment/rag-retriever-mcp -n $(STAGING_NAMESPACE) --timeout=180s
 	kubectl rollout status deployment/ui -n $(STAGING_NAMESPACE) --timeout=180s
+
+k8s-restart-production:
+	kubectl rollout restart deployment -n $(PRODUCTION_NAMESPACE) api planner policy worker coder qdrant rag-retriever-mcp ui
+	kubectl rollout status deployment/postgres -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/redis -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/qdrant -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/api -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/planner -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/policy -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/worker -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/coder -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/rag-retriever-mcp -n $(PRODUCTION_NAMESPACE) --timeout=180s
+	kubectl rollout status deployment/ui -n $(PRODUCTION_NAMESPACE) --timeout=180s
 
 k8s-sync-shared:
 	./scripts/k8s_sync_shared.sh all

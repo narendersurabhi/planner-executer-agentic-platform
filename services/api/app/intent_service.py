@@ -440,13 +440,15 @@ def _segment_required_inputs_for_candidates(
     *,
     required_input_lookup: Callable[[str], list[str]],
 ) -> list[str]:
-    required_inputs: list[str] = []
     for capability_id in capability_ids:
+        required_inputs: list[str] = []
         for raw_input in required_input_lookup(capability_id):
             normalized = intent_contract.normalize_required_input_key(raw_input)
             if normalized and normalized not in required_inputs:
                 required_inputs.append(normalized)
-    return required_inputs
+        if required_inputs:
+            return required_inputs
+    return []
 
 
 def _fallback_used(mode: str, source: str | None) -> bool:

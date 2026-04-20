@@ -79,6 +79,7 @@ make k8s-sync-shared
 For a staging deployment, use `deploy/k8s/overlays/staging`. It is designed to work either in a dedicated staging cluster or in a shared cluster under the `awe-staging` namespace.
 
 For the full staging runbook, including Docker Desktop staging and regression gating before production promotion, see `docs/staging-deployment.md`.
+For the GitHub Actions release pipeline and required deployment secrets, see `docs/cicd-pipeline.md`.
 
 Create a sparse `.env.staging` with only staging overrides and secrets; missing non-secret values fall back to `.env.example` when `setup_k8s_env.sh` renders the ConfigMap.
 

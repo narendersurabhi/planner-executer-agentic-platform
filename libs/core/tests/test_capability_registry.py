@@ -77,3 +77,25 @@ def test_capability_allowlist_canonicalizes_legacy_render_aliases(monkeypatch):
 
     assert decision.allowed is True
     assert decision.reason == "allowed"
+
+
+def test_planner_collectible_inputs_prefer_registry_hints(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+
+    assert capability_registry.planner_collectible_inputs_for_capability(
+        "document.pdf.render",
+        registry=registry,
+    ) == ["path"]
+
+
+def test_planner_collectible_inputs_fallback_to_schema_required(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+
+    assert capability_registry.planner_collectible_inputs_for_capability(
+        "llm.text.generate",
+        registry=registry,
+    ) == ["prompt"]

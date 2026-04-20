@@ -8247,6 +8247,12 @@ def _capability_required_inputs_for_intent_normalization(capability_id: str) -> 
     spec = registry.get(normalized)
     if spec is None:
         return []
+    planner_inputs = capability_registry.planner_collectible_inputs_for_capability(
+        normalized,
+        registry=registry,
+    )
+    if planner_inputs:
+        return planner_inputs
     input_schema, _ = _resolve_capability_schemas(spec, include_schemas=True)
     if not isinstance(input_schema, dict):
         return []

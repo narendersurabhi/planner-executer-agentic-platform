@@ -1,0 +1,73 @@
+name: promote-production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Immutable image tag to promote to production, for example sha-abc123def456"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-production
+  cancel-in-progress: false
+
+jobs:
+  deploy-production:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        env:
+          PRODUCTION_KUBECONFIG_B64: ${{ secrets.PRODUCTION_KUBECONFIG_B64 }}
+        run: |
+          if [ -z "${PRODUCTION_KUBECONFIG_B64:-}" ]; then
+            echo "::error::Missing PRODUCTION_KUBECONFIG_B64 secret."
+            exit 1
+          fi
+          printf '%s' "${PRODUCTION_KUBECONFIG_B64}" | base64 --decode > "${RUNNER_TEMP}/kubeconfig"
+          echo "KUBECONFIG=${RUNNER_TEMP}/kubeconfig" >> "${GITHUB_ENV}"
+
+      - name: Write production env file
+        env:
+          PRODUCTION_ENV_FILE_CONTENT: ${{ secrets.PRODUCTION_ENV_FILE }}
+        run: |
+          if [ -z "${PRODUCTION_ENV_FILE_CONTENT:-}" ]; then
+            echo "::error::Missing PRODUCTION_ENV_FILE secret."
+            exit 1
+          fi
+          printf '%s' "${PRODUCTION_ENV_FILE_CONTENT}" > .env.production
+
+      - name: Resolve image owner
+        id: image
+        run: |
+          IMAGE_OWNER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "image_owner=${IMAGE_OWNER}" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy production release
+        run: |
+          PRODUCTION_IMAGE_REGISTRY=ghcr.io \
+          PRODUCTION_IMAGE_OWNER=${{ steps.image.outputs.image_owner }} \
+          PRODUCTION_IMAGE_TAG=${{ github.event.inputs.image_tag }} \
+          make k8s-up-production
+
+      - name: Capture production cluster snapshot
+        if: always()
+        run: |
+          mkdir -p artifacts/release
+          kubectl get deploy,po,svc -n awe -o wide > artifacts/release/production-cluster-snapshot.txt
+
+      - name: Upload production cluster snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-cluster-snapshot-${{ github.event.inputs.image_tag }}
+          path: artifacts/release/production-cluster-snapshot.txt

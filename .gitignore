@@ -5,6 +5,7 @@ node_modules/
 .next/
 .env
 .env.staging
+.env.production
 *.sqlite
 /workspace/
 /artifacts/

@@ -181,19 +181,20 @@ def test_normalize_goal_intent_returns_envelope() -> None:
                 questions=[],
                 blocking_slots=[],
                 missing_slots=[],
-                slot_values={"intent_action": "generate"},
+                slot_values={"intent_action": "generate", "instruction": "Create a report"},
                 clarification_mode="targeted_slot_filling",
             ),
-            decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(
-                segments=[
-                    workflow_contracts.IntentGraphSegment(
-                        id="s1",
-                        intent="generate",
-                        suggested_capabilities=["document.spec.generate", "document.spec.generate"],
-                    )
-                ],
-                source="llm",
-            ),
+                decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(
+                    segments=[
+                        workflow_contracts.IntentGraphSegment(
+                            id="s1",
+                            intent="generate",
+                            required_inputs=["instruction"],
+                            suggested_capabilities=["document.spec.generate", "document.spec.generate"],
+                        )
+                    ],
+                    source="llm",
+                ),
             capability_required_inputs=lambda capability_id: (
                 ["topic"] if capability_id == "document.spec.generate" else []
             ),
@@ -318,7 +319,7 @@ def test_normalize_goal_intent_uses_capability_required_inputs_for_clarification
     assert envelope.clarification.questions == ["What output path or filename should be used?"]
 
 
-def test_normalize_goal_intent_uses_capability_required_document_fields_for_clarification() -> None:
+def test_normalize_goal_intent_does_not_expand_direct_segment_inputs_with_capability_fields() -> None:
     envelope = intent_service.normalize_goal_intent(
         "Create a deployment report.",
         config=intent_service.IntentNormalizeConfig(
@@ -367,9 +368,168 @@ def test_normalize_goal_intent_uses_capability_required_document_fields_for_clar
         ),
     )
 
-    assert envelope.profile.missing_slots == ["audience", "tone"]
+    assert envelope.profile.missing_slots == []
+    assert envelope.profile.requires_blocking_clarification is False
+    assert envelope.clarification.questions == []
+
+
+def test_normalize_goal_intent_uses_capability_required_inputs_as_segment_fallback() -> None:
+    envelope = intent_service.normalize_goal_intent(
+        "Render the approved document spec.",
+        config=intent_service.IntentNormalizeConfig(
+            include_decomposition=True,
+            assessment_mode="hybrid",
+            assessment_model="gpt-test",
+            decomposition_mode="hybrid",
+            decomposition_model="gpt-test",
+        ),
+        runtime=intent_service.IntentNormalizeRuntime(
+            assess_goal_intent=lambda _goal: workflow_contracts.GoalIntentProfile(
+                intent="render",
+                source="heuristic",
+                confidence=0.88,
+                risk_level="bounded_write",
+                low_confidence=False,
+                needs_clarification=False,
+                requires_blocking_clarification=False,
+                questions=[],
+                blocking_slots=[],
+                missing_slots=[],
+                slot_values={"intent_action": "render"},
+                clarification_mode="targeted_slot_filling",
+            ),
+            decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(
+                segments=[
+                    workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="render",
+                        objective="Render final artifact",
+                        required_inputs=[],
+                        suggested_capabilities=["document.pdf.render"],
+                    )
+                ],
+                source="llm",
+            ),
+            capability_required_inputs=lambda capability_id: (
+                ["path"] if capability_id == "document.pdf.render" else ["document_spec", "path"]
+            ),
+        ),
+    )
+
+    assert envelope.profile.missing_slots == ["path"]
+    assert envelope.profile.requires_blocking_clarification is True
+    assert envelope.clarification.questions == ["What output path or filename should be used?"]
+
+
+def test_normalize_goal_intent_prioritizes_segments_matching_primary_profile_intent() -> None:
+    envelope = intent_service.normalize_goal_intent(
+        "List GitHub branches and summarize release readiness.",
+        config=intent_service.IntentNormalizeConfig(
+            include_decomposition=True,
+            assessment_mode="hybrid",
+            assessment_model="gpt-test",
+            decomposition_mode="hybrid",
+            decomposition_model="gpt-test",
+        ),
+        runtime=intent_service.IntentNormalizeRuntime(
+            assess_goal_intent=lambda _goal: workflow_contracts.GoalIntentProfile(
+                intent="transform",
+                source="heuristic",
+                confidence=0.88,
+                risk_level="read_only",
+                low_confidence=False,
+                needs_clarification=False,
+                requires_blocking_clarification=False,
+                questions=[],
+                blocking_slots=[],
+                missing_slots=[],
+                slot_values={"intent_action": "transform", "target_system": "github"},
+                clarification_mode="targeted_slot_filling",
+            ),
+            decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(
+                segments=[
+                    workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="io",
+                        objective="List GitHub branches",
+                        required_inputs=["query", "target_repo"],
+                        suggested_capabilities=["github.branch.list"],
+                    ),
+                    workflow_contracts.IntentGraphSegment(
+                        id="s2",
+                        intent="transform",
+                        objective="summarize release readiness",
+                        required_inputs=["input_data"],
+                        suggested_capabilities=["utility.json.transform"],
+                    ),
+                ],
+                source="llm",
+            ),
+            capability_required_inputs=lambda _capability_id: [],
+        ),
+    )
+
+    assert envelope.profile.missing_slots == []
+    assert envelope.profile.requires_blocking_clarification is False
+    assert envelope.clarification.questions == []
+
+
+def test_normalize_goal_intent_skips_capability_input_fallback_when_low_confidence() -> None:
+    envelope = intent_service.normalize_goal_intent(
+        "Delete the production deployment manifest from the workspace.",
+        config=intent_service.IntentNormalizeConfig(
+            include_decomposition=True,
+            assessment_mode="hybrid",
+            assessment_model="gpt-test",
+            decomposition_mode="hybrid",
+            decomposition_model="gpt-test",
+        ),
+        runtime=intent_service.IntentNormalizeRuntime(
+            assess_goal_intent=lambda _goal: workflow_contracts.GoalIntentProfile(
+                intent="generate",
+                source="default",
+                confidence=0.4,
+                threshold=0.7,
+                risk_level="high_risk_write",
+                low_confidence=True,
+                needs_clarification=True,
+                requires_blocking_clarification=True,
+                questions=[],
+                blocking_slots=["intent_action", "output_format", "safety_constraints"],
+                missing_slots=["intent_action", "output_format", "safety_constraints"],
+                slot_values={
+                    "intent_action": "generate",
+                    "output_format": "",
+                    "target_system": "workspace",
+                    "safety_constraints": "",
+                    "risk_level": "high_risk_write",
+                },
+                clarification_mode="targeted_slot_filling",
+            ),
+            decompose_goal_intent=lambda _goal, **_kwargs: workflow_contracts.IntentGraph(
+                segments=[
+                    workflow_contracts.IntentGraphSegment(
+                        id="s1",
+                        intent="generate",
+                        objective="Delete the production deployment manifest from the workspace",
+                        required_inputs=[],
+                        suggested_capabilities=["filesystem.workspace.delete"],
+                    )
+                ],
+                source="llm",
+            ),
+            capability_required_inputs=lambda _capability_id: ["path"],
+        ),
+    )
+
+    assert envelope.profile.missing_slots == [
+        "intent_action",
+        "output_format",
+        "safety_constraints",
+    ]
     assert envelope.profile.requires_blocking_clarification is True
     assert envelope.clarification.questions == [
-        "Who is the target audience?",
-        "What tone should it use?",
+        "What should the system do first (generate, transform, validate, render, or io)?",
+        "What output format do you need (for example PDF, DOCX, JSON, or Markdown)?",
+        "What safety constraints must be enforced (for example read-only, no deletes, dry-run)?",
     ]

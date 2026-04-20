@@ -122,6 +122,49 @@ def test_decompose_goal_intent_prefers_github_publish_capabilities() -> None:
     assert segments[2]["suggested_capabilities"][0] == "github.pull_request.create"
 
 
+def test_decompose_goal_intent_prefers_workspace_delete_capability_for_destructive_goal() -> None:
+    graph = intent_contract.decompose_goal_intent(
+        "Delete the production deployment manifest from the workspace."
+    )
+    segments = graph["segments"]
+    assert len(segments) == 1
+    assert segments[0]["suggested_capabilities"][0] == "filesystem.workspace.delete"
+    assert "instruction" not in segments[0]["required_inputs"]
+
+
+def test_derive_segment_missing_inputs_accepts_goal_implied_instruction() -> None:
+    missing = intent_contract.derive_segment_missing_inputs(
+        goal="Generate a quarterly planning memo draft for leadership.",
+        segment={
+            "intent": "generate",
+            "objective": "Generate a quarterly planning memo draft for leadership",
+            "required_inputs": ["instruction"],
+            "slots": {"must_have_inputs": ["instruction"]},
+        },
+        slot_values={"intent_action": "generate"},
+        candidate_required_inputs=[],
+        low_confidence=False,
+    )
+    assert missing == []
+
+
+def test_derive_segment_missing_inputs_accepts_explicit_goal_path() -> None:
+    missing = intent_contract.derive_segment_missing_inputs(
+        goal="Render the approved document spec to /shared/artifacts/q1-plan.pdf.",
+        segment={
+            "intent": "render",
+            "objective": "Render the approved document spec to /shared/artifacts/q1-plan.pdf",
+            "required_inputs": ["path_or_format", "output_format=pdf"],
+            "suggested_capabilities": ["document.pdf.render"],
+            "slots": {"must_have_inputs": ["path", "output_format"]},
+        },
+        slot_values={"intent_action": "render", "output_format": "pdf"},
+        candidate_required_inputs=[],
+        low_confidence=False,
+    )
+    assert missing == []
+
+
 def test_validate_intent_segment_contract_requires_renderer_explicit_path() -> None:
     segment = {
         "intent": "render",

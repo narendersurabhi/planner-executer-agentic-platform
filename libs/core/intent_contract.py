@@ -266,6 +266,15 @@ def _contains_any(text: str, tokens: Iterable[str]) -> bool:
     return False
 
 
+def _looks_like_workspace_delete_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return (
+        "workspace" in lowered
+        and _contains_any(lowered, ("delete", "remove", "destroy", "drop", "wipe", "purge"))
+        and _contains_any(lowered, ("manifest", "file", "files", "directory", "folder", "workspace"))
+    )
+
+
 def _prepend_unique(items: list[str], *candidates: str) -> list[str]:
     ordered = list(items)
     for candidate in reversed(candidates):
@@ -891,13 +900,16 @@ def derive_segment_missing_inputs(
     candidate_capabilities = _coerce_string_tuple(segment.get("suggested_capabilities"))
     candidate_formats = _segment_candidate_format_hints(candidate_capabilities)
     candidate_systems = _segment_candidate_system_hints(candidate_capabilities)
+    raw_required_inputs = list(_coerce_string_tuple(segment.get("required_inputs")))
+    raw_must_have_inputs = list(_coerce_string_tuple(segment_slots.get("must_have_inputs")))
     combined_required_inputs: list[str] = []
     direct_clarification_candidates: set[str] = set(_CLARIFICATION_REQUIRED_INPUT_KEYS)
-    for raw_value in (
-        list(_coerce_string_tuple(segment.get("required_inputs")))
-        + list(_coerce_string_tuple(segment_slots.get("must_have_inputs")))
-        + [str(item) for item in candidate_required_inputs if isinstance(item, str)]
-    ):
+    required_input_sources: list[str] = raw_required_inputs + raw_must_have_inputs
+    if not low_confidence and not raw_required_inputs and not raw_must_have_inputs:
+        required_input_sources.extend(
+            [str(item) for item in candidate_required_inputs if isinstance(item, str)]
+        )
+    for raw_value in required_input_sources:
         normalized = normalize_required_input_key(raw_value)
         if normalized and normalized not in combined_required_inputs:
             combined_required_inputs.append(normalized)
@@ -955,20 +967,29 @@ def derive_segment_missing_inputs(
     for key in combined_required_inputs:
         if key not in direct_clarification_candidates:
             continue
-        if key == "instruction" and not instruction_present:
-            missing_inputs.append("instruction")
+        if key == "instruction":
+            if not instruction_present:
+                missing_inputs.append("instruction")
             continue
-        if key in {"path", "output_path", "filename"} and not path_present:
-            missing_inputs.append("path")
+        if key in {"path", "output_path", "filename"}:
+            if not path_present:
+                missing_inputs.append("path")
             continue
-        if key == "output_format" and not output_format_present:
-            missing_inputs.append("output_format")
+        if key == "output_format":
+            if not output_format_present:
+                missing_inputs.append("output_format")
             continue
-        if key == "target_system" and not target_system_present:
-            missing_inputs.append("target_system")
+        if key == "target_system":
+            if not target_system_present:
+                missing_inputs.append("target_system")
             continue
-        if key == "safety_constraints" and not safety_present:
-            missing_inputs.append("safety_constraints")
+        if key == "safety_constraints":
+            if not safety_present:
+                missing_inputs.append("safety_constraints")
+            continue
+        if key == "intent_action":
+            if not intent_action_present:
+                missing_inputs.append("intent_action")
             continue
         if not _mapping_has_value(segment_slots, key) and not _mapping_has_value(slot_values, key):
             missing_inputs.append(key)
@@ -1008,6 +1029,16 @@ def derive_envelope_clarification(
     )
     segments = graph_map.get("segments") if isinstance(graph_map.get("segments"), list) else []
     low_confidence = bool(profile_map.get("low_confidence"))
+    profile_intent = normalize_task_intent(profile_map.get("intent")) or ""
+    prioritized_segment_ids: set[str] = set()
+    if profile_intent and len(segments) > 1:
+        prioritized_segment_ids = {
+            str(segment.get("id") or "").strip()
+            for segment in segments
+            if isinstance(segment, Mapping)
+            and normalize_task_intent(segment.get("intent")) == profile_intent
+            and str(segment.get("id") or "").strip()
+        }
     candidate_required_inputs_by_segment = (
         candidate_required_inputs_by_segment
         if isinstance(candidate_required_inputs_by_segment, Mapping)
@@ -1019,6 +1050,8 @@ def derive_envelope_clarification(
         if not isinstance(raw_segment, Mapping):
             continue
         segment_id = str(raw_segment.get("id") or "").strip()
+        if prioritized_segment_ids and segment_id not in prioritized_segment_ids:
+            continue
         segment_missing = derive_segment_missing_inputs(
             goal=goal,
             segment=raw_segment,
@@ -1520,6 +1553,8 @@ def _split_goal_clauses(goal_text: str) -> list[str]:
 def _required_inputs_for_clause(intent: str, clause: str) -> tuple[str, ...]:
     base = list(_REQUIRED_INPUTS_BY_INTENT.get(intent, ()))
     lowered = clause.lower()
+    if intent == "generate" and _looks_like_workspace_delete_request(lowered):
+        base = []
     if intent == "render":
         if "pdf" in lowered:
             base.append("output_format=pdf")
@@ -1574,6 +1609,8 @@ def _suggested_capabilities_for_clause(
         elif "docx" in lowered:
             suggestions = ["document.docx.render"]
     if intent == "generate":
+        if _looks_like_workspace_delete_request(context_lowered):
+            suggestions = _prepend_unique(suggestions, "filesystem.workspace.delete")
         if "openapi" in context_lowered:
             suggestions = _prepend_unique(suggestions, "openapi.spec.generate_iterative")
         if any(token in lowered for token in ("code changes", "codegen", "code change", "source code")):
