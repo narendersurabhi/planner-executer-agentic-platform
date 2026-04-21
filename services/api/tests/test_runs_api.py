@@ -298,6 +298,72 @@ def test_task_started_and_heartbeat_update_attempt_leases_and_execution_request(
         assert request.lease_expires_at is not None
 
 
+def test_task_completed_ignores_missing_step_attempt_on_execution_request(monkeypatch) -> None:
+    job = _create_job()
+    _create_plan(job["id"])
+    correlation_id = f"corr-{uuid.uuid4()}"
+
+    with SessionLocal() as db:
+        task = db.query(TaskRecord).filter(TaskRecord.job_id == job["id"]).first()
+        assert task is not None
+        main._task_payload_from_record(task, correlation_id=correlation_id, context={})
+        task_id = task.id
+
+    def _fake_finished_attempt(*_args, **_kwargs) -> StepAttemptRecord:
+        return StepAttemptRecord(
+            id="missing-step-attempt-id",
+            run_id=job["run_id"],
+            job_id=job["id"],
+            step_id=task_id,
+            attempt_number=1,
+            status=models.TaskStatus.completed.value,
+            worker_id="worker-phase2",
+            started_at=_utcnow(),
+            finished_at=_utcnow(),
+            error_code=None,
+            error_message=None,
+            retry_classification="succeeded",
+            lease_owner="worker-phase2",
+            lease_expires_at=_utcnow(),
+            last_heartbeat_at=_utcnow(),
+            heartbeat_count=0,
+            result_summary_json={},
+        )
+
+    monkeypatch.setattr(main, "_upsert_step_attempt_finished", _fake_finished_attempt)
+
+    main._handle_event(
+        "tasks.events",
+        {
+            "data": json.dumps(
+                {
+                    "type": "task.completed",
+                    "job_id": job["id"],
+                    "task_id": task_id,
+                    "occurred_at": _utcnow().isoformat(),
+                    "payload": {
+                        "task_id": task_id,
+                        "attempts": 1,
+                        "worker_consumer": "worker-phase2",
+                        "outputs": {"ok": True},
+                    },
+                    "correlation_id": correlation_id,
+                }
+            )
+        },
+    )
+
+    with SessionLocal() as db:
+        request = (
+            db.query(ExecutionRequestRecord)
+            .filter(ExecutionRequestRecord.run_id == job["run_id"])
+            .first()
+        )
+        assert request is not None
+        assert request.status == models.TaskStatus.completed.value
+        assert request.step_attempt_id is None
+
+
 def test_run_control_endpoints_delegate_to_job_lifecycle(monkeypatch) -> None:
     monkeypatch.setattr(main, "_dispatch_ready_work_for_job", lambda *_args, **_kwargs: None)
 

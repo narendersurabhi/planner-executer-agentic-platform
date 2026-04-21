@@ -749,6 +749,10 @@ def normalize_intent_segment_slots(
         or _normalize_output_format(fallback_slots.get("output_format"))
         or _infer_segment_output_format(objective, suggested_capabilities, required_inputs)
     )
+    if intent == "render" and output_format == "json":
+        render_hint = _first_output_format_hint(suggested_capabilities)
+        if render_hint in {"docx", "pdf", "md", "txt", "html"}:
+            output_format = render_hint
     artifact_type = (
         _normalize_slot_token(_slot_value(raw_slots, "artifact_type"))
         or _normalize_slot_token(fallback_slots.get("artifact_type"))
@@ -768,6 +772,8 @@ def normalize_intent_segment_slots(
         or _normalize_risk_level(fallback_slots.get("risk_level"))
         or _infer_segment_risk_level(intent, objective, suggested_capabilities)
     )
+    if intent == "render" and _risk_rank(risk_level) < _risk_rank("bounded_write"):
+        risk_level = "bounded_write"
     must_have_inputs = _normalize_must_have_inputs(
         _slot_value(raw_slots, "must_have_inputs")
         if _slot_value(raw_slots, "must_have_inputs") is not None
@@ -1123,6 +1129,23 @@ def _tool_output_format_hint(tool_name: str) -> str | None:
     return None
 
 
+def _first_output_format_hint(values: Iterable[Any]) -> str | None:
+    for value in values:
+        hinted = _tool_output_format_hint(str(value or ""))
+        if hinted:
+            return hinted
+    return None
+
+
+def _is_document_spec_generation_identifier(value: Any) -> bool:
+    return str(value or "").strip().lower() in {
+        "llm_generate_document_spec",
+        "document.spec.generate",
+        "llm_generate_document_spec_from_markdown",
+        "document.spec.generate_from_markdown",
+    }
+
+
 def _coerce_payload_mapping(payload: Any) -> Mapping[str, Any]:
     if isinstance(payload, Mapping):
         return payload
@@ -1155,12 +1178,7 @@ def _payload_has_required_input(
     payload_map: Mapping[str, Any], key: str, *, tool_name: str | None = None
 ) -> bool:
     normalized_tool_name = str(tool_name or "").strip().lower()
-    allow_job_context = tool_name not in {
-        "llm_generate_document_spec",
-        "document.spec.generate",
-        "llm_generate_document_spec_from_markdown",
-        "document.spec.generate_from_markdown",
-    }
+    allow_job_context = not _is_document_spec_generation_identifier(normalized_tool_name)
     if key == "query" and normalized_tool_name in {
         "filesystem.workspace.list",
         "filesystem.artifacts.list",
@@ -1371,9 +1389,23 @@ def validate_intent_segment_contract(
         return f"must_have_inputs_missing:{','.join(sorted(set(missing_inputs)))}"
 
     output_format = slots.get("output_format")
+    ignore_final_artifact_format = (
+        slots.get("artifact_type") == "document_spec"
+        and (
+            _is_document_spec_generation_identifier(tool_name)
+            or _is_document_spec_generation_identifier(capability_id)
+        )
+    )
     if isinstance(output_format, str) and output_format:
         resolved_format = _normalize_output_format(output_format)
-        if resolved_format:
+        render_hint = _tool_output_format_hint(capability_id or tool_name)
+        if (
+            normalize_task_intent(task_intent) == "render"
+            and resolved_format == "json"
+            and render_hint in {"docx", "pdf", "md", "txt", "html"}
+        ):
+            resolved_format = render_hint
+        if resolved_format and not ignore_final_artifact_format:
             raw_path = payload_map.get("path")
             if not isinstance(raw_path, str):
                 raw_path = payload_map.get("output_path")
@@ -1387,7 +1419,7 @@ def validate_intent_segment_contract(
                             f"output_format_mismatch:{tool_name}:"
                             f"expected={resolved_format}:got={normalized_ext}"
                         )
-            hinted = _tool_output_format_hint(capability_id or tool_name)
+            hinted = render_hint
             if hinted and hinted != resolved_format:
                 return (
                     f"output_format_mismatch:{tool_name}:"

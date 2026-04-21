@@ -54,6 +54,15 @@ class PlanRequestCapabilityAdapter(BaseModel):
     tool_name: str | None = None
 
 
+class PlanRequestCapabilityExport(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    path: str
+    description: str | None = None
+    required: bool = True
+
+
 class PlanRequestCapability(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -66,6 +75,7 @@ class PlanRequestCapability(BaseModel):
     input_schema_ref: str | None = None
     output_schema_ref: str | None = None
     aliases: list[str] = Field(default_factory=list)
+    exports: list[PlanRequestCapabilityExport] = Field(default_factory=list)
     planner_hints: dict[str, Any] = Field(default_factory=dict)
     adapters: list[PlanRequestCapabilityAdapter] = Field(default_factory=list)
 
@@ -553,6 +563,15 @@ def build_plan_request(
                 input_schema_ref=spec.input_schema_ref,
                 output_schema_ref=spec.output_schema_ref,
                 aliases=list(spec.aliases),
+                exports=[
+                    PlanRequestCapabilityExport(
+                        name=export.name,
+                        path=export.path,
+                        description=export.description,
+                        required=export.required,
+                    )
+                    for export in spec.exports
+                ],
                 planner_hints=(
                     dict(spec.planner_hints) if isinstance(spec.planner_hints, dict) else {}
                 ),

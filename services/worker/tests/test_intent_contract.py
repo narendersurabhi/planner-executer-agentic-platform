@@ -203,6 +203,35 @@ def test_tool_payload_builds_github_repo_query_from_context_fields() -> None:
     assert payload["query"] == "repo:scientific-agent-lab owner:narendersurabhi"
 
 
+def test_tool_payload_strips_final_path_for_document_spec_generation() -> None:
+    payload = main._tool_payload(
+        "llm_generate_document_spec",
+        "GenerateDocumentSpec",
+        {
+            "job_context": {
+                "path": "Narender.docx",
+                "output_format": "docx",
+            }
+        },
+        {"output_path": "Narender.docx"},
+        {
+            "llm_generate_document_spec": {
+                "instruction": "Create a document spec.",
+                "topic": "Agentic AI Ops best practices",
+                "audience": "agentic ai ops engineers",
+                "tone": "practical",
+            }
+        },
+    )
+
+    assert payload == {
+        "instruction": "Create a document spec.",
+        "topic": "Agentic AI Ops best practices",
+        "audience": "agentic ai ops engineers",
+        "tone": "practical",
+    }
+
+
 def test_validate_expected_output_rejects_invalid_render_validation_report() -> None:
     error = main._validate_expected_output(
         {

@@ -56,6 +56,13 @@ def test_build_plan_request_extracts_intent_graph_and_capabilities() -> None:
                 enabled=True,
             ),
         ),
+        exports=(
+            capability_registry.CapabilityExportSpec(
+                name="repos",
+                path="repos",
+                description="Repository search results",
+            ),
+        ),
         planner_hints={"task_intents": ["io"]},
     )
 
@@ -73,6 +80,7 @@ def test_build_plan_request_extracts_intent_graph_and_capabilities() -> None:
     assert planner_contracts.capability_map(request)["github.repo.list"].planner_hints == {
         "task_intents": ["io"]
     }
+    assert planner_contracts.capability_map(request)["github.repo.list"].exports[0].name == "repos"
     assert request.semantic_capability_hints[0]["capability_id"] == "github.repo.list"
     assert request.max_dependency_depth == 4
 

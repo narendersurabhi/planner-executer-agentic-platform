@@ -65,6 +65,18 @@ def test_capability_registry_resolves_legacy_render_aliases(monkeypatch):
     assert registry.require("document.pdf.generate").capability_id == "document.pdf.render"
 
 
+def test_capability_registry_parses_document_validate_output_contract(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+    spec = registry.require("document.spec.validate")
+
+    assert spec.output_schema_ref == "document_spec_validate_capability_output"
+    assert len(spec.exports) == 1
+    assert spec.exports[0].name == "validation_report"
+    assert spec.exports[0].path == "$"
+
+
 def test_capability_allowlist_canonicalizes_legacy_render_aliases(monkeypatch):
     monkeypatch.setenv("CAPABILITY_GOVERNANCE_ENABLED", "true")
     monkeypatch.setenv("CAPABILITY_GOVERNANCE_MODE", "enforce")

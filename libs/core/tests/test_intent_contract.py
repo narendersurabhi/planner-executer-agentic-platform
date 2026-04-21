@@ -306,6 +306,74 @@ def test_validate_intent_segment_contract_treats_renderer_hint_as_output_format_
     assert mismatch is None
 
 
+def test_validate_intent_segment_contract_treats_render_json_as_spec_input_format() -> None:
+    segment = {
+        "intent": "render",
+        "objective": "Render DocumentSpec JSON into a document",
+        "required_inputs": ["document_spec_json", "path"],
+        "suggested_capabilities": ["document.docx.render"],
+        "slots": {
+            "entity": "artifact",
+            "artifact_type": "document",
+            "output_format": "json",
+            "risk_level": "bounded_write",
+            "must_have_inputs": ["document_spec", "path"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="render",
+        tool_name="document.docx.render",
+        payload={"document_spec": {"blocks": []}, "path": "Narender.docx"},
+        capability_id="document.docx.render",
+        capability_risk_tier="bounded_write",
+    )
+    assert mismatch is None
+
+
+def test_normalize_intent_segment_slots_uses_render_capability_for_json_spec_input() -> None:
+    slots = intent_contract.normalize_intent_segment_slots(
+        raw_slots={
+            "entity": "artifact",
+            "artifact_type": "document",
+            "output_format": "json",
+            "risk_level": "bounded_write",
+            "must_have_inputs": ["document_spec", "path"],
+        },
+        fallback_slots=None,
+        intent="render",
+        objective="Render DocumentSpec JSON into a document",
+        required_inputs=["document_spec_json", "path"],
+        suggested_capabilities=["document.docx.render"],
+    )
+
+    assert slots["output_format"] == "docx"
+
+
+def test_validate_intent_segment_contract_normalizes_render_risk_to_bounded_write() -> None:
+    segment = {
+        "intent": "render",
+        "objective": "Render final DOCX",
+        "required_inputs": ["document_spec", "path"],
+        "slots": {
+            "entity": "report",
+            "artifact_type": "document",
+            "output_format": "docx",
+            "risk_level": "read_only",
+            "must_have_inputs": ["document_spec", "path"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="render",
+        tool_name="document.docx.render",
+        payload={"document_spec": {"blocks": []}, "path": "artifacts/output.docx"},
+        capability_id="document.docx.render",
+        capability_risk_tier="bounded_write",
+    )
+    assert mismatch is None
+
+
 def test_validate_intent_segment_contract_allows_io_segment_for_transform_task() -> None:
     segment = {
         "intent": "io",
@@ -800,6 +868,35 @@ def test_validate_intent_segment_contract_ignores_goal_for_document_spec_generat
         task_intent="generate",
         tool_name="llm_generate_document_spec",
         payload={"instruction": "Generate the requested document specification."},
+        capability_id="document.spec.generate",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
+def test_validate_intent_segment_contract_ignores_final_path_for_document_spec_generation() -> None:
+    segment = {
+        "intent": "generate",
+        "objective": "GenerateDocumentSpec",
+        "required_inputs": ["instruction"],
+        "suggested_capabilities": ["document.spec.generate"],
+        "slots": {
+            "entity": "document_spec",
+            "artifact_type": "document_spec",
+            "output_format": "json",
+            "risk_level": "read_only",
+            "must_have_inputs": ["instruction"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="generate",
+        tool_name="llm_generate_document_spec",
+        payload={
+            "instruction": "Create a document spec.",
+            "path": "Narender.docx",
+            "output_path": "Narender.docx",
+        },
         capability_id="document.spec.generate",
         capability_risk_tier="read_only",
     )

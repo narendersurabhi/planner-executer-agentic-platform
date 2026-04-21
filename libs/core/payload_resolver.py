@@ -13,6 +13,24 @@ class ToolInputReferenceError(ValueError):
     """Raised when a tool input reference cannot be resolved."""
 
 
+_DOCUMENT_SPEC_GENERATION_TOOL_NAMES = {
+    "llm_generate_document_spec",
+    "document.spec.generate",
+    "llm_generate_document_spec_from_markdown",
+    "document.spec.generate_from_markdown",
+}
+
+_DOCUMENT_SPEC_FINAL_ARTIFACT_KEYS = {
+    "path",
+    "output_path",
+    "filename",
+    "file_name",
+    "output_filename",
+    "format",
+    "output_format",
+}
+
+
 def resolve_tool_inputs(
     tool_requests: list[str],
     instruction: str,
@@ -97,6 +115,7 @@ def resolve_tool_payload(
     payload = _fill_payload_from_context(payload, context)
     payload = _promote_document_job_fields(payload, tool_name=tool_name)
     payload = _canonicalize_render_path_aliases(payload, tool_name=tool_name)
+    payload = _drop_document_spec_final_artifact_fields(payload, tool_name=tool_name)
     if tool_name == "llm_generate_with_context":
         normalized: dict[str, Any] = {"prompt": str(payload.get("prompt") or "")}
         if "context" in payload:
@@ -300,6 +319,7 @@ def normalize_reference_payload_for_validation(
     if isinstance(normalized, dict):
         normalized = _promote_document_job_fields(normalized)
         normalized = _canonicalize_render_path_aliases(normalized, tool_name=tool_name)
+        normalized = _drop_document_spec_final_artifact_fields(normalized, tool_name=tool_name)
     return normalized
 
 
@@ -320,6 +340,20 @@ def _canonicalize_render_path_aliases(
             canonical["path"] = value.strip()
             break
     return canonical
+
+
+def _drop_document_spec_final_artifact_fields(
+    payload: dict[str, Any],
+    *,
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    if str(tool_name or "").strip().lower() not in _DOCUMENT_SPEC_GENERATION_TOOL_NAMES:
+        return dict(payload)
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _DOCUMENT_SPEC_FINAL_ARTIFACT_KEYS
+    }
 
 
 def _resolve_payload_references(value: Any, context: dict[str, Any], *, strict: bool) -> Any:

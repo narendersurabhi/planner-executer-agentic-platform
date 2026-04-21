@@ -1503,7 +1503,8 @@ def test_intent_decompose_endpoint_uses_llm_when_enabled(monkeypatch):
     assert graph["segments"][0]["intent"] == "generate"
     assert graph["segments"][0]["source"] == "llm"
     assert graph["segments"][0]["slots"]["entity"] == "summary"
-    assert graph["segments"][0]["slots"]["must_have_inputs"] == ["instruction"]
+    assert graph["segments"][0]["required_inputs"] == ["prompt"]
+    assert graph["segments"][0]["slots"]["must_have_inputs"] == ["prompt"]
     assert requests
     assert requests[0].metadata is not None
     assert requests[0].metadata["operation"] == "intent_decompose"
@@ -2022,6 +2023,42 @@ def test_intent_decompose_uses_semantic_capability_hints_in_llm_prompt(monkeypat
     assert prompts
     assert "Most relevant capabilities for this goal from local semantic search" in prompts[0]
     assert "document.pdf.render" in prompts[0]
+    assert "Compact capability contracts (authoritative for decomposition)" in prompts[0]
+    assert '"required_inputs"' in prompts[0]
+    assert '"exports"' in prompts[0]
+    assert '"output_schema_ref"' in prompts[0]
+
+
+def test_intent_decompose_uses_selected_capability_contract_inputs(monkeypatch):
+    class _Provider(LLMProvider):
+        def generate(self, prompt: str):  # noqa: ARG002
+            return LLMResponse(
+                content=(
+                    '{"segments":[{"id":"s1","intent":"render","objective":"Render docx report",'
+                    '"confidence":0.9,"depends_on":[],"required_inputs":["document_spec_json"],'
+                    '"suggested_capabilities":["document.docx.render"],'
+                    '"slots":{"entity":"report","artifact_type":"document","output_format":"docx",'
+                    '"risk_level":"bounded_write","must_have_inputs":["document_spec_json"]}}]}'
+                )
+            )
+
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_ENABLED", True)
+    monkeypatch.setattr(main, "INTENT_DECOMPOSE_MODE", "llm")
+    monkeypatch.setattr(main, "_intent_decompose_provider", _Provider())
+
+    response = client.post(
+        "/intent/decompose",
+        json={"goal": "Render a DOCX report from a document spec"},
+    )
+
+    assert response.status_code == 200
+    segment = response.json()["intent_graph"]["segments"][0]
+    assert segment["suggested_capabilities"] == ["document.docx.render"]
+    assert "document_spec" in segment["required_inputs"]
+    assert "path" in segment["required_inputs"]
+    assert "document_spec_json" not in segment["required_inputs"]
+    assert "document_spec" in segment["slots"]["must_have_inputs"]
+    assert "path" in segment["slots"]["must_have_inputs"]
 
 
 def test_intent_decompose_emits_capability_search_event_for_semantic_hints(monkeypatch):
@@ -4495,6 +4532,13 @@ def test_list_capabilities_returns_required_inputs(monkeypatch):
             ),
         ),
         tags=("github",),
+        exports=(
+            cap_registry.CapabilityExportSpec(
+                name="repos",
+                path="repos",
+                description="Repository matches",
+            ),
+        ),
         enabled=True,
     )
     registry = cap_registry.CapabilityRegistry(capabilities={"github.repo.list": capability})
@@ -4519,6 +4563,14 @@ def test_list_capabilities_returns_required_inputs(monkeypatch):
     assert item["group"] == "github"
     assert item["subgroup"] == "repositories"
     assert item["required_inputs"] == ["query"]
+    assert item["exports"] == [
+        {
+            "name": "repos",
+            "path": "repos",
+            "description": "Repository matches",
+            "required": True,
+        }
+    ]
 
 
 def test_capability_required_inputs_uses_repo_local_schema_fallback(monkeypatch):

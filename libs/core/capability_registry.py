@@ -44,6 +44,14 @@ class CapabilityAllowDecision:
 
 
 @dataclass(frozen=True)
+class CapabilityExportSpec:
+    name: str
+    path: str
+    description: str | None = None
+    required: bool = True
+
+
+@dataclass(frozen=True)
 class CapabilitySpec:
     capability_id: str
     description: str
@@ -56,6 +64,7 @@ class CapabilitySpec:
     adapters: tuple[CapabilityAdapterSpec, ...] = ()
     tags: tuple[str, ...] = ()
     aliases: tuple[str, ...] = ()
+    exports: tuple[CapabilityExportSpec, ...] = ()
     planner_hints: dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
 
@@ -341,6 +350,7 @@ def _parse_capability(raw: dict[str, Any], idx: int) -> CapabilitySpec:
     output_schema_ref = _optional_str(raw.get("output_schema_ref"), None)
     tags = _parse_string_list(raw.get("tags"), field_name=f"capabilities[{idx}].tags")
     aliases = _parse_string_list(raw.get("aliases"), field_name=f"capabilities[{idx}].aliases")
+    exports = _parse_exports(raw.get("exports"), idx)
     planner_hints = raw.get("planner_hints", {})
     if not isinstance(planner_hints, dict):
         raise CapabilityRegistryError(f"capabilities[{idx}].planner_hints must be an object")
@@ -365,9 +375,49 @@ def _parse_capability(raw: dict[str, Any], idx: int) -> CapabilitySpec:
         adapters=adapters,
         tags=tags,
         aliases=aliases,
+        exports=exports,
         planner_hints=dict(planner_hints),
         enabled=enabled,
     )
+
+
+def _parse_exports(raw: Any, capability_idx: int) -> tuple[CapabilityExportSpec, ...]:
+    field_prefix = f"capabilities[{capability_idx}].exports"
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise CapabilityRegistryError(f"{field_prefix} must be a list")
+    exports: list[CapabilityExportSpec] = []
+    seen_names: set[str] = set()
+    for export_idx, entry in enumerate(raw):
+        export_prefix = f"{field_prefix}[{export_idx}]"
+        description: str | None = None
+        required = True
+        if isinstance(entry, str):
+            name = _optional_str(entry, None)
+            path = name
+        elif isinstance(entry, dict):
+            name = _required_str(entry, ("name",), f"{export_prefix}.name")
+            path = _optional_str(entry.get("path"), None) or name
+            description = _optional_str(entry.get("description"), None)
+            required = bool(entry.get("required", True))
+        else:
+            raise CapabilityRegistryError(f"{export_prefix} must be a string or object")
+        if not name:
+            raise CapabilityRegistryError(f"missing_required_field:{export_prefix}.name")
+        normalized_name = name.lower()
+        if normalized_name in seen_names:
+            raise CapabilityRegistryError(f"duplicate_capability_export:{name}")
+        seen_names.add(normalized_name)
+        exports.append(
+            CapabilityExportSpec(
+                name=name,
+                path=path or name,
+                description=description,
+                required=required,
+            )
+        )
+    return tuple(exports)
 
 
 def _parse_adapter(raw: Any, capability_idx: int, adapter_idx: int) -> CapabilityAdapterSpec:

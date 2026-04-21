@@ -284,6 +284,15 @@ def _llm_plan_repair_prompt(
                 subgroup=capability.subgroup,
                 input_schema_ref=capability.input_schema_ref,
                 output_schema_ref=capability.output_schema_ref,
+                exports=[
+                    planner_contracts.PlanRequestCapabilityExport(
+                        name=export.name,
+                        path=export.path,
+                        description=export.description,
+                        required=export.required,
+                    )
+                    for export in capability.exports
+                ],
                 planner_hints=(
                     dict(capability.planner_hints)
                     if isinstance(capability.planner_hints, dict)
@@ -923,6 +932,25 @@ def _reference_task_name_from_from_spec(from_spec: Any) -> str | None:
     return task_name or None
 
 
+def _reference_path_segments(from_spec: Any) -> list[str]:
+    if isinstance(from_spec, list):
+        return [str(segment) for segment in from_spec if str(segment).strip()]
+    if isinstance(from_spec, str):
+        raw = from_spec.strip()
+        if not raw:
+            return []
+        if raw.startswith("$."):
+            raw = raw[2:]
+        if raw.startswith("/"):
+            return [
+                segment.replace("~1", "/").replace("~0", "~")
+                for segment in raw.split("/")[1:]
+                if segment
+            ]
+        return [segment for segment in raw.split(".") if segment]
+    return []
+
+
 def _collect_referenced_task_names(value: Any) -> set[str]:
     names: set[str] = set()
     if isinstance(value, dict):
@@ -986,6 +1014,25 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
     tasks = [task.model_copy(deep=True) for task in plan.tasks]
     task_by_name = {task.name: task for task in tasks}
     changed = False
+    try:
+        capabilities = capability_registry.load_capability_registry().enabled_capabilities()
+    except Exception:  # noqa: BLE001
+        capabilities = {}
+    exported_paths_by_request: dict[str, set[str]] = {}
+    for capability_id, spec in capabilities.items():
+        paths = {
+            str(export.path or "").strip()
+            for export in spec.exports
+            if str(export.name or "").strip() == "document_spec"
+            and str(export.path or "").strip()
+        }
+        if not paths:
+            continue
+        exported_paths_by_request.setdefault(capability_id, set()).update(paths)
+        for adapter in spec.adapters:
+            tool_name = str(adapter.tool_name or "").strip()
+            if tool_name:
+                exported_paths_by_request.setdefault(tool_name, set()).update(paths)
     renderer_requests = {
         "docx_render_from_spec",
         "docx_generate_from_spec",
@@ -1016,6 +1063,41 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
         if not ref_task:
             return False
         return ref_task in task_by_name
+
+    def _reference_request_and_output_path(value: Any) -> tuple[str | None, str | None]:
+        if not isinstance(value, dict):
+            return None, None
+        segments = _reference_path_segments(value.get("$from"))
+        if len(segments) < 4 or segments[0] not in {"dependencies_by_name", "dependencies"}:
+            return None, None
+        source_task = task_by_name.get(segments[1])
+        if source_task is None:
+            return None, None
+        tail = segments[2:]
+        request_ids = {str(request_id) for request_id in (source_task.tool_requests or [])}
+        for end in range(len(tail), 0, -1):
+            candidate = ".".join(tail[:end]).strip()
+            if candidate in request_ids:
+                output_path = ".".join(tail[end:]).strip()
+                return candidate, output_path or None
+        return None, None
+
+    def _valid_document_spec_ref(value: Any) -> bool:
+        if not _ref_task_exists(value):
+            return False
+        request_id, output_path = _reference_request_and_output_path(value)
+        if not request_id or not output_path:
+            return False
+        exported_paths = exported_paths_by_request.get(request_id)
+        if not exported_paths:
+            return False
+        return output_path in exported_paths
+
+    def _document_spec_export_path_for_request(request_id: str) -> str | None:
+        exported_paths = exported_paths_by_request.get(str(request_id or "").strip())
+        if not exported_paths:
+            return None
+        return sorted(exported_paths)[0]
 
     def _find_source_task_name(
         current_task: models.TaskCreate,
@@ -1062,7 +1144,7 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
         payload_raw = tool_inputs.get(request_id)
         payload = dict(payload_raw) if isinstance(payload_raw, dict) else {}
 
-        has_valid_document_spec_ref = _ref_task_exists(payload.get("document_spec"))
+        has_valid_document_spec_ref = _valid_document_spec_ref(payload.get("document_spec"))
         if ("document_spec" not in payload) or (
             isinstance(payload.get("document_spec"), dict) and not has_valid_document_spec_ref
         ):
@@ -1070,10 +1152,13 @@ def _ensure_renderer_required_inputs(plan: models.PlanCreate) -> models.PlanCrea
                 task, index, document_spec_producers
             )
             if source_task_name and source_request_id:
+                export_path = _document_spec_export_path_for_request(source_request_id)
+                if not export_path:
+                    continue
                 payload["document_spec"] = {
                     "$from": (
                         f"dependencies_by_name.{source_task_name}."
-                        f"{source_request_id}.document_spec"
+                        f"{source_request_id}.{export_path}"
                     )
                 }
                 changed = True

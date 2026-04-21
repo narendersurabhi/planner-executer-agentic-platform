@@ -19,6 +19,7 @@ _INTERNAL_CHAT_USER_ID_KEY = "_chat_user_id"
 _CHAT_STATE_VERSION_KEY = "_chat_state_version"
 _CHAT_STATE_CONFLICT_COUNT_KEY = "_chat_state_conflict_count"
 _PENDING_CLARIFICATION_SLOT_KEYS = (
+    "goal",
     "instruction",
     "topic",
     "audience",
@@ -37,85 +38,20 @@ _PENDING_CLARIFICATION_SLOT_KEYS = (
     "length",
     "markdown_text",
     "target_repo",
+    "workspace_path",
 )
-_CLARIFICATION_INTENT_CHANGE_ARTIFACT_TOKENS = {
-    "document",
-    "doc",
-    "docx",
-    "pdf",
-    "markdown",
-    "json",
-    "report",
-    "guide",
-    "checklist",
-    "workflow",
-    "job",
-    "issue",
-    "repo",
-    "repository",
-    "file",
-    "files",
-    "summary",
-    "runbook",
-    "query",
-}
-_CLARIFICATION_INTENT_CHANGE_ACTION_TOKENS = {
-    "create",
-    "generate",
-    "write",
-    "make",
-    "render",
-    "build",
-    "draft",
-    "search",
-    "list",
-    "read",
-    "inspect",
-    "fetch",
-    "produce",
-}
+_BOOTSTRAP_EXECUTION_ACTION_TOKENS = {"create", "generate", "make", "build"}
+_BOOTSTRAP_EXECUTION_ARTIFACT_TOKENS = {"document", "repo", "repository", "file", "workflow"}
+_BOOTSTRAP_CONTINUATION_TOKENS = {"yes", "no", "use", "create", "start"}
 _OUTPUT_FORMAT_TOKENS = {"pdf", "docx", "markdown", "json", "word"}
 _TONE_TOKENS = {"practical", "formal", "conversational", "executive", "technical", "concise"}
-_OUTPUT_FORMAT_BY_EXTENSION = {
-    "pdf": "pdf",
-    "docx": "docx",
-    "md": "md",
-    "markdown": "md",
-    "json": "json",
-    "csv": "csv",
-    "xlsx": "xlsx",
-    "html": "html",
-    "txt": "txt",
-    "text": "txt",
-}
-_CLARIFICATION_FIELD_ALIASES = {
-    "content": "instruction",
-    "contextual_information": "query",
-    "document_instructions": "instruction",
-    "document_intent_title": "topic",
-    "document_name": "path",
-    "document_spec_content": "instruction",
-    "document_spec_title": "topic",
-    "document_title": "topic",
-    "document_topic": "topic",
-    "document_topic_summary": "topic",
-    "filepath": "path",
-    "format": "output_format",
-    "grounding_facts": "query",
-    "output_dir": "path",
-    "output_directory": "path",
-    "output_file_path": "path",
-    "output_filepath": "path",
-    "rendered_document_content": "instruction",
-    "retrieved_content": "query",
-    "target_directory": "path",
-    "target_format": "output_format",
-    "topic_context": "topic",
-    "topic_description": "topic",
-    "topic_query": "query",
-    "user_clarification": "instruction",
-    "user_goal": "instruction",
-}
+
+
+@dataclass(frozen=True)
+class ChatThreadHints:
+    action_tokens: frozenset[str] = frozenset()
+    artifact_tokens: frozenset[str] = frozenset()
+    continuation_tokens: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -172,6 +108,22 @@ class ChatSubmitNormalizationResult:
     goal_intent_profile: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ClarificationLifecycle:
+    state: chat_contracts.ClarificationState | None = None
+    active: bool = False
+    pending_fields: tuple[str, ...] = ()
+    required_fields: tuple[str, ...] = ()
+    questions: tuple[str, ...] = ()
+    current_question: str | None = None
+    current_question_field: str | None = None
+    known_slot_values: dict[str, Any] = field(default_factory=dict)
+    goal_intent_profile: dict[str, Any] = field(default_factory=dict)
+
+    def next_question(self) -> str | None:
+        return self.current_question or (self.questions[0] if self.questions else None)
+
+
 def _submit_normalization_failure_questions(
     *,
     session_metadata: Mapping[str, Any] | None,
@@ -185,8 +137,8 @@ def _submit_normalization_failure_questions(
             if question and question not in questions:
                 questions.append(question)
 
-    pending = _parse_pending_clarification_state(session_metadata)
-    for raw_question in (pending.questions if pending is not None else []):
+    lifecycle = clarification_lifecycle_from_metadata(session_metadata)
+    for raw_question in lifecycle.questions:
         _append(raw_question)
 
     if isinstance(assessment, Mapping):
@@ -214,6 +166,73 @@ def _parse_pending_clarification_state(
         return None
 
 
+def clarification_state_from_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> chat_contracts.ClarificationState | None:
+    return _parse_pending_clarification_state(metadata)
+
+
+def clarification_lifecycle_from_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> ClarificationLifecycle:
+    return clarification_lifecycle_from_state(_parse_pending_clarification_state(metadata))
+
+
+def clarification_lifecycle_from_state(
+    state: chat_contracts.ClarificationState | Mapping[str, Any] | None,
+) -> ClarificationLifecycle:
+    if isinstance(state, chat_contracts.ClarificationState):
+        parsed = state
+    else:
+        parsed = _coerce_clarification_state(state)
+    return _clarification_lifecycle(parsed)
+
+
+def pending_clarification_is_active(metadata: Mapping[str, Any] | None) -> bool:
+    return clarification_lifecycle_from_metadata(metadata).active
+
+
+def _clarification_state_has_pending_work(
+    state: chat_contracts.ClarificationState | None,
+) -> bool:
+    return clarification_lifecycle_from_state(state).active
+
+
+def persist_pending_clarification_state(
+    metadata: dict[str, Any],
+    *,
+    state: Mapping[str, Any] | chat_contracts.ClarificationState | None,
+    draft_goal: str | None = None,
+    cleared_keys: set[str] | None = None,
+) -> bool:
+    lifecycle = clarification_lifecycle_from_state(state)
+    if lifecycle.active and lifecycle.state is not None:
+        if isinstance(draft_goal, str) and draft_goal.strip():
+            metadata["draft_goal"] = draft_goal.strip()
+        metadata["pending_clarification"] = _canonical_pending_state_payload(lifecycle)
+        return True
+    for key in ("draft_goal", "pending_clarification"):
+        metadata.pop(key, None)
+        if cleared_keys is not None:
+            cleared_keys.add(key)
+    return False
+
+
+def clear_pending_clarification_state(
+    metadata: dict[str, Any],
+    *,
+    cleared_keys: set[str] | None = None,
+    include_workflow_input: bool = False,
+) -> None:
+    keys = ["draft_goal", "pending_clarification"]
+    if include_workflow_input:
+        keys.append("pending_workflow_input")
+    for key in keys:
+        metadata.pop(key, None)
+        if cleared_keys is not None:
+            cleared_keys.add(key)
+
+
 def _coerce_clarification_state(
     value: Mapping[str, Any] | None,
 ) -> chat_contracts.ClarificationState | None:
@@ -223,6 +242,208 @@ def _coerce_clarification_state(
         return chat_contracts.ClarificationState.model_validate(dict(value))
     except Exception:  # noqa: BLE001
         return None
+
+
+def _clarification_lifecycle(
+    state: chat_contracts.ClarificationState | None,
+) -> ClarificationLifecycle:
+    if state is None:
+        return ClarificationLifecycle()
+
+    known_slot_values = _known_clarification_slot_values(state)
+    profile = dict(state.goal_intent_profile or {})
+    profile_requires_clarification = bool(
+        profile.get("needs_clarification")
+        or profile.get("requires_blocking_clarification")
+    )
+
+    profile_fields = _unresolved_clarification_fields(
+        [profile.get("missing_slots"), profile.get("blocking_slots")],
+        known_slot_values=known_slot_values,
+    )
+    state_pending_fields = _unresolved_clarification_fields(
+        [state.pending_fields, state.required_fields],
+        known_slot_values=known_slot_values,
+    )
+    current_question_field = _normalize_clarification_field_key(state.current_question_field)
+    current_question_field = (
+        current_question_field
+        if current_question_field and current_question_field not in known_slot_values
+        else ""
+    )
+    pending_fields = tuple(
+        _ordered_clarification_fields(
+            profile_fields,
+            state_pending_fields,
+            [current_question_field] if current_question_field else [],
+        )
+    )
+    required_fields = tuple(
+        _ordered_clarification_fields(
+            profile_fields,
+            state.required_fields,
+            [current_question_field] if current_question_field else [],
+        )
+    )
+
+    raw_questions = _unique_string_list(
+        [state.current_question] if state.current_question else [],
+        state.questions,
+        state.pending_questions,
+    )
+    questions = _active_lifecycle_questions(
+        raw_questions=raw_questions,
+        candidate_fields=pending_fields or required_fields,
+        known_slot_values=known_slot_values,
+        goal=state.original_goal,
+        profile_requires_clarification=profile_requires_clarification,
+    )
+    current_question = questions[0] if questions else None
+    resolved_question_field = _clarification_field_from_question(
+        question=current_question,
+        candidate_fields=pending_fields or required_fields or _PENDING_CLARIFICATION_SLOT_KEYS,
+        goal=state.original_goal,
+    )
+    if resolved_question_field and resolved_question_field not in known_slot_values:
+        current_question_field = resolved_question_field
+        if current_question_field not in pending_fields:
+            pending_fields = tuple(_ordered_clarification_fields([current_question_field], pending_fields))
+        if current_question_field not in required_fields:
+            required_fields = tuple(_ordered_clarification_fields([current_question_field], required_fields))
+    elif not current_question_field and pending_fields:
+        current_question_field = pending_fields[0]
+
+    active = bool(
+        pending_fields
+        or required_fields
+        or (profile_requires_clarification and questions)
+    )
+    return ClarificationLifecycle(
+        state=state,
+        active=active,
+        pending_fields=pending_fields,
+        required_fields=required_fields,
+        questions=tuple(questions if active else ()),
+        current_question=current_question if active else None,
+        current_question_field=current_question_field if active else None,
+        known_slot_values=known_slot_values,
+        goal_intent_profile=profile,
+    )
+
+
+def _known_clarification_slot_values(
+    state: chat_contracts.ClarificationState,
+) -> dict[str, Any]:
+    known: dict[str, Any] = {}
+    for raw_slots in (state.known_slot_values, state.resolved_slots):
+        if not isinstance(raw_slots, Mapping):
+            continue
+        for raw_key, raw_value in raw_slots.items():
+            key = _normalize_clarification_field_key(raw_key)
+            if not key or key in known:
+                continue
+            if raw_value is None:
+                continue
+            if isinstance(raw_value, str):
+                value = raw_value.strip()
+                if not value:
+                    continue
+                known[key] = value
+            else:
+                known[key] = raw_value
+    return known
+
+
+def _unresolved_clarification_fields(
+    collections: Sequence[Any],
+    *,
+    known_slot_values: Mapping[str, Any],
+) -> list[str]:
+    fields: list[str] = []
+    for collection in collections:
+        if not isinstance(collection, Sequence) or isinstance(collection, (str, bytes)):
+            continue
+        for raw_field in collection:
+            field = _normalize_clarification_field_key(raw_field)
+            if not field or field in fields:
+                continue
+            value = known_slot_values.get(field)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                continue
+            fields.append(field)
+    return fields
+
+
+def _active_lifecycle_questions(
+    *,
+    raw_questions: Sequence[str],
+    candidate_fields: Sequence[str],
+    known_slot_values: Mapping[str, Any],
+    goal: str,
+    profile_requires_clarification: bool,
+) -> list[str]:
+    questions: list[str] = []
+    candidate_field_list = list(candidate_fields)
+    for question in raw_questions:
+        question_field = _clarification_field_from_question(
+            question=question,
+            candidate_fields=candidate_field_list or _PENDING_CLARIFICATION_SLOT_KEYS,
+            goal=goal,
+            allow_single_candidate_fallback=False,
+        )
+        if question_field:
+            value = known_slot_values.get(question_field)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                continue
+            if candidate_field_list and question_field not in candidate_field_list:
+                continue
+        elif candidate_field_list:
+            continue
+        elif not profile_requires_clarification:
+            continue
+        if question not in questions:
+            questions.append(question)
+    if not questions and candidate_field_list:
+        question = chat_clarification_normalizer.clarification_question_for_field(
+            candidate_field_list[0],
+            goal=goal,
+        )
+        if question:
+            questions.append(question)
+    return questions
+
+
+def _canonical_pending_state_payload(
+    lifecycle: ClarificationLifecycle,
+) -> dict[str, Any]:
+    state = lifecycle.state
+    if state is None:
+        return {}
+    profile = dict(state.goal_intent_profile or {})
+    profile["missing_slots"] = list(lifecycle.pending_fields)
+    profile["blocking_slots"] = list(lifecycle.required_fields or lifecycle.pending_fields)
+    profile["needs_clarification"] = lifecycle.active
+    profile["requires_blocking_clarification"] = lifecycle.active
+    profile["questions"] = list(lifecycle.questions)
+    payload = state.model_dump(mode="json", exclude_none=True)
+    payload.update(
+        {
+            "goal_intent_profile": profile,
+            "questions": ([lifecycle.current_question] if lifecycle.current_question else []),
+            "pending_questions": list(lifecycle.questions),
+            "current_question": lifecycle.current_question,
+            "current_question_field": lifecycle.current_question_field,
+            "pending_fields": list(lifecycle.pending_fields),
+            "required_fields": list(lifecycle.required_fields),
+            "known_slot_values": dict(lifecycle.known_slot_values),
+            "resolved_slots": dict(lifecycle.known_slot_values),
+            "answered_fields": sorted(str(key) for key in lifecycle.known_slot_values.keys()),
+        }
+    )
+    return chat_contracts.ClarificationState.model_validate(payload).model_dump(
+        mode="json",
+        exclude_none=True,
+    )
 
 
 def _session_state_version(metadata: Mapping[str, Any] | None) -> int:
@@ -254,10 +475,7 @@ def _unique_string_list(*values: Sequence[Any] | None) -> list[str]:
 
 
 def _normalize_clarification_field_key(value: Any) -> str:
-    normalized = intent_contract.normalize_required_input_key(value)
-    if not normalized:
-        return ""
-    return _CLARIFICATION_FIELD_ALIASES.get(normalized, normalized)
+    return chat_clarification_normalizer.normalize_clarification_field_key(value)
 
 
 def _clarification_output_format_from_path(path: Any) -> str | None:
@@ -267,7 +485,8 @@ def _clarification_output_format_from_path(path: Any) -> str | None:
     if not candidate or "." not in candidate:
         return None
     extension = candidate.rsplit(".", 1)[-1]
-    return _OUTPUT_FORMAT_BY_EXTENSION.get(extension)
+    normalized = chat_clarification_normalizer.normalize_output_format_token(extension)
+    return normalized or None
 
 
 def _merge_known_clarification_slots(
@@ -377,6 +596,7 @@ def _clarification_field_from_question(
     question: str | None,
     candidate_fields: Sequence[Any] = (),
     goal: str = "",
+    allow_single_candidate_fallback: bool = True,
 ) -> str | None:
     normalized_question = str(question or "").strip()
     if not normalized_question:
@@ -432,6 +652,16 @@ def _clarification_field_from_question(
     if any(
         token in question_lower
         for token in (
+            "system do first",
+            "generate, transform, validate, render, or io",
+            "generate, transform, validate, render",
+            "intent action",
+        )
+    ) and "intent_action" in candidate_set:
+        return "intent_action"
+    if any(
+        token in question_lower
+        for token in (
             "specifically cover",
             "what content should be in the document",
             "what specific content should be in the document",
@@ -443,7 +673,7 @@ def _clarification_field_from_question(
         for field in ("instruction", "markdown_text", "query"):
             if field in candidate_set:
                 return field
-    return candidates[0] if len(candidates) == 1 else None
+    return candidates[0] if allow_single_candidate_fallback and len(candidates) == 1 else None
 
 
 def _ordered_clarification_fields(*collections: Sequence[Any] | None) -> list[str]:
@@ -467,9 +697,11 @@ def _merge_clarification_state_for_persistence(
     if latest_state is None and desired_state is None:
         return {}
     if latest_state is None:
-        return desired_state.model_dump(mode="json", exclude_none=True)
+        lifecycle = clarification_lifecycle_from_state(desired_state)
+        return _canonical_pending_state_payload(lifecycle) if lifecycle.active else {}
     if desired_state is None:
-        return latest_state.model_dump(mode="json", exclude_none=True)
+        lifecycle = clarification_lifecycle_from_state(latest_state)
+        return _canonical_pending_state_payload(lifecycle) if lifecycle.active else {}
 
     known_slot_values: dict[str, Any] = {}
     slot_provenance: dict[str, str] = {}
@@ -599,7 +831,10 @@ def _merge_clarification_state_for_persistence(
     merged.auto_path_allowed = bool(
         latest_state.auto_path_allowed or desired_state.auto_path_allowed
     )
-    return merged.model_dump(mode="json", exclude_none=True)
+    lifecycle = clarification_lifecycle_from_state(merged)
+    if not lifecycle.active:
+        return {}
+    return _canonical_pending_state_payload(lifecycle)
 
 
 def _clarification_question_queue(questions: Sequence[Any] | None) -> list[str]:
@@ -889,6 +1124,40 @@ def _pending_clarification_state(
                     if source_key in normalized_fields
                     else workflow_contracts.SlotProvenance.explicit_user.value
                 )
+    assessment_unresolved_fields: set[str] = set()
+    if isinstance(assessment, Mapping):
+        for raw_field in (assessment.get("missing_slots") or []) + (assessment.get("blocking_slots") or []):
+            field = _normalize_clarification_field_key(raw_field)
+            if field:
+                assessment_unresolved_fields.add(field)
+    assessment_low_confidence = bool(
+        isinstance(assessment, Mapping)
+        and (
+            assessment.get("low_confidence")
+            or (
+                isinstance(assessment.get("confidence"), (int, float))
+                and isinstance(assessment.get("threshold"), (int, float))
+                and float(assessment.get("confidence") or 0) < float(assessment.get("threshold") or 0)
+            )
+        )
+    )
+    if isinstance(assessment, Mapping) and isinstance(assessment.get("slot_values"), Mapping):
+        for raw_key, value in dict(assessment.get("slot_values") or {}).items():
+            source_key = _normalize_clarification_field_key(raw_key)
+            if not source_key or source_key in known_slot_values:
+                continue
+            if assessment_low_confidence and source_key in assessment_unresolved_fields:
+                continue
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    continue
+                known_slot_values[source_key] = stripped
+            elif value is not None:
+                known_slot_values[source_key] = value
+            else:
+                continue
+            slot_provenance[source_key] = workflow_contracts.SlotProvenance.inferred.value
     _ensure_inferred_clarification_slots(
         known_slot_values=known_slot_values,
         slot_provenance=slot_provenance,
@@ -903,12 +1172,17 @@ def _pending_clarification_state(
                     required_fields.append(field)
                 if field and field not in pending_fields:
                     pending_fields.append(field)
-    for raw_field in (existing_state.pending_fields if existing_state is not None else []):
-        if isinstance(raw_field, str):
-            field = _normalize_clarification_field_key(raw_field)
-            if field and field not in pending_fields and field not in known_slot_values:
-                pending_fields.append(field)
-    if existing_state is not None:
+    reset_existing_pending_fields = (
+        isinstance(assessment, Mapping)
+        and str(assessment.get("source") or "").strip() == "chat_boundary_meta_clarification"
+    )
+    if not reset_existing_pending_fields:
+        for raw_field in (existing_state.pending_fields if existing_state is not None else []):
+            if isinstance(raw_field, str):
+                field = _normalize_clarification_field_key(raw_field)
+                if field and field not in pending_fields and field not in known_slot_values:
+                    pending_fields.append(field)
+    if existing_state is not None and not reset_existing_pending_fields:
         for raw_field in existing_state.required_fields:
             if isinstance(raw_field, str):
                 field = _normalize_clarification_field_key(raw_field)
@@ -990,6 +1264,38 @@ def _pending_clarification_state(
         allowed_fields=allowed_fields,
         known_slot_values=known_slot_values,
     )
+    question_candidate_fields = (
+        list(pending_fields)
+        + list(required_fields)
+        + list(active_target.required_fields if active_target is not None else ())
+    )
+    filtered_question_queue: list[str] = []
+    if question_candidate_fields:
+        for question in question_queue:
+            question_field = _clarification_field_from_question(
+                question=question,
+                candidate_fields=_PENDING_CLARIFICATION_SLOT_KEYS,
+                goal=resolved_goal or original_goal,
+            )
+            if not question_field:
+                continue
+            value = known_slot_values.get(question_field)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                continue
+            if question_field not in question_candidate_fields:
+                continue
+            if question not in filtered_question_queue:
+                filtered_question_queue.append(question)
+    if not filtered_question_queue and pending_fields:
+        filtered_question_queue = [
+            chat_clarification_normalizer.clarification_question_for_field(
+                pending_fields[0],
+                goal=resolved_goal or original_goal,
+            )
+        ]
+    if question_candidate_fields or filtered_question_queue:
+        question_queue = filtered_question_queue
+    active_questions = question_queue[:1]
     execution_frame = (
         existing_state.execution_frame.model_copy(deep=True)
         if existing_state is not None
@@ -1022,8 +1328,12 @@ def _pending_clarification_state(
         goal=resolved_goal or original_goal,
     )
     if current_question_field:
-        if current_question_field not in required_fields:
+        if current_question_field in known_slot_values:
+            current_question = None
+            current_question_field = None
+        elif current_question_field not in required_fields:
             required_fields = [current_question_field, *required_fields]
+    if current_question_field:
         pending_fields = [
             current_question_field,
             *[field for field in pending_fields if field != current_question_field],
@@ -1074,13 +1384,17 @@ def _apply_pending_clarification_mapping(
     dict[str, Any],
     ChatSubmitNormalizationResult | None,
 ]:
-    pending_state = _parse_pending_clarification_state(session_metadata)
+    pending_lifecycle = clarification_lifecycle_from_metadata(session_metadata)
+    pending_state = pending_lifecycle.state if pending_lifecycle.active else None
     if pending_state is None or runtime.normalize_submit_context is None:
+        updated_metadata = dict(session_metadata)
+        if pending_lifecycle.state is not None and not pending_lifecycle.active:
+            clear_pending_clarification_state(updated_metadata)
         return (
             goal,
             context_envelope,
             dict(merged_context or {}),
-            dict(session_metadata),
+            updated_metadata,
             None,
         )
 
@@ -1143,7 +1457,7 @@ def _apply_pending_clarification_mapping(
         and normalization.goal_intent_profile
         else dict(pending_state.goal_intent_profile or {})
     )
-    updated_metadata["pending_clarification"] = _pending_clarification_state(
+    next_pending_state = _pending_clarification_state(
         resolved_goal=updated_goal,
         questions=clarification_question_queue,
         assessment=assessment,
@@ -1156,6 +1470,15 @@ def _apply_pending_clarification_mapping(
         ),
         latest_user_answer=content,
     )
+    next_lifecycle = clarification_lifecycle_from_state(next_pending_state)
+    if next_lifecycle.active:
+        persist_pending_clarification_state(
+            updated_metadata,
+            state=next_pending_state,
+            draft_goal=updated_goal,
+        )
+    else:
+        clear_pending_clarification_state(updated_metadata)
     return updated_goal, updated_envelope, updated_context, updated_metadata, normalization
 
 
@@ -1291,7 +1614,11 @@ def _looks_like_local_clarification_field_answer(
     if normalized_field == "tone":
         return bool(tokens & _TONE_TOKENS) and len(tokens) <= 8
     if normalized_field == "audience":
-        return not bool(tokens & _CLARIFICATION_INTENT_CHANGE_ACTION_TOKENS) and len(tokens) <= 12
+        return not bool(tokens & _chat_thread_hints().action_tokens) and len(tokens) <= 12
+    if normalized_field == "goal":
+        return len(tokens) >= 4
+    if normalized_field == "workspace_path":
+        return bool(tokens & {"workspace", "folder", "directory", "path", "repo", "repository"})
     if normalized_field in {"path", "output_path"}:
         return bool(
             re.search(
@@ -1317,6 +1644,14 @@ def _looks_like_pending_clarification_intent_change(
         lowered,
     ):
         return False
+    tokens = set(re.findall(r"[a-z0-9]+", lowered))
+    hints = _chat_thread_hints()
+    if (
+        len(tokens) > 12
+        and bool(tokens & hints.artifact_tokens)
+        and bool(tokens & hints.action_tokens)
+    ):
+        return True
     if _looks_like_local_clarification_field_answer(
         content,
         current_field=pending_state.current_question_field,
@@ -1336,10 +1671,7 @@ def _looks_like_pending_clarification_intent_change(
     )
     if not any(re.search(pattern, lowered) for pattern in redirect_patterns):
         return False
-    tokens = set(re.findall(r"[a-z0-9]+", lowered))
-    return bool(tokens & _CLARIFICATION_INTENT_CHANGE_ARTIFACT_TOKENS) and bool(
-        tokens & _CLARIFICATION_INTENT_CHANGE_ACTION_TOKENS
-    )
+    return bool(tokens & hints.artifact_tokens) and bool(tokens & hints.action_tokens)
 
 
 def create_session(
@@ -1419,16 +1751,18 @@ def handle_turn(
     if bound_user_id and not _chat_session_user_id(session_metadata):
         session_metadata[_INTERNAL_CHAT_USER_ID_KEY] = bound_user_id
     restarted_pending_clarification = False
-    pending_state = _parse_pending_clarification_state(session_metadata)
+    pending_lifecycle = clarification_lifecycle_from_metadata(session_metadata)
+    pending_state = pending_lifecycle.state if pending_lifecycle.active else None
     pending_state_before_mapping = pending_state
     if _looks_like_pending_clarification_intent_change(
         content,
         pending_state=pending_state,
     ):
         restarted_pending_clarification = True
-        session_metadata.pop("draft_goal", None)
-        session_metadata.pop("pending_clarification", None)
-        session_metadata.pop("pending_workflow_input", None)
+        clear_pending_clarification_state(
+            session_metadata,
+            include_workflow_input=True,
+        )
     session_context = _sanitize_chat_context(_coerce_context_json(session_metadata.get("context_json")))
     turn_context = _prepare_turn_context(
         request.context_json,
@@ -1436,12 +1770,15 @@ def handle_turn(
         content=content,
     )
     turn_context = _sanitize_chat_context(turn_context)
+    messages = _message_records_for_session(db, record.id)
+    chat_messages = [_message_from_record(message) for message in messages]
     candidate_goal = (
         content.strip()
         if restarted_pending_clarification
         else _candidate_goal(
             content,
             session_metadata,
+            messages=chat_messages,
             is_chat_only_correction=runtime.is_chat_only_correction,
         )
     )
@@ -1465,8 +1802,6 @@ def handle_turn(
         job_id=None,
         created_at=now,
     )
-    messages = _message_records_for_session(db, record.id)
-    chat_messages = [_message_from_record(message) for message in messages]
     pre_route_normalization: ChatSubmitNormalizationResult | None = None
     (
         candidate_goal,
@@ -1559,15 +1894,19 @@ def handle_turn(
             goal_intent_profile=dict(assessment),
             context_json=merged_context,
         )
-        session_metadata["draft_goal"] = resolved_goal
-        session_metadata["pending_clarification"] = _pending_clarification_state(
-            resolved_goal=resolved_goal,
-            questions=question_queue,
-            assessment=assessment,
-            session_metadata=session_metadata,
-            context_json=merged_context,
-            normalized_intent_envelope=normalized_intent_envelope,
-            latest_user_answer=content,
+        persist_pending_clarification_state(
+            session_metadata,
+            state=_pending_clarification_state(
+                resolved_goal=resolved_goal,
+                questions=question_queue,
+                assessment=assessment,
+                session_metadata=session_metadata,
+                context_json=merged_context,
+                normalized_intent_envelope=normalized_intent_envelope,
+                latest_user_answer=content,
+            ),
+            draft_goal=resolved_goal,
+            cleared_keys=cleared_session_keys,
         )
     elif route_type == "submit_job":
         normalization = pre_route_normalization
@@ -1588,12 +1927,20 @@ def handle_turn(
                     "chat_submit_normalization_failed",
                     extra={"session_id": record.id},
                 )
+                fallback_questions = _submit_normalization_failure_questions(
+                    session_metadata=session_metadata,
+                    assessment=assessment,
+                )
                 normalization = ChatSubmitNormalizationResult(
                     goal=resolved_goal,
-                    clarification_questions=_submit_normalization_failure_questions(
-                        session_metadata=session_metadata,
-                        assessment=assessment,
-                    ),
+                    clarification_questions=fallback_questions,
+                    requires_blocking_clarification=True,
+                    goal_intent_profile={
+                        **dict(assessment),
+                        "needs_clarification": True,
+                        "requires_blocking_clarification": True,
+                        "questions": fallback_questions,
+                    },
                 )
         if normalization is not None:
             if isinstance(normalization.context_json, Mapping) and normalization.context_json:
@@ -1623,7 +1970,7 @@ def handle_turn(
                 )
             clarification_questions = _active_clarification_questions(clarification_question_queue)
             if clarification_questions or normalization.requires_blocking_clarification:
-                assistant_content = "\n".join(clarification_questions)
+                assistant_content = "\n".join(clarification_questions or clarification_question_queue)
                 assistant_action = chat_contracts.AssistantAction(
                     type=chat_contracts.AssistantActionType.ask_clarification,
                     goal=resolved_goal,
@@ -1631,15 +1978,19 @@ def handle_turn(
                     goal_intent_profile=dict(assessment),
                     context_json=merged_context,
                 )
-                session_metadata["draft_goal"] = resolved_goal
-                session_metadata["pending_clarification"] = _pending_clarification_state(
-                    resolved_goal=resolved_goal,
-                    questions=clarification_question_queue,
-                    assessment=assessment,
-                    session_metadata=session_metadata,
-                    context_json=merged_context,
-                    normalized_intent_envelope=normalized_intent_envelope,
-                    latest_user_answer=content,
+                persist_pending_clarification_state(
+                    session_metadata,
+                    state=_pending_clarification_state(
+                        resolved_goal=resolved_goal,
+                        questions=clarification_question_queue,
+                        assessment=assessment,
+                        session_metadata=session_metadata,
+                        context_json=merged_context,
+                        normalized_intent_envelope=normalized_intent_envelope,
+                        latest_user_answer=content,
+                    ),
+                    draft_goal=resolved_goal,
+                    cleared_keys=cleared_session_keys,
                 )
             else:
                 created_job = runtime.create_job(
@@ -1664,9 +2015,10 @@ def handle_turn(
                     context_json=merged_context,
                 )
                 session_metadata["active_job_id"] = created_job.id
-                session_metadata.pop("draft_goal", None)
-                session_metadata.pop("pending_clarification", None)
-                cleared_session_keys.update({"draft_goal", "pending_clarification"})
+                clear_pending_clarification_state(
+                    session_metadata,
+                    cleared_keys=cleared_session_keys,
+                )
         else:
             created_job = runtime.create_job(
                 models.JobCreate(
@@ -1690,9 +2042,10 @@ def handle_turn(
                 context_json=merged_context,
             )
             session_metadata["active_job_id"] = created_job.id
-            session_metadata.pop("draft_goal", None)
-            session_metadata.pop("pending_clarification", None)
-            cleared_session_keys.update({"draft_goal", "pending_clarification"})
+            clear_pending_clarification_state(
+                session_metadata,
+                cleared_keys=cleared_session_keys,
+            )
     elif route_type == "run_workflow":
         workflow_invocation = workflow_invocation_from_context(merged_context)
         if workflow_invocation is None or not workflow_invocation.has_target():
@@ -1709,15 +2062,25 @@ def handle_turn(
                 goal_intent_profile=dict(assessment),
                 context_json=merged_context,
             )
-            session_metadata["draft_goal"] = resolved_goal
-            session_metadata["pending_clarification"] = _pending_clarification_state(
-                resolved_goal=resolved_goal,
-                questions=[question],
-                assessment=assessment,
-                session_metadata=session_metadata,
-                context_json=merged_context,
-                normalized_intent_envelope=normalized_intent_envelope,
-                latest_user_answer=content,
+            workflow_assessment = {
+                **dict(assessment),
+                "needs_clarification": True,
+                "requires_blocking_clarification": True,
+                "questions": [question],
+            }
+            persist_pending_clarification_state(
+                session_metadata,
+                state=_pending_clarification_state(
+                    resolved_goal=resolved_goal,
+                    questions=[question],
+                    assessment=workflow_assessment,
+                    session_metadata=session_metadata,
+                    context_json=merged_context,
+                    normalized_intent_envelope=normalized_intent_envelope,
+                    latest_user_answer=content,
+                ),
+                draft_goal=resolved_goal,
+                cleared_keys=cleared_session_keys,
             )
         else:
             try:
@@ -1741,15 +2104,25 @@ def handle_turn(
                         goal_intent_profile=dict(assessment),
                         context_json=merged_context,
                     )
-                    session_metadata["draft_goal"] = resolved_goal
-                    session_metadata["pending_clarification"] = _pending_clarification_state(
-                        resolved_goal=resolved_goal,
-                        questions=[question],
-                        assessment=assessment,
-                        session_metadata=session_metadata,
-                        context_json=merged_context,
-                        normalized_intent_envelope=normalized_intent_envelope,
-                        latest_user_answer=content,
+                    workflow_assessment = {
+                        **dict(assessment),
+                        "needs_clarification": True,
+                        "requires_blocking_clarification": True,
+                        "questions": [question],
+                    }
+                    persist_pending_clarification_state(
+                        session_metadata,
+                        state=_pending_clarification_state(
+                            resolved_goal=resolved_goal,
+                            questions=[question],
+                            assessment=workflow_assessment,
+                            session_metadata=session_metadata,
+                            context_json=merged_context,
+                            normalized_intent_envelope=normalized_intent_envelope,
+                            latest_user_answer=content,
+                        ),
+                        draft_goal=resolved_goal,
+                        cleared_keys=cleared_session_keys,
                     )
                     session_metadata["pending_workflow_input"] = dict(next_input)
                 else:
@@ -1794,11 +2167,10 @@ def handle_turn(
                     else:
                         session_metadata.pop("active_workflow_trigger_id", None)
                         cleared_session_keys.add("active_workflow_trigger_id")
-                    session_metadata.pop("draft_goal", None)
-                    session_metadata.pop("pending_clarification", None)
-                    session_metadata.pop("pending_workflow_input", None)
-                    cleared_session_keys.update(
-                        {"draft_goal", "pending_clarification", "pending_workflow_input"}
+                    clear_pending_clarification_state(
+                        session_metadata,
+                        cleared_keys=cleared_session_keys,
+                        include_workflow_input=True,
                     )
             except Exception as exc:  # noqa: BLE001
                 assistant_content = (
@@ -1860,11 +2232,10 @@ def handle_turn(
                     goal_intent_profile=dict(assessment),
                     context_json=merged_context,
                 )
-                session_metadata.pop("draft_goal", None)
-                session_metadata.pop("pending_clarification", None)
-                session_metadata.pop("pending_workflow_input", None)
-                cleared_session_keys.update(
-                    {"draft_goal", "pending_clarification", "pending_workflow_input"}
+                clear_pending_clarification_state(
+                    session_metadata,
+                    cleared_keys=cleared_session_keys,
+                    include_workflow_input=True,
                 )
         except Exception as exc:  # noqa: BLE001
             assistant_content = (
@@ -1885,11 +2256,10 @@ def handle_turn(
             context_json=merged_context,
         )
         if bool(turn_plan.get("clear_pending_clarification")):
-            session_metadata.pop("draft_goal", None)
-            session_metadata.pop("pending_clarification", None)
-            session_metadata.pop("pending_workflow_input", None)
-            cleared_session_keys.update(
-                {"draft_goal", "pending_clarification", "pending_workflow_input"}
+            clear_pending_clarification_state(
+                session_metadata,
+                cleared_keys=cleared_session_keys,
+                include_workflow_input=True,
             )
     if restarted_pending_clarification:
         for key in ("draft_goal", "pending_clarification", "pending_workflow_input"):
@@ -1968,16 +2338,126 @@ def _candidate_goal(
     content: str,
     session_metadata: Mapping[str, Any],
     *,
+    messages: Sequence[chat_contracts.ChatMessage] | None = None,
     is_chat_only_correction: Callable[[str], bool] | None = None,
 ) -> str:
     draft_goal = session_metadata.get("draft_goal")
     pending_state = _parse_pending_clarification_state(session_metadata)
+    if not _clarification_state_has_pending_work(pending_state):
+        pending_state = None
     original_goal = str(pending_state.original_goal or "").strip() if pending_state is not None else ""
     if original_goal:
         return f"{original_goal}\n\nUser clarification: {content.strip()}"
     if isinstance(draft_goal, str) and draft_goal.strip() and pending_state is not None:
         return f"{draft_goal.strip()}\n\nUser clarification: {content.strip()}"
+    threaded_goal = _execution_thread_candidate_goal(
+        content,
+        messages=messages,
+        is_chat_only_correction=is_chat_only_correction,
+    )
+    if threaded_goal:
+        return threaded_goal
     return content.strip()
+
+
+def _execution_thread_candidate_goal(
+    content: str,
+    *,
+    messages: Sequence[chat_contracts.ChatMessage] | None,
+    is_chat_only_correction: Callable[[str], bool] | None = None,
+) -> str:
+    current = str(content or "").strip()
+    if not current:
+        return ""
+    if is_chat_only_correction is not None and is_chat_only_correction(current):
+        return ""
+    lowered_current = current.lower()
+    if lowered_current in {"thanks", "thank you", "ok", "okay", "cool"}:
+        return ""
+
+    recent_user_messages = [
+        str(message.content or "").strip()
+        for message in list(messages or [])[-8:]
+        if str(getattr(message, "role", "")).lower().endswith("user")
+        and str(message.content or "").strip()
+    ]
+    if not recent_user_messages:
+        return ""
+
+    execution_blob = " ".join(recent_user_messages).lower()
+    thread_hints = _chat_thread_hints()
+    execution_tokens = set(re.findall(r"[a-z0-9]+", execution_blob))
+    has_execution_action = bool(execution_tokens & thread_hints.action_tokens)
+    has_execution_artifact = bool(execution_tokens & thread_hints.artifact_tokens)
+    if not (has_execution_action and has_execution_artifact):
+        return ""
+
+    current_tokens = set(re.findall(r"[a-z0-9]+", lowered_current))
+    if len(current.split()) > 80 and not (current_tokens & thread_hints.continuation_tokens):
+        return ""
+
+    parts: list[str] = []
+    for message in recent_user_messages[-5:]:
+        if message not in parts:
+            parts.append(message)
+    if current not in parts:
+        parts.append(current)
+    if len(parts) < 2:
+        return ""
+    return "\n\nUser clarification: ".join(parts)
+
+
+def _chat_thread_hints() -> ChatThreadHints:
+    action_tokens = set(_BOOTSTRAP_EXECUTION_ACTION_TOKENS)
+    artifact_tokens = set(_BOOTSTRAP_EXECUTION_ARTIFACT_TOKENS)
+    continuation_tokens = set(_BOOTSTRAP_CONTINUATION_TOKENS)
+    try:
+        registry = capability_registry.load_capability_registry()
+    except Exception:  # noqa: BLE001
+        return ChatThreadHints(
+            action_tokens=frozenset(action_tokens),
+            artifact_tokens=frozenset(artifact_tokens),
+            continuation_tokens=frozenset(continuation_tokens),
+        )
+
+    for spec in registry.enabled_capabilities().values():
+        artifact_tokens.update(_tokens_from_text(spec.capability_id))
+        artifact_tokens.update(_tokens_from_text(spec.group or ""))
+        artifact_tokens.update(_tokens_from_text(spec.subgroup or ""))
+        for value in (*spec.tags, *spec.aliases):
+            artifact_tokens.update(_tokens_from_text(value))
+        hints = spec.planner_hints if isinstance(spec.planner_hints, Mapping) else {}
+        action_tokens.update(_tokens_from_sequence(hints.get("task_intents")))
+        raw_thread_hints = hints.get("chat_thread_hints")
+        if not isinstance(raw_thread_hints, Mapping):
+            continue
+        action_tokens.update(_tokens_from_sequence(raw_thread_hints.get("action_tokens")))
+        artifact_tokens.update(_tokens_from_sequence(raw_thread_hints.get("artifact_tokens")))
+        continuation_tokens.update(_tokens_from_sequence(raw_thread_hints.get("continuation_tokens")))
+
+    return ChatThreadHints(
+        action_tokens=frozenset(action_tokens),
+        artifact_tokens=frozenset(artifact_tokens),
+        continuation_tokens=frozenset(continuation_tokens),
+    )
+
+
+def _tokens_from_sequence(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return tokens
+    for item in value:
+        if isinstance(item, str):
+            tokens.update(_tokens_from_text(item))
+    return tokens
+
+
+def _tokens_from_text(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+        if token
+    }
 
 
 def _message_records_for_session(db: Session, session_id: str) -> list[ChatMessageRecord]:

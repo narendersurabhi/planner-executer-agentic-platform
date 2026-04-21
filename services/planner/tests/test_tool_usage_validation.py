@@ -845,6 +845,38 @@ def test_validate_plan_rejects_missing_intent_segment_must_have_inputs() -> None
     )
 
 
+def test_validate_plan_treats_render_json_format_as_document_spec_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAPABILITY_MODE", "enabled")
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+    plan = _plan_with_task(
+        "document.docx.render",
+        {"document_spec": {"blocks": []}, "path": "Narender.docx"},
+        intent=models.ToolIntent.render,
+    )
+    job = _job_with_goal_intent_segment(
+        {
+            "id": "s1",
+            "intent": "render",
+            "objective": "Render DocumentSpec JSON into a document",
+            "required_inputs": ["document_spec_json", "path"],
+            "suggested_capabilities": ["document.docx.render"],
+            "slots": {
+                "entity": "artifact",
+                "artifact_type": "document",
+                "output_format": "json",
+                "risk_level": "bounded_write",
+                "must_have_inputs": ["document_spec", "path"],
+            },
+        }
+    )
+
+    valid, reason = _validate_plan(plan, [], job)
+
+    assert valid, reason
+
+
 def test_validate_plan_requires_explicit_prompt_for_llm_text_generate() -> None:
     plan = models.PlanCreate(
         planner_version="1",
@@ -1397,6 +1429,131 @@ def test_ensure_renderer_required_inputs_autowires_legacy_renderer_aliases() -> 
     payload = dict(render_task.tool_inputs["docx_generate_from_spec"])
     assert payload["document_spec"] == {
         "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
+    }
+
+
+def test_ensure_renderer_required_inputs_repairs_generic_output_reference() -> None:
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                tool_requests=["document.spec.generate"],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderDocxDocument",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["GenerateDocumentSpec"],
+                tool_requests=["document.docx.render"],
+                tool_inputs={
+                    "document.docx.render": {
+                        "document_spec": {
+                            "$from": "dependencies_by_name.GenerateDocumentSpec.output"
+                        },
+                        "path": "Narender.docx",
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_renderer_required_inputs(plan)
+    render_task = next(item for item in updated.tasks if item.name == "RenderDocxDocument")
+    payload = dict(render_task.tool_inputs["document.docx.render"])
+    assert payload["document_spec"] == {
+        "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
+    }
+    assert payload["path"] == "Narender.docx"
+
+
+def test_ensure_renderer_required_inputs_uses_capability_exports(monkeypatch) -> None:
+    capability = capability_registry.CapabilitySpec(
+        capability_id="document.spec.generate",
+        description="Generate a document spec",
+        risk_tier="read_only",
+        idempotency="read",
+        exports=(
+            capability_registry.CapabilityExportSpec(
+                name="document_spec",
+                path="artifact.spec",
+                description="Generated spec",
+            ),
+        ),
+        adapters=(
+            capability_registry.CapabilityAdapterSpec(
+                type="tool",
+                server_id="local_worker",
+                tool_name="llm_generate_document_spec",
+                enabled=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        capability_registry,
+        "load_capability_registry",
+        lambda: capability_registry.CapabilityRegistry(
+            capabilities={"document.spec.generate": capability}
+        ),
+    )
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                tool_requests=["document.spec.generate"],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderDocxDocument",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["GenerateDocumentSpec"],
+                tool_requests=["document.docx.render"],
+                tool_inputs={
+                    "document.docx.render": {
+                        "document_spec": {
+                            "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
+                        },
+                        "path": "Narender.docx",
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_renderer_required_inputs(plan)
+    render_task = next(item for item in updated.tasks if item.name == "RenderDocxDocument")
+    payload = dict(render_task.tool_inputs["document.docx.render"])
+    assert payload["document_spec"] == {
+        "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.artifact.spec"
     }
 
 

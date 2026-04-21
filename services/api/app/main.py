@@ -2822,7 +2822,7 @@ def _active_job_confirmation_turn_plan(
 ) -> dict[str, Any] | None:
     if not isinstance(session_metadata, Mapping):
         return None
-    if session_metadata.get("pending_clarification"):
+    if chat_service.pending_clarification_is_active(session_metadata):
         return None
     active_job_id = str(session_metadata.get("active_job_id") or "").strip()
     if not active_job_id or not _looks_like_execution_confirmation(content):
@@ -3877,7 +3877,11 @@ def _chat_clarification_turn_plan(
         normalized_questions = existing_questions
     assessment["needs_clarification"] = True
     assessment["requires_blocking_clarification"] = True
-    assessment["source"] = str(assessment.get("source") or source).strip() or source
+    assessment["source"] = str(source or assessment.get("source") or "").strip() or "chat_clarification"
+    if source == "chat_boundary_meta_clarification":
+        assessment["missing_slots"] = []
+        assessment["blocking_slots"] = []
+        assessment["clarification_mode"] = source
 
     resolved_assistant_content = (
         str(assistant_content or "").strip()
@@ -4210,9 +4214,7 @@ def _route_chat_turn(
     )
     if active_job_confirmation is not None:
         return active_job_confirmation
-    pending_clarification = bool(
-        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
-    )
+    pending_clarification = chat_service.pending_clarification_is_active(session_metadata)
     if CHAT_RESPONSE_MODE != "answer_or_handoff":
         return _route_chat_turn_legacy(
             content=content,
@@ -4405,9 +4407,7 @@ def _route_chat_turn_legacy(
         session_metadata=session_metadata,
         merged_context=merged_context,
     )
-    pending_clarification = bool(
-        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
-    )
+    pending_clarification = chat_service.pending_clarification_is_active(session_metadata)
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     exit_pending_to_chat = (
         pending_clarification
@@ -4498,9 +4498,7 @@ def _route_chat_turn_with_router(
     merged_context: Mapping[str, Any] | None,
     messages: Sequence[chat_contracts.ChatMessage] | None,
 ) -> dict[str, Any]:
-    pending_clarification = bool(
-        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
-    )
+    pending_clarification = chat_service.pending_clarification_is_active(session_metadata)
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     if _chat_router_provider is None:
         return _chat_router_failure_response(
@@ -4571,9 +4569,7 @@ def _fallback_chat_turn_route(
     session_metadata: Mapping[str, Any] | None,
     merged_context: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    pending_clarification = bool(
-        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
-    )
+    pending_clarification = chat_service.pending_clarification_is_active(session_metadata)
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     exit_pending_to_chat = (
         pending_clarification
@@ -4607,6 +4603,34 @@ def _fallback_chat_turn_route(
         }
     normalized = _normalize_goal_intent(candidate_goal)
     assessment = _chat_route_goal_intent_profile(normalized.profile, goal=candidate_goal)
+    context_satisfied_fields = [
+        field
+        for field in list(assessment.missing_slots or []) + list(assessment.blocking_slots or [])
+        if _context_has_clarification_value(merged_context or {}, field)
+    ]
+    if context_satisfied_fields:
+        remaining_missing = [
+            field for field in assessment.missing_slots if field not in context_satisfied_fields
+        ]
+        remaining_blocking = [
+            field for field in assessment.blocking_slots if field not in context_satisfied_fields
+        ]
+        assessment = assessment.model_copy(
+            update={
+                "missing_slots": remaining_missing,
+                "blocking_slots": remaining_blocking,
+                "needs_clarification": bool(remaining_missing or remaining_blocking),
+                "requires_blocking_clarification": bool(remaining_missing or remaining_blocking),
+                "questions": [
+                    question
+                    for question in assessment.questions
+                    if not any(
+                        _clarification_question_targets_field(question, field, candidate_goal)
+                        for field in context_satisfied_fields
+                    )
+                ],
+            }
+        )
     assessment_json = workflow_contracts.dump_goal_intent_profile(assessment) or {}
     normalized_json = workflow_contracts.dump_normalized_intent_envelope(normalized) or {}
     active_target = (
@@ -5306,13 +5330,12 @@ def _build_chat_route_request(
     messages: Sequence[chat_contracts.ChatMessage] | None,
     user_id: str | None = None,
 ) -> chat_contracts.ChatRouteRequest:
-    pending_clarification = bool(
-        isinstance(session_metadata, Mapping) and session_metadata.get("pending_clarification")
-    )
+    clarification_lifecycle = chat_service.clarification_lifecycle_from_metadata(session_metadata)
+    pending_clarification = clarification_lifecycle.active
     normalized = _normalize_goal_intent(candidate_goal)
     heuristic = _chat_route_goal_intent_profile(normalized.profile, goal=candidate_goal)
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
-    pending_state = _pending_clarification_state_from_metadata(session_metadata)
+    pending_state = clarification_lifecycle.state if pending_clarification else None
     recent_messages = [
         chat_contracts.ChatRouteRequestMessage(
             role=message.role,
@@ -5367,12 +5390,10 @@ def _build_chat_route_request(
         "active_capability_id": str(pending_state.active_capability_id or "").strip()
         if pending_state is not None
         else "",
-        "pending_fields": list(pending_state.pending_fields or pending_state.required_fields or [])
-        if pending_state is not None
-        else [],
-        "pending_questions": list(pending_state.pending_questions or pending_state.questions or [])
-        if pending_state is not None
-        else [],
+        "pending_fields": list(
+            clarification_lifecycle.pending_fields or clarification_lifecycle.required_fields
+        ),
+        "pending_questions": list(clarification_lifecycle.questions),
     }
     return chat_contracts.ChatRouteRequest(
         request_id=_chat_route_request_id(
@@ -5451,8 +5472,15 @@ def _build_chat_router_prompt(
     *,
     route_request: chat_contracts.ChatRouteRequest,
 ) -> str:
+    direct_capabilities = [
+        candidate.model_dump(mode="json", exclude_none=True)
+        for candidate in route_request.routing_evidence.retrieved_candidates
+        if candidate.candidate_type == chat_contracts.ChatRouteCandidateType.direct_agent
+    ]
     payload = {
+        "current_user_message": route_request.message,
         "route_request": route_request.model_dump(mode="json", exclude_none=True),
+        "direct_capabilities": direct_capabilities,
         "response_schema": {
             "route": "respond | tool_call | ask_clarification | submit_job | run_workflow",
             "assistant_response": "string",
@@ -5773,7 +5801,9 @@ def _build_chat_boundary_evidence(
     session_metadata: Mapping[str, Any] | None,
     merged_context: Mapping[str, Any] | None,
 ) -> chat_contracts.ChatBoundaryEvidence:
-    pending_state = _pending_clarification_state_from_metadata(session_metadata)
+    clarification_lifecycle = chat_service.clarification_lifecycle_from_metadata(session_metadata)
+    pending_state = clarification_lifecycle.state if clarification_lifecycle.active else None
+    pending_active = clarification_lifecycle.active
     pending = (
         pending_state.model_dump(mode="json", exclude_none=True)
         if pending_state is not None
@@ -5788,7 +5818,7 @@ def _build_chat_boundary_evidence(
             if capability_id and capability_id not in preferred_capability_ids:
                 preferred_capability_ids.append(capability_id)
     pending_fields = list(
-        pending_state.pending_fields or pending_state.required_fields if pending_state is not None else []
+        clarification_lifecycle.pending_fields or clarification_lifecycle.required_fields
     )
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     top_capabilities, top_families = _chat_boundary_capability_evidence(
@@ -5800,9 +5830,9 @@ def _build_chat_boundary_evidence(
     intent_profile = _chat_boundary_intent_evidence(
         content=content,
         candidate_goal=candidate_goal,
-        pending_clarification=bool(pending),
+        pending_clarification=pending_active,
     )
-    likely_clarification_answer = bool(pending) and _looks_like_pending_clarification_answer(content)
+    likely_clarification_answer = pending_active and _looks_like_pending_clarification_answer(content)
     (
         top_capability_score,
         top_family_score,
@@ -5831,7 +5861,7 @@ def _build_chat_boundary_evidence(
     return chat_contracts.ChatBoundaryEvidence(
         goal=str(candidate_goal or "").strip(),
         conversation_mode_hint=conversation_mode_hint,
-        pending_clarification=bool(pending),
+        pending_clarification=pending_active,
         workflow_target_available=workflow_invocation is not None,
         likely_clarification_answer=likely_clarification_answer,
         intent=str(intent_profile.intent or "").strip() if intent_profile is not None else "",
@@ -5891,17 +5921,18 @@ def _build_chat_boundary_decision_prompt(
                 "content": str(message.content or "")[:800],
             }
         )
+    clarification_lifecycle = chat_service.clarification_lifecycle_from_metadata(session_metadata)
+    pending_active = clarification_lifecycle.active
     pending = (
-        dict(session_metadata.get("pending_clarification"))
-        if isinstance(session_metadata, Mapping)
-        and isinstance(session_metadata.get("pending_clarification"), Mapping)
+        clarification_lifecycle.state.model_dump(mode="json", exclude_none=True)
+        if clarification_lifecycle.state is not None and pending_active
         else {}
     )
     workflow_invocation = chat_service.workflow_invocation_from_context(merged_context)
     payload = {
         "current_user_message": content,
         "candidate_goal": candidate_goal,
-        "pending_clarification": bool(pending),
+        "pending_clarification": pending_active,
         "draft_goal": (
             str(session_metadata.get("draft_goal") or "").strip()
             if isinstance(session_metadata, Mapping)
@@ -6170,12 +6201,12 @@ def _finalize_chat_turn_plan(
     route_type = str(finalized.get("type") or "").strip().lower()
     if route_type != "respond":
         return finalized
+    if bool(finalized.get("response_generated")):
+        return finalized
     capability_catalog_response = _capability_discovery_chat_response(content)
     if capability_catalog_response:
         finalized["assistant_content"] = capability_catalog_response
         finalized["response_generated"] = True
-        return finalized
-    if bool(finalized.get("response_generated")):
         return finalized
     fallback_response = str(finalized.get("assistant_content") or "").strip()
     finalized["assistant_content"] = _generate_chat_response(
@@ -6265,6 +6296,24 @@ def _normalize_chat_route(
             normalized = intent_contract.normalize_required_input_key(slot_name)
             if normalized and normalized in blocking_slots and normalized not in missing_slots:
                 missing_slots.append(normalized)
+    if isinstance(parsed.get("missing_slots"), list):
+        for slot_name in parsed.get("missing_slots") or []:
+            normalized = intent_contract.normalize_required_input_key(slot_name)
+            if normalized and normalized not in blocking_slots:
+                blocking_slots.append(normalized)
+            if normalized and normalized not in missing_slots:
+                missing_slots.append(normalized)
+    missing_slots, blocking_slots = _drop_goal_satisfied_missing_slots(
+        missing_slots=missing_slots,
+        blocking_slots=blocking_slots,
+        slot_values=slot_values,
+        candidate_goal=candidate_goal,
+    )
+    missing_slots, blocking_slots = _drop_context_satisfied_missing_slots(
+        missing_slots=missing_slots,
+        blocking_slots=blocking_slots,
+        context_json=route_request.context_json,
+    )
     low_confidence = confidence < threshold
     if (
         route != "respond"
@@ -6330,6 +6379,9 @@ def _normalize_chat_route(
         capability_id = ""
         fallback_used = True
         fallback_reason = fallback_reason or "invalid_direct_capability"
+    if route == "tool_call" and capability_id in CHAT_DIRECT_CAPABILITIES:
+        blocking_slots = []
+        missing_slots = []
     if route == "tool_call" and (missing_slots or risk_level != "read_only"):
         route = "ask_clarification" if missing_slots else ("submit_job" if execution_oriented else "respond")
         fallback_used = True
@@ -6380,6 +6432,22 @@ def _normalize_chat_route(
                     ]
                 fallback_used = True
                 fallback_reason = fallback_reason or "workflow_target_missing"
+    if (
+        route == "ask_clarification"
+        and not clarification_questions
+        and not missing_slots
+        and execution_oriented
+        and fallback_reason
+        not in {
+            "workflow_candidate_ambiguous",
+            "workflow_target_missing",
+        }
+    ):
+        route = "submit_job"
+        clarification_questions = []
+        assistant_response = ""
+        fallback_used = True
+        fallback_reason = fallback_reason or "resolved_clarification_submits_job"
     if route == "submit_job" and missing_slots:
         route = "ask_clarification"
         fallback_used = True
@@ -6478,6 +6546,7 @@ def _normalize_chat_route(
         "goal_intent_profile": workflow_contracts.dump_goal_intent_profile(assessment) or {},
         "resolved_goal": candidate_goal,
         "context_json_updates": workflow_context_updates,
+        "response_generated": bool(route == "respond" and assistant_response),
         "routing_decision": chat_contracts.ChatRouteDecision(
             route=route,
             confidence=round(confidence, 3),
@@ -6515,6 +6584,92 @@ def _normalize_chat_route(
             selected_candidate_calibrated_confidence=selected_candidate_calibration,
         ).model_dump(mode="json", exclude_none=True),
     }
+
+
+def _drop_goal_satisfied_missing_slots(
+    *,
+    missing_slots: Sequence[str],
+    blocking_slots: Sequence[str],
+    slot_values: dict[str, Any],
+    candidate_goal: str,
+) -> tuple[list[str], list[str]]:
+    goal_text = str(candidate_goal or "").strip()
+    goal_has_prompt = len(goal_text.split()) >= 4
+    satisfied = {"prompt", "goal"} if goal_has_prompt else set()
+    if goal_has_prompt:
+        for key in ("prompt", "goal"):
+            if not str(slot_values.get(key) or "").strip():
+                slot_values[key] = goal_text
+    if not str(slot_values.get("workspace_path") or "").strip():
+        workspace_updates = chat_clarification_normalizer.heuristic_field_updates_for_answer(
+            preferred_field="workspace_path",
+            latest_answer=goal_text,
+            allowed_fields=["workspace_path"],
+        )
+        workspace_path = str(workspace_updates.get("workspace_path") or "").strip()
+        if workspace_path:
+            slot_values["workspace_path"] = workspace_path
+    if str(slot_values.get("workspace_path") or "").strip():
+        satisfied.add("workspace_path")
+    return (
+        [slot for slot in missing_slots if slot not in satisfied],
+        [slot for slot in blocking_slots if slot not in satisfied],
+    )
+
+
+def _drop_context_satisfied_missing_slots(
+    *,
+    missing_slots: Sequence[str],
+    blocking_slots: Sequence[str],
+    context_json: Mapping[str, Any] | None,
+) -> tuple[list[str], list[str]]:
+    if not isinstance(context_json, Mapping):
+        return list(missing_slots), list(blocking_slots)
+    satisfied = {
+        slot
+        for slot in [*missing_slots, *blocking_slots]
+        if _context_has_clarification_value(context_json, slot)
+    }
+    if not satisfied:
+        return list(missing_slots), list(blocking_slots)
+    return (
+        [slot for slot in missing_slots if slot not in satisfied],
+        [slot for slot in blocking_slots if slot not in satisfied],
+    )
+
+
+def _context_has_clarification_value(
+    context_json: Mapping[str, Any],
+    slot_name: str,
+) -> bool:
+    normalized_slot = intent_contract.normalize_required_input_key(slot_name)
+    if not normalized_slot:
+        return False
+    for raw_key, raw_value in context_json.items():
+        normalized_key = chat_clarification_normalizer.normalize_clarification_field_key(raw_key)
+        if normalized_key != normalized_slot:
+            continue
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, str):
+            return bool(raw_value.strip())
+        return True
+    return False
+
+
+def _clarification_question_targets_field(
+    question: str,
+    field: str,
+    goal: str,
+) -> bool:
+    normalized_field = intent_contract.normalize_required_input_key(field)
+    if not normalized_field:
+        return False
+    canonical = chat_clarification_normalizer.clarification_question_for_field(
+        normalized_field,
+        goal=goal,
+    )
+    return str(question or "").strip() == canonical
 
 
 def _chat_direct_capability_description(capability_id: str) -> str:
@@ -6607,15 +6762,7 @@ def _candidate_capability_ids_for_envelope(
 def _pending_clarification_state_from_metadata(
     metadata: Mapping[str, Any] | None,
 ) -> chat_contracts.ClarificationState | None:
-    if not isinstance(metadata, Mapping):
-        return None
-    raw = metadata.get("pending_clarification")
-    if not isinstance(raw, Mapping):
-        return None
-    try:
-        return chat_contracts.ClarificationState.model_validate(dict(raw))
-    except Exception:  # noqa: BLE001
-        return None
+    return chat_service.clarification_state_from_metadata(metadata)
 
 
 def _capability_family_for_id(capability_id: str) -> str | None:
@@ -6640,10 +6787,11 @@ def _active_execution_target_for_chat(
     session_metadata: Mapping[str, Any] | None,
     merged_context: Mapping[str, Any] | None,
 ) -> intent_contract.ActiveExecutionTarget | None:
-    pending_state = _pending_clarification_state_from_metadata(session_metadata)
-    if pending_state is None:
+    clarification_lifecycle = chat_service.clarification_lifecycle_from_metadata(session_metadata)
+    pending_state = clarification_lifecycle.state
+    if pending_state is None or not clarification_lifecycle.active:
         return None
-    known_slot_values = dict(pending_state.known_slot_values or {})
+    known_slot_values = dict(clarification_lifecycle.known_slot_values)
     if isinstance(merged_context, Mapping):
         for key, raw_value in merged_context.items():
             if raw_value is None:
@@ -6655,7 +6803,9 @@ def _active_execution_target_for_chat(
         graph=workflow_contracts.dump_intent_graph(normalized.graph) or {},
         candidate_capabilities=normalized.candidate_capabilities,
         known_slot_values=known_slot_values,
-        pending_fields=tuple(pending_state.pending_fields or pending_state.required_fields),
+        pending_fields=tuple(
+            clarification_lifecycle.pending_fields or clarification_lifecycle.required_fields
+        ),
         preferred_segment_id=pending_state.active_segment_id,
         preferred_capability_id=pending_state.active_capability_id,
     )
@@ -6685,6 +6835,8 @@ def _chat_submit_capability_contracts(
                 "chat_required_fields": planner_hints.get("chat_required_fields"),
                 "field_descriptions": planner_hints.get("chat_field_descriptions"),
                 "field_examples": planner_hints.get("chat_field_examples"),
+                "field_aliases": planner_hints.get("chat_field_aliases"),
+                "field_questions": planner_hints.get("chat_field_questions"),
             }
         )
     return contracts
@@ -6804,10 +6956,11 @@ def _normalize_chat_submit_context(
         user_id=user_id,
         context_envelope=context_envelope,
     )
-    pending_state = _pending_clarification_state_from_metadata(session_metadata)
+    clarification_lifecycle = chat_service.clarification_lifecycle_from_metadata(session_metadata)
+    pending_state = clarification_lifecycle.state if clarification_lifecycle.active else None
     preferred_field = (
-        intent_contract.normalize_required_input_key(pending_state.current_question_field)
-        if pending_state is not None and pending_state.current_question_field
+        intent_contract.normalize_required_input_key(clarification_lifecycle.current_question_field)
+        if clarification_lifecycle.current_question_field
         else None
     )
     conversation_history = _chat_submit_conversation_history(messages)
@@ -6820,9 +6973,7 @@ def _normalize_chat_submit_context(
         preferred_field=preferred_field,
         latest_answer=content,
         allowed_fields=(
-            tuple(pending_state.pending_fields or pending_state.required_fields)
-            if pending_state is not None
-            else ()
+            tuple(clarification_lifecycle.pending_fields or clarification_lifecycle.required_fields)
         ),
     )
     if heuristic_updates:
@@ -6931,6 +7082,13 @@ def _normalize_chat_submit_context(
         context=effective_intent_context,
         normalized_intent_envelope=refreshed_normalized,
     )
+    for field in unresolved:
+        normalized_field = intent_contract.normalize_required_input_key(field)
+        if not normalized_field or normalized_field in reconciled_missing_fields:
+            continue
+        if _context_has_clarification_value(effective_intent_context, normalized_field):
+            continue
+        reconciled_missing_fields.append(normalized_field)
     refreshed_assessment["missing_slots"] = list(reconciled_missing_fields)
     refreshed_assessment["blocking_slots"] = list(reconciled_missing_fields)
     refreshed_assessment["needs_clarification"] = bool(reconciled_missing_fields)
@@ -6951,8 +7109,8 @@ def _normalize_chat_submit_context(
     residual_pending_fields: list[str] = []
     if pending_state is not None:
         pending_field_candidates = [
-            *list(pending_state.pending_fields or ()),
-            *list(pending_state.required_fields or ()),
+            *list(clarification_lifecycle.pending_fields or ()),
+            *list(clarification_lifecycle.required_fields or ()),
         ]
         for raw_field in pending_field_candidates:
             normalized_field = intent_contract.normalize_required_input_key(raw_field)
@@ -7283,6 +7441,12 @@ def _run_chat_direct_capability(
         intent_profile=task_intent_profiles.get(task_record.id),
     )
     task_payload["run_id"] = job.id
+    raw_tool_inputs = task_payload.get("tool_inputs")
+    if isinstance(raw_tool_inputs, Mapping):
+        tool_inputs = dict(raw_tool_inputs)
+        if capability_spec.capability_id not in tool_inputs and len(tool_inputs) == 1:
+            tool_inputs[capability_spec.capability_id] = dict(next(iter(tool_inputs.values())))
+            task_payload["tool_inputs"] = tool_inputs
 
     attempts = int(task_payload.get("attempts") or 1)
     max_attempts = int(task_payload.get("max_attempts") or 1)
@@ -8723,13 +8887,111 @@ def _intent_catalog_capability_ids() -> set[str]:
         return set()
 
 
-def _intent_catalog_capability_entries() -> list[dict[str, str]]:
+def _intent_catalog_capability_entries() -> list[dict[str, Any]]:
     try:
         registry = capability_registry.load_capability_registry()
-        return capability_search.build_capability_search_entries(registry.enabled_capabilities())
+        capabilities = registry.enabled_capabilities()
+        entries = capability_search.build_capability_search_entries(capabilities)
+        return [
+            _with_intent_capability_contract_fields(entry, capabilities.get(str(entry.get("id") or "")))
+            for entry in entries
+        ]
     except Exception:  # noqa: BLE001
         logger.exception("intent_catalog_capability_registry_load_failed")
         return []
+
+
+def _with_intent_capability_contract_fields(
+    entry: Mapping[str, Any],
+    spec: capability_registry.CapabilitySpec | None,
+) -> dict[str, Any]:
+    item = dict(entry)
+    if spec is None:
+        return item
+    input_schema, _ = _resolve_capability_schemas(spec, include_schemas=True)
+    schema_required = _schema_required_fields(input_schema)
+    planner_required = capability_registry.planner_collectible_inputs_for_capability(
+        spec.capability_id
+    )
+    required_inputs = _dedupe_strings(
+        [
+            *schema_required,
+            *planner_required,
+            *_coerce_string_list(spec.planner_hints.get("required_inputs")),
+        ]
+    )
+    item.update(
+        {
+            "risk_tier": spec.risk_tier,
+            "idempotency": spec.idempotency,
+            "allowed_task_intents": _capability_allowed_task_intents(spec),
+            "required_inputs": required_inputs,
+            "optional_inputs": _schema_optional_fields(input_schema, required_inputs)[:8],
+            "input_schema_ref": spec.input_schema_ref or "",
+            "output_schema_ref": spec.output_schema_ref or "",
+            "exports": [
+                {
+                    "name": export.name,
+                    "path": export.path,
+                }
+                for export in spec.exports
+            ],
+        }
+    )
+    search_blob_parts = [
+        str(item.get("search_blob") or ""),
+        " ".join(required_inputs),
+        " ".join(str(export.get("name") or "") for export in item["exports"]),
+        " ".join(item["allowed_task_intents"]),
+    ]
+    item["search_blob"] = " ".join(part for part in search_blob_parts if part).lower()
+    return item
+
+
+def _schema_required_fields(schema: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(schema, Mapping):
+        return []
+    return _dedupe_strings(schema.get("required") if isinstance(schema.get("required"), list) else [])
+
+
+def _schema_optional_fields(
+    schema: Mapping[str, Any] | None,
+    required_inputs: Sequence[str],
+) -> list[str]:
+    if not isinstance(schema, Mapping):
+        return []
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return []
+    required = set(required_inputs)
+    return _dedupe_strings(
+        key for key in properties.keys() if isinstance(key, str) and key not in required
+    )
+
+
+def _dedupe_strings(values: Iterable[Any]) -> list[str]:
+    deduped: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip()
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def _capability_allowed_task_intents(spec: capability_registry.CapabilitySpec) -> list[str]:
+    raw_task_intents = spec.planner_hints.get("task_intents")
+    if isinstance(raw_task_intents, list):
+        normalized = _dedupe_strings(
+            intent_contract.normalize_task_intent(item) or "" for item in raw_task_intents
+        )
+        if normalized:
+            return normalized
+    hinted = _capability_task_intent_hint(spec.capability_id)
+    if hinted:
+        return [hinted]
+    return []
 
 
 def _semantic_goal_capability_hints(
@@ -8934,7 +9196,7 @@ def _rank_default_capabilities_for_intent_segment(
     intent: str,
     objective: str,
     allowed_capability_ids: set[str],
-    allowed_capability_catalog: list[dict[str, str]],
+    allowed_capability_catalog: list[dict[str, Any]],
     limit: int = 3,
 ) -> list[dict[str, Any]]:
     if not allowed_capability_ids:
@@ -9054,7 +9316,7 @@ def _rank_default_capabilities_for_intent_segment(
 def _llm_goal_intent_prompt(
     *,
     goal: str,
-    allowed_capability_catalog: list[dict[str, str]],
+    allowed_capability_catalog: list[dict[str, Any]],
     semantic_goal_capabilities: list[dict[str, Any]],
     capability_top_k: int,
 ) -> str:
@@ -9100,7 +9362,7 @@ def _llm_infer_goal_intent_with_capabilities(
     provider: LLMProvider,
     fallback_inference: intent_contract.TaskIntentInference,
     allowed_capability_ids: set[str],
-    allowed_capability_catalog: list[dict[str, str]],
+    allowed_capability_catalog: list[dict[str, Any]],
     capability_top_k: int,
     semantic_goal_capabilities: list[dict[str, Any]] | None = None,
 ) -> intent_contract.TaskIntentInference:
@@ -9210,13 +9472,85 @@ def _filter_catalog_capability_ids(
     return [capability_id for capability_id in capability_ids if capability_id in allowed_capability_ids]
 
 
+def _capability_entry_lookup(
+    allowed_capability_catalog: Sequence[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    return {
+        str(entry.get("id") or "").strip(): entry
+        for entry in allowed_capability_catalog
+        if str(entry.get("id") or "").strip()
+    }
+
+
+def _contract_required_inputs_for_capabilities(
+    capability_ids: Sequence[str],
+    allowed_capability_catalog: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    lookup = _capability_entry_lookup(allowed_capability_catalog)
+    required_inputs: list[str] = []
+    for capability_id in capability_ids:
+        entry = lookup.get(str(capability_id or "").strip())
+        if entry is None:
+            continue
+        required_inputs.extend(_coerce_string_list(entry.get("required_inputs")))
+    return _dedupe_strings(required_inputs)
+
+
+def _compact_capability_contract(
+    entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": str(entry.get("id") or "").strip(),
+        "description": str(entry.get("description") or "").strip()[:180],
+        "allowed_task_intents": _coerce_string_list(entry.get("allowed_task_intents")),
+        "required_inputs": _coerce_string_list(entry.get("required_inputs")),
+        "optional_inputs": _coerce_string_list(entry.get("optional_inputs"))[:8],
+        "exports": [
+            {
+                "name": str(export.get("name") or "").strip(),
+                "path": str(export.get("path") or "").strip(),
+            }
+            for export in (entry.get("exports") if isinstance(entry.get("exports"), list) else [])
+            if isinstance(export, Mapping) and str(export.get("name") or "").strip()
+        ],
+        "risk_tier": str(entry.get("risk_tier") or "").strip(),
+        "input_schema_ref": str(entry.get("input_schema_ref") or "").strip(),
+        "output_schema_ref": str(entry.get("output_schema_ref") or "").strip(),
+    }
+
+
+def _compact_capability_contracts_for_prompt(
+    *,
+    allowed_capability_catalog: Sequence[Mapping[str, Any]],
+    semantic_goal_capabilities: Sequence[Mapping[str, Any]] | None,
+    max_contracts: int = 12,
+) -> list[dict[str, Any]]:
+    lookup = _capability_entry_lookup(allowed_capability_catalog)
+    ordered_ids: list[str] = []
+    for item in semantic_goal_capabilities or []:
+        capability_id = str(item.get("id") or "").strip()
+        if capability_id and capability_id not in ordered_ids:
+            ordered_ids.append(capability_id)
+    for entry in allowed_capability_catalog:
+        capability_id = str(entry.get("id") or "").strip()
+        if capability_id and capability_id not in ordered_ids:
+            ordered_ids.append(capability_id)
+        if len(ordered_ids) >= max_contracts:
+            break
+    return [
+        _compact_capability_contract(lookup[capability_id])
+        for capability_id in ordered_ids[: max(1, max_contracts)]
+        if capability_id in lookup
+    ]
+
+
 def _normalize_llm_intent_graph(
     *,
     goal: str,
     parsed: dict[str, Any],
     fallback_graph: dict[str, Any],
     allowed_capability_ids: set[str],
-    allowed_capability_catalog: list[dict[str, str]],
+    allowed_capability_catalog: list[dict[str, Any]],
     capability_top_k: int,
 ) -> dict[str, Any]:
     raw_segments = parsed.get("segments")
@@ -9293,6 +9627,12 @@ def _normalize_llm_intent_graph(
             if isinstance(item, Mapping) and str(item.get("id") or "").strip()
         ]
         intent = _reconcile_intent_with_capabilities(intent, suggested_capabilities)
+        contract_required_inputs = _contract_required_inputs_for_capabilities(
+            suggested_capabilities,
+            allowed_capability_catalog,
+        )
+        if contract_required_inputs:
+            required_inputs = contract_required_inputs
         slots = intent_contract.normalize_intent_segment_slots(
             raw_slots=raw_segment.get("slots"),
             fallback_slots=(
@@ -9305,6 +9645,8 @@ def _normalize_llm_intent_graph(
             required_inputs=required_inputs,
             suggested_capabilities=suggested_capabilities,
         )
+        if contract_required_inputs:
+            slots["must_have_inputs"] = contract_required_inputs
 
         depends_raw = _coerce_string_list(raw_segment.get("depends_on"))
         depends_on = [dep for dep in depends_raw if dep in seen_ids]
@@ -9369,13 +9711,18 @@ def _llm_decompose_goal_intent(
     provider: LLMProvider,
     fallback_graph: dict[str, Any],
     allowed_capability_ids: set[str],
-    allowed_capability_catalog: list[dict[str, str]],
+    allowed_capability_catalog: list[dict[str, Any]],
     capability_top_k: int,
     interaction_summaries: list[dict[str, Any]] | None = None,
     workflow_hints: list[dict[str, Any]] | None = None,
     semantic_goal_capabilities: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     allowed_intents = ", ".join(member.value for member in models.ToolIntent)
+    compact_contracts = _compact_capability_contracts_for_prompt(
+        allowed_capability_catalog=allowed_capability_catalog,
+        semantic_goal_capabilities=semantic_goal_capabilities,
+        max_contracts=max(8, min(16, capability_top_k * 4)),
+    )
     catalog_lines = [
         (
             f"- {entry['id']}"
@@ -9404,6 +9751,9 @@ def _llm_decompose_goal_intent(
         "- use depends_on only for prior segment IDs\n"
         "- confidence must be between 0 and 1\n"
         "- keep intent consistent with suggested_capabilities and capability subgroup semantics\n"
+        "- use the compact capability contracts as the authority for required_inputs, risk_level, and downstream exports\n"
+        "- do not invent required_inputs when the selected capability contract lists required_inputs\n"
+        "- use exports exactly when wiring downstream dependencies; do not invent output field names\n"
         "- document.docx.render and document.pdf.render MUST use intent=render\n"
         "- slots.output_format must be one of: pdf, docx, md, txt, html, json, csv, xlsx when known\n"
         "- slots.risk_level must be one of: read_only, bounded_write, high_risk_write\n"
@@ -9415,6 +9765,10 @@ def _llm_decompose_goal_intent(
     if catalog_lines:
         prompt += "Allowed capability catalog:\n"
         prompt += "\n".join(catalog_lines)
+        prompt += "\n"
+    if compact_contracts:
+        prompt += "Compact capability contracts (authoritative for decomposition):\n"
+        prompt += json.dumps(compact_contracts, ensure_ascii=True)
         prompt += "\n"
     if workflow_hints:
         prompt += "Similar successful workflow hints from semantic memory:\n"
@@ -9441,6 +9795,7 @@ def _llm_decompose_goal_intent(
                 "operation": "intent_decompose",
                 "goal_len": len(goal),
                 "capability_catalog_size": len(allowed_capability_catalog),
+                "capability_contracts": len(compact_contracts),
                 "capability_top_k": capability_top_k,
                 "workflow_hints": len(workflow_hints or []),
                 "semantic_goal_capabilities": len(semantic_goal_capabilities or []),
@@ -15702,8 +16057,13 @@ def _update_execution_request_status(
     )
     if record is None:
         return
+    validated_step_attempt_id = _validated_step_attempt_id(
+        db,
+        step_attempt_id=step_attempt_id,
+        execution_request_id=record.id,
+    )
     record.status = status
-    record.step_attempt_id = step_attempt_id
+    record.step_attempt_id = validated_step_attempt_id
     if worker_id is not None:
         record.lease_owner = worker_id
     if heartbeat_at is not None:
@@ -15726,6 +16086,27 @@ def _payload_attempt_number(payload: Mapping[str, Any] | None) -> int | None:
     except (TypeError, ValueError):
         return None
     return attempt_number if attempt_number > 0 else None
+
+
+def _validated_step_attempt_id(
+    db: Session,
+    *,
+    step_attempt_id: str | None,
+    execution_request_id: str,
+) -> str | None:
+    if not isinstance(step_attempt_id, str) or not step_attempt_id:
+        return None
+    record = db.query(StepAttemptRecord).filter(StepAttemptRecord.id == step_attempt_id).first()
+    if record is not None:
+        return record.id
+    logger.warning(
+        "execution_request_missing_step_attempt",
+        extra={
+            "execution_request_id": execution_request_id,
+            "step_attempt_id": step_attempt_id,
+        },
+    )
+    return None
 
 
 def _parse_event_datetime(value: Any) -> datetime | None:
@@ -17063,6 +17444,15 @@ def list_capabilities(
                 "tags": list(spec.tags),
                 "input_schema_ref": spec.input_schema_ref,
                 "output_schema_ref": spec.output_schema_ref,
+                "exports": [
+                    {
+                        "name": export.name,
+                        "path": export.path,
+                        "description": export.description,
+                        "required": export.required,
+                    }
+                    for export in spec.exports
+                ],
                 "input_schema": input_schema,
                 "output_schema": output_schema,
                 "required_inputs": required_inputs,

@@ -1121,8 +1121,13 @@ def test_chat_turn_blocks_first_submit_when_selected_capability_required_fields_
     assert body["job"] is None
     assert body["assistant_message"]["action"]["type"] == "ask_clarification"
     assert "target audience" in body["assistant_message"]["content"].lower()
-    assert "tone" in body["assistant_message"]["content"].lower()
-    assert body["session"]["metadata"]["pending_clarification"]["questions"]
+    assert "tone" not in body["assistant_message"]["content"].lower()
+    pending = body["session"]["metadata"]["pending_clarification"]
+    assert pending["questions"] == ["Who is the target audience?"]
+    assert pending["pending_questions"] == [
+        "Who is the target audience?",
+        "What tone should it use (for example practical, formal, conversational, or executive)?",
+    ]
 
 
 def test_chat_turn_blocks_submit_when_post_normalization_still_requires_blocking_clarification(
@@ -2059,6 +2064,300 @@ def test_pending_clarification_state_filters_polluted_fields_and_derives_output_
     assert pending_state["slot_provenance"]["output_format"] == "inferred"
 
 
+def test_pending_clarification_state_drops_known_intent_action_question() -> None:
+    pending_state = chat_service._pending_clarification_state(
+        resolved_goal="create a git repo named firstrepo-from-my-agent",
+        questions=["What should the system do first (generate, transform, validate, render, or io)?"],
+        assessment={
+            "missing_slots": ["goal", "workspace_path"],
+            "blocking_slots": ["goal", "workspace_path"],
+            "slot_values": {
+                "intent_action": "generate",
+                "target_system": "workspace",
+                "risk_level": "bounded_write",
+            },
+        },
+        session_metadata={},
+        context_json={},
+    )
+
+    assert pending_state["known_slot_values"]["intent_action"] == "generate"
+    assert pending_state["pending_fields"] == ["goal", "workspace_path"]
+    assert pending_state["current_question_field"] == "goal"
+    assert pending_state["questions"] == ["What should this repository or workspace be used for?"]
+
+
+def test_candidate_goal_preserves_multiturn_execution_requirements() -> None:
+    messages = [
+        main.chat_contracts.ChatMessage(
+            id="m1",
+            session_id="s1",
+            role=main.chat_contracts.ChatRole.user,
+            content=(
+                "create a git repo with the name first-repo-by-my-ai-agent. "
+                "the goal is to create a small website to count down to next new year. "
+                "save it in workspace folder."
+            ),
+            created_at=datetime.now(UTC),
+        ),
+        main.chat_contracts.ChatMessage(
+            id="m2",
+            session_id="s1",
+            role=main.chat_contracts.ChatRole.assistant,
+            content="What technologies should I use?",
+            created_at=datetime.now(UTC),
+        ),
+        main.chat_contracts.ChatMessage(
+            id="m3",
+            session_id="s1",
+            role=main.chat_contracts.ChatRole.user,
+            content="use basic HTML, CSS and Javascript, so that I can open it as an html file.",
+            created_at=datetime.now(UTC),
+        ),
+    ]
+
+    goal = chat_service._candidate_goal(
+        "Make it minimalistic, just show the count down.",
+        {},
+        messages=messages,
+    )
+
+    assert "first-repo-by-my-ai-agent" in goal
+    assert "small website to count down to next new year" in goal
+    assert "basic HTML, CSS and Javascript" in goal
+    assert "Make it minimalistic" in goal
+
+
+def test_candidate_goal_uses_registry_thread_hints(monkeypatch) -> None:
+    registry = cap_registry.CapabilityRegistry(
+        capabilities={
+            "custom.widget.assemble": cap_registry.CapabilitySpec(
+                capability_id="custom.widget.assemble",
+                description="Assemble a custom widget.",
+                risk_tier="bounded_write",
+                idempotency="safe_write",
+                group="custom",
+                subgroup="widgets",
+                planner_hints={
+                    "chat_thread_hints": {
+                        "action_tokens": ["assemble"],
+                        "artifact_tokens": ["widget"],
+                        "continuation_tokens": ["sleek"],
+                    }
+                },
+            )
+        }
+    )
+    monkeypatch.setattr(chat_service.capability_registry, "load_capability_registry", lambda: registry)
+    messages = [
+        main.chat_contracts.ChatMessage(
+            id="m1",
+            session_id="s1",
+            role=main.chat_contracts.ChatRole.user,
+            content="assemble a widget in the workspace",
+            created_at=datetime.now(UTC),
+        )
+    ]
+    long_followup = " ".join(["sleek"] + ["visual"] * 85)
+
+    goal = chat_service._candidate_goal(long_followup, {}, messages=messages)
+
+    assert goal.startswith("assemble a widget")
+    assert long_followup in goal
+
+
+def test_chat_route_treats_prompt_as_satisfied_by_candidate_goal() -> None:
+    slot_values: dict[str, str] = {}
+
+    missing, blocking = main._drop_goal_satisfied_missing_slots(
+        missing_slots=["prompt", "goal", "workspace_path"],
+        blocking_slots=["prompt", "goal", "workspace_path"],
+        slot_values=slot_values,
+        candidate_goal=(
+            "Create a small HTML countdown website in workspace/narender folder."
+        ),
+    )
+
+    assert missing == []
+    assert blocking == []
+    assert slot_values["prompt"] == "Create a small HTML countdown website in workspace/narender folder."
+    assert slot_values["goal"] == "Create a small HTML countdown website in workspace/narender folder."
+    assert slot_values["workspace_path"] == "workspace/narender"
+
+
+def test_heuristic_updates_capture_goal_and_workspace_path_answers() -> None:
+    goal_updates = main.chat_clarification_normalizer.heuristic_field_updates_for_answer(
+        preferred_field="goal",
+        latest_answer="the goal is to create a small web app for counting down to next New Year",
+        allowed_fields=["goal", "workspace_path"],
+    )
+    workspace_updates = main.chat_clarification_normalizer.heuristic_field_updates_for_answer(
+        preferred_field="workspace_path",
+        latest_answer="create it in workspace folder",
+        allowed_fields=["goal", "workspace_path"],
+    )
+
+    assert goal_updates == {
+        "goal": "the goal is to create a small web app for counting down to next New Year"
+    }
+    assert workspace_updates == {"workspace_path": "workspace"}
+
+
+def test_heuristic_updates_preserve_workspace_subpath_answers() -> None:
+    workspace_updates = main.chat_clarification_normalizer.heuristic_field_updates_for_answer(
+        preferred_field="workspace_path",
+        latest_answer="save it in workspace/narender folder",
+        allowed_fields=["goal", "workspace_path"],
+    )
+
+    assert workspace_updates == {"workspace_path": "workspace/narender"}
+
+
+def test_pending_clarification_state_drops_question_when_no_fields_pending() -> None:
+    pending_state = chat_service._pending_clarification_state(
+        resolved_goal="create a small HTML countdown website in workspace/narender folder",
+        questions=["Provide clarification for input 'goal' so planning can continue."],
+        assessment={
+            "missing_slots": ["goal", "workspace_path"],
+            "blocking_slots": ["goal", "workspace_path"],
+            "slot_values": {
+                "goal": "create a small HTML countdown website",
+                "workspace_path": "workspace/narender",
+            },
+        },
+        session_metadata={},
+        context_json={},
+    )
+
+    assert pending_state["pending_fields"] == []
+    assert pending_state["required_fields"] == []
+    assert pending_state["questions"] == []
+    assert pending_state["pending_questions"] == []
+    assert "current_question" not in pending_state
+
+
+def test_resolved_pending_clarification_is_not_active() -> None:
+    pending_state = chat_service._pending_clarification_state(
+        resolved_goal="create a small HTML countdown website in workspace/narender folder",
+        questions=["Provide clarification for input 'workspace_path'."],
+        assessment={
+            "missing_slots": [],
+            "blocking_slots": [],
+            "slot_values": {
+                "goal": "create a small HTML countdown website",
+                "workspace_path": "workspace/narender",
+            },
+        },
+        session_metadata={},
+        context_json={},
+    )
+
+    assert chat_service.pending_clarification_is_active(
+        {"pending_clarification": pending_state}
+    ) is False
+
+
+def test_persist_pending_clarification_clears_inactive_state() -> None:
+    metadata = {
+        "draft_goal": "create a small HTML countdown website",
+        "pending_clarification": {
+            "schema_version": "clarification_state_v1",
+            "original_goal": "create a small HTML countdown website",
+            "goal_intent_profile": {
+                "missing_slots": [],
+                "blocking_slots": [],
+                "needs_clarification": False,
+                "requires_blocking_clarification": False,
+                "questions": ["Provide clarification for input 'workspace_path'."],
+            },
+            "questions": ["Provide clarification for input 'workspace_path'."],
+            "pending_questions": ["Provide clarification for input 'workspace_path'."],
+            "known_slot_values": {"workspace_path": "workspace/narender"},
+            "resolved_slots": {"workspace_path": "workspace/narender"},
+        },
+    }
+    cleared: set[str] = set()
+
+    was_active = chat_service.persist_pending_clarification_state(
+        metadata,
+        state=metadata["pending_clarification"],
+        draft_goal="create a small HTML countdown website",
+        cleared_keys=cleared,
+    )
+
+    assert was_active is False
+    assert "pending_clarification" not in metadata
+    assert "draft_goal" not in metadata
+    assert cleared == {"pending_clarification", "draft_goal"}
+
+
+def test_clarification_lifecycle_derives_question_from_pending_field() -> None:
+    pending_state = {
+        "schema_version": "clarification_state_v1",
+        "original_goal": "create a report",
+        "goal_intent_profile": {
+            "missing_slots": ["audience"],
+            "blocking_slots": ["audience"],
+            "needs_clarification": True,
+            "requires_blocking_clarification": True,
+            "questions": ["Old generic question that should not be persisted."],
+        },
+        "pending_fields": ["audience"],
+        "required_fields": ["audience"],
+        "questions": ["Old generic question that should not be persisted."],
+        "pending_questions": ["Old generic question that should not be persisted."],
+        "known_slot_values": {},
+        "resolved_slots": {},
+    }
+
+    lifecycle = chat_service.clarification_lifecycle_from_state(pending_state)
+
+    assert lifecycle.active is True
+    assert lifecycle.pending_fields == ("audience",)
+    assert lifecycle.questions == ("Who is the target audience?",)
+    assert lifecycle.next_question() == "Who is the target audience?"
+
+
+def test_resolved_ask_clarification_route_submits_job() -> None:
+    candidate_goal = (
+        "create a git repo with the name first-repo-by-my-ai-agent. "
+        "the goal is to create a small website to count down to next new year. "
+        "save it in workspace/narender folder. Create an HTML file, java script "
+        "that counts down for the next new year."
+    )
+    route_request = main._build_chat_route_request(
+        content="Create an HTML file, java script that counts down for the next new year.",
+        candidate_goal=candidate_goal,
+        session_metadata={},
+        merged_context={
+            "goal": candidate_goal,
+            "workspace_path": "workspace/narender",
+            "output_format": "html",
+        },
+        messages=[],
+    )
+
+    plan = main._normalize_chat_route(
+        {
+            "route": "ask_clarification",
+            "assistant_response": "I still need the exact workspace path.",
+            "intent": "generate",
+            "risk_level": "bounded_write",
+            "confidence": 0.9,
+            "clarification_questions": ["What exact workspace path should I use?"],
+            "missing_inputs": [],
+        },
+        content="Create an HTML file, java script that counts down for the next new year.",
+        candidate_goal=candidate_goal,
+        route_request=route_request,
+    )
+
+    assert plan["type"] == "submit_job"
+    assert plan["assistant_content"] == ""
+    assert plan["clarification_questions"] == []
+    assert plan["goal_intent_profile"]["missing_slots"] == []
+
+
 def test_merge_clarification_state_does_not_revive_stale_pending_queue() -> None:
     latest = main.chat_contracts.ClarificationState(
         original_goal="create a document",
@@ -2087,13 +2386,7 @@ def test_merge_clarification_state_does_not_revive_stale_pending_queue() -> None
 
     merged = chat_service._merge_clarification_state_for_persistence(latest, desired)
 
-    assert merged["pending_fields"] == []
-    assert merged["required_fields"] == []
-    assert merged["pending_questions"] == []
-    assert merged["questions"] == []
-    assert "current_question" not in merged
-    assert "current_question_field" not in merged
-    assert merged["known_slot_values"]["instruction"] == "Cover Agentic AI Ops at top companies."
+    assert merged == {}
 
 
 def test_chat_submit_normalization_keeps_document_clarification_open_for_path_only_answer(
@@ -4886,7 +5179,7 @@ def test_chat_boundary_overrides_chat_reply_to_continue_pending_for_clarificatio
     assert calls["router"] == 1
 
 
-def test_chat_boundary_preserves_pending_clarification_for_execution_oriented_long_answer(
+def test_chat_boundary_clears_stale_pending_clarification_for_execution_oriented_long_answer(
     monkeypatch,
 ) -> None:
     session = client.post("/chat/sessions", json={}).json()
@@ -4920,7 +5213,7 @@ def test_chat_boundary_preserves_pending_clarification_for_execution_oriented_lo
         def generate_request_json_object(self, request):
             payload = json.loads(request.prompt)
             evidence = payload["boundary_evidence"]
-            assert evidence["pending_clarification"] is True
+            assert evidence["pending_clarification"] is False
             assert evidence["likely_clarification_answer"] is False
             assert evidence["conversation_mode_hint"] == "execution_oriented"
             return {
@@ -4951,15 +5244,15 @@ def test_chat_boundary_preserves_pending_clarification_for_execution_oriented_lo
     body = response.json()
     assert body["job"] is None
     assert body["assistant_message"]["action"]["type"] == "ask_clarification"
-    assert body["assistant_message"]["metadata"]["boundary_decision"]["decision"] == "continue_pending"
+    assert body["assistant_message"]["metadata"]["boundary_decision"]["decision"] == "execution_request"
     assert (
         body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
-        == "pending_clarification_state_preservation"
-    )
-    assert body["session"]["metadata"]["pending_clarification"]["original_goal"] == (
-        "Generate a deployment report"
+        == "execution_signal_override"
     )
     assert "pending_clarification" in body["session"]["metadata"]
+    assert body["session"]["metadata"]["pending_clarification"]["original_goal"] != (
+        "Generate a deployment report"
+    )
     assert calls["router"] == 1
 
 

@@ -241,6 +241,15 @@ def build_llm_prompt(request: planner_contracts.PlanRequest) -> str:
             "input_schema_ref": capability.input_schema_ref,
             "output_schema_ref": capability.output_schema_ref,
             "aliases": list(capability.aliases),
+            "exports": [
+                {
+                    "name": export.name,
+                    "path": export.path,
+                    "description": export.description,
+                    "required": export.required,
+                }
+                for export in capability.exports
+            ],
             "planner_hints": dict(capability.planner_hints),
             "adapters": [
                 {
