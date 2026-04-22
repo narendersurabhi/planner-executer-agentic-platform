@@ -284,10 +284,14 @@ def heuristic_field_updates_for_answer(
     if normalized_preferred == "instruction" and _looks_like_substantive_instruction(answer):
         return {"instruction": answer}
     if normalized_preferred in {"topic", "audience"}:
+        if _looks_like_meta_clarification_answer(answer) or _looks_like_bundled_execution_answer(answer):
+            return {}
         if not _looks_like_simple_field_answer(answer, max_tokens=16):
             return {}
         return {normalized_preferred: " ".join(answer.split())}
     if normalized_preferred == "tone":
+        if _looks_like_meta_clarification_answer(answer) or _looks_like_bundled_execution_answer(answer):
+            return {}
         if not _looks_like_simple_field_answer(answer, max_tokens=8):
             return {}
         return {"tone": " ".join(answer.split()).lower()}
@@ -302,6 +306,12 @@ def heuristic_field_updates_for_answer(
     if normalized_preferred == "workspace_path":
         return {"workspace_path": _normalize_workspace_path_answer(answer)}
     if normalized_preferred == "output_format":
+        if not _looks_like_simple_field_answer(answer, max_tokens=5) and not re.search(
+            r"\b(?:pdf|docx|markdown|json|word)\b",
+            answer,
+            flags=re.IGNORECASE,
+        ):
+            return {}
         normalized_format = _normalize_output_format_token(answer)
         if normalized_format:
             return {"output_format": normalized_format}
@@ -313,11 +323,36 @@ def _looks_like_simple_field_answer(answer: str, *, max_tokens: int) -> bool:
     if not normalized:
         return False
     lowered = normalized.lower()
-    if "\n" in normalized or "answer:" in lowered:
+    if "\n" in normalized or "answer:" in lowered or "?" in normalized:
+        return False
+    if _looks_like_meta_clarification_answer(normalized):
         return False
     if re.search(r"(^|\s)\d+[.)]\s", normalized):
         return False
     return len(re.findall(r"[A-Za-z0-9._-]+", normalized)) <= max_tokens
+
+
+def _looks_like_meta_clarification_answer(answer: str) -> bool:
+    lowered = str(answer or "").strip().lower()
+    if not lowered:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:clarify|what do you|what you|what still|still need|need from me)\b",
+            lowered,
+        )
+    )
+
+
+def _looks_like_bundled_execution_answer(answer: str) -> bool:
+    lowered = str(answer or "").strip().lower()
+    if not lowered:
+        return False
+    if re.search(r"\b(?:pdf|docx|markdown|json|word)\b", lowered):
+        return True
+    if re.search(r"\b(?:make|create|generate|save|render|write)\b", lowered):
+        return True
+    return False
 
 
 def _normalize_workspace_path_answer(answer: str) -> str:

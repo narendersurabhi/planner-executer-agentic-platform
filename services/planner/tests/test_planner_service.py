@@ -483,6 +483,71 @@ def test_validate_capability_inputs_accepts_iterative_document_generation_fields
     assert error is None
 
 
+def test_validate_capability_inputs_accepts_iterative_runbook_generation_fields() -> None:
+    capability = planner_contracts.PlanRequestCapability(
+        capability_id="document.runbook.generate_iterative",
+        input_schema_ref="document_runbook_iterative_capability_input",
+        planner_hints={"task_intents": ["generate"]},
+    )
+    request = planner_contracts.PlanRequest(
+        job_id="job-1",
+        goal="create a document",
+        job_context={
+            "instruction": "evaluation strategies for ai agents, tool calls and RAG",
+            "topic": "agentic ai evals",
+            "audience": "agentic ai architects",
+            "tone": "practical",
+        },
+        job_payload={
+            "goal": "create a document",
+            "context_json": {
+                "instruction": "evaluation strategies for ai agents, tool calls and RAG",
+                "topic": "agentic ai evals",
+                "audience": "agentic ai architects",
+                "tone": "practical",
+            },
+        },
+    )
+    task = models.TaskCreate(
+        name="GenerateDocumentSpec",
+        description="Generate iterative runbook document spec",
+        instruction="create a practical runbook",
+        acceptance_criteria=["Spec produced"],
+        expected_output_schema_ref="schemas/document_spec",
+        intent=models.ToolIntent.generate,
+        deps=[],
+        tool_requests=["document.runbook.generate_iterative"],
+        tool_inputs={
+            "document.runbook.generate_iterative": {
+                "instruction": "evaluation strategies for ai agents, tool calls and RAG",
+                "topic": "agentic ai evals",
+                "audience": "agentic ai architects",
+                "tone": "practical",
+            }
+        },
+        critic_required=False,
+    )
+
+    payload = planner_service.build_capability_validation_payload(
+        task,
+        "document.runbook.generate_iterative",
+        dict(task.tool_inputs["document.runbook.generate_iterative"]),
+        request,
+    )
+    error = planner_service.validate_capability_inputs(
+        capability,
+        task,
+        dict(task.tool_inputs["document.runbook.generate_iterative"]),
+        request,
+        schema_registry_path="schemas",
+    )
+
+    assert payload["job"]["context_json"]["instruction"] == (
+        "evaluation strategies for ai agents, tool calls and RAG"
+    )
+    assert error is None
+
+
 def test_validate_plan_request_accepts_iterative_document_goal_alias() -> None:
     request = planner_contracts.PlanRequest(
         job_id="job-1",

@@ -1449,29 +1449,45 @@ def _apply_pending_clarification_mapping(
             None,
         )
 
-    try:
-        normalization = runtime.normalize_submit_context(
-            db=db,
-            goal=goal,
-            content=content,
-            session_metadata=session_metadata,
-            merged_context=merged_context,
-            context_envelope=context_envelope,
-            user_id=user_id,
-            messages=messages,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "chat_pending_clarification_mapping_failed",
-            extra={"session_id": session_metadata.get("id")},
-        )
-        return (
-            goal,
-            context_envelope,
-            dict(merged_context or {}),
-            dict(session_metadata),
-            None,
-        )
+    normalization = _local_pending_clarification_normalization(
+        goal=goal,
+        content=content,
+        session_metadata=session_metadata,
+        merged_context=merged_context,
+        pending_lifecycle=pending_lifecycle,
+    )
+    if normalization is None:
+        if _looks_like_pending_meta_clarification(content):
+            return (
+                goal,
+                context_envelope,
+                dict(merged_context or {}),
+                dict(session_metadata),
+                None,
+            )
+        try:
+            normalization = runtime.normalize_submit_context(
+                db=db,
+                goal=goal,
+                content=content,
+                session_metadata=session_metadata,
+                merged_context=merged_context,
+                context_envelope=context_envelope,
+                user_id=user_id,
+                messages=messages,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "chat_pending_clarification_mapping_failed",
+                extra={"session_id": session_metadata.get("id")},
+            )
+            return (
+                goal,
+                context_envelope,
+                dict(merged_context or {}),
+                dict(session_metadata),
+                None,
+            )
 
     if normalization is None:
         return (
@@ -1482,6 +1498,182 @@ def _apply_pending_clarification_mapping(
             None,
         )
 
+    return _apply_clarification_normalization_result(
+        goal=goal,
+        content=content,
+        session_metadata=session_metadata,
+        merged_context=merged_context,
+        context_envelope=context_envelope,
+        pending_state=pending_state,
+        normalization=normalization,
+    )
+
+
+def _local_pending_clarification_normalization(
+    *,
+    goal: str,
+    content: str,
+    session_metadata: Mapping[str, Any],
+    merged_context: Mapping[str, Any] | None,
+    pending_lifecycle: ClarificationLifecycle,
+) -> ChatSubmitNormalizationResult | None:
+    current_field = _normalize_clarification_field_key(pending_lifecycle.current_question_field)
+    if not current_field:
+        return None
+    lowered_content = str(content or "").lower()
+    if re.search(r"\b(?:actually|instead|rather)\b", lowered_content):
+        return None
+    if _looks_like_pending_meta_clarification(content):
+        return None
+    if _should_skip_local_pending_slot_mapping(
+        field=current_field,
+        content=content,
+    ):
+        return None
+    candidate_fields = list(pending_lifecycle.pending_fields or pending_lifecycle.required_fields)
+    updates = chat_clarification_normalizer.heuristic_field_updates_for_answer(
+        preferred_field=current_field,
+        latest_answer=content,
+        allowed_fields=tuple(candidate_fields),
+    )
+    if not updates:
+        return None
+
+    updated_context = dict(merged_context or {})
+    updated_context.update(updates)
+    known_slot_values = {
+        **dict(pending_lifecycle.known_slot_values or {}),
+        **{
+            _normalize_clarification_field_key(key): value
+            for key, value in updates.items()
+            if _normalize_clarification_field_key(key)
+        },
+    }
+    remaining_fields: list[str] = []
+    for raw_field in _ordered_clarification_fields(
+        pending_lifecycle.pending_fields,
+        pending_lifecycle.required_fields,
+    ):
+        field = _normalize_clarification_field_key(raw_field)
+        if not field or field in remaining_fields:
+            continue
+        value = known_slot_values.get(field, updated_context.get(field))
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            continue
+        remaining_fields.append(field)
+
+    assessment = dict(pending_lifecycle.goal_intent_profile or {})
+    slot_values = (
+        dict(assessment.get("slot_values"))
+        if isinstance(assessment.get("slot_values"), Mapping)
+        else {}
+    )
+    slot_values.update(updates)
+    assessment["slot_values"] = slot_values
+    assessment["missing_slots"] = list(remaining_fields)
+    assessment["blocking_slots"] = list(remaining_fields)
+    assessment["needs_clarification"] = bool(remaining_fields)
+    assessment["requires_blocking_clarification"] = bool(remaining_fields)
+    remaining_questions: list[str] = []
+    for question in pending_lifecycle.questions:
+        question_field = _clarification_field_from_question(
+            question=question,
+            candidate_fields=remaining_fields,
+            goal=goal,
+            allow_single_candidate_fallback=False,
+        )
+        if question_field in remaining_fields and question not in remaining_questions:
+            remaining_questions.append(question)
+    for field in remaining_fields:
+        if any(
+            _clarification_field_from_question(
+                question=question,
+                candidate_fields=(field,),
+                goal=goal,
+            )
+            == field
+            for question in remaining_questions
+        ):
+            continue
+        question = chat_clarification_normalizer.clarification_question_for_field(
+            field,
+            goal=goal,
+        )
+        if question and question not in remaining_questions:
+            remaining_questions.append(question)
+    assessment["questions"] = remaining_questions
+    if remaining_fields:
+        assessment["clarification_mode"] = (
+            str(assessment.get("clarification_mode") or "").strip()
+            or "targeted_slot_filling"
+        )
+    else:
+        assessment["clarification_mode"] = None
+
+    updated_context["clarification_normalization"] = {
+        "source": "chat_clarification_heuristic",
+        "fields": sorted(updates.keys()),
+        "confidence": {field: 1.0 for field in updates},
+    }
+    return ChatSubmitNormalizationResult(
+        goal=goal,
+        context_json=updated_context,
+        clarification_questions=list(assessment["questions"]),
+        requires_blocking_clarification=bool(remaining_fields),
+        goal_intent_profile=assessment,
+    )
+
+
+def _looks_like_pending_meta_clarification(content: str) -> bool:
+    normalized = str(content or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    if "answer:" in lowered:
+        return False
+    return "?" in normalized or bool(
+        re.search(
+            r"\b(?:clarify|what do you|what you|what still|still need|need from me)\b",
+            lowered,
+        )
+    )
+
+
+def _should_skip_local_pending_slot_mapping(*, field: str, content: str) -> bool:
+    if field in {"instruction", "goal"}:
+        return False
+    normalized = str(content or "").strip()
+    if not normalized:
+        return True
+    lowered = normalized.lower()
+    if "," in normalized or "." in normalized or ";" in normalized:
+        return True
+    if re.search(r"\b(?:make|create|generate|save|render|write)\b", lowered):
+        return True
+    if re.search(r"\b(?:pdf|docx|markdown|json|word)\b", lowered) and re.search(
+        r"\bfor\b",
+        lowered,
+    ):
+        return True
+    return False
+
+
+def _apply_clarification_normalization_result(
+    *,
+    goal: str,
+    content: str,
+    session_metadata: Mapping[str, Any],
+    merged_context: Mapping[str, Any] | None,
+    context_envelope: workflow_contracts.ContextEnvelope,
+    pending_state: chat_contracts.ClarificationState,
+    normalization: ChatSubmitNormalizationResult,
+) -> tuple[
+    str,
+    workflow_contracts.ContextEnvelope,
+    dict[str, Any],
+    dict[str, Any],
+    ChatSubmitNormalizationResult,
+]:
     updated_goal = str(normalization.goal or "").strip() or goal
     updated_envelope = context_envelope
     if updated_goal != goal or (
@@ -1583,6 +1775,105 @@ def _clarification_mapping_metadata(
         "resolved_active_field": resolved_active_field,
         "queue_advanced": queue_advanced,
         "restarted": bool(restarted),
+    }
+
+
+def _pending_clarification_fast_turn_plan(
+    *,
+    candidate_goal: str,
+    session_metadata: Mapping[str, Any],
+    normalization: ChatSubmitNormalizationResult | None,
+    had_pending_clarification: bool,
+    had_pending_workflow_input: bool,
+    restarted: bool,
+    exit_pending_to_chat: bool,
+) -> dict[str, Any] | None:
+    if (
+        not had_pending_clarification
+        or had_pending_workflow_input
+        or restarted
+        or exit_pending_to_chat
+        or normalization is None
+    ):
+        return None
+    lifecycle = clarification_lifecycle_from_metadata(session_metadata)
+    assessment = (
+        dict(normalization.goal_intent_profile)
+        if isinstance(normalization.goal_intent_profile, Mapping)
+        and normalization.goal_intent_profile
+        else dict(lifecycle.goal_intent_profile or {})
+    )
+    resolved_goal = str(normalization.goal or "").strip() or candidate_goal
+    if lifecycle.active:
+        questions = list(lifecycle.questions)
+        if not questions:
+            questions = [
+                str(question).strip()
+                for question in normalization.clarification_questions
+                if isinstance(question, str) and question.strip()
+            ]
+        questions = _active_clarification_questions(questions)
+        return {
+            "type": "ask_clarification",
+            "assistant_content": "\n".join(questions),
+            "clarification_questions": questions,
+            "goal_intent_profile": assessment,
+            "resolved_goal": resolved_goal,
+            "context_json_updates": (
+                dict(normalization.context_json)
+                if isinstance(normalization.context_json, Mapping)
+                else {}
+            ),
+            "routing_decision": {
+                "route": "ask_clarification",
+                "fallback_used": True,
+                "fallback_reason": "pending_clarification_fast_path",
+                "reason_codes": ["pending_clarification_fast_path"],
+                "missing_inputs": list(assessment.get("missing_slots") or []),
+                "clarification_questions": questions,
+            },
+        }
+    if normalization.requires_blocking_clarification:
+        questions = _active_clarification_questions(normalization.clarification_questions)
+        return {
+            "type": "ask_clarification",
+            "assistant_content": "\n".join(questions),
+            "clarification_questions": questions,
+            "goal_intent_profile": assessment,
+            "resolved_goal": resolved_goal,
+            "context_json_updates": (
+                dict(normalization.context_json)
+                if isinstance(normalization.context_json, Mapping)
+                else {}
+            ),
+            "routing_decision": {
+                "route": "ask_clarification",
+                "fallback_used": True,
+                "fallback_reason": "pending_clarification_fast_path",
+                "reason_codes": ["pending_clarification_fast_path"],
+                "missing_inputs": list(assessment.get("missing_slots") or []),
+                "clarification_questions": questions,
+            },
+        }
+    return {
+        "type": "submit_job",
+        "assistant_content": "",
+        "clarification_questions": [],
+        "goal_intent_profile": assessment,
+        "resolved_goal": resolved_goal,
+        "context_json_updates": (
+            dict(normalization.context_json)
+            if isinstance(normalization.context_json, Mapping)
+            else {}
+        ),
+        "routing_decision": {
+            "route": "submit_job",
+            "fallback_used": True,
+            "fallback_reason": "pending_clarification_fast_path",
+            "reason_codes": ["pending_clarification_fast_path"],
+            "missing_inputs": [],
+            "clarification_questions": [],
+        },
     }
 
 
@@ -1805,6 +2096,13 @@ def handle_turn(
     pending_lifecycle = clarification_lifecycle_from_metadata(session_metadata)
     pending_state = pending_lifecycle.state if pending_lifecycle.active else None
     pending_state_before_mapping = pending_state
+    had_pending_clarification_before_mapping = pending_state_before_mapping is not None
+    had_pending_workflow_input = isinstance(session_metadata.get("pending_workflow_input"), Mapping)
+    exit_pending_to_chat = bool(
+        pending_state_before_mapping is not None
+        and runtime.is_chat_only_correction is not None
+        and runtime.is_chat_only_correction(content)
+    )
     if _looks_like_pending_clarification_intent_change(
         content,
         pending_state=pending_state,
@@ -1878,14 +2176,26 @@ def handle_turn(
         normalization=pre_route_normalization,
         restarted=restarted_pending_clarification,
     )
-    route_context = context_service.chat_route_context_view(context_envelope)
-    turn_plan = runtime.route_turn(
-        content=content,
+    fast_pending_plan = _pending_clarification_fast_turn_plan(
         candidate_goal=candidate_goal,
         session_metadata=session_metadata,
-        merged_context=route_context,
-        messages=chat_messages,
+        normalization=pre_route_normalization,
+        had_pending_clarification=had_pending_clarification_before_mapping,
+        had_pending_workflow_input=had_pending_workflow_input,
+        restarted=restarted_pending_clarification,
+        exit_pending_to_chat=exit_pending_to_chat,
     )
+    if fast_pending_plan is not None:
+        turn_plan = fast_pending_plan
+    else:
+        route_context = context_service.chat_route_context_view(context_envelope)
+        turn_plan = runtime.route_turn(
+            content=content,
+            candidate_goal=candidate_goal,
+            session_metadata=session_metadata,
+            merged_context=route_context,
+            messages=chat_messages,
+        )
     normalized_intent_envelope = (
         dict(turn_plan.get("normalized_intent_envelope"))
         if isinstance(turn_plan.get("normalized_intent_envelope"), Mapping)

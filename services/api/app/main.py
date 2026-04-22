@@ -3931,17 +3931,13 @@ def _chat_boundary_failure_response(
             clarification_questions=list(fallback.get("clarification_questions") or []),
         ).model_dump(mode="json", exclude_none=True)
         return fallback
-    fallback = _fallback_chat_turn_route(
-        content=content,
-        candidate_goal=candidate_goal,
-        session_metadata=session_metadata,
-        merged_context=merged_context,
+    fallback = _chat_response_turn_plan(
+        goal=content.strip() or candidate_goal,
+        assistant_content=_fallback_chat_response(content),
     )
     assessment = dict(fallback.get("goal_intent_profile") or {})
     assessment["source"] = "chat_boundary_fallback"
     assessment["routing_fallback_reason"] = "boundary_decision_failed"
-    if pending_clarification:
-        assessment["pending_clarification"] = True
     fallback["goal_intent_profile"] = (
         workflow_contracts.dump_goal_intent_profile(assessment) or assessment
     )
@@ -7003,6 +6999,10 @@ def _normalize_chat_submit_context(
         if context_envelope is not None
         else dict(merged_context) if isinstance(merged_context, Mapping) else {}
     )
+    stripped_content = str(content or "").strip()
+    goal_with_clarification = goal
+    if stripped_content and f"User clarification: {stripped_content}" not in goal:
+        goal_with_clarification = f"{goal}\n\nUser clarification: {stripped_content}"
     normalized = _normalize_goal_intent(
         goal,
         db=db,
@@ -7033,6 +7033,11 @@ def _normalize_chat_submit_context(
         updates.update(heuristic_updates)
         running_context.update(heuristic_updates)
         accepted_confidence.update({field: 1.0 for field in heuristic_updates})
+    explicit_path = _extract_chat_clarification_path(content)
+    if explicit_path and not str(running_context.get("path") or "").strip():
+        updates["path"] = explicit_path
+        running_context["path"] = explicit_path
+        accepted_confidence["path"] = 1.0
     active_target = _active_execution_target_for_chat(
         normalized=normalized,
         session_metadata=session_metadata,
@@ -7072,7 +7077,7 @@ def _normalize_chat_submit_context(
         if CHAT_CLARIFICATION_NORMALIZER_ENABLED:
             contract_updates, contract_unresolved, contract_confidence = (
                 chat_clarification_normalizer.normalize_contract_fields_with_llm(
-                    goal=goal,
+                    goal=goal_with_clarification,
                     contract=contract,
                     provider=_chat_clarification_normalizer_provider,
                     confidence_threshold=CHAT_CLARIFICATION_NORMALIZER_CONFIDENCE_THRESHOLD,
@@ -7212,12 +7217,32 @@ def _normalize_chat_submit_context(
     if not context_updates and not clarification_questions:
         return None
     return chat_service.ChatSubmitNormalizationResult(
-        goal=goal,
+        goal=goal_with_clarification if updates else goal,
         context_json=context_updates,
         clarification_questions=clarification_questions,
         requires_blocking_clarification=requires_blocking_clarification,
         goal_intent_profile=refreshed_assessment,
     )
+
+
+def _extract_chat_clarification_path(content: str) -> str:
+    normalized = str(content or "").strip()
+    if not normalized:
+        return ""
+    extension_pattern = r"(?:docx|pdf|md|markdown|json|txt)"
+    quoted = re.search(
+        rf"""["']([^"'\n]+\.(?:{extension_pattern}))["']""",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if quoted:
+        return quoted.group(1).strip()
+    path_like = re.search(
+        rf"\b((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9][A-Za-z0-9_. -]*\.(?:{extension_pattern}))\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return path_like.group(1).strip() if path_like else ""
 
 
 def _chat_runtime() -> chat_service.ChatServiceRuntime:

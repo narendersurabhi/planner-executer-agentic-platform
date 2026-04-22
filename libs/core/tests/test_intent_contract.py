@@ -874,6 +874,35 @@ def test_validate_intent_segment_contract_ignores_goal_for_document_spec_generat
     assert mismatch is None
 
 
+def test_validate_intent_segment_contract_ignores_workspace_path_for_document_spec_generation() -> None:
+    segment = {
+        "intent": "generate",
+        "objective": "Generate a document spec",
+        "required_inputs": ["goal", "workspace_path"],
+        "slots": {
+            "entity": "artifact",
+            "artifact_type": "content",
+            "output_format": "json",
+            "risk_level": "read_only",
+            "must_have_inputs": ["goal", "workspace_path"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="generate",
+        tool_name="document.spec.generate",
+        payload={
+            "instruction": "Create a document spec.",
+            "topic": "Agent + Capability Workbench",
+            "audience": "operators",
+            "tone": "practical",
+        },
+        capability_id="document.spec.generate",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
 def test_validate_intent_segment_contract_ignores_final_path_for_document_spec_generation() -> None:
     segment = {
         "intent": "generate",

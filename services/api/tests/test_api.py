@@ -5333,6 +5333,60 @@ def test_preflight_plan_endpoint_accepts_document_segment_main_topic_alias() -> 
     assert body["errors"] == {}
 
 
+def test_preflight_plan_endpoint_ignores_workspace_path_for_document_spec_generate() -> None:
+    payload = {
+        "plan": {
+            "planner_version": "ui_chaining_composer_v1",
+            "tasks_summary": "document generation",
+            "dag_edges": [],
+            "tasks": [
+                {
+                    "name": "GenerateDocumentSpec",
+                    "description": "Generate a DocumentSpec",
+                    "instruction": "Generate a practical Workbench runbook spec.",
+                    "acceptance_criteria": ["done"],
+                    "expected_output_schema_ref": "",
+                    "intent": "generate",
+                    "deps": [],
+                    "tool_requests": ["document.spec.generate"],
+                    "tool_inputs": {
+                        "document.spec.generate": {
+                            "instruction": "Generate a practical Workbench runbook spec.",
+                            "topic": "Agent + Capability Workbench",
+                            "audience": "operators",
+                            "tone": "practical",
+                        }
+                    },
+                    "critic_required": False,
+                }
+            ],
+        },
+        "goal_intent_graph": {
+            "segments": [
+                {
+                    "id": "s1",
+                    "intent": "generate",
+                    "objective": "Generate content in a workspace",
+                    "required_inputs": ["goal", "workspace_path"],
+                    "slots": {
+                        "entity": "artifact",
+                        "artifact_type": "content",
+                        "output_format": "json",
+                        "risk_level": "read_only",
+                        "must_have_inputs": ["goal", "workspace_path"],
+                    },
+                }
+            ]
+        },
+        "job_context": {},
+    }
+    response = client.post("/plans/preflight", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is True
+    assert body["errors"] == {}
+
+
 def test_preflight_plan_endpoint_ignores_render_output_format_for_iterative_document_generation() -> None:
     payload = {
         "plan": {

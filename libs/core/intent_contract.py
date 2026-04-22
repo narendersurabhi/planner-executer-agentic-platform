@@ -1141,8 +1141,32 @@ def _is_document_spec_generation_identifier(value: Any) -> bool:
     return str(value or "").strip().lower() in {
         "llm_generate_document_spec",
         "document.spec.generate",
+        "llm_iterative_improve_document_spec",
+        "document.spec.generate_iterative",
         "llm_generate_document_spec_from_markdown",
         "document.spec.generate_from_markdown",
+    }
+
+
+def _ignored_document_spec_generation_required_inputs(
+    tool_name: str | None,
+    capability_id: str | None,
+) -> set[str]:
+    if not (
+        _is_document_spec_generation_identifier(tool_name)
+        or _is_document_spec_generation_identifier(capability_id)
+    ):
+        return set()
+    return {
+        "goal",
+        "workspace_path",
+        "filename",
+        "path",
+        "output_path",
+        "output_format",
+        "format",
+        "compactness",
+        "length_limit",
     }
 
 
@@ -1372,8 +1396,14 @@ def validate_intent_segment_contract(
     )
     payload_map = _coerce_payload_mapping(payload)
     missing_inputs: list[str] = []
+    ignored_required_inputs = _ignored_document_spec_generation_required_inputs(
+        tool_name,
+        capability_id,
+    )
     for key in slots.get("must_have_inputs", []):
         if not isinstance(key, str) or not key:
+            continue
+        if key in ignored_required_inputs:
             continue
         if key == "output_format" and _tool_output_format_hint(capability_id or tool_name):
             continue

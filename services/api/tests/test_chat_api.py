@@ -1503,6 +1503,7 @@ def test_chat_turn_maps_pending_answer_before_routing_and_advances_queue(
     assert pending["known_slot_values"]["audience"] == "Senior software engineers"
     assert pending["current_question_field"] == "tone"
     assert pending["questions"] == ["What tone should it use?"]
+    assert route_calls["count"] == 1
 
 
 def test_answer_or_handoff_maps_pending_answer_before_routing(
@@ -1624,6 +1625,7 @@ def test_answer_or_handoff_maps_pending_answer_before_routing(
     assert body["session"]["metadata"]["pending_clarification"]["known_slot_values"][
         "audience"
     ] == "Agentic AI Architects"
+    assert route_calls["count"] == 1
 
 
 def test_chat_turn_restarts_pending_clarification_for_execution_intent_change(
@@ -3762,7 +3764,7 @@ def test_chat_turn_normalizes_using_selected_github_capability_contract(monkeypa
     class _Router:
         def generate_request_json_object(self, request):
             calls["count"] += 1
-            if calls["count"] == 1:
+            if "authentication failures in private repos" not in request.prompt:
                 return {
                     "route": "ask_clarification",
                     "assistant_response": "What GitHub issues should I search for?",
@@ -3779,7 +3781,14 @@ def test_chat_turn_normalizes_using_selected_github_capability_contract(monkeypa
                 "confidence": 0.95,
             }
 
-    def _normalize_goal_intent(goal, **_kwargs):
+    def _normalize_goal_intent(goal, **kwargs):
+        context_envelope = kwargs.get("context_envelope")
+        intent_context = (
+            main.context_service.intent_context_view(context_envelope)
+            if context_envelope is not None
+            else {}
+        )
+        has_query = bool(str(intent_context.get("query") or "").strip())
         return main.workflow_contracts.NormalizedIntentEnvelope(
             goal=goal,
             profile=main.workflow_contracts.GoalIntentProfile(
@@ -3789,11 +3798,11 @@ def test_chat_turn_normalizes_using_selected_github_capability_contract(monkeypa
                 risk_level="read_only",
                 threshold=0.7,
                 low_confidence=False,
-                needs_clarification=False,
-                requires_blocking_clarification=False,
-                questions=[],
-                blocking_slots=[],
-                missing_slots=[],
+                needs_clarification=not has_query,
+                requires_blocking_clarification=not has_query,
+                questions=[] if has_query else ["What GitHub issues should I search for?"],
+                blocking_slots=[] if has_query else ["query"],
+                missing_slots=[] if has_query else ["query"],
                 slot_values={"intent_action": "io", "risk_level": "read_only"},
             ),
             graph=main.workflow_contracts.IntentGraph(
@@ -3819,10 +3828,57 @@ def test_chat_turn_normalizes_using_selected_github_capability_contract(monkeypa
                 "unresolved_fields": [],
             }
 
+    def _route_turn(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "type": "ask_clarification",
+                "assistant_content": "What GitHub issues should I search for?",
+                "clarification_questions": ["What GitHub issues should I search for?"],
+                "goal_intent_profile": {
+                    "intent": "io",
+                    "source": "test",
+                    "confidence": 0.95,
+                    "risk_level": "read_only",
+                    "threshold": 0.7,
+                    "low_confidence": False,
+                    "needs_clarification": True,
+                    "requires_blocking_clarification": True,
+                    "questions": ["What GitHub issues should I search for?"],
+                    "blocking_slots": ["query"],
+                    "missing_slots": ["query"],
+                    "slot_values": {"intent_action": "io", "risk_level": "read_only"},
+                },
+                "resolved_goal": kwargs["candidate_goal"],
+            }
+        return {
+            "type": "submit_job",
+            "assistant_content": "",
+            "clarification_questions": [],
+            "goal_intent_profile": {
+                "intent": "io",
+                "source": "test",
+                "confidence": 0.95,
+                "risk_level": "read_only",
+                "threshold": 0.7,
+                "low_confidence": False,
+                "needs_clarification": False,
+                "requires_blocking_clarification": False,
+                "questions": [],
+                "blocking_slots": [],
+                "missing_slots": [],
+                "slot_values": {"intent_action": "io", "risk_level": "read_only"},
+            },
+            "resolved_goal": kwargs["candidate_goal"],
+        }
+
     monkeypatch.setattr(main, "_normalize_goal_intent", _normalize_goal_intent)
+    monkeypatch.setattr(main, "_route_chat_turn", _route_turn)
     monkeypatch.setattr(main, "_chat_router_provider", _Router())
     monkeypatch.setattr(main, "_chat_clarification_normalizer_provider", _Normalizer())
     monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", True)
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "CHAT_ROUTING_MODE", "always_router")
 
     session = client.post("/chat/sessions", json={}).json()
     first = client.post(
@@ -4198,7 +4254,7 @@ def test_chat_turn_response_first_answer_or_handoff_can_escalate_to_router(monke
         assert body["job"] is None
 
 
-def test_chat_turn_response_first_boundary_failure_preserves_execution_fallback(monkeypatch) -> None:
+def test_chat_turn_response_first_boundary_failure_uses_chat_fallback(monkeypatch) -> None:
     class _FailingResponder:
         def generate_request_json_object(self, request):
             assert request.metadata == {"component": "chat_boundary_decision"}
@@ -4217,7 +4273,8 @@ def test_chat_turn_response_first_boundary_failure_preserves_execution_fallback(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
+    assert body["job"] is None
+    assert body["assistant_message"]["action"]["type"] == "respond"
     assert body["assistant_message"]["metadata"]["goal_intent_profile"]["source"] == "chat_boundary_fallback"
     assert (
         body["assistant_message"]["metadata"]["goal_intent_profile"]["routing_fallback_reason"]
@@ -5292,12 +5349,12 @@ def test_chat_boundary_overrides_chat_reply_to_continue_pending_for_clarificatio
     assert response.status_code == 200
     body = response.json()
     assert body["assistant_message"]["action"]["type"] in {"submit_job", "ask_clarification"}
-    assert body["assistant_message"]["metadata"]["boundary_decision"]["decision"] == "continue_pending"
     assert (
-        body["assistant_message"]["metadata"]["boundary_decision"]["reason_code"]
-        == "clarification_answer_override"
+        body["assistant_message"]["metadata"]["routing_decision"]["fallback_reason"]
+        == "pending_clarification_fast_path"
     )
-    assert calls["router"] == 1
+    assert "boundary_decision" not in body["assistant_message"]["metadata"]
+    assert calls["router"] == 0
 
 
 def test_chat_boundary_clears_stale_pending_clarification_for_execution_oriented_long_answer(

@@ -6,6 +6,7 @@ _DOCUMENT_GENERATION_REQUEST_IDS = {
     "llm_iterative_improve_document_spec",
     "llm_iterative_improve_runbook_spec",
     "document.spec.generate_iterative",
+    "document.runbook.generate_iterative",
 }
 
 _DOCUMENT_SPEC_GENERATION_REQUEST_IDS = {
