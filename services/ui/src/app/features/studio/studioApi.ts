@@ -12,6 +12,8 @@ import type {
   AgentDefinition,
   AgentDefinitionCreateRequest,
   AgentDefinitionUpdateRequest,
+  AgentDefinitionVersion,
+  AgentDefinitionVersionPublishRequest,
   CapabilityCatalog,
 } from "./types";
 
@@ -89,6 +91,7 @@ export type WorkbenchAgentRunRequest = {
   context_json?: Record<string, unknown>;
   run_spec: Record<string, unknown>;
   agent_definition_id?: string | null;
+  agent_definition_version_id?: string | null;
 };
 
 export type WorkbenchDebuggerStep = {
@@ -251,6 +254,33 @@ export async function updateAgentDefinition(
 
 export async function deleteAgentDefinition(agentId: string): Promise<{ ok: boolean }> {
   return deleteJson<{ ok: boolean }>(`/agents/definitions/${encodeURIComponent(agentId)}`);
+}
+
+export async function publishAgentDefinitionVersion(
+  agentId: string,
+  req: AgentDefinitionVersionPublishRequest = {}
+): Promise<AgentDefinitionVersion> {
+  return postJson<AgentDefinitionVersion>(
+    `/agents/definitions/${encodeURIComponent(agentId)}/versions`,
+    req
+  );
+}
+
+export async function fetchAgentDefinitionVersions(
+  agentId: string
+): Promise<AgentDefinitionVersion[]> {
+  return getJson<AgentDefinitionVersion[]>(
+    `/agents/definitions/${encodeURIComponent(agentId)}/versions`
+  );
+}
+
+export async function fetchAgentDefinitionVersion(
+  agentId: string,
+  versionNumber: number
+): Promise<AgentDefinitionVersion> {
+  return getJson<AgentDefinitionVersion>(
+    `/agents/definitions/${encodeURIComponent(agentId)}/versions/${versionNumber}`
+  );
 }
 
 // ─── Workbench launch ─────────────────────────────────────────────────────────

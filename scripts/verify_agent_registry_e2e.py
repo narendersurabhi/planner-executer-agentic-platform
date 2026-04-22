@@ -181,23 +181,28 @@ def _verify_profile_launch(
     bearer_token: str | None,
     agent_definition_id: str,
     *,
+    agent_definition_version_id: str | None = None,
+    agent_definition_version_number: int | None = None,
     primary_capability_id: str,
     extra_capability_id: str | None,
     expected: JsonObject,
 ) -> JsonObject:
+    body: JsonObject = {
+        "agent_definition_id": agent_definition_id,
+        "context_json": {"verification": "agent_registry_phase_4"},
+        "run_spec": _agent_run_spec(
+            primary_capability_id=primary_capability_id,
+            extra_capability_id=extra_capability_id,
+        ),
+    }
+    if agent_definition_version_id:
+        body["agent_definition_version_id"] = agent_definition_version_id
     launch_response = _request(
         base_url,
         "POST",
         "/workbench/agent-runs",
         bearer_token=bearer_token,
-        body={
-            "agent_definition_id": agent_definition_id,
-            "context_json": {"verification": "agent_registry_phase_4"},
-            "run_spec": _agent_run_spec(
-                primary_capability_id=primary_capability_id,
-                extra_capability_id=extra_capability_id,
-            ),
-        },
+        body=body,
         timeout_s=60.0,
     )
     _assert(isinstance(launch_response, dict), "Profile launch response was not an object.")
@@ -218,6 +223,20 @@ def _verify_profile_launch(
         snapshot.get("agent_definition_id") == agent_definition_id,
         "Agent definition snapshot has the wrong id.",
     )
+    if agent_definition_version_id:
+        _assert(
+            run.get("metadata", {}).get("agent_definition_version_id")
+            == agent_definition_version_id,
+            "Version launch did not persist agent_definition_version_id in metadata.",
+        )
+        _assert(
+            snapshot.get("agent_definition_version_id") == agent_definition_version_id,
+            "Version launch snapshot has the wrong version id.",
+        )
+        _assert(
+            snapshot.get("agent_definition_version_number") == agent_definition_version_number,
+            "Version launch snapshot has the wrong version number.",
+        )
     steps = run_spec.get("steps")
     _assert(isinstance(steps, list) and len(steps) >= 1, "Profile launch returned no steps.")
     first_inputs = steps[0].get("input_bindings") if isinstance(steps[0], dict) else None
@@ -368,24 +387,83 @@ def verify(args: argparse.Namespace) -> JsonObject:
         )
         report["checks"].append("profile_fetched")
 
+        published = _request(
+            base_url,
+            "POST",
+            f"/agents/definitions/{agent_definition_id}/versions",
+            bearer_token=bearer_token,
+            body={
+                "version_note": "Agent Registry e2e published snapshot.",
+                "published_by": "agent-registry-e2e",
+                "metadata": {"verification_run_id": run_id},
+            },
+        )
+        _assert(isinstance(published, dict), "Publish version response was not an object.")
+        agent_definition_version_id = str(published.get("id") or "")
+        _assert(agent_definition_version_id, "Publish version response did not include an id.")
+        _assert(
+            published.get("version_number") == 1,
+            "First published Agent Definition version was not version 1.",
+        )
+        report["agent_definition_version_id"] = agent_definition_version_id
+        report["checks"].append("profile_version_published")
+
         updated = _request(
             base_url,
             "PUT",
             f"/agents/definitions/{agent_definition_id}",
             bearer_token=bearer_token,
-            body={"description": "Updated by Agent Registry phase 4 verifier."},
+            body={
+                "description": "Updated by Agent Registry phase 5 verifier.",
+                "default_goal": "Changed after published version.",
+                "default_workspace_path": "changed-after-publish",
+                "default_constraints": ["changed after publish"],
+                "default_max_steps": 2,
+            },
         )
         _assert(
             isinstance(updated, dict)
-            and updated.get("description") == "Updated by Agent Registry phase 4 verifier.",
+            and updated.get("description") == "Updated by Agent Registry phase 5 verifier.",
             "Updated definition did not return the expected description.",
         )
         report["checks"].append("profile_updated")
+
+        listed_versions = _request(
+            base_url,
+            "GET",
+            f"/agents/definitions/{agent_definition_id}/versions",
+            bearer_token=bearer_token,
+        )
+        _assert(isinstance(listed_versions, list), "List versions response was not a list.")
+        _assert(
+            [item.get("version_number") for item in listed_versions if isinstance(item, dict)]
+            == [1],
+            "Published versions did not return the expected immutable version list.",
+        )
+        report["checks"].append("profile_version_listed")
 
         profile_launch = _verify_profile_launch(
             base_url,
             bearer_token,
             agent_definition_id,
+            primary_capability_id=primary_capability_id,
+            extra_capability_id=extra_capability_id,
+            expected={
+                "goal": "Changed after published version.",
+                "workspace_path": "changed-after-publish",
+                "constraints": "changed after publish",
+                "max_steps": 2,
+            },
+        )
+        report["profile_launch"] = profile_launch
+        report["checks"].append("profile_launch_snapshot_persisted")
+
+        version_launch = _verify_profile_launch(
+            base_url,
+            bearer_token,
+            agent_definition_id,
+            agent_definition_version_id=agent_definition_version_id,
+            agent_definition_version_number=1,
             primary_capability_id=primary_capability_id,
             extra_capability_id=extra_capability_id,
             expected={
@@ -395,8 +473,8 @@ def verify(args: argparse.Namespace) -> JsonObject:
                 "max_steps": default_max_steps,
             },
         )
-        report["profile_launch"] = profile_launch
-        report["checks"].append("profile_launch_snapshot_persisted")
+        report["version_launch"] = version_launch
+        report["checks"].append("profile_version_launch_snapshot_persisted")
 
         if not args.skip_unsaved_launch:
             unsaved_launch = _verify_unsaved_launch(

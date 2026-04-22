@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -188,6 +188,62 @@ class AgentDefinitionRecord(Base):
     user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class AgentDefinitionVersionRecord(Base):
+    __tablename__ = "agent_definition_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_definition_id",
+            "version_number",
+            name="uq_agent_definition_versions_definition_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    agent_definition_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_definitions.id"),
+        index=True,
+    )
+    version_number: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_capability_id: Mapped[str] = mapped_column(String, index=True)
+    instructions: Mapped[str] = mapped_column(Text)
+    default_goal: Mapped[str] = mapped_column(String, default="")
+    default_workspace_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    default_constraints_json: Mapped[List[str]] = mapped_column(
+        "default_constraints", JSON, default=list
+    )
+    default_max_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model_config_json: Mapped[Dict[str, Any]] = mapped_column(
+        "model_config", JSON, default=dict
+    )
+    allowed_capability_ids_json: Mapped[List[str]] = mapped_column(
+        "allowed_capability_ids", JSON, default=list
+    )
+    memory_policy_json: Mapped[Dict[str, Any]] = mapped_column(
+        "memory_policy", JSON, default=dict
+    )
+    guardrail_policy_json: Mapped[Dict[str, Any]] = mapped_column(
+        "guardrail_policy", JSON, default=dict
+    )
+    workspace_policy_json: Mapped[Dict[str, Any]] = mapped_column(
+        "workspace_policy", JSON, default=dict
+    )
+    definition_metadata_json: Mapped[Dict[str, Any]] = mapped_column(
+        "definition_metadata", JSON, default=dict
+    )
+    version_metadata_json: Mapped[Dict[str, Any]] = mapped_column(
+        "version_metadata", JSON, default=dict
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    published_by: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    version_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    definition_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    definition_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
 class RunRecord(Base):

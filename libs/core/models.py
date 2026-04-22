@@ -540,6 +540,7 @@ class WorkbenchAgentRunRequest(BaseModel):
     user_id: Optional[str] = None
     context_json: Dict[str, Any] = Field(default_factory=dict)
     agent_definition_id: Optional[str] = None
+    agent_definition_version_id: Optional[str] = None
     # Caller supplies an ephemeral RunSpec (structured builder output or raw JSON)
     run_spec: Dict[str, Any] = Field(default_factory=dict)
 
@@ -955,6 +956,12 @@ class AgentDefinitionUpdate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class AgentDefinitionVersionPublish(BaseModel):
+    version_note: Optional[str] = None
+    published_by: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentDefinition(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -979,10 +986,42 @@ class AgentDefinition(BaseModel):
     updated_at: datetime
 
 
+class AgentDefinitionVersion(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    agent_definition_id: str
+    version_number: int
+    name: str
+    description: Optional[str] = None
+    agent_capability_id: str
+    instructions: str
+    default_goal: str = ""
+    default_workspace_path: Optional[str] = None
+    default_constraints: List[str] = Field(default_factory=list)
+    default_max_steps: Optional[int] = None
+    llm_config: Dict[str, Any] = Field(default_factory=dict, alias="model_config")
+    allowed_capability_ids: List[str] = Field(default_factory=list)
+    memory_policy: Dict[str, Any] = Field(default_factory=dict)
+    guardrail_policy: Dict[str, Any] = Field(default_factory=dict)
+    workspace_policy: Dict[str, Any] = Field(default_factory=dict)
+    definition_metadata: Dict[str, Any] = Field(default_factory=dict)
+    version_metadata: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    user_id: Optional[str] = None
+    published_by: Optional[str] = None
+    version_note: Optional[str] = None
+    definition_created_at: Optional[datetime] = None
+    definition_updated_at: Optional[datetime] = None
+    created_at: datetime
+
+
 class AgentDefinitionSnapshot(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     agent_definition_id: str
+    agent_definition_version_id: Optional[str] = None
+    agent_definition_version_number: Optional[int] = None
     name: str
     description: Optional[str] = None
     agent_capability_id: str

@@ -56,6 +56,7 @@ from libs.core.llm_provider import (
 from .database import Base, SessionLocal, engine
 from .models import (
     AgentDefinitionRecord,
+    AgentDefinitionVersionRecord,
     ChatMessageRecord,
     ChatSessionRecord,
     EventOutboxRecord,
@@ -2069,6 +2070,88 @@ def _agent_definition_from_record(record: AgentDefinitionRecord) -> models.Agent
     )
 
 
+def _agent_definition_next_version_number(
+    agent_definition_id: str,
+    db: Session,
+) -> int:
+    latest = (
+        db.query(AgentDefinitionVersionRecord)
+        .filter(AgentDefinitionVersionRecord.agent_definition_id == agent_definition_id)
+        .order_by(AgentDefinitionVersionRecord.version_number.desc())
+        .first()
+    )
+    return int(latest.version_number) + 1 if latest is not None else 1
+
+
+def _agent_definition_version_from_definition(
+    definition: AgentDefinitionRecord,
+    *,
+    version_number: int,
+    payload: models.AgentDefinitionVersionPublish,
+    created_at: datetime,
+) -> AgentDefinitionVersionRecord:
+    return AgentDefinitionVersionRecord(
+        id=str(uuid.uuid4()),
+        agent_definition_id=definition.id,
+        version_number=version_number,
+        name=definition.name,
+        description=definition.description,
+        agent_capability_id=definition.agent_capability_id,
+        instructions=definition.instructions,
+        default_goal=definition.default_goal or "",
+        default_workspace_path=definition.default_workspace_path,
+        default_constraints_json=list(definition.default_constraints_json or []),
+        default_max_steps=definition.default_max_steps,
+        model_config_json=dict(definition.model_config_json or {}),
+        allowed_capability_ids_json=list(definition.allowed_capability_ids_json or []),
+        memory_policy_json=dict(definition.memory_policy_json or {}),
+        guardrail_policy_json=dict(definition.guardrail_policy_json or {}),
+        workspace_policy_json=dict(definition.workspace_policy_json or {}),
+        definition_metadata_json=dict(definition.metadata_json or {}),
+        version_metadata_json=dict(payload.metadata) if isinstance(payload.metadata, dict) else {},
+        enabled=bool(definition.enabled),
+        user_id=definition.user_id,
+        published_by=_agent_definition_text(payload.published_by, max_len=120, collapse=True)
+        or None,
+        version_note=_agent_definition_text(payload.version_note, max_len=2000) or None,
+        definition_created_at=definition.created_at,
+        definition_updated_at=definition.updated_at,
+        created_at=created_at,
+    )
+
+
+def _agent_definition_version_from_record(
+    record: AgentDefinitionVersionRecord,
+) -> models.AgentDefinitionVersion:
+    return models.AgentDefinitionVersion(
+        id=record.id,
+        agent_definition_id=record.agent_definition_id,
+        version_number=record.version_number,
+        name=record.name,
+        description=record.description,
+        agent_capability_id=record.agent_capability_id,
+        instructions=record.instructions,
+        default_goal=record.default_goal or "",
+        default_workspace_path=record.default_workspace_path,
+        default_constraints=record.default_constraints_json or [],
+        default_max_steps=record.default_max_steps,
+        llm_config=record.model_config_json or {},
+        allowed_capability_ids=record.allowed_capability_ids_json or [],
+        memory_policy=record.memory_policy_json or {},
+        guardrail_policy=record.guardrail_policy_json or {},
+        workspace_policy=record.workspace_policy_json or {},
+        definition_metadata=record.definition_metadata_json or {},
+        version_metadata=record.version_metadata_json or {},
+        enabled=bool(record.enabled),
+        user_id=record.user_id,
+        published_by=record.published_by,
+        version_note=record.version_note,
+        definition_created_at=record.definition_created_at,
+        definition_updated_at=record.definition_updated_at,
+        created_at=record.created_at,
+    )
+
+
 def _agent_definition_snapshot_from_record(
     record: AgentDefinitionRecord,
     *,
@@ -2094,6 +2177,37 @@ def _agent_definition_snapshot_from_record(
         metadata=record.metadata_json or {},
         definition_created_at=record.created_at,
         definition_updated_at=record.updated_at,
+        captured_at=captured_at,
+    )
+
+
+def _agent_definition_snapshot_from_version_record(
+    record: AgentDefinitionVersionRecord,
+    *,
+    captured_at: datetime,
+) -> models.AgentDefinitionSnapshot:
+    return models.AgentDefinitionSnapshot(
+        agent_definition_id=record.agent_definition_id,
+        agent_definition_version_id=record.id,
+        agent_definition_version_number=record.version_number,
+        name=record.name,
+        description=record.description,
+        agent_capability_id=record.agent_capability_id,
+        instructions=record.instructions,
+        default_goal=record.default_goal or "",
+        default_workspace_path=record.default_workspace_path,
+        default_constraints=record.default_constraints_json or [],
+        default_max_steps=record.default_max_steps,
+        llm_config=record.model_config_json or {},
+        allowed_capability_ids=record.allowed_capability_ids_json or [],
+        memory_policy=record.memory_policy_json or {},
+        guardrail_policy=record.guardrail_policy_json or {},
+        workspace_policy=record.workspace_policy_json or {},
+        enabled=bool(record.enabled),
+        user_id=record.user_id,
+        metadata=record.definition_metadata_json or {},
+        definition_created_at=record.definition_created_at,
+        definition_updated_at=record.definition_updated_at,
         captured_at=captured_at,
     )
 
@@ -19615,6 +19729,82 @@ def update_agent_definition(
     return _agent_definition_from_record(record)
 
 
+@app.post(
+    "/agents/definitions/{agent_id}/versions",
+    response_model=models.AgentDefinitionVersion,
+)
+def publish_agent_definition_version(
+    agent_id: str,
+    payload: models.AgentDefinitionVersionPublish,
+    db: Session = Depends(get_db),
+) -> models.AgentDefinitionVersion:
+    record = (
+        db.query(AgentDefinitionRecord)
+        .filter(AgentDefinitionRecord.id == agent_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="agent_definition_not_found")
+    if not record.enabled:
+        raise HTTPException(status_code=422, detail="agent_definition_disabled")
+
+    now = _utcnow()
+    version = _agent_definition_version_from_definition(
+        record,
+        version_number=_agent_definition_next_version_number(record.id, db),
+        payload=payload,
+        created_at=now,
+    )
+    db.add(version)
+    db.commit()
+    db.refresh(version)
+    return _agent_definition_version_from_record(version)
+
+
+@app.get(
+    "/agents/definitions/{agent_id}/versions",
+    response_model=List[models.AgentDefinitionVersion],
+)
+def list_agent_definition_versions(
+    agent_id: str,
+    db: Session = Depends(get_db),
+) -> List[models.AgentDefinitionVersion]:
+    exists = (
+        db.query(AgentDefinitionRecord.id)
+        .filter(AgentDefinitionRecord.id == agent_id)
+        .first()
+    )
+    if exists is None:
+        raise HTTPException(status_code=404, detail="agent_definition_not_found")
+    records = (
+        db.query(AgentDefinitionVersionRecord)
+        .filter(AgentDefinitionVersionRecord.agent_definition_id == agent_id)
+        .order_by(AgentDefinitionVersionRecord.version_number.desc())
+        .all()
+    )
+    return [_agent_definition_version_from_record(record) for record in records]
+
+
+@app.get(
+    "/agents/definitions/{agent_id}/versions/{version_number}",
+    response_model=models.AgentDefinitionVersion,
+)
+def get_agent_definition_version(
+    agent_id: str,
+    version_number: int,
+    db: Session = Depends(get_db),
+) -> models.AgentDefinitionVersion:
+    record = (
+        db.query(AgentDefinitionVersionRecord)
+        .filter(AgentDefinitionVersionRecord.agent_definition_id == agent_id)
+        .filter(AgentDefinitionVersionRecord.version_number == version_number)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="agent_definition_version_not_found")
+    return _agent_definition_version_from_record(record)
+
+
 @app.delete("/agents/definitions/{agent_id}")
 def delete_agent_definition(
     agent_id: str,
@@ -20798,6 +20988,51 @@ def _workbench_load_agent_definition(
     return record
 
 
+def _workbench_load_agent_definition_version(
+    agent_definition_version_id: str | None,
+    *,
+    expected_agent_definition_id: str | None,
+    db: Session,
+) -> AgentDefinitionVersionRecord | None:
+    normalized = _agent_definition_text(agent_definition_version_id, max_len=120, collapse=True)
+    if not normalized:
+        return None
+    record = (
+        db.query(AgentDefinitionVersionRecord)
+        .filter(AgentDefinitionVersionRecord.id == normalized)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="agent_definition_version_not_found")
+    expected = _agent_definition_text(expected_agent_definition_id, max_len=120, collapse=True)
+    if expected and record.agent_definition_id != expected:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "agent_definition_version_mismatch",
+                "agent_definition_id": expected,
+                "agent_definition_version_id": record.id,
+                "version_agent_definition_id": record.agent_definition_id,
+            },
+        )
+    definition = (
+        db.query(AgentDefinitionRecord)
+        .filter(AgentDefinitionRecord.id == record.agent_definition_id)
+        .first()
+    )
+    if definition is None:
+        raise HTTPException(status_code=404, detail="agent_definition_not_found")
+    if not definition.enabled:
+        raise HTTPException(status_code=422, detail="agent_definition_disabled")
+    return record
+
+
+def _workbench_agent_definition_id(
+    definition: AgentDefinitionRecord | AgentDefinitionVersionRecord,
+) -> str:
+    return getattr(definition, "agent_definition_id", None) or definition.id
+
+
 def _workbench_missing_binding_value(value: Any) -> bool:
     if value is None:
         return True
@@ -20824,7 +21059,7 @@ def _workbench_capability_risk_level(
 
 
 def _workbench_agent_definition_risk_level(
-    definition: AgentDefinitionRecord,
+    definition: AgentDefinitionRecord | AgentDefinitionVersionRecord,
 ) -> str:
     spec = _workbench_validate_capability(definition.agent_capability_id)
     return _workbench_capability_risk_level(spec)
@@ -20847,7 +21082,7 @@ def _workbench_capability_intent_for_step(
 
 
 def _workbench_agent_definition_intent_metadata(
-    definition: AgentDefinitionRecord,
+    definition: AgentDefinitionRecord | AgentDefinitionVersionRecord,
     *,
     launch_goal: str,
     run_spec: models.RunSpec,
@@ -20953,7 +21188,7 @@ def _workbench_agent_definition_intent_metadata(
 
 def _workbench_validate_agent_definition_constraints(
     run_spec: models.RunSpec,
-    definition: AgentDefinitionRecord,
+    definition: AgentDefinitionRecord | AgentDefinitionVersionRecord,
 ) -> None:
     if not run_spec.steps:
         raise HTTPException(
@@ -20965,7 +21200,7 @@ def _workbench_validate_agent_definition_constraints(
             status_code=422,
             detail={
                 "error": "agent_definition_primary_capability_mismatch",
-                "agent_definition_id": definition.id,
+                "agent_definition_id": _workbench_agent_definition_id(definition),
                 "expected_capability_id": definition.agent_capability_id,
                 "actual_capability_id": primary_capability_id,
             },
@@ -20993,7 +21228,7 @@ def _workbench_validate_agent_definition_constraints(
             status_code=422,
             detail={
                 "error": "agent_definition_disallowed_capability",
-                "agent_definition_id": definition.id,
+                "agent_definition_id": _workbench_agent_definition_id(definition),
                 "allowed_capability_ids": sorted(allowed_capability_ids),
                 "disallowed": disallowed,
             },
@@ -21002,7 +21237,7 @@ def _workbench_validate_agent_definition_constraints(
 
 def _workbench_apply_agent_definition_defaults(
     run_spec: models.RunSpec,
-    definition: AgentDefinitionRecord,
+    definition: AgentDefinitionRecord | AgentDefinitionVersionRecord,
     *,
     launch_goal: str,
     captured_at: datetime,
@@ -21031,15 +21266,24 @@ def _workbench_apply_agent_definition_defaults(
             primary_updates["instruction"] = definition.instructions
         steps[0] = primary_step.model_copy(update=primary_updates)
 
-    snapshot = _agent_definition_snapshot_from_record(
-        definition,
-        captured_at=captured_at,
-    ).model_dump(mode="json", by_alias=True)
+    if isinstance(definition, AgentDefinitionVersionRecord):
+        snapshot = _agent_definition_snapshot_from_version_record(
+            definition,
+            captured_at=captured_at,
+        ).model_dump(mode="json", by_alias=True)
+    else:
+        snapshot = _agent_definition_snapshot_from_record(
+            definition,
+            captured_at=captured_at,
+        ).model_dump(mode="json", by_alias=True)
     metadata = {
         **dict(run_spec.metadata or {}),
-        "agent_definition_id": definition.id,
+        "agent_definition_id": _workbench_agent_definition_id(definition),
         "agent_definition_snapshot": snapshot,
     }
+    if isinstance(definition, AgentDefinitionVersionRecord):
+        metadata["agent_definition_version_id"] = definition.id
+        metadata["agent_definition_version_number"] = definition.version_number
     for key, value in _workbench_agent_definition_intent_metadata(
         definition,
         launch_goal=launch_goal,
@@ -21299,19 +21543,25 @@ def workbench_agent_run(
     canonical job/plan/run.  Returns the run and normalized RunSpec.
     """
     agent_definition = _workbench_load_agent_definition(payload.agent_definition_id, db)
+    agent_definition_version = _workbench_load_agent_definition_version(
+        payload.agent_definition_version_id,
+        expected_agent_definition_id=payload.agent_definition_id,
+        db=db,
+    )
+    agent_profile = agent_definition_version or agent_definition
     raw_run_spec = dict(payload.run_spec) if isinstance(payload.run_spec, dict) else {}
     run_spec = _workbench_validate_agent_run_spec(raw_run_spec)
     effective_goal = str(payload.goal or "").strip()
     effective_title = str(payload.title or "").strip()
     effective_user_id = payload.user_id
-    if agent_definition is not None:
-        effective_goal = effective_goal or str(agent_definition.default_goal or "").strip()
-        effective_title = effective_title or str(agent_definition.name or "").strip()
-        effective_user_id = effective_user_id or agent_definition.user_id
-        _workbench_validate_agent_definition_constraints(run_spec, agent_definition)
+    if agent_profile is not None:
+        effective_goal = effective_goal or str(agent_profile.default_goal or "").strip()
+        effective_title = effective_title or str(agent_profile.name or "").strip()
+        effective_user_id = effective_user_id or agent_profile.user_id
+        _workbench_validate_agent_definition_constraints(run_spec, agent_profile)
         run_spec = _workbench_apply_agent_definition_defaults(
             run_spec,
-            agent_definition,
+            agent_profile,
             launch_goal=effective_goal,
             captured_at=_utcnow(),
         )

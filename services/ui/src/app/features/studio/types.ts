@@ -84,6 +84,40 @@ export type AgentDefinitionUpdateRequest = Partial<
   }
 >;
 
+export type AgentDefinitionVersionPublishRequest = {
+  version_note?: string | null;
+  published_by?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type AgentDefinitionVersion = {
+  id: string;
+  agent_definition_id: string;
+  version_number: number;
+  name: string;
+  description?: string | null;
+  agent_capability_id: string;
+  instructions: string;
+  default_goal: string;
+  default_workspace_path?: string | null;
+  default_constraints: string[];
+  default_max_steps?: number | null;
+  model_config: Record<string, unknown>;
+  allowed_capability_ids: string[];
+  memory_policy: Record<string, unknown>;
+  guardrail_policy: Record<string, unknown>;
+  workspace_policy: Record<string, unknown>;
+  definition_metadata: Record<string, unknown>;
+  version_metadata: Record<string, unknown>;
+  enabled: boolean;
+  user_id?: string | null;
+  published_by?: string | null;
+  version_note?: string | null;
+  definition_created_at?: string | null;
+  definition_updated_at?: string | null;
+  created_at: string;
+};
+
 export type StudioSurface = "workflow" | "workbench";
 
 export type ComposerInputBinding =

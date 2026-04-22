@@ -33,6 +33,8 @@ def test_agent_definition_snapshot_uses_model_config_alias() -> None:
 
     snapshot = models.AgentDefinitionSnapshot(
         agent_definition_id="agent-1",
+        agent_definition_version_id="version-1",
+        agent_definition_version_number=2,
         name="Codegen autonomous",
         agent_capability_id="codegen.autonomous",
         instructions="Implement the requested code change.",
@@ -43,5 +45,32 @@ def test_agent_definition_snapshot_uses_model_config_alias() -> None:
     dumped = snapshot.model_dump(mode="json", by_alias=True)
 
     assert dumped["agent_definition_id"] == "agent-1"
+    assert dumped["agent_definition_version_id"] == "version-1"
+    assert dumped["agent_definition_version_number"] == 2
     assert dumped["model_config"] == {"provider": "openai"}
     assert dumped["captured_at"] == captured_at.isoformat().replace("+00:00", "Z")
+
+
+def test_agent_definition_version_uses_model_config_alias() -> None:
+    created_at = datetime.now(UTC)
+
+    version = models.AgentDefinitionVersion(
+        id="version-1",
+        agent_definition_id="agent-1",
+        version_number=1,
+        name="Codegen autonomous",
+        agent_capability_id="codegen.autonomous",
+        instructions="Implement the requested code change.",
+        model_config={"provider": "openai"},
+        version_metadata={"label": "published"},
+        created_at=created_at,
+    )
+
+    dumped = version.model_dump(mode="json", by_alias=True)
+
+    assert dumped["id"] == "version-1"
+    assert dumped["agent_definition_id"] == "agent-1"
+    assert dumped["version_number"] == 1
+    assert dumped["model_config"] == {"provider": "openai"}
+    assert dumped["version_metadata"] == {"label": "published"}
+    assert dumped["created_at"] == created_at.isoformat().replace("+00:00", "Z")

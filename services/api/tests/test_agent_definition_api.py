@@ -209,6 +209,79 @@ def test_agent_definition_crud_and_soft_delete(monkeypatch) -> None:
     assert disabled_list_response.json()[0]["enabled"] is False
 
 
+def test_agent_definition_publish_versions_are_immutable(monkeypatch) -> None:
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", _agent_registry)
+    user_id = f"agent-version-{uuid.uuid4()}"
+
+    create_response = client.post(
+        "/agents/definitions",
+        json={
+            "name": "Versioned codegen profile",
+            "description": "Before publish",
+            "agent_capability_id": "codegen.autonomous",
+            "instructions": "Use the published instructions.",
+            "default_goal": "Use the published goal.",
+            "default_workspace_path": "published-workspace",
+            "default_constraints": ["published constraint"],
+            "default_max_steps": 3,
+            "model_config": {"model": "published"},
+            "allowed_capability_ids": ["filesystem.workspace.list"],
+            "metadata": {"draft": "before"},
+            "user_id": user_id,
+        },
+    )
+    assert create_response.status_code == 200
+    agent_id = create_response.json()["id"]
+
+    publish_response = client.post(
+        f"/agents/definitions/{agent_id}/versions",
+        json={
+            "version_note": "Initial publish",
+            "published_by": "phase-five-test",
+            "metadata": {"channel": "staging"},
+        },
+    )
+    assert publish_response.status_code == 200
+    version = publish_response.json()
+    version_id = version["id"]
+    assert version["agent_definition_id"] == agent_id
+    assert version["version_number"] == 1
+    assert version["description"] == "Before publish"
+    assert version["default_goal"] == "Use the published goal."
+    assert version["model_config"] == {"model": "published"}
+    assert version["definition_metadata"] == {"draft": "before"}
+    assert version["version_metadata"] == {"channel": "staging"}
+    assert version["published_by"] == "phase-five-test"
+    assert version["version_note"] == "Initial publish"
+
+    update_response = client.put(
+        f"/agents/definitions/{agent_id}",
+        json={
+            "description": "After publish",
+            "instructions": "Use changed instructions.",
+            "default_goal": "Use changed goal.",
+            "default_workspace_path": "changed-workspace",
+            "default_constraints": ["changed constraint"],
+            "default_max_steps": 8,
+            "model_config": {"model": "changed"},
+            "metadata": {"draft": "after"},
+        },
+    )
+    assert update_response.status_code == 200
+
+    list_response = client.get(f"/agents/definitions/{agent_id}/versions")
+    assert list_response.status_code == 200
+    assert [item["version_number"] for item in list_response.json()] == [1]
+
+    get_response = client.get(f"/agents/definitions/{agent_id}/versions/1")
+    assert get_response.status_code == 200
+    fetched_version = get_response.json()
+    assert fetched_version["id"] == version_id
+    assert fetched_version["description"] == "Before publish"
+    assert fetched_version["default_goal"] == "Use the published goal."
+    assert fetched_version["model_config"] == {"model": "published"}
+
+
 def test_agent_definition_create_rejects_non_agentic_primary_capability(monkeypatch) -> None:
     monkeypatch.setattr(main.capability_registry, "load_capability_registry", _agent_registry)
 
@@ -338,6 +411,121 @@ def test_workbench_agent_run_with_definition_applies_defaults_and_stores_snapsho
     assert persisted_snapshot["name"] == "Codegen launch profile"
     assert persisted_snapshot["instructions"] == "Use the saved agent profile instructions."
     assert persisted_snapshot["model_config"] == {"provider": "openai", "model": "gpt-5.4"}
+
+
+def test_workbench_agent_run_with_definition_version_uses_published_snapshot(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", _agent_registry)
+    user_id = f"agent-version-launch-{uuid.uuid4()}"
+
+    create_response = client.post(
+        "/agents/definitions",
+        json={
+            "name": "Published launch profile",
+            "agent_capability_id": "codegen.autonomous",
+            "instructions": "Use published launch instructions.",
+            "default_goal": "Use published launch goal.",
+            "default_workspace_path": "published-launch-workspace",
+            "default_constraints": ["published launch constraint"],
+            "default_max_steps": 4,
+            "allowed_capability_ids": ["filesystem.workspace.list"],
+            "user_id": user_id,
+        },
+    )
+    assert create_response.status_code == 200
+    agent_id = create_response.json()["id"]
+
+    publish_response = client.post(f"/agents/definitions/{agent_id}/versions", json={})
+    assert publish_response.status_code == 200
+    version_id = publish_response.json()["id"]
+
+    update_response = client.put(
+        f"/agents/definitions/{agent_id}",
+        json={
+            "instructions": "Changed launch instructions.",
+            "default_goal": "Changed launch goal.",
+            "default_workspace_path": "changed-launch-workspace",
+            "default_constraints": ["changed launch constraint"],
+            "default_max_steps": 9,
+        },
+    )
+    assert update_response.status_code == 200
+
+    launch_response = client.post(
+        "/workbench/agent-runs",
+        json={
+            "agent_definition_version_id": version_id,
+            "context_json": {"workspace": "demo"},
+            "run_spec": _profile_agent_run_spec(),
+        },
+    )
+
+    assert launch_response.status_code == 200
+    body = launch_response.json()
+    first_step = body["run_spec"]["steps"][0]
+    assert body["run"]["title"] == "Published launch profile"
+    assert body["run"]["goal"] == "Use published launch goal."
+    assert body["run"]["metadata"]["agent_definition_id"] == agent_id
+    assert body["run"]["metadata"]["agent_definition_version_id"] == version_id
+    assert body["run"]["metadata"]["agent_definition_version_number"] == 1
+    snapshot = body["run"]["metadata"]["agent_definition_snapshot"]
+    assert snapshot["agent_definition_id"] == agent_id
+    assert snapshot["agent_definition_version_id"] == version_id
+    assert snapshot["agent_definition_version_number"] == 1
+    assert snapshot["instructions"] == "Use published launch instructions."
+    assert first_step["instruction"] == "Use published launch instructions."
+    assert first_step["input_bindings"] == {
+        "goal": "Use published launch goal.",
+        "workspace_path": "published-launch-workspace",
+        "constraints": "published launch constraint",
+        "max_steps": 4,
+    }
+
+
+def test_workbench_agent_run_with_definition_version_rejects_mismatch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", _agent_registry)
+
+    first_response = client.post(
+        "/agents/definitions",
+        json={
+            "name": "First versioned profile",
+            "agent_capability_id": "codegen.autonomous",
+            "instructions": "Use first instructions.",
+            "user_id": f"first-{uuid.uuid4()}",
+        },
+    )
+    second_response = client.post(
+        "/agents/definitions",
+        json={
+            "name": "Second versioned profile",
+            "agent_capability_id": "codegen.autonomous",
+            "instructions": "Use second instructions.",
+            "user_id": f"second-{uuid.uuid4()}",
+        },
+    )
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_id = first_response.json()["id"]
+    second_id = second_response.json()["id"]
+    publish_response = client.post(f"/agents/definitions/{first_id}/versions", json={})
+    assert publish_response.status_code == 200
+    version_id = publish_response.json()["id"]
+
+    launch_response = client.post(
+        "/workbench/agent-runs",
+        json={
+            "agent_definition_id": second_id,
+            "agent_definition_version_id": version_id,
+            "context_json": {"workspace": "demo"},
+            "run_spec": _profile_agent_run_spec(extra_capability_id=None),
+        },
+    )
+
+    assert launch_response.status_code == 422
+    assert launch_response.json()["detail"]["error"] == "agent_definition_version_mismatch"
 
 
 def test_workbench_agent_run_with_definition_rejects_primary_mismatch(
