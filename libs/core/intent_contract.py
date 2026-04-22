@@ -1364,6 +1364,10 @@ def _segment_task_intent_compatible(segment_intent: str, task_intent: str) -> bo
     # Planner tasks using derive/validation utilities can be transform/validate.
     if segment_intent == "io" and task_intent in {"transform", "validate"}:
         return True
+    # Generated artifacts often need small transform helpers, such as deriving an
+    # output filename, before the final render/write step.
+    if segment_intent == "generate" and task_intent == "transform":
+        return True
     return False
 
 
@@ -1400,6 +1404,8 @@ def validate_intent_segment_contract(
         tool_name,
         capability_id,
     )
+    if _capability_derives_output_path(capability_id or tool_name):
+        ignored_required_inputs.update({"goal", "workspace_path"})
     for key in slots.get("must_have_inputs", []):
         if not isinstance(key, str) or not key:
             continue

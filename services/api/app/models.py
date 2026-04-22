@@ -154,6 +154,42 @@ class WorkflowRunRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime)
 
 
+class AgentDefinitionRecord(Base):
+    __tablename__ = "agent_definitions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_capability_id: Mapped[str] = mapped_column(String, index=True)
+    instructions: Mapped[str] = mapped_column(Text)
+    default_goal: Mapped[str] = mapped_column(String, default="")
+    default_workspace_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    default_constraints_json: Mapped[List[str]] = mapped_column(
+        "default_constraints", JSON, default=list
+    )
+    default_max_steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model_config_json: Mapped[Dict[str, Any]] = mapped_column(
+        "model_config", JSON, default=dict
+    )
+    allowed_capability_ids_json: Mapped[List[str]] = mapped_column(
+        "allowed_capability_ids", JSON, default=list
+    )
+    memory_policy_json: Mapped[Dict[str, Any]] = mapped_column(
+        "memory_policy", JSON, default=dict
+    )
+    guardrail_policy_json: Mapped[Dict[str, Any]] = mapped_column(
+        "guardrail_policy", JSON, default=dict
+    )
+    workspace_policy_json: Mapped[Dict[str, Any]] = mapped_column(
+        "workspace_policy", JSON, default=dict
+    )
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
 class RunRecord(Base):
     __tablename__ = "runs"
 

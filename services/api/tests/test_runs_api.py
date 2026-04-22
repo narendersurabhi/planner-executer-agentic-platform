@@ -298,6 +298,70 @@ def test_task_started_and_heartbeat_update_attempt_leases_and_execution_request(
         assert request.lease_expires_at is not None
 
 
+def test_task_started_accepts_existing_naive_step_attempt_timestamp() -> None:
+    job = _create_job()
+    _create_plan(job["id"])
+    correlation_id = f"corr-{uuid.uuid4()}"
+
+    with SessionLocal() as db:
+        task = db.query(TaskRecord).filter(TaskRecord.job_id == job["id"]).first()
+        assert task is not None
+        main._task_payload_from_record(task, correlation_id=correlation_id, context={})
+        task_id = task.id
+
+    started_at = _utcnow()
+    main._handle_event(
+        "tasks.events",
+        {
+            "data": json.dumps(
+                {
+                    "type": "task.started",
+                    "job_id": job["id"],
+                    "task_id": task_id,
+                    "occurred_at": started_at.isoformat(),
+                    "payload": {
+                        "task_id": task_id,
+                        "attempts": 1,
+                        "worker_consumer": "worker-phase2",
+                    },
+                    "correlation_id": correlation_id,
+                }
+            )
+        },
+    )
+
+    with SessionLocal() as db:
+        attempt = db.query(StepAttemptRecord).filter(StepAttemptRecord.step_id == task_id).first()
+        assert attempt is not None
+        attempt.started_at = started_at.replace(tzinfo=None)
+        db.commit()
+
+    main._handle_event(
+        "tasks.events",
+        {
+            "data": json.dumps(
+                {
+                    "type": "task.started",
+                    "job_id": job["id"],
+                    "task_id": task_id,
+                    "occurred_at": started_at.isoformat(),
+                    "payload": {
+                        "task_id": task_id,
+                        "attempts": 1,
+                        "worker_consumer": "worker-phase2",
+                    },
+                    "correlation_id": correlation_id,
+                }
+            )
+        },
+    )
+
+    with SessionLocal() as db:
+        attempt = db.query(StepAttemptRecord).filter(StepAttemptRecord.step_id == task_id).first()
+        assert attempt is not None
+        assert attempt.status == models.TaskStatus.running.value
+
+
 def test_task_completed_ignores_missing_step_attempt_on_execution_request(monkeypatch) -> None:
     job = _create_job()
     _create_plan(job["id"])

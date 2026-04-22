@@ -401,6 +401,61 @@ def test_validate_intent_segment_contract_allows_io_segment_for_transform_task()
     assert mismatch is None
 
 
+def test_validate_intent_segment_contract_allows_generate_segment_for_filename_transform() -> None:
+    segment = {
+        "intent": "generate",
+        "objective": "Create a document",
+        "slots": {
+            "entity": "document",
+            "artifact_type": "document",
+            "output_format": "docx",
+            "risk_level": "read_only",
+            "must_have_inputs": ["topic"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="transform",
+        tool_name="derive_output_filename",
+        payload={
+            "topic": "Agentic AI ops at top companies",
+            "output_dir": "documents",
+            "output_extension": "docx",
+        },
+        capability_id="derive_output_filename",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
+def test_validate_intent_segment_contract_ignores_goal_workspace_for_filename_derivation() -> None:
+    segment = {
+        "intent": "generate",
+        "objective": "Execute autonomous code generation within the workspace.",
+        "required_inputs": ["goal", "workspace_path"],
+        "suggested_capabilities": ["codegen.autonomous"],
+        "slots": {
+            "entity": "code_changes",
+            "artifact_type": "code",
+            "output_format": "txt",
+            "risk_level": "high_risk_write",
+            "must_have_inputs": ["goal", "workspace_path"],
+        },
+    }
+    mismatch = intent_contract.validate_intent_segment_contract(
+        segment=segment,
+        task_intent="transform",
+        tool_name="derive_output_filename",
+        payload={
+            "topic": "Generate an output filename for the workbench replay",
+            "output_dir": "worker",
+        },
+        capability_id="derive_output_filename",
+        capability_risk_tier="read_only",
+    )
+    assert mismatch is None
+
+
 def test_validate_intent_segment_contract_allows_io_segment_for_validate_task() -> None:
     segment = {
         "intent": "io",

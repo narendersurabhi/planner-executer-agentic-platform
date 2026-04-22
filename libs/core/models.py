@@ -539,6 +539,7 @@ class WorkbenchAgentRunRequest(BaseModel):
     goal: str = ""
     user_id: Optional[str] = None
     context_json: Dict[str, Any] = Field(default_factory=dict)
+    agent_definition_id: Optional[str] = None
     # Caller supplies an ephemeral RunSpec (structured builder output or raw JSON)
     run_spec: Dict[str, Any] = Field(default_factory=dict)
 
@@ -911,6 +912,96 @@ class JobCreate(BaseModel):
     idempotency_key: Optional[str] = None
     planning_mode: PlanningMode = PlanningMode.static
     adaptive_policy: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentDefinitionCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    description: Optional[str] = None
+    agent_capability_id: str
+    instructions: str
+    default_goal: str = ""
+    default_workspace_path: Optional[str] = None
+    default_constraints: List[str] = Field(default_factory=list)
+    default_max_steps: Optional[int] = Field(default=None, gt=0)
+    llm_config: Dict[str, Any] = Field(default_factory=dict, alias="model_config")
+    allowed_capability_ids: List[str] = Field(default_factory=list)
+    memory_policy: Dict[str, Any] = Field(default_factory=dict)
+    guardrail_policy: Dict[str, Any] = Field(default_factory=dict)
+    workspace_policy: Dict[str, Any] = Field(default_factory=dict)
+    user_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentDefinitionUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: Optional[str] = None
+    description: Optional[str] = None
+    agent_capability_id: Optional[str] = None
+    instructions: Optional[str] = None
+    default_goal: Optional[str] = None
+    default_workspace_path: Optional[str] = None
+    default_constraints: Optional[List[str]] = None
+    default_max_steps: Optional[int] = Field(default=None, gt=0)
+    llm_config: Optional[Dict[str, Any]] = Field(default=None, alias="model_config")
+    allowed_capability_ids: Optional[List[str]] = None
+    memory_policy: Optional[Dict[str, Any]] = None
+    guardrail_policy: Optional[Dict[str, Any]] = None
+    workspace_policy: Optional[Dict[str, Any]] = None
+    enabled: Optional[bool] = None
+    user_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class AgentDefinition(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    name: str
+    description: Optional[str] = None
+    agent_capability_id: str
+    instructions: str
+    default_goal: str = ""
+    default_workspace_path: Optional[str] = None
+    default_constraints: List[str] = Field(default_factory=list)
+    default_max_steps: Optional[int] = None
+    llm_config: Dict[str, Any] = Field(default_factory=dict, alias="model_config")
+    allowed_capability_ids: List[str] = Field(default_factory=list)
+    memory_policy: Dict[str, Any] = Field(default_factory=dict)
+    guardrail_policy: Dict[str, Any] = Field(default_factory=dict)
+    workspace_policy: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    user_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentDefinitionSnapshot(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    agent_definition_id: str
+    name: str
+    description: Optional[str] = None
+    agent_capability_id: str
+    instructions: str
+    default_goal: str = ""
+    default_workspace_path: Optional[str] = None
+    default_constraints: List[str] = Field(default_factory=list)
+    default_max_steps: Optional[int] = None
+    llm_config: Dict[str, Any] = Field(default_factory=dict, alias="model_config")
+    allowed_capability_ids: List[str] = Field(default_factory=list)
+    memory_policy: Dict[str, Any] = Field(default_factory=dict)
+    guardrail_policy: Dict[str, Any] = Field(default_factory=dict)
+    workspace_policy: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    user_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    definition_created_at: Optional[datetime] = None
+    definition_updated_at: Optional[datetime] = None
+    captured_at: datetime
 
 
 class WorkflowDefinitionCreate(BaseModel):

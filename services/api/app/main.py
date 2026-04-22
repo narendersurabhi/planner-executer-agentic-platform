@@ -55,6 +55,7 @@ from libs.core.llm_provider import (
 )
 from .database import Base, SessionLocal, engine
 from .models import (
+    AgentDefinitionRecord,
     ChatMessageRecord,
     ChatSessionRecord,
     EventOutboxRecord,
@@ -1925,6 +1926,175 @@ def _workflow_definition_from_record(
         metadata=record.metadata_json or {},
         created_at=record.created_at,
         updated_at=record.updated_at,
+    )
+
+
+def _agent_definition_text(value: Any, *, max_len: int = 4000, collapse: bool = False) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip()
+    if collapse:
+        normalized = re.sub(r"\s+", " ", normalized)
+    if len(normalized) > max_len:
+        normalized = normalized[:max_len].strip()
+    return normalized
+
+
+def _agent_definition_string_list(values: Any, *, max_items: int = 64) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = _agent_definition_text(item, max_len=240, collapse=True)
+        if not text:
+            continue
+        dedupe_key = text.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        normalized.append(text)
+        if len(normalized) >= max_items:
+            break
+    return normalized
+
+
+def _agent_definition_capability_registry() -> capability_registry.CapabilityRegistry:
+    try:
+        return capability_registry.load_capability_registry()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"agent_definition_capability_registry_load_failed:{exc}",
+        ) from exc
+
+
+def _agent_definition_is_agentic_capability(
+    spec: capability_registry.CapabilitySpec,
+) -> bool:
+    capability_id = str(spec.capability_id or "").strip().lower()
+    tags = {str(tag or "").strip().lower() for tag in spec.tags or ()}
+    return (
+        capability_id == "codegen.autonomous"
+        or ".autonomous" in capability_id
+        or "autonomous" in tags
+        or "coding-agent" in tags
+    )
+
+
+def _agent_definition_validate_primary_capability(
+    capability_id: str,
+    registry: capability_registry.CapabilityRegistry,
+) -> str:
+    normalized = _agent_definition_text(capability_id, max_len=240, collapse=True)
+    if not normalized:
+        raise HTTPException(status_code=422, detail="agent_definition_capability_id_required")
+    spec = registry.get(normalized)
+    if spec is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"agent_definition_capability_not_found:{normalized}",
+        )
+    if not _agent_definition_is_agentic_capability(spec):
+        raise HTTPException(
+            status_code=422,
+            detail=f"agent_definition_primary_capability_not_agentic:{spec.capability_id}",
+        )
+    return spec.capability_id
+
+
+def _agent_definition_validate_allowed_capabilities(
+    capability_ids: Any,
+    registry: capability_registry.CapabilityRegistry,
+) -> list[str]:
+    normalized_ids = _agent_definition_string_list(capability_ids)
+    allowed: list[str] = []
+    seen: set[str] = set()
+    for capability_id in normalized_ids:
+        spec = registry.get(capability_id)
+        if spec is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"agent_definition_allowed_capability_not_found:{capability_id}",
+            )
+        if spec.capability_id in seen:
+            continue
+        seen.add(spec.capability_id)
+        allowed.append(spec.capability_id)
+    return allowed
+
+
+def _agent_definition_validate_create_payload(
+    payload: models.AgentDefinitionCreate,
+) -> tuple[str, str, str, list[str]]:
+    registry = _agent_definition_capability_registry()
+    name = _agent_definition_text(payload.name, max_len=120, collapse=True)
+    if not name:
+        raise HTTPException(status_code=422, detail="agent_definition_name_required")
+    instructions = _agent_definition_text(payload.instructions, max_len=12000)
+    if not instructions:
+        raise HTTPException(status_code=422, detail="agent_definition_instructions_required")
+    agent_capability_id = _agent_definition_validate_primary_capability(
+        payload.agent_capability_id,
+        registry,
+    )
+    allowed_capability_ids = _agent_definition_validate_allowed_capabilities(
+        payload.allowed_capability_ids,
+        registry,
+    )
+    return name, instructions, agent_capability_id, allowed_capability_ids
+
+
+def _agent_definition_from_record(record: AgentDefinitionRecord) -> models.AgentDefinition:
+    return models.AgentDefinition(
+        id=record.id,
+        name=record.name,
+        description=record.description,
+        agent_capability_id=record.agent_capability_id,
+        instructions=record.instructions,
+        default_goal=record.default_goal or "",
+        default_workspace_path=record.default_workspace_path,
+        default_constraints=record.default_constraints_json or [],
+        default_max_steps=record.default_max_steps,
+        llm_config=record.model_config_json or {},
+        allowed_capability_ids=record.allowed_capability_ids_json or [],
+        memory_policy=record.memory_policy_json or {},
+        guardrail_policy=record.guardrail_policy_json or {},
+        workspace_policy=record.workspace_policy_json or {},
+        enabled=bool(record.enabled),
+        user_id=record.user_id,
+        metadata=record.metadata_json or {},
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _agent_definition_snapshot_from_record(
+    record: AgentDefinitionRecord,
+    *,
+    captured_at: datetime,
+) -> models.AgentDefinitionSnapshot:
+    return models.AgentDefinitionSnapshot(
+        agent_definition_id=record.id,
+        name=record.name,
+        description=record.description,
+        agent_capability_id=record.agent_capability_id,
+        instructions=record.instructions,
+        default_goal=record.default_goal or "",
+        default_workspace_path=record.default_workspace_path,
+        default_constraints=record.default_constraints_json or [],
+        default_max_steps=record.default_max_steps,
+        llm_config=record.model_config_json or {},
+        allowed_capability_ids=record.allowed_capability_ids_json or [],
+        memory_policy=record.memory_policy_json or {},
+        guardrail_policy=record.guardrail_policy_json or {},
+        workspace_policy=record.workspace_policy_json or {},
+        enabled=bool(record.enabled),
+        user_id=record.user_id,
+        metadata=record.metadata_json or {},
+        definition_created_at=record.created_at,
+        definition_updated_at=record.updated_at,
+        captured_at=captured_at,
     )
 
 
@@ -16206,6 +16376,14 @@ def _parse_event_datetime(value: Any) -> datetime | None:
     return None
 
 
+def _event_datetime_for_compare(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _step_attempt_record_id(step_id: str, attempt_number: int) -> str:
     return hashlib.sha1(f"step_attempt:{step_id}:{attempt_number}".encode("utf-8")).hexdigest()
 
@@ -16393,7 +16571,8 @@ def _upsert_step_attempt_started(
     record.lease_owner = worker_id or record.lease_owner
     record.lease_expires_at = lease_expires_at
     record.last_heartbeat_at = occurred_at
-    if record.started_at is None or occurred_at < record.started_at:
+    current_started_at = _event_datetime_for_compare(record.started_at)
+    if current_started_at is None or occurred_at < current_started_at:
         record.started_at = occurred_at
     return record
 
@@ -19275,6 +19454,185 @@ def _compile_workflow_definition_version(
     }
 
 
+@app.post("/agents/definitions", response_model=models.AgentDefinition)
+def create_agent_definition(
+    payload: models.AgentDefinitionCreate,
+    db: Session = Depends(get_db),
+) -> models.AgentDefinition:
+    name, instructions, agent_capability_id, allowed_capability_ids = (
+        _agent_definition_validate_create_payload(payload)
+    )
+    now = _utcnow()
+    record = AgentDefinitionRecord(
+        id=str(uuid.uuid4()),
+        name=name,
+        description=_agent_definition_text(payload.description, max_len=2000) or None,
+        agent_capability_id=agent_capability_id,
+        instructions=instructions,
+        default_goal=_agent_definition_text(payload.default_goal, max_len=4000),
+        default_workspace_path=(
+            _agent_definition_text(payload.default_workspace_path, max_len=500, collapse=True)
+            or None
+        ),
+        default_constraints_json=_agent_definition_string_list(payload.default_constraints),
+        default_max_steps=payload.default_max_steps,
+        model_config_json=dict(payload.llm_config) if isinstance(payload.llm_config, dict) else {},
+        allowed_capability_ids_json=allowed_capability_ids,
+        memory_policy_json=(
+            dict(payload.memory_policy) if isinstance(payload.memory_policy, dict) else {}
+        ),
+        guardrail_policy_json=(
+            dict(payload.guardrail_policy) if isinstance(payload.guardrail_policy, dict) else {}
+        ),
+        workspace_policy_json=(
+            dict(payload.workspace_policy) if isinstance(payload.workspace_policy, dict) else {}
+        ),
+        metadata_json=dict(payload.metadata) if isinstance(payload.metadata, dict) else {},
+        enabled=True,
+        user_id=_semantic_normalize_text(payload.user_id, max_len=120) or None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _agent_definition_from_record(record)
+
+
+@app.get("/agents/definitions", response_model=List[models.AgentDefinition])
+def list_agent_definitions(
+    user_id: str | None = Query(None),
+    include_disabled: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> List[models.AgentDefinition]:
+    query = db.query(AgentDefinitionRecord)
+    normalized_user_id = _semantic_normalize_text(user_id, max_len=120)
+    if normalized_user_id:
+        query = query.filter(AgentDefinitionRecord.user_id == normalized_user_id)
+    if not include_disabled:
+        query = query.filter(AgentDefinitionRecord.enabled.is_(True))
+    records = query.order_by(AgentDefinitionRecord.updated_at.desc()).all()
+    return [_agent_definition_from_record(record) for record in records]
+
+
+@app.get("/agents/definitions/{agent_id}", response_model=models.AgentDefinition)
+def get_agent_definition(
+    agent_id: str,
+    db: Session = Depends(get_db),
+) -> models.AgentDefinition:
+    record = (
+        db.query(AgentDefinitionRecord)
+        .filter(AgentDefinitionRecord.id == agent_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="agent_definition_not_found")
+    return _agent_definition_from_record(record)
+
+
+@app.put("/agents/definitions/{agent_id}", response_model=models.AgentDefinition)
+def update_agent_definition(
+    agent_id: str,
+    payload: models.AgentDefinitionUpdate,
+    db: Session = Depends(get_db),
+) -> models.AgentDefinition:
+    record = (
+        db.query(AgentDefinitionRecord)
+        .filter(AgentDefinitionRecord.id == agent_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="agent_definition_not_found")
+
+    fields_set = payload.model_fields_set
+    registry: capability_registry.CapabilityRegistry | None = None
+    if "agent_capability_id" in fields_set or "allowed_capability_ids" in fields_set:
+        registry = _agent_definition_capability_registry()
+
+    if "name" in fields_set:
+        name = _agent_definition_text(payload.name, max_len=120, collapse=True)
+        if not name:
+            raise HTTPException(status_code=422, detail="agent_definition_name_required")
+        record.name = name
+    if "description" in fields_set:
+        record.description = _agent_definition_text(payload.description, max_len=2000) or None
+    if "agent_capability_id" in fields_set:
+        assert registry is not None
+        record.agent_capability_id = _agent_definition_validate_primary_capability(
+            payload.agent_capability_id or "",
+            registry,
+        )
+    if "instructions" in fields_set:
+        instructions = _agent_definition_text(payload.instructions, max_len=12000)
+        if not instructions:
+            raise HTTPException(status_code=422, detail="agent_definition_instructions_required")
+        record.instructions = instructions
+    if "default_goal" in fields_set:
+        record.default_goal = _agent_definition_text(payload.default_goal, max_len=4000)
+    if "default_workspace_path" in fields_set:
+        record.default_workspace_path = (
+            _agent_definition_text(payload.default_workspace_path, max_len=500, collapse=True)
+            or None
+        )
+    if "default_constraints" in fields_set:
+        record.default_constraints_json = _agent_definition_string_list(
+            payload.default_constraints or []
+        )
+    if "default_max_steps" in fields_set:
+        record.default_max_steps = payload.default_max_steps
+    if "llm_config" in fields_set:
+        record.model_config_json = (
+            dict(payload.llm_config) if isinstance(payload.llm_config, dict) else {}
+        )
+    if "allowed_capability_ids" in fields_set:
+        assert registry is not None
+        record.allowed_capability_ids_json = _agent_definition_validate_allowed_capabilities(
+            payload.allowed_capability_ids or [],
+            registry,
+        )
+    if "memory_policy" in fields_set:
+        record.memory_policy_json = (
+            dict(payload.memory_policy) if isinstance(payload.memory_policy, dict) else {}
+        )
+    if "guardrail_policy" in fields_set:
+        record.guardrail_policy_json = (
+            dict(payload.guardrail_policy) if isinstance(payload.guardrail_policy, dict) else {}
+        )
+    if "workspace_policy" in fields_set:
+        record.workspace_policy_json = (
+            dict(payload.workspace_policy) if isinstance(payload.workspace_policy, dict) else {}
+        )
+    if "enabled" in fields_set and payload.enabled is not None:
+        record.enabled = bool(payload.enabled)
+    if "user_id" in fields_set:
+        record.user_id = _semantic_normalize_text(payload.user_id, max_len=120) or None
+    if "metadata" in fields_set:
+        record.metadata_json = dict(payload.metadata) if isinstance(payload.metadata, dict) else {}
+
+    record.updated_at = _utcnow()
+    db.commit()
+    db.refresh(record)
+    return _agent_definition_from_record(record)
+
+
+@app.delete("/agents/definitions/{agent_id}")
+def delete_agent_definition(
+    agent_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    record = (
+        db.query(AgentDefinitionRecord)
+        .filter(AgentDefinitionRecord.id == agent_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="agent_definition_not_found")
+    record.enabled = False
+    record.updated_at = _utcnow()
+    db.commit()
+    return {"ok": True}
+
+
 @app.post("/workflows/definitions", response_model=models.WorkflowDefinition)
 def create_workflow_definition(
     payload: models.WorkflowDefinitionCreate,
@@ -20142,6 +20500,7 @@ def _create_plan_internal(
         policy_decision={},
     )
     db.add(record)
+    db.flush()
     task_intent_profiles: dict[str, dict[str, Any]] = {}
     goal_intent_segments = _goal_intent_segments_from_metadata(
         job.metadata_json if job and isinstance(job.metadata_json, dict) else {}
@@ -20387,10 +20746,28 @@ def _workbench_validate_agent_run_spec(
                 "issues": bad_refs,
             },
         )
+    normalized_steps: list[models.StepSpec] = []
+    for step in run_spec.steps:
+        capability_id = str(step.capability_request.capability_id or "").strip().lower()
+        request_id = str(step.capability_request.request_id or "").strip().lower()
+        if capability_id == "llm.text.generate" or request_id == "llm.text.generate":
+            bindings = dict(step.input_bindings or {})
+            prompt_value = bindings.get("prompt")
+            has_prompt = (
+                prompt_value is not None
+                and (not isinstance(prompt_value, str) or bool(prompt_value.strip()))
+            )
+            instruction = str(step.instruction or "").strip()
+            if not has_prompt and instruction:
+                bindings["prompt"] = instruction
+                step = step.model_copy(update={"input_bindings": bindings})
+        normalized_steps.append(step)
+
     # Stamp workbench metadata and normalize kind to api
     run_spec = run_spec.model_copy(
         update={
             "kind": models.RunKind.api,
+            "steps": normalized_steps,
             "metadata": {
                 **dict(run_spec.metadata or {}),
                 "surface": _WORKBENCH_SURFACE_TAG,
@@ -20400,6 +20777,288 @@ def _workbench_validate_agent_run_spec(
         }
     )
     return run_spec
+
+
+def _workbench_load_agent_definition(
+    agent_definition_id: str | None,
+    db: Session,
+) -> AgentDefinitionRecord | None:
+    normalized = _agent_definition_text(agent_definition_id, max_len=120, collapse=True)
+    if not normalized:
+        return None
+    record = (
+        db.query(AgentDefinitionRecord)
+        .filter(AgentDefinitionRecord.id == normalized)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="agent_definition_not_found")
+    if not record.enabled:
+        raise HTTPException(status_code=422, detail="agent_definition_disabled")
+    return record
+
+
+def _workbench_missing_binding_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not bool(value.strip())
+    return False
+
+
+def _workbench_step_canonical_capability_id(step: models.StepSpec) -> str:
+    capability_id = str(step.capability_request.capability_id or "").strip()
+    spec = _workbench_validate_capability(capability_id)
+    return spec.capability_id
+
+
+def _workbench_capability_risk_level(
+    spec: capability_registry.CapabilitySpec,
+) -> str:
+    risk_tier = str(spec.risk_tier or "").strip().lower()
+    if "high" in risk_tier or risk_tier in {"unsafe_write", "write"}:
+        return "high_risk_write"
+    if "bounded" in risk_tier or "write" in risk_tier:
+        return "bounded_write"
+    return "read_only"
+
+
+def _workbench_agent_definition_risk_level(
+    definition: AgentDefinitionRecord,
+) -> str:
+    spec = _workbench_validate_capability(definition.agent_capability_id)
+    return _workbench_capability_risk_level(spec)
+
+
+def _workbench_capability_intent_for_step(
+    capability_id: str,
+) -> str:
+    hint = _capability_task_intent_hint(capability_id)
+    if hint:
+        return hint
+    normalized = str(capability_id or "").strip().lower()
+    if "render" in normalized:
+        return models.ToolIntent.render.value
+    if normalized.startswith(("filesystem.", "github.")) or any(
+        token in normalized for token in ("list", "read", "lookup", "search")
+    ):
+        return models.ToolIntent.io.value
+    return models.ToolIntent.transform.value
+
+
+def _workbench_agent_definition_intent_metadata(
+    definition: AgentDefinitionRecord,
+    *,
+    launch_goal: str,
+    run_spec: models.RunSpec,
+) -> dict[str, Any]:
+    objective = launch_goal or str(definition.default_goal or "").strip() or definition.name
+    risk_level = _workbench_agent_definition_risk_level(definition)
+    primary_segment = {
+        "id": "agent_definition_primary",
+        "intent": models.ToolIntent.generate.value,
+        "objective": objective,
+        "source": "agent_definition",
+        "confidence": 1.0,
+        "required_inputs": ["goal", "workspace_path"],
+        "suggested_capabilities": [definition.agent_capability_id],
+        "slots": {
+            "entity": "agent_definition",
+            "artifact_type": "code" if "codegen" in definition.agent_capability_id else "workspace",
+            "output_format": "txt",
+            "risk_level": risk_level,
+            "must_have_inputs": ["goal", "workspace_path"],
+        },
+    }
+    segments = [primary_segment]
+    candidate_capabilities = {
+        "agent_definition_primary": [definition.agent_capability_id],
+    }
+    for step in run_spec.steps[1:]:
+        capability_id = _workbench_step_canonical_capability_id(step)
+        spec = _workbench_validate_capability(capability_id)
+        segment_id = f"agent_definition_step_{step.step_id}"
+        step_intent = _workbench_capability_intent_for_step(capability_id)
+        segments.append(
+            {
+                "id": segment_id,
+                "intent": step_intent,
+                "objective": step.description or step.instruction or step.name or capability_id,
+                "source": "agent_definition",
+                "confidence": 1.0,
+                "depends_on": list(step.depends_on or []),
+                "required_inputs": [],
+                "suggested_capabilities": [capability_id],
+                "slots": {
+                    "entity": capability_id,
+                    "artifact_type": str(spec.group or spec.subgroup or "capability"),
+                    "output_format": "json",
+                    "risk_level": _workbench_capability_risk_level(spec),
+                    "must_have_inputs": [],
+                },
+            }
+        )
+        candidate_capabilities[segment_id] = [capability_id]
+
+    intent_order = []
+    for segment in segments:
+        intent = str(segment.get("intent") or "").strip()
+        if intent and intent not in intent_order:
+            intent_order.append(intent)
+    profile = {
+        "intent": models.ToolIntent.generate.value,
+        "source": "agent_definition",
+        "confidence": 1.0,
+        "risk_level": risk_level,
+        "slot_values": {
+            "goal": objective,
+            "workspace_path": str(definition.default_workspace_path or "").strip(),
+        },
+    }
+    graph = {
+        "segments": segments,
+        "summary": {
+            "segment_count": len(segments),
+            "intent_order": intent_order,
+            "capability_suggestions_total": len(segments),
+            "capability_suggestions_selected": len(segments),
+        },
+        "overall_confidence": 1.0,
+        "source": "agent_definition",
+    }
+    return {
+        "goal_intent_profile": profile,
+        "goal_intent_graph": graph,
+        "normalized_intent_envelope": {
+            "schema_version": "intent_envelope_v1",
+            "goal": objective,
+            "profile": profile,
+            "graph": graph,
+            "candidate_capabilities": candidate_capabilities,
+            "clarification": {
+                "needs_clarification": False,
+                "requires_blocking_clarification": False,
+                "missing_inputs": [],
+                "questions": [],
+                "blocking_slots": [],
+                "slot_values": profile["slot_values"],
+            },
+            "trace": {
+                "assessment_source": "agent_definition",
+                "decomposition_source": "agent_definition",
+            },
+        },
+    }
+
+
+def _workbench_validate_agent_definition_constraints(
+    run_spec: models.RunSpec,
+    definition: AgentDefinitionRecord,
+) -> None:
+    if not run_spec.steps:
+        raise HTTPException(
+            status_code=422, detail="workbench_agent_run_spec_must_have_at_least_one_step"
+        )
+    primary_capability_id = _workbench_step_canonical_capability_id(run_spec.steps[0])
+    if primary_capability_id != definition.agent_capability_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "agent_definition_primary_capability_mismatch",
+                "agent_definition_id": definition.id,
+                "expected_capability_id": definition.agent_capability_id,
+                "actual_capability_id": primary_capability_id,
+            },
+        )
+
+    allowed_capability_ids = {
+        str(capability_id or "").strip()
+        for capability_id in (definition.allowed_capability_ids_json or [])
+        if str(capability_id or "").strip()
+    }
+    if not allowed_capability_ids:
+        return
+    disallowed: list[dict[str, str]] = []
+    for step in run_spec.steps[1:]:
+        capability_id = _workbench_step_canonical_capability_id(step)
+        if capability_id not in allowed_capability_ids:
+            disallowed.append(
+                {
+                    "step_id": step.step_id,
+                    "capability_id": capability_id,
+                }
+            )
+    if disallowed:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "agent_definition_disallowed_capability",
+                "agent_definition_id": definition.id,
+                "allowed_capability_ids": sorted(allowed_capability_ids),
+                "disallowed": disallowed,
+            },
+        )
+
+
+def _workbench_apply_agent_definition_defaults(
+    run_spec: models.RunSpec,
+    definition: AgentDefinitionRecord,
+    *,
+    launch_goal: str,
+    captured_at: datetime,
+) -> models.RunSpec:
+    steps = list(run_spec.steps)
+    if steps:
+        primary_step = steps[0]
+        input_bindings = dict(primary_step.input_bindings or {})
+        effective_goal = launch_goal or str(definition.default_goal or "").strip()
+        if _workbench_missing_binding_value(input_bindings.get("goal")) and effective_goal:
+            input_bindings["goal"] = effective_goal
+        if _workbench_missing_binding_value(input_bindings.get("workspace_path")):
+            workspace_path = str(definition.default_workspace_path or "").strip()
+            if workspace_path:
+                input_bindings["workspace_path"] = workspace_path
+        if _workbench_missing_binding_value(input_bindings.get("constraints")):
+            constraints = _agent_definition_string_list(definition.default_constraints_json or [])
+            if constraints:
+                input_bindings["constraints"] = "\n".join(constraints)
+        if _workbench_missing_binding_value(input_bindings.get("max_steps")):
+            if definition.default_max_steps is not None:
+                input_bindings["max_steps"] = int(definition.default_max_steps)
+
+        primary_updates: dict[str, Any] = {"input_bindings": input_bindings}
+        if not str(primary_step.instruction or "").strip():
+            primary_updates["instruction"] = definition.instructions
+        steps[0] = primary_step.model_copy(update=primary_updates)
+
+    snapshot = _agent_definition_snapshot_from_record(
+        definition,
+        captured_at=captured_at,
+    ).model_dump(mode="json", by_alias=True)
+    metadata = {
+        **dict(run_spec.metadata or {}),
+        "agent_definition_id": definition.id,
+        "agent_definition_snapshot": snapshot,
+    }
+    for key, value in _workbench_agent_definition_intent_metadata(
+        definition,
+        launch_goal=launch_goal,
+        run_spec=run_spec,
+    ).items():
+        metadata.setdefault(key, value)
+    tasks_summary = (
+        str(run_spec.tasks_summary or "").strip()
+        or launch_goal
+        or str(definition.default_goal or "").strip()
+        or definition.name
+    )
+    return run_spec.model_copy(
+        update={
+            "steps": steps,
+            "tasks_summary": tasks_summary,
+            "metadata": metadata,
+        }
+    )
 
 
 def _workbench_launch_run(
@@ -20418,8 +21077,10 @@ def _workbench_launch_run(
     effective_title = str(title or "").strip() or effective_goal
     use_postgres_scheduler = STUDIO_RUN_SCHEDULER_ENABLED
     serialized_run_spec = run_spec.model_dump(mode="json")
+    run_metadata = dict(run_spec.metadata or {})
 
     metadata_overrides: dict[str, Any] = {
+        **run_metadata,
         "surface": _WORKBENCH_SURFACE_TAG,
         "workbench_mode": run_spec.metadata.get("workbench_mode", "capability"),
         "ephemeral": True,
@@ -20462,6 +21123,7 @@ def _workbench_launch_run(
         run_record.run_spec_json = serialized_run_spec
         run_record.metadata_json = {
             **(run_record.metadata_json or {}),
+            **run_metadata,
             "surface": _WORKBENCH_SURFACE_TAG,
             "workbench_mode": run_spec.metadata.get("workbench_mode", "capability"),
             "ephemeral": True,
@@ -20483,6 +21145,7 @@ def _workbench_launch_run(
             user_id=normalized_user_id,
             run_spec_json=serialized_run_spec,
             metadata_json={
+                **run_metadata,
                 "surface": _WORKBENCH_SURFACE_TAG,
                 "workbench_mode": run_spec.metadata.get("workbench_mode", "capability"),
                 "ephemeral": True,
@@ -20635,14 +21298,29 @@ def workbench_agent_run(
     validates all capability references, stamps workbench metadata, and creates a
     canonical job/plan/run.  Returns the run and normalized RunSpec.
     """
+    agent_definition = _workbench_load_agent_definition(payload.agent_definition_id, db)
     raw_run_spec = dict(payload.run_spec) if isinstance(payload.run_spec, dict) else {}
     run_spec = _workbench_validate_agent_run_spec(raw_run_spec)
+    effective_goal = str(payload.goal or "").strip()
+    effective_title = str(payload.title or "").strip()
+    effective_user_id = payload.user_id
+    if agent_definition is not None:
+        effective_goal = effective_goal or str(agent_definition.default_goal or "").strip()
+        effective_title = effective_title or str(agent_definition.name or "").strip()
+        effective_user_id = effective_user_id or agent_definition.user_id
+        _workbench_validate_agent_definition_constraints(run_spec, agent_definition)
+        run_spec = _workbench_apply_agent_definition_defaults(
+            run_spec,
+            agent_definition,
+            launch_goal=effective_goal,
+            captured_at=_utcnow(),
+        )
 
     run_record, final_run_spec = _workbench_launch_run(
         run_spec,
-        title=str(payload.title or "").strip() or "Agent workbench run",
-        goal=str(payload.goal or "").strip(),
-        user_id=payload.user_id,
+        title=effective_title or "Agent workbench run",
+        goal=effective_goal,
+        user_id=effective_user_id,
         context_json=payload.context_json,
         db=db,
     )
