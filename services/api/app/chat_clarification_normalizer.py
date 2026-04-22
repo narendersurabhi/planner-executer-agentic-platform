@@ -184,7 +184,12 @@ def normalize_contract_fields_with_llm(
             )
         )
     except (LLMProviderError, ValueError):
-        return {}, list(contract.required_fields), {}
+        unresolved = [
+            field
+            for field in contract.required_fields
+            if field in contract.missing_fields and field not in heuristic_updates
+        ]
+        return heuristic_updates, unresolved, heuristic_confidence
 
     raw_slots = parsed.get("normalized_slots")
     slot_map = dict(raw_slots) if isinstance(raw_slots, Mapping) else {}
@@ -200,13 +205,7 @@ def normalize_contract_fields_with_llm(
 
     updates: dict[str, str] = {}
     accepted_confidence: dict[str, float] = {}
-    for field_name, value in heuristic_updates.items():
-        updates[field_name] = value
-        accepted_confidence[field_name] = heuristic_confidence[field_name]
-        unresolved.discard(field_name)
     for field_name in effective_missing_fields:
-        if field_name in updates:
-            continue
         raw_value = slot_map.get(field_name)
         if not isinstance(raw_value, str) or not raw_value.strip():
             if field_name in contract.required_fields:
@@ -224,6 +223,12 @@ def normalize_contract_fields_with_llm(
             continue
         updates[field_name] = value
         accepted_confidence[field_name] = confidence
+        unresolved.discard(field_name)
+    for field_name, value in heuristic_updates.items():
+        if field_name in updates:
+            continue
+        updates[field_name] = value
+        accepted_confidence[field_name] = heuristic_confidence[field_name]
         unresolved.discard(field_name)
 
     for field_name in contract.required_fields:
@@ -278,8 +283,22 @@ def heuristic_field_updates_for_answer(
         return {}
     if normalized_preferred == "instruction" and _looks_like_substantive_instruction(answer):
         return {"instruction": answer}
+    if normalized_preferred in {"topic", "audience"}:
+        if not _looks_like_simple_field_answer(answer, max_tokens=16):
+            return {}
+        return {normalized_preferred: " ".join(answer.split())}
+    if normalized_preferred == "tone":
+        if not _looks_like_simple_field_answer(answer, max_tokens=8):
+            return {}
+        return {"tone": " ".join(answer.split()).lower()}
     if normalized_preferred == "goal" and _looks_like_substantive_instruction(answer):
         return {"goal": answer}
+    if normalized_preferred in {"path", "output_path", "filename"}:
+        if not _looks_like_simple_field_answer(answer, max_tokens=12):
+            return {}
+        normalized_path = _normalize_field_value("path", answer)
+        if normalized_path:
+            return {normalized_preferred: normalized_path}
     if normalized_preferred == "workspace_path":
         return {"workspace_path": _normalize_workspace_path_answer(answer)}
     if normalized_preferred == "output_format":
@@ -287,6 +306,18 @@ def heuristic_field_updates_for_answer(
         if normalized_format:
             return {"output_format": normalized_format}
     return {}
+
+
+def _looks_like_simple_field_answer(answer: str, *, max_tokens: int) -> bool:
+    normalized = str(answer or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    if "\n" in normalized or "answer:" in lowered:
+        return False
+    if re.search(r"(^|\s)\d+[.)]\s", normalized):
+        return False
+    return len(re.findall(r"[A-Za-z0-9._-]+", normalized)) <= max_tokens
 
 
 def _normalize_workspace_path_answer(answer: str) -> str:

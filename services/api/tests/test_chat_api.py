@@ -1505,6 +1505,127 @@ def test_chat_turn_maps_pending_answer_before_routing_and_advances_queue(
     assert pending["questions"] == ["What tone should it use?"]
 
 
+def test_answer_or_handoff_maps_pending_answer_before_routing(
+    monkeypatch,
+) -> None:
+    route_calls = {"count": 0}
+
+    def _route_turn(**kwargs):
+        route_calls["count"] += 1
+        if route_calls["count"] == 1:
+            return {
+                "type": "ask_clarification",
+                "assistant_content": "Who is the target audience?",
+                "clarification_questions": ["Who is the target audience?"],
+                "goal_intent_profile": {
+                    "intent": "generate",
+                    "source": "test",
+                    "confidence": 0.97,
+                    "risk_level": "bounded_write",
+                    "threshold": 0.7,
+                    "low_confidence": False,
+                    "needs_clarification": True,
+                    "requires_blocking_clarification": True,
+                    "questions": ["Who is the target audience?"],
+                    "blocking_slots": ["audience", "tone"],
+                    "missing_slots": ["audience", "tone"],
+                    "slot_values": {
+                        "intent_action": "generate",
+                        "risk_level": "bounded_write",
+                    },
+                },
+                "resolved_goal": kwargs["candidate_goal"],
+            }
+        assert kwargs["merged_context"]["audience"] == "Agentic AI Architects"
+        assert (
+            kwargs["session_metadata"]["pending_clarification"]["known_slot_values"]["audience"]
+            == "Agentic AI Architects"
+        )
+        return {
+            "type": "ask_clarification",
+            "assistant_content": "What tone should it use?",
+            "clarification_questions": ["What tone should it use?"],
+            "goal_intent_profile": {
+                "intent": "generate",
+                "source": "test",
+                "confidence": 0.97,
+                "risk_level": "bounded_write",
+                "threshold": 0.7,
+                "low_confidence": False,
+                "needs_clarification": True,
+                "requires_blocking_clarification": True,
+                "questions": ["What tone should it use?"],
+                "blocking_slots": ["tone"],
+                "missing_slots": ["tone"],
+                "slot_values": {
+                    "intent_action": "generate",
+                    "risk_level": "bounded_write",
+                    "audience": "Agentic AI Architects",
+                },
+            },
+            "resolved_goal": kwargs["candidate_goal"],
+        }
+
+    def _normalize_submit_context(**kwargs):
+        pending = kwargs["session_metadata"].get("pending_clarification")
+        if not pending:
+            return None
+        return chat_service.ChatSubmitNormalizationResult(
+            goal=kwargs["goal"],
+            context_json={
+                "audience": "Agentic AI Architects",
+                "clarification_normalization": {
+                    "source": "chat_clarification_normalizer",
+                    "fields": ["audience"],
+                    "confidence": {"audience": 1.0},
+                },
+            },
+            clarification_questions=["What tone should it use?"],
+            requires_blocking_clarification=True,
+            goal_intent_profile={
+                "intent": "generate",
+                "source": "test_submit_normalizer",
+                "confidence": 0.97,
+                "risk_level": "bounded_write",
+                "threshold": 0.7,
+                "low_confidence": False,
+                "needs_clarification": True,
+                "requires_blocking_clarification": True,
+                "questions": ["What tone should it use?"],
+                "blocking_slots": ["tone"],
+                "missing_slots": ["tone"],
+                "slot_values": {
+                    "intent_action": "generate",
+                    "risk_level": "bounded_write",
+                    "audience": "Agentic AI Architects",
+                },
+            },
+        )
+
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODE", "answer_or_handoff")
+    monkeypatch.setattr(main, "_route_chat_turn", _route_turn)
+    monkeypatch.setattr(main, "_normalize_chat_submit_context", _normalize_submit_context)
+
+    session = client.post("/chat/sessions", json={}).json()
+    first = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Create a deployment report", "context_json": {}, "priority": 0},
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        f"/chat/sessions/{session['id']}/messages",
+        json={"content": "Agentic AI Architects", "context_json": {}, "priority": 0},
+    )
+
+    assert second.status_code == 200
+    body = second.json()
+    assert body["assistant_message"]["action"]["type"] == "ask_clarification"
+    assert body["session"]["metadata"]["pending_clarification"]["known_slot_values"][
+        "audience"
+    ] == "Agentic AI Architects"
+
+
 def test_chat_turn_restarts_pending_clarification_for_execution_intent_change(
     monkeypatch,
 ) -> None:
@@ -5807,6 +5928,29 @@ def test_build_chat_pending_correction_provider_prefers_dedicated_model(monkeypa
     monkeypatch.setattr(main, "resolve_provider", _resolve_provider)
 
     provider = main._build_chat_pending_correction_provider()
+
+    assert provider is not None
+    assert captured == {"provider_name": "openai", "model": "gpt-5-nano"}
+
+
+def test_build_chat_clarification_normalizer_provider_prefers_dedicated_model(
+    monkeypatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def _resolve_provider(provider_name, **kwargs):
+        captured["provider_name"] = provider_name
+        captured["model"] = kwargs.get("model") or ""
+        return object()
+
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_ENABLED", True)
+    monkeypatch.setattr(main, "LLM_PROVIDER_NAME", "openai")
+    monkeypatch.setattr(main, "CHAT_CLARIFICATION_NORMALIZER_MODEL", "gpt-5-nano")
+    monkeypatch.setattr(main, "CHAT_RESPONSE_MODEL", "gpt-4.1-mini")
+    monkeypatch.setattr(main, "LLM_MODEL_NAME", "gpt-5-mini")
+    monkeypatch.setattr(main, "resolve_provider", _resolve_provider)
+
+    provider = main._build_chat_clarification_normalizer_provider()
 
     assert provider is not None
     assert captured == {"provider_name": "openai", "model": "gpt-5-nano"}

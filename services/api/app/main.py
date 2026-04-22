@@ -7238,7 +7238,6 @@ def _chat_runtime() -> chat_service.ChatServiceRuntime:
         make_id=lambda: str(uuid.uuid4()),
         normalize_submit_context=_normalize_chat_submit_context,
         is_chat_only_correction=_looks_like_chat_only_correction,
-        defer_pending_clarification_mapping=CHAT_RESPONSE_MODE == "answer_or_handoff",
     )
 
 

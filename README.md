@@ -773,6 +773,7 @@ The API also supports narrower model knobs for chat and intent paths:
 CHAT_ROUTER_MODEL=<model>
 CHAT_RESPONSE_MODEL=<model>
 CHAT_PENDING_CORRECTION_MODEL=<model>
+CHAT_CLARIFICATION_NORMALIZER_MODEL=<lighter-model>
 INTENT_ASSESS_MODEL=<model>
 INTENT_DECOMPOSE_MODEL=<model>
 ```
