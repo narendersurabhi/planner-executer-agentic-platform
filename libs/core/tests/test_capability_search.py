@@ -11,7 +11,7 @@ def test_search_capabilities_prefers_pdf_rendering_for_pdf_report_query() -> Non
         intent_hint="render",
     )
     ids = [str(item["id"]) for item in results]
-    assert "document.pdf.generate" in ids
+    assert "document.pdf.render" in ids
     assert any("pdf" in str(item["reason"]).lower() for item in results)
 
 

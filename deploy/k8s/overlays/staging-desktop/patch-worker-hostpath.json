@@ -1,0 +1,51 @@
+[
+  {
+    "op": "add",
+    "path": "/spec/template/spec/nodeSelector",
+    "value": {
+      "awe.shared-workspace": "true"
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/initContainers",
+    "value": [
+      {
+        "name": "init-shared",
+        "image": "busybox:1.36",
+        "command": ["sh", "-c", "mkdir -p /shared/workspace /shared/artifacts"],
+        "volumeMounts": [
+          {
+            "name": "shared-data",
+            "mountPath": "/shared"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/volumes",
+    "value": [
+      {
+        "name": "capability-registry-config",
+        "configMap": {
+          "name": "capability-registry"
+        }
+      },
+      {
+        "name": "mcp-servers-config",
+        "configMap": {
+          "name": "mcp-servers-config"
+        }
+      },
+      {
+        "name": "shared-data",
+        "hostPath": {
+          "path": "/var/awe-shared",
+          "type": "DirectoryOrCreate"
+        }
+      }
+    ]
+  }
+]

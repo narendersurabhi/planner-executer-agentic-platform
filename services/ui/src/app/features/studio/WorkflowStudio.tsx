@@ -1,21 +1,27 @@
 "use client";
 
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
+import AppShell from "../../components/AppShell";
 import ComposerDagCanvas from "../../components/composer/ComposerDagCanvas";
 import ComposerValidationPanel from "../../components/composer/ComposerValidationPanel";
-import ScreenHeader, {
-  screenHeaderPrimaryActionClassName,
-  screenHeaderSecondaryActionClassName
-} from "../../components/ScreenHeader";
+import {
+  WorkflowNodeIcon,
+  resolveWorkflowNodeVisual,
+} from "../../components/workflow/WorkflowNodeIcon";
 import StudioCapabilityPalette from "./StudioCapabilityPalette";
 import StudioCompilePanel from "./StudioCompilePanel";
+import StudioWorkbenchSurface from "./StudioWorkbenchSurface";
+import StudioWorkbenchIcon from "./StudioWorkbenchIcon";
 import StudioWorkflowInterfacePanel from "./StudioWorkflowInterfacePanel";
 import StudioNodeInspector from "./StudioNodeInspector";
-import StudioWorkflowLibrary from "./StudioWorkflowLibrary";
 import type {
   CanvasPoint,
   CapabilityCatalog,
+  CapabilityItem,
+  CapabilitySchemaField,
   ChainPreflightResult,
   ComposerCompileResponse,
   ComposerDraft,
@@ -27,6 +33,7 @@ import type {
   StudioControlCase,
   StudioControlConfig,
   StudioControlKind,
+  StudioSurface,
   WorkflowBinding,
   WorkflowDefinition,
   WorkflowInputDefinition,
@@ -34,9 +41,11 @@ import type {
   WorkflowOutputDefinition,
   WorkflowRun,
   WorkflowRunResult,
+  WorkflowRuntimeSettings,
   WorkflowTrigger,
   WorkflowVariableDefinition,
   WorkflowVersion,
+  WorkbenchWorkflowPromotionDraft,
 } from "./types";
 import {
   CHAINABLE_REQUIRED_FIELDS,
@@ -47,6 +56,7 @@ import {
   DAG_CANVAS_PADDING,
   DAG_CANVAS_SNAP,
   capabilityInputSchemaProperties,
+  capabilityOutputSchemaFields,
   collectContextPathSuggestions,
   collectComposerValidationIssues,
   defaultDagNodePosition,
@@ -54,12 +64,11 @@ import {
   formatTimestamp,
   getCapabilityRequiredInputs,
   inferCapabilityOutputPath,
-  inferOutputExtensionForCapability,
   isContextInputPresent,
   isInteractiveCanvasTarget,
   isPathOutputReference,
   normalizeComposerEdges,
-  outputPathSuggestionsForNode,
+  outputPathSuggestionsForNodeWithCapability,
   readContextObject,
   schemaPropertyTypeLabel,
   taskNameFromCapability,
@@ -67,11 +76,18 @@ import {
 } from "./utils";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "/api";
+const DEMO_DATA_ENABLED = process.env.NEXT_PUBLIC_DEMO_DATA === "true";
 const MEMORY_USER_ID_KEY = "ape.memory.user_id.v1";
+const STUDIO_WORKSPACE_LAYOUT_VERSION = 3;
+const STUDIO_WORKSPACE_LAYOUT_STORAGE_KEY = `ape.studio.workspace_layout.v${STUDIO_WORKSPACE_LAYOUT_VERSION}`;
+const LEGACY_FLOATING_STUDIO_LAYOUT_STORAGE_KEY = "ape.studio.workspace_layout.v2";
 const DEFAULT_WORKSPACE_USER_ID = "narendersurabhi";
+const DAG_CANVAS_ZOOM_MIN = 0.7;
+const DAG_CANVAS_ZOOM_MAX = 1.5;
+const DAG_CANVAS_ZOOM_STEP = 0.1;
 
 const initialStudioDraft = (): ComposerDraft => ({
-  summary: "Workflow Studio draft",
+  summary: "Workflow Builder draft",
   nodes: [],
   edges: [],
 });
@@ -80,6 +96,13 @@ const initialWorkflowInterface = (): WorkflowInterface => ({
   inputs: [],
   variables: [],
   outputs: [],
+});
+
+const initialWorkflowRuntimeSettings = (): WorkflowRuntimeSettings => ({
+  executionMode: "static",
+  adaptivePolicy: {
+    maxReplans: 2,
+  },
 });
 
 const createStudioOutput = () => ({
@@ -128,6 +151,12 @@ const createWorkflowOutputDefinition = (): WorkflowOutputDefinition => ({
   binding: null,
 });
 
+const initialStudioBottomTrayState = (): StudioBottomTrayState => ({
+  activePanelId: "interface",
+  height: 300,
+  collapsed: false,
+});
+
 const defaultControlConfig = (kind: StudioControlKind): StudioControlConfig => {
   if (kind === "if") {
     return { expression: "", trueLabel: "true" };
@@ -139,6 +168,105 @@ const defaultControlConfig = (kind: StudioControlKind): StudioControlConfig => {
     return { expression: "", switchCases: [createStudioControlCase()] };
   }
   return { expression: "", parallelMode: "fan_out" };
+};
+
+type DagConnectorDragState = {
+  sourceNodeId: string;
+  x: number;
+  y: number;
+  branchLabel?: string;
+  sourcePortY?: number;
+};
+
+const dagNodeOutputAnchorY = (
+  node: ComposerDraftNode,
+  branchLabel?: string
+) => {
+  if (node.nodeKind !== "control") {
+    return DAG_CANVAS_NODE_HEIGHT / 2;
+  }
+  if (node.controlKind === "if_else") {
+    const normalized = String(branchLabel || "").trim().toLowerCase();
+    if (normalized.includes("false") || normalized.includes("else")) {
+      return 64;
+    }
+    if (normalized) {
+      return 40;
+    }
+  }
+  return DAG_CANVAS_NODE_HEIGHT / 2;
+};
+
+const normalizeDagBranchLabel = (branchLabel?: string) =>
+  String(branchLabel || "").trim().toLowerCase();
+
+const buildDagEdgeRoute = ({
+  startX,
+  startY,
+  endX,
+  endY,
+  branchLabel,
+}: {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+  branchLabel?: string;
+}) => {
+  const normalizedBranchLabel = normalizeDagBranchLabel(branchLabel);
+  const deltaX = endX - startX;
+  const deltaY = endY - startY;
+  const horizontalDistance = Math.max(Math.abs(deltaX), 1);
+  const branchDirection =
+    normalizedBranchLabel.includes("false") || normalizedBranchLabel.includes("else")
+      ? 1
+      : normalizedBranchLabel
+        ? -1
+        : 0;
+
+  if (deltaX <= 72) {
+    const controlPull = Math.max(42, Math.min(112, horizontalDistance * 0.45));
+    const labelOffsetY = branchDirection < 0 ? -18 : 20;
+    return {
+      path: `M ${startX} ${startY} C ${startX + controlPull} ${startY}, ${endX - controlPull} ${endY}, ${endX} ${endY}`,
+      midX: startX + deltaX / 2,
+      midY: startY + deltaY / 2,
+      labelX: startX + deltaX / 2,
+      labelY: startY + deltaY / 2 + labelOffsetY,
+    };
+  }
+
+  if (!normalizedBranchLabel) {
+    const startLead = Math.min(96, Math.max(58, horizontalDistance * 0.24));
+    const endLead = Math.min(118, Math.max(70, horizontalDistance * 0.3));
+    return {
+      path: `M ${startX} ${startY} C ${startX + startLead} ${startY}, ${endX - endLead} ${endY}, ${endX} ${endY}`,
+      midX: startX + deltaX / 2,
+      midY: startY + deltaY / 2,
+      labelX: startX + deltaX / 2,
+      labelY: startY + deltaY / 2,
+    };
+  }
+
+  const branchOffset = Math.min(54, Math.max(28, Math.abs(deltaY) * 0.16 + 18));
+  const branchY = startY + branchDirection * branchOffset;
+  const splitX = startX + Math.min(78, Math.max(48, horizontalDistance * 0.16));
+  const settleX = startX + Math.min(168, Math.max(112, horizontalDistance * 0.34));
+  const arriveX = endX - Math.min(116, Math.max(62, horizontalDistance * 0.22));
+  const labelOffsetY = branchDirection < 0 ? -18 : 20;
+
+  return {
+    path: [
+      `M ${startX} ${startY}`,
+      `C ${startX + 26} ${startY}, ${splitX - 16} ${startY}, ${splitX} ${branchY}`,
+      `S ${settleX - 22} ${branchY}, ${settleX} ${branchY}`,
+      `C ${settleX + 44} ${branchY}, ${arriveX} ${endY}, ${endX} ${endY}`,
+    ].join(" "),
+    midX: settleX + (endX - settleX) * 0.44,
+    midY: branchY + (endY - branchY) * 0.56,
+    labelX: splitX + (settleX - splitX) * 0.42,
+    labelY: branchY + labelOffsetY,
+  };
 };
 
 const defaultBranchLabelForSourceNode = (
@@ -165,6 +293,91 @@ const defaultBranchLabelForSourceNode = (
     }
   }
   return "";
+};
+
+const clampDagCanvasZoom = (value: number) =>
+  Math.min(DAG_CANVAS_ZOOM_MAX, Math.max(DAG_CANVAS_ZOOM_MIN, Math.round(value * 100) / 100));
+
+const clampNumber = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, value));
+
+const buildAutoLayoutPositions = (
+  nodes: ComposerDraftNode[],
+  edges: ComposerDraftEdge[]
+): Record<string, CanvasPoint> => {
+  if (nodes.length === 0) {
+    return {};
+  }
+
+  const nodeIds = nodes.map((node) => node.id);
+  const indegree = new Map<string, number>(nodeIds.map((id) => [id, 0]));
+  const outgoing = new Map<string, string[]>(nodeIds.map((id) => [id, []]));
+  const level = new Map<string, number>(nodeIds.map((id) => [id, 0]));
+
+  edges.forEach((edge) => {
+    if (!indegree.has(edge.fromNodeId) || !indegree.has(edge.toNodeId)) {
+      return;
+    }
+    outgoing.get(edge.fromNodeId)?.push(edge.toNodeId);
+    indegree.set(edge.toNodeId, (indegree.get(edge.toNodeId) || 0) + 1);
+  });
+
+  const queue = nodes
+    .filter((node) => (indegree.get(node.id) || 0) === 0)
+    .map((node) => node.id);
+  const visited: string[] = [];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    visited.push(current);
+    const currentLevel = level.get(current) || 0;
+    (outgoing.get(current) || []).forEach((nextId) => {
+      level.set(nextId, Math.max(level.get(nextId) || 0, currentLevel + 1));
+      indegree.set(nextId, (indegree.get(nextId) || 0) - 1);
+      if ((indegree.get(nextId) || 0) === 0) {
+        queue.push(nextId);
+      }
+    });
+  }
+
+  if (visited.length !== nodes.length) {
+    return Object.fromEntries(nodes.map((node, index) => [node.id, defaultDagNodePosition(index)]));
+  }
+
+  const columns = new Map<number, ComposerDraftNode[]>();
+  nodes.forEach((node) => {
+    const columnIndex = level.get(node.id) || 0;
+    const columnNodes = columns.get(columnIndex) || [];
+    columnNodes.push(node);
+    columns.set(columnIndex, columnNodes);
+  });
+
+  const sortedColumns = Array.from(columns.entries()).sort(([left], [right]) => left - right);
+  const columnGap = 128;
+  const rowGap = 92;
+  const layoutWidth =
+    sortedColumns.length * DAG_CANVAS_NODE_WIDTH + Math.max(0, sortedColumns.length - 1) * columnGap;
+  const startX = Math.max(DAG_CANVAS_PADDING + 36, Math.round((DAG_CANVAS_MIN_WIDTH - layoutWidth) / 2));
+
+  const maxRows = Math.max(...sortedColumns.map(([, columnNodes]) => columnNodes.length));
+  const layoutHeight = maxRows * DAG_CANVAS_NODE_HEIGHT + Math.max(0, maxRows - 1) * rowGap;
+  const startY = Math.max(DAG_CANVAS_PADDING + 22, Math.round((DAG_CANVAS_MIN_HEIGHT - layoutHeight) / 2));
+
+  const positions: Record<string, CanvasPoint> = {};
+  sortedColumns.forEach(([columnIndex, columnNodes]) => {
+    const columnHeight =
+      columnNodes.length * DAG_CANVAS_NODE_HEIGHT +
+      Math.max(0, columnNodes.length - 1) * rowGap;
+    const columnStartY = Math.max(startY, Math.round((DAG_CANVAS_MIN_HEIGHT - columnHeight) / 2));
+    columnNodes.forEach((node, rowIndex) => {
+      positions[node.id] = {
+        x: startX + columnIndex * (DAG_CANVAS_NODE_WIDTH + columnGap),
+        y: columnStartY + rowIndex * (DAG_CANVAS_NODE_HEIGHT + rowGap),
+      };
+    });
+  });
+
+  return positions;
 };
 
 const initialContextJson = () =>
@@ -544,14 +757,869 @@ const restorePersistedWorkflowDraft = (
       draft?.workflowInterface ||
         (isRecord(draft) && "workflow_interface" in draft ? draft.workflow_interface : null)
     ),
+    runtimeSettings: (() => {
+      const runtimeSettings =
+        draft?.runtimeSettings ||
+        (isRecord(draft) && "runtime_settings" in draft ? draft.runtime_settings : null);
+      const adaptivePolicy =
+        runtimeSettings &&
+        typeof runtimeSettings === "object" &&
+        !Array.isArray(runtimeSettings) &&
+        "adaptivePolicy" in runtimeSettings
+          ? (runtimeSettings as { adaptivePolicy?: { maxReplans?: unknown } }).adaptivePolicy
+          : runtimeSettings &&
+              typeof runtimeSettings === "object" &&
+              !Array.isArray(runtimeSettings) &&
+              "adaptive_policy" in runtimeSettings
+            ? (runtimeSettings as { adaptive_policy?: { maxReplans?: unknown; max_replans?: unknown } })
+                .adaptive_policy
+            : null;
+      const maxReplansValue =
+        adaptivePolicy && typeof adaptivePolicy === "object" && !Array.isArray(adaptivePolicy)
+          ? Number(
+              (adaptivePolicy as { maxReplans?: unknown; max_replans?: unknown }).maxReplans ??
+                (adaptivePolicy as { maxReplans?: unknown; max_replans?: unknown }).max_replans ??
+                initialWorkflowRuntimeSettings().adaptivePolicy?.maxReplans ??
+                2
+            )
+          : Number(initialWorkflowRuntimeSettings().adaptivePolicy?.maxReplans ?? 2);
+      const normalizedMaxReplans = Number.isFinite(maxReplansValue)
+        ? maxReplansValue
+        : Number(initialWorkflowRuntimeSettings().adaptivePolicy?.maxReplans ?? 2);
+      const executionModeValue =
+        runtimeSettings &&
+        typeof runtimeSettings === "object" &&
+        !Array.isArray(runtimeSettings) &&
+        ("executionMode" in runtimeSettings || "execution_mode" in runtimeSettings)
+          ? ((runtimeSettings as { executionMode?: unknown; execution_mode?: unknown }).executionMode ??
+              (runtimeSettings as { executionMode?: unknown; execution_mode?: unknown }).execution_mode)
+          : "static";
+      return {
+        executionMode: executionModeValue === "adaptive" ? "adaptive" : "static",
+        adaptivePolicy: {
+          maxReplans: Math.max(0, Math.min(10, normalizedMaxReplans)),
+        },
+      } satisfies WorkflowRuntimeSettings;
+    })(),
     composerDraft: {
       summary:
         typeof draft?.summary === "string" && draft.summary.trim()
           ? draft.summary
-          : fallbackGoal || "Workflow Studio draft",
+          : fallbackGoal || "Workflow Builder draft",
       nodes,
       edges: normalizeComposerEdges(nodes, normalizePersistedEdges(draft?.edges)),
     },
+  };
+};
+
+type FloatingStudioPanelId =
+  | "palette"
+  | "compile"
+  | "setup"
+  | "interface"
+  | "library"
+  | "inspector";
+
+type StudioPanelMode = "docked" | "floating";
+type StudioDockZone = "left" | "right" | "bottom" | "overlay" | "none";
+type StudioWorkspaceMode = "default" | "focus_graph";
+
+type FloatingStudioPanelLayout = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  zIndex: number;
+  minimized: boolean;
+  mode: StudioPanelMode;
+  dockZone: StudioDockZone;
+};
+
+type FloatingStudioPanelDragState = {
+  id: FloatingStudioPanelId;
+  offsetX: number;
+  offsetY: number;
+};
+
+type FloatingStudioPanelResizeDirection =
+  | "n"
+  | "e"
+  | "s"
+  | "w"
+  | "ne"
+  | "nw"
+  | "se"
+  | "sw";
+
+type FloatingStudioPanelResizeState = {
+  id: FloatingStudioPanelId;
+  direction: FloatingStudioPanelResizeDirection;
+  mode: StudioPanelMode;
+  startX: number;
+  startY: number;
+  startLeft: number;
+  startTop: number;
+  startWidth: number;
+  startHeight: number;
+};
+
+type StudioBottomTrayState = {
+  activePanelId: FloatingStudioPanelId;
+  height: number;
+  collapsed: boolean;
+};
+
+type StudioBottomTrayResizeState = {
+  startY: number;
+  startHeight: number;
+};
+
+type StudioWorkspaceRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type ResolvedStudioWorkspacePanelRects = {
+  graph: StudioWorkspaceRect;
+  leftDock: StudioWorkspaceRect | null;
+  rightDock: StudioWorkspaceRect | null;
+  bottomDock: StudioWorkspaceRect | null;
+  minimizedShelf: StudioWorkspaceRect | null;
+};
+
+const FLOATING_STUDIO_PANEL_IDS: FloatingStudioPanelId[] = [
+  "palette",
+  "compile",
+  "setup",
+  "interface",
+  "library",
+  "inspector",
+];
+
+const FLOATING_STUDIO_PANEL_HEADER_HEIGHT = 44;
+const FLOATING_STUDIO_PANEL_MIN_WIDTH = 280;
+const FLOATING_STUDIO_PANEL_MIN_HEIGHT = 180;
+const FLOATING_STUDIO_PANEL_STAGE_PADDING = 18;
+const FLOATING_STUDIO_PANEL_SNAP_DISTANCE = 28;
+const STUDIO_MINIMIZED_SHELF_HEIGHT = 58;
+const STUDIO_BOTTOM_TRAY_MIN_HEIGHT = 240;
+const STUDIO_BOTTOM_TRAY_MAX_HEIGHT = 420;
+const STUDIO_BOTTOM_TRAY_COLLAPSED_HEIGHT = 56;
+const STUDIO_DOCK_PANEL_GAP = 14;
+
+const STUDIO_DOCK_ZONE_DEFAULTS: Record<
+  FloatingStudioPanelId,
+  { mode: StudioPanelMode; dockZone: StudioDockZone }
+> = {
+  palette: { mode: "docked", dockZone: "left" },
+  compile: { mode: "docked", dockZone: "right" },
+  setup: { mode: "docked", dockZone: "right" },
+  interface: { mode: "docked", dockZone: "bottom" },
+  library: { mode: "docked", dockZone: "bottom" },
+  inspector: { mode: "docked", dockZone: "right" },
+};
+
+const STUDIO_PANEL_DISPLAY_ORDER: FloatingStudioPanelId[] = [
+  "palette",
+  "inspector",
+  "compile",
+  "setup",
+  "interface",
+  "library",
+];
+const STUDIO_PANEL_TITLES: Record<FloatingStudioPanelId, string> = {
+  palette: "Step Palette",
+  compile: "Readiness Check",
+  setup: "Workflow Settings",
+  interface: "Request Contract",
+  library: "Saved Workflows",
+  inspector: "Step Inspector",
+};
+const STUDIO_DOCK_ZONE_LABELS: Record<Exclude<StudioDockZone, "overlay" | "none">, string> = {
+  left: "Dock Left",
+  right: "Dock Right",
+  bottom: "Dock Bottom",
+};
+const STUDIO_PANEL_ALLOWED_DOCK_ZONES: Record<
+  FloatingStudioPanelId,
+  Exclude<StudioDockZone, "overlay" | "none">[]
+> = {
+  palette: ["left", "bottom"],
+  compile: ["left", "right", "bottom"],
+  setup: ["left", "right", "bottom"],
+  interface: ["left", "right", "bottom"],
+  library: ["left", "right", "bottom"],
+  inspector: ["right", "bottom"],
+};
+
+const FLOATING_STUDIO_PANEL_RESIZE_HANDLES: {
+  direction: FloatingStudioPanelResizeDirection;
+  className: string;
+}[] = [
+  {
+    direction: "n",
+    className: "absolute inset-x-3 top-0 z-20 h-2 cursor-ns-resize",
+  },
+  {
+    direction: "s",
+    className: "absolute inset-x-3 bottom-0 z-20 h-2 cursor-ns-resize",
+  },
+  {
+    direction: "w",
+    className: "absolute inset-y-3 left-0 z-20 w-2 cursor-ew-resize",
+  },
+  {
+    direction: "e",
+    className: "absolute inset-y-3 right-0 z-20 w-2 cursor-ew-resize",
+  },
+  {
+    direction: "nw",
+    className: "absolute left-0 top-0 z-20 h-3 w-3 cursor-nwse-resize",
+  },
+  {
+    direction: "ne",
+    className: "absolute right-0 top-0 z-20 h-3 w-3 cursor-nesw-resize",
+  },
+  {
+    direction: "sw",
+    className: "absolute bottom-0 left-0 z-20 h-3 w-3 cursor-nesw-resize",
+  },
+  {
+    direction: "se",
+    className: "absolute bottom-0 right-0 z-20 h-3 w-3 cursor-nwse-resize",
+  },
+];
+
+const getFloatingStudioPanelActiveHeight = (layout: FloatingStudioPanelLayout) =>
+  layout.minimized ? FLOATING_STUDIO_PANEL_HEADER_HEIGHT : layout.height;
+
+const buildDockedPanelLayouts = (
+  stageWidth: number,
+  stageHeight: number
+): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> => {
+  const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const columnGap = STUDIO_DOCK_PANEL_GAP;
+  const paletteWidth = Math.round(clampNumber(stageWidth * 0.2, 280, 320));
+  const rightRailWidth = Math.round(clampNumber(stageWidth * 0.235, 320, 364));
+  const compileHeight = 248;
+  const setupHeight = Math.round(clampNumber(stageHeight * 0.36, 320, 420));
+  const inspectorHeight = Math.round(clampNumber(stageHeight * 0.34, 280, 396));
+  const bottomHeight = Math.round(clampNumber(stageHeight * 0.3, 250, 320));
+  const bottomAvailableWidth = Math.max(
+    FLOATING_STUDIO_PANEL_MIN_WIDTH * 2 + columnGap,
+    stageWidth - padding * 2
+  );
+  const libraryWidth = Math.round(
+    clampNumber(
+      bottomAvailableWidth * 0.3,
+      FLOATING_STUDIO_PANEL_MIN_WIDTH,
+      Math.max(FLOATING_STUDIO_PANEL_MIN_WIDTH, bottomAvailableWidth - 420 - columnGap)
+    )
+  );
+  const interfaceWidth = Math.max(
+    420,
+    Math.min(
+      bottomAvailableWidth - libraryWidth - columnGap,
+      bottomAvailableWidth - FLOATING_STUDIO_PANEL_MIN_WIDTH - columnGap
+    )
+  );
+  const bottomY = Math.max(padding, stageHeight - bottomHeight - padding);
+  const rightX = Math.max(padding, stageWidth - rightRailWidth - padding);
+
+  return {
+    palette: {
+      x: padding,
+      y: padding,
+      width: paletteWidth,
+      height: Math.max(520, stageHeight - bottomHeight - columnGap - padding * 2),
+      zIndex: 2,
+      minimized: false,
+      ...STUDIO_DOCK_ZONE_DEFAULTS.palette,
+    },
+    compile: {
+      x: rightX,
+      y: padding,
+      width: rightRailWidth,
+      height: compileHeight,
+      zIndex: 4,
+      minimized: false,
+      ...STUDIO_DOCK_ZONE_DEFAULTS.compile,
+    },
+    setup: {
+      x: rightX,
+      y: padding + compileHeight + columnGap,
+      width: rightRailWidth,
+      height: setupHeight,
+      zIndex: 3,
+      minimized: false,
+      ...STUDIO_DOCK_ZONE_DEFAULTS.setup,
+    },
+    interface: {
+      x: padding,
+      y: bottomY,
+      width: interfaceWidth,
+      height: bottomHeight,
+      zIndex: 2,
+      minimized: false,
+      ...STUDIO_DOCK_ZONE_DEFAULTS.interface,
+    },
+    library: {
+      x: padding + interfaceWidth + columnGap,
+      y: bottomY,
+      width: libraryWidth,
+      height: bottomHeight,
+      zIndex: 2,
+      minimized: false,
+      ...STUDIO_DOCK_ZONE_DEFAULTS.library,
+    },
+    inspector: {
+      x: rightX,
+      y: padding,
+      width: rightRailWidth,
+      height: inspectorHeight,
+      zIndex: 5,
+      minimized: false,
+      ...STUDIO_DOCK_ZONE_DEFAULTS.inspector,
+    },
+  };
+};
+
+const createInitialFloatingStudioPanelLayouts = (
+  stageWidth: number,
+  stageHeight: number
+) => buildDockedPanelLayouts(stageWidth, stageHeight);
+
+const clampDockedStudioPanelLayout = (
+  layout: FloatingStudioPanelLayout,
+  defaultLayout: FloatingStudioPanelLayout,
+  stageWidth: number,
+  stageHeight: number
+): FloatingStudioPanelLayout => {
+  const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const dockZone = layout.dockZone === "none" ? defaultLayout.dockZone : layout.dockZone;
+  const maxSideWidth = Math.max(
+    FLOATING_STUDIO_PANEL_MIN_WIDTH,
+    stageWidth - padding * 2 - 220
+  );
+  const maxBottomWidth = Math.max(
+    FLOATING_STUDIO_PANEL_MIN_WIDTH,
+    stageWidth - padding * 2
+  );
+  const width =
+    dockZone === "bottom"
+      ? Math.min(
+          maxBottomWidth,
+          Math.max(FLOATING_STUDIO_PANEL_MIN_WIDTH, layout.width || defaultLayout.width)
+        )
+      : Math.min(
+          maxSideWidth,
+          Math.max(FLOATING_STUDIO_PANEL_MIN_WIDTH, layout.width || defaultLayout.width)
+        );
+  const minHeight = dockZone === "bottom" ? 220 : FLOATING_STUDIO_PANEL_HEADER_HEIGHT;
+  const maxHeight = Math.max(minHeight, stageHeight - padding * 2);
+  const height = Math.min(
+    maxHeight,
+    Math.max(minHeight, layout.height || defaultLayout.height)
+  );
+
+  return {
+    ...defaultLayout,
+    width,
+    height,
+    minimized: layout.minimized,
+    mode: "docked",
+    dockZone,
+    zIndex: layout.zIndex,
+  };
+};
+
+const clampFloatingStudioPanelLayout = (
+  layout: FloatingStudioPanelLayout,
+  stageWidth: number,
+  stageHeight: number,
+  measuredWidth?: number,
+  measuredHeight?: number
+): FloatingStudioPanelLayout => {
+  const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const maxPanelWidth = Math.max(FLOATING_STUDIO_PANEL_MIN_WIDTH, stageWidth - padding * 2);
+  const maxPanelHeight = Math.max(FLOATING_STUDIO_PANEL_MIN_HEIGHT, stageHeight - padding * 2);
+  const panelWidth = Math.min(
+    maxPanelWidth,
+    Math.max(FLOATING_STUDIO_PANEL_MIN_WIDTH, layout.width)
+  );
+  const panelHeight = Math.min(
+    maxPanelHeight,
+    Math.max(FLOATING_STUDIO_PANEL_MIN_HEIGHT, layout.height)
+  );
+  const activeHeight = layout.minimized ? FLOATING_STUDIO_PANEL_HEADER_HEIGHT : panelHeight;
+  const maxX = Math.max(padding, stageWidth - panelWidth - padding);
+  const maxY = Math.max(padding, stageHeight - activeHeight - padding);
+  return {
+    ...layout,
+    width: panelWidth,
+    height: panelHeight,
+    x: Math.min(maxX, Math.max(padding, layout.x)),
+    y: Math.min(maxY, Math.max(padding, layout.y)),
+  };
+};
+
+const syncFloatingStudioPanelLayoutToStage = (
+  layout: FloatingStudioPanelLayout,
+  defaultLayout: FloatingStudioPanelLayout,
+  stageWidth: number,
+  stageHeight: number,
+  measuredWidth?: number,
+  measuredHeight?: number
+) => {
+  if (layout.mode === "floating") {
+    return clampFloatingStudioPanelLayout(
+      layout,
+      stageWidth,
+      stageHeight,
+      measuredWidth,
+      measuredHeight
+    );
+  }
+  return clampDockedStudioPanelLayout(layout, defaultLayout, stageWidth, stageHeight);
+};
+
+const pickFloatingStudioPanelSnapTarget = (
+  value: number,
+  targets: number[],
+  threshold: number
+) => {
+  let closest = value;
+  let closestDistance = threshold + 1;
+  targets.forEach((target) => {
+    const distance = Math.abs(value - target);
+    if (distance <= threshold && distance < closestDistance) {
+      closest = target;
+      closestDistance = distance;
+    }
+  });
+  return closest;
+};
+
+const resizeFloatingStudioPanelLayout = (
+  layout: FloatingStudioPanelLayout,
+  panelId: FloatingStudioPanelId,
+  resizeState: FloatingStudioPanelResizeState,
+  pointerX: number,
+  pointerY: number,
+  stageWidth: number,
+  stageHeight: number
+): FloatingStudioPanelLayout => {
+  if (layout.mode === "docked") {
+    if (layout.dockZone !== "left" && layout.dockZone !== "right") {
+      return layout;
+    }
+    const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+    const maxSideWidth = Math.max(
+      FLOATING_STUDIO_PANEL_MIN_WIDTH,
+      stageWidth - padding * 2 - 220
+    );
+    const deltaX = pointerX - resizeState.startX;
+    const width = clampNumber(
+      resizeState.startWidth + (layout.dockZone === "left" ? deltaX : -deltaX),
+      FLOATING_STUDIO_PANEL_MIN_WIDTH,
+      maxSideWidth
+    );
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    return clampDockedStudioPanelLayout(
+      {
+        ...layout,
+        width,
+      },
+      layout.dockZone === defaults[panelId].dockZone
+        ? defaults[panelId]
+        : { ...defaults[panelId], dockZone: layout.dockZone },
+      stageWidth,
+      stageHeight
+    );
+  }
+
+  const stageMinX = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const stageMinY = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const stageMaxX = Math.max(stageMinX, stageWidth - FLOATING_STUDIO_PANEL_STAGE_PADDING);
+  const stageMaxY = Math.max(stageMinY, stageHeight - FLOATING_STUDIO_PANEL_STAGE_PADDING);
+  const deltaX = pointerX - resizeState.startX;
+  const deltaY = pointerY - resizeState.startY;
+  const startRight = resizeState.startLeft + resizeState.startWidth;
+  const startBottom = resizeState.startTop + resizeState.startHeight;
+  let left = resizeState.startLeft;
+  let top = resizeState.startTop;
+  let right = startRight;
+  let bottom = startBottom;
+
+  if (resizeState.direction.includes("w")) {
+    left = Math.max(
+      stageMinX,
+      Math.min(startRight - FLOATING_STUDIO_PANEL_MIN_WIDTH, resizeState.startLeft + deltaX)
+    );
+  }
+
+  if (resizeState.direction.includes("e")) {
+    right = Math.min(
+      stageMaxX,
+      Math.max(resizeState.startLeft + FLOATING_STUDIO_PANEL_MIN_WIDTH, startRight + deltaX)
+    );
+  }
+
+  if (resizeState.direction.includes("n")) {
+    top = Math.max(
+      stageMinY,
+      Math.min(startBottom - FLOATING_STUDIO_PANEL_MIN_HEIGHT, resizeState.startTop + deltaY)
+    );
+  }
+
+  if (resizeState.direction.includes("s")) {
+    bottom = Math.min(
+      stageMaxY,
+      Math.max(resizeState.startTop + FLOATING_STUDIO_PANEL_MIN_HEIGHT, startBottom + deltaY)
+    );
+  }
+
+  return clampFloatingStudioPanelLayout(
+    {
+      ...layout,
+      x: left,
+      y: top,
+      width: right - left,
+      height: bottom - top,
+      minimized: false,
+      mode: "floating",
+    },
+    stageWidth,
+    stageHeight
+  );
+};
+
+const snapFloatingStudioPanelLayout = (
+  panelId: FloatingStudioPanelId,
+  layout: FloatingStudioPanelLayout,
+  stageWidth: number,
+  stageHeight: number
+) => {
+  const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+  const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const activeHeight = getFloatingStudioPanelActiveHeight(layout);
+  const rightDockX = Math.max(padding, stageWidth - layout.width - padding);
+  const bottomDockY = Math.max(padding, stageHeight - activeHeight - padding);
+  const centeredDockX = Math.max(
+    padding,
+    Math.min((stageWidth - layout.width) / 2, stageWidth - layout.width - padding)
+  );
+  const snappedX = pickFloatingStudioPanelSnapTarget(
+    layout.x,
+    [padding, defaults[panelId].x, centeredDockX, rightDockX],
+    FLOATING_STUDIO_PANEL_SNAP_DISTANCE
+  );
+  const snappedY = pickFloatingStudioPanelSnapTarget(
+    layout.y,
+    [padding, defaults[panelId].y, bottomDockY],
+    FLOATING_STUDIO_PANEL_SNAP_DISTANCE
+  );
+  return clampFloatingStudioPanelLayout(
+    {
+      ...layout,
+      x: snappedX,
+      y: snappedY,
+    },
+    stageWidth,
+    stageHeight
+  );
+};
+
+type PersistedStudioWorkspaceLayout = {
+  version: number;
+  workspaceMode?: StudioWorkspaceMode;
+  bottomTray?: {
+    activePanelId?: string;
+    height?: number;
+    collapsed?: boolean;
+  };
+  panels: Record<string, Partial<FloatingStudioPanelLayout>>;
+};
+
+const parsePersistedStudioPanelLayouts = (
+  parsed: unknown
+): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null => {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const candidatePanels = parsed as Record<string, Partial<FloatingStudioPanelLayout>>;
+  return FLOATING_STUDIO_PANEL_IDS.reduce<Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null>(
+    (acc, panelId) => {
+      if (!acc) {
+        return null;
+      }
+      const candidate = candidatePanels[panelId];
+      if (!candidate) {
+        return null;
+      }
+      const defaults = STUDIO_DOCK_ZONE_DEFAULTS[panelId];
+      const { x, y, width, height, zIndex, minimized, mode, dockZone } = candidate;
+      if (
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        !Number.isFinite(width) ||
+        !Number.isFinite(height) ||
+        !Number.isFinite(zIndex) ||
+        typeof minimized !== "boolean"
+      ) {
+        return null;
+      }
+      acc[panelId] = {
+        x: Number(x),
+        y: Number(y),
+        width: Number(width),
+        height: Number(height),
+        zIndex: Number(zIndex),
+        minimized,
+        mode: mode === "floating" || mode === "docked" ? mode : defaults.mode,
+        dockZone:
+          dockZone === "left" ||
+          dockZone === "right" ||
+          dockZone === "bottom" ||
+          dockZone === "overlay" ||
+          dockZone === "none"
+            ? dockZone
+            : defaults.dockZone,
+      };
+      return acc;
+    },
+    {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+  );
+};
+
+const readPersistedStudioWorkspaceLayout = (raw: string | null) => {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as PersistedStudioWorkspaceLayout | Record<string, unknown>;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "version" in parsed &&
+      Number((parsed as PersistedStudioWorkspaceLayout).version) === STUDIO_WORKSPACE_LAYOUT_VERSION &&
+      "panels" in parsed
+    ) {
+      const layout = parsed as PersistedStudioWorkspaceLayout;
+      const panels = parsePersistedStudioPanelLayouts(layout.panels);
+      if (!panels) {
+        return null;
+      }
+      const traySource = layout.bottomTray;
+      const trayHeight = Number(traySource?.height);
+      return {
+        panels,
+        workspaceMode: layout.workspaceMode === "focus_graph" ? "focus_graph" : "default",
+        bottomTray: {
+          activePanelId:
+            traySource?.activePanelId &&
+            FLOATING_STUDIO_PANEL_IDS.includes(traySource.activePanelId as FloatingStudioPanelId)
+              ? (traySource.activePanelId as FloatingStudioPanelId)
+              : initialStudioBottomTrayState().activePanelId,
+          height: Number.isFinite(trayHeight)
+            ? clampNumber(trayHeight, STUDIO_BOTTOM_TRAY_MIN_HEIGHT, STUDIO_BOTTOM_TRAY_MAX_HEIGHT)
+            : initialStudioBottomTrayState().height,
+          collapsed: Boolean(traySource?.collapsed),
+        } satisfies StudioBottomTrayState,
+      };
+    }
+    const panels = parsePersistedStudioPanelLayouts(parsed);
+    if (!panels) {
+      return null;
+    }
+    return {
+      panels,
+      workspaceMode: "default" as const,
+      bottomTray: initialStudioBottomTrayState(),
+    };
+  } catch {
+    return null;
+  }
+};
+
+const createPersistedStudioWorkspaceLayout = ({
+  panels,
+  bottomTray,
+}: {
+  panels: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>;
+  bottomTray: StudioBottomTrayState;
+}): PersistedStudioWorkspaceLayout => ({
+  version: STUDIO_WORKSPACE_LAYOUT_VERSION,
+  workspaceMode: "default",
+  bottomTray: {
+    activePanelId: bottomTray.activePanelId,
+    height: bottomTray.height,
+    collapsed: bottomTray.collapsed,
+  },
+  panels,
+});
+
+const readPersistedFloatingStudioPanelLayouts = (
+  raw: string | null
+): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null => {
+  const restored = readPersistedStudioWorkspaceLayout(raw);
+  return restored?.panels || null;
+};
+
+const readLegacyFloatingStudioPanelLayouts = (
+  raw: string | null
+): Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null => {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, Partial<FloatingStudioPanelLayout>>;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return FLOATING_STUDIO_PANEL_IDS.reduce<Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null>(
+      (acc, panelId) => {
+        if (!acc) {
+          return null;
+        }
+        const candidate = parsed[panelId];
+        if (!candidate) {
+          return null;
+        }
+        const defaults = STUDIO_DOCK_ZONE_DEFAULTS[panelId];
+        const { x, y, width, height, zIndex, minimized, mode, dockZone } = candidate;
+        if (
+          !Number.isFinite(x) ||
+          !Number.isFinite(y) ||
+          !Number.isFinite(width) ||
+          !Number.isFinite(height) ||
+          !Number.isFinite(zIndex) ||
+          typeof minimized !== "boolean"
+        ) {
+          return null;
+        }
+        acc[panelId] = {
+          x: Number(x),
+          y: Number(y),
+          width: Number(width),
+          height: Number(height),
+          zIndex: Number(zIndex),
+          minimized,
+          mode: mode === "floating" || mode === "docked" ? mode : defaults.mode,
+          dockZone:
+            dockZone === "left" ||
+            dockZone === "right" ||
+            dockZone === "bottom" ||
+            dockZone === "overlay" ||
+            dockZone === "none"
+              ? dockZone
+              : defaults.dockZone,
+        };
+        return acc;
+      },
+      {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+    );
+  } catch {
+    return null;
+  }
+};
+
+const resolveWorkspacePanelRects = (
+  layouts: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>,
+  stageWidth: number,
+  stageHeight: number,
+  options: {
+    showInspector: boolean;
+    showMinimizedShelf: boolean;
+    showBottomTray: boolean;
+    bottomTrayHeight: number;
+  }
+): ResolvedStudioWorkspacePanelRects => {
+  const padding = FLOATING_STUDIO_PANEL_STAGE_PADDING;
+  const gap = STUDIO_DOCK_PANEL_GAP;
+  const shouldShowDockedPanel = (panelId: FloatingStudioPanelId) =>
+    layouts[panelId].mode === "docked" &&
+    !layouts[panelId].minimized &&
+    (panelId !== "inspector" || options.showInspector);
+
+  const dockedLeftPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) => shouldShowDockedPanel(panelId) && layouts[panelId].dockZone === "left"
+  );
+  const dockedRightPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) => shouldShowDockedPanel(panelId) && layouts[panelId].dockZone === "right"
+  );
+  const dockedBottomPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) => shouldShowDockedPanel(panelId) && layouts[panelId].dockZone === "bottom"
+  );
+
+  const leftDockWidth = dockedLeftPanelIds.reduce(
+    (maxWidth, panelId) => Math.max(maxWidth, layouts[panelId].width),
+    0
+  );
+  const rightDockWidth = dockedRightPanelIds.reduce(
+    (maxWidth, panelId) => Math.max(maxWidth, layouts[panelId].width),
+    0
+  );
+  const bottomDockHeight = options.showBottomTray ? options.bottomTrayHeight : 0;
+  const minimizedShelfHeight = options.showMinimizedShelf ? STUDIO_MINIMIZED_SHELF_HEIGHT : 0;
+
+  const graphX = padding + (leftDockWidth ? leftDockWidth + gap : 0);
+  const graphY = padding;
+  const graphBottom =
+    stageHeight -
+    padding -
+    (minimizedShelfHeight ? minimizedShelfHeight + gap : 0) -
+    (bottomDockHeight ? bottomDockHeight + gap : 0);
+  const graphWidth = Math.max(
+    420,
+    stageWidth - graphX - padding - (rightDockWidth ? rightDockWidth + gap : 0)
+  );
+  const graphHeight = Math.max(360, graphBottom - graphY);
+  const bottomDockY = graphY + graphHeight + gap;
+  const minimizedShelfY =
+    stageHeight - padding - (minimizedShelfHeight || 0);
+
+  return {
+    graph: {
+      x: graphX,
+      y: graphY,
+      width: graphWidth,
+      height: graphHeight,
+    },
+    leftDock: leftDockWidth
+      ? {
+          x: padding,
+          y: graphY,
+          width: leftDockWidth,
+          height: graphHeight,
+        }
+      : null,
+    rightDock: rightDockWidth
+      ? {
+          x: stageWidth - padding - rightDockWidth,
+          y: graphY,
+          width: rightDockWidth,
+          height: graphHeight,
+        }
+      : null,
+    bottomDock: bottomDockHeight
+      ? {
+          x: padding,
+          y: bottomDockY,
+          width: stageWidth - padding * 2,
+          height: bottomDockHeight,
+        }
+      : null,
+    minimizedShelf: minimizedShelfHeight
+      ? {
+          x: padding,
+          y: minimizedShelfY,
+          width: stageWidth - padding * 2,
+          height: minimizedShelfHeight,
+        }
+      : null,
   };
 };
 
@@ -562,6 +1630,9 @@ export default function WorkflowStudio() {
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>(initialStudioDraft);
   const [workflowInterface, setWorkflowInterface] = useState<WorkflowInterface>(
     initialWorkflowInterface
+  );
+  const [workflowRuntimeSettings, setWorkflowRuntimeSettings] = useState<WorkflowRuntimeSettings>(
+    initialWorkflowRuntimeSettings
   );
   const [capabilityCatalog, setCapabilityCatalog] = useState<CapabilityCatalog | null>(null);
   const [capabilityLoading, setCapabilityLoading] = useState(true);
@@ -580,6 +1651,7 @@ export default function WorkflowStudio() {
   const [workflowDefinitions, setWorkflowDefinitions] = useState<WorkflowDefinition[]>([]);
   const [workflowDefinitionsLoading, setWorkflowDefinitionsLoading] = useState(true);
   const [workflowDefinitionsError, setWorkflowDefinitionsError] = useState<string | null>(null);
+  const [demoDataDetected, setDemoDataDetected] = useState(DEMO_DATA_ENABLED);
   const [workflowVersions, setWorkflowVersions] = useState<WorkflowVersion[]>([]);
   const [workflowVersionsLoading, setWorkflowVersionsLoading] = useState(false);
   const [workflowVersionsError, setWorkflowVersionsError] = useState<string | null>(null);
@@ -592,26 +1664,79 @@ export default function WorkflowStudio() {
   const [workflowActionLoading, setWorkflowActionLoading] = useState<
     "save" | "publish" | "run" | null
   >(null);
+  const [pendingWorkbenchWorkflowDraft, setPendingWorkbenchWorkflowDraft] =
+    useState<WorkbenchWorkflowPromotionDraft | null>(null);
   const [activeComposerIssueFocus, setActiveComposerIssueFocus] = useState<ComposerIssueFocus | null>(
     null
   );
   const [composerNodePositions, setComposerNodePositions] = useState<Record<string, CanvasPoint>>({});
   const [hoveredDagEdgeKey, setHoveredDagEdgeKey] = useState<string | null>(null);
   const [dagEdgeDraftSourceNodeId, setDagEdgeDraftSourceNodeId] = useState<string | null>(null);
-  const [dagConnectorDrag, setDagConnectorDrag] = useState<{
-    sourceNodeId: string;
-    x: number;
-    y: number;
-  } | null>(null);
+  const [dagConnectorDrag, setDagConnectorDrag] = useState<DagConnectorDragState | null>(null);
   const [dagCanvasDraggingNodeId, setDagCanvasDraggingNodeId] = useState<string | null>(null);
   const [dagConnectorHoverTargetNodeId, setDagConnectorHoverTargetNodeId] = useState<string | null>(
     null
   );
+  const [dagCanvasZoom, setDagCanvasZoom] = useState(1);
+  const [studioWorkspaceMode, setStudioWorkspaceMode] =
+    useState<StudioWorkspaceMode>("default");
+  const [workflowSetupExpanded, setWorkflowSetupExpanded] = useState(false);
+  const [studioBottomTray, setStudioBottomTray] = useState<StudioBottomTrayState>(
+    initialStudioBottomTrayState
+  );
+  const [floatingStudioPanelDrag, setFloatingStudioPanelDrag] =
+    useState<FloatingStudioPanelDragState | null>(null);
+  const [floatingStudioPanelResize, setFloatingStudioPanelResize] =
+    useState<FloatingStudioPanelResizeState | null>(null);
+  const [studioBottomTrayResize, setStudioBottomTrayResize] =
+    useState<StudioBottomTrayResizeState | null>(null);
+  const [studioWorkspaceStageSize, setStudioWorkspaceStageSize] = useState({
+    width: 0,
+    height: 0,
+  });
+  const [floatingStudioPanels, setFloatingStudioPanels] = useState<
+    Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+  >(() => createInitialFloatingStudioPanelLayouts(1440, 1040));
+  const [activeStudioPanelMenuId, setActiveStudioPanelMenuId] =
+    useState<FloatingStudioPanelId | null>(null);
 
   const dagCanvasDragOffsetRef = useRef<CanvasPoint>({ x: 0, y: 0 });
   const dagCanvasViewportRef = useRef<HTMLDivElement | null>(null);
   const dagCanvasRef = useRef<HTMLDivElement | null>(null);
   const inspectorBindingRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const studioWorkspaceStageRef = useRef<HTMLDivElement | null>(null);
+  const floatingStudioPanelRefs = useRef<Record<FloatingStudioPanelId, HTMLDivElement | null>>({
+    palette: null,
+    compile: null,
+    setup: null,
+    interface: null,
+    library: null,
+    inspector: null,
+  });
+  const floatingStudioPanelsInitializedRef = useRef(false);
+  const persistedFloatingStudioPanelsRef = useRef<
+    Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null
+  >(null);
+  const persistedStudioBottomTrayRef = useRef<StudioBottomTrayState | null>(null);
+  const focusGraphPanelSnapshotRef = useRef<
+    Record<FloatingStudioPanelId, FloatingStudioPanelLayout> | null
+  >(null);
+  const router = useRouter();
+  const pathname = usePathname() || "/studio";
+  const searchParams = useSearchParams();
+  const requestedStudioMode = String(searchParams.get("mode") || "").trim();
+  const requestedStudioSurface = String(searchParams.get("surface") || "")
+    .trim()
+    .toLowerCase();
+  const activeStudioSurface: StudioSurface =
+    requestedStudioSurface === "workbench" ? "workbench" : "workflow";
+  const requestedWorkflowDefinitionId = String(searchParams.get("definition") || "").trim();
+  const requestedWorkflowVersionId = String(searchParams.get("version") || "").trim();
+  const handledStudioRouteSelectionRef = useRef("");
+  const handledDemoWorkflowSelectionRef = useRef(false);
+  const [workbenchSurfaceMounted, setWorkbenchSurfaceMounted] = useState(
+    activeStudioSurface === "workbench"
+  );
 
   const deferredPaletteQuery = useDeferredValue(paletteQuery);
   const visualChainNodes = composerDraft.nodes;
@@ -630,6 +1755,12 @@ export default function WorkflowStudio() {
   };
 
   useEffect(() => {
+    if (activeStudioSurface === "workbench") {
+      setWorkbenchSurfaceMounted(true);
+    }
+  }, [activeStudioSurface]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -645,12 +1776,55 @@ export default function WorkflowStudio() {
     }
     window.localStorage.setItem(MEMORY_USER_ID_KEY, workspaceUserId);
   }, [workspaceUserId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const restored =
+      readPersistedStudioWorkspaceLayout(
+        window.localStorage.getItem(STUDIO_WORKSPACE_LAYOUT_STORAGE_KEY)
+      ) ||
+      readPersistedStudioWorkspaceLayout(
+        window.localStorage.getItem(LEGACY_FLOATING_STUDIO_LAYOUT_STORAGE_KEY)
+      ) || {
+        panels: readLegacyFloatingStudioPanelLayouts(
+          window.localStorage.getItem(LEGACY_FLOATING_STUDIO_LAYOUT_STORAGE_KEY)
+        ),
+        workspaceMode: "default" as const,
+        bottomTray: initialStudioBottomTrayState(),
+      };
+    persistedFloatingStudioPanelsRef.current = restored?.panels || null;
+    persistedStudioBottomTrayRef.current = restored?.bottomTray || initialStudioBottomTrayState();
+    setStudioWorkspaceMode(restored?.workspaceMode === "focus_graph" ? "focus_graph" : "default");
+  }, []);
   const contextPathSuggestions = useMemo(
     () => collectContextPathSuggestions(contextState.context),
     [contextState.context]
   );
   const activeWorkflowDefinitionId = savedWorkflowDefinition?.id || null;
   const activeWorkflowVersionId = loadedWorkflowVersionId || publishedWorkflowVersion?.id || null;
+  const isTypingTarget = (target: EventTarget | null) => {
+    const element = target instanceof HTMLElement ? target : null;
+    if (!element) {
+      return false;
+    }
+    const tagName = element.tagName.toLowerCase();
+    return (
+      element.isContentEditable ||
+      tagName === "input" ||
+      tagName === "textarea" ||
+      tagName === "select" ||
+      tagName === "button" ||
+      Boolean(element.closest("[contenteditable='true']"))
+    );
+  };
+
+  useEffect(() => {
+    if (contextState.invalid) {
+      setWorkflowSetupExpanded(true);
+    }
+  }, [contextState.invalid]);
 
   useEffect(() => {
     let cancelled = false;
@@ -700,6 +1874,9 @@ export default function WorkflowStudio() {
         `${apiUrl}/workflows/definitions${params.size > 0 ? `?${params.toString()}` : ""}`
       );
       const body = (await response.json()) as WorkflowDefinition[] | { detail?: unknown };
+      if (response.headers.get("x-demo-data") === "true") {
+        setDemoDataDetected(true);
+      }
       if (!response.ok) {
         const detail = (body as { detail?: unknown }).detail;
         throw new Error(
@@ -888,22 +2065,30 @@ export default function WorkflowStudio() {
   useEffect(() => {
     setComposerNodePositions((prev) => {
       const next = { ...prev };
-      let changed = false;
+      const missingNodeIds = visualChainNodes.filter((node) => !next[node.id]).map((node) => node.id);
+      const staleNodeIds = Object.keys(next).filter(
+        (nodeId) => !visualChainNodes.some((node) => node.id === nodeId)
+      );
+
+      if (missingNodeIds.length === 0 && staleNodeIds.length === 0) {
+        return prev;
+      }
+
+      if (Object.keys(prev).length === 0 && visualChainNodes.length > 0) {
+        return buildAutoLayoutPositions(visualChainNodes, composerDraftEdges);
+      }
+
       visualChainNodes.forEach((node, index) => {
         if (!next[node.id]) {
           next[node.id] = defaultDagNodePosition(index);
-          changed = true;
         }
       });
-      Object.keys(next).forEach((nodeId) => {
-        if (!visualChainNodes.some((node) => node.id === nodeId)) {
-          delete next[nodeId];
-          changed = true;
-        }
+      staleNodeIds.forEach((nodeId) => {
+        delete next[nodeId];
       });
-      return changed ? next : prev;
+      return next;
     });
-  }, [visualChainNodes]);
+  }, [composerDraftEdges, visualChainNodes]);
 
   useEffect(() => {
     if (!selectedDagNodeId) {
@@ -949,9 +2134,11 @@ export default function WorkflowStudio() {
         return;
       }
       const rect = canvas.getBoundingClientRect();
+      const pointerX = Math.max(0, (event.clientX - rect.left) / dagCanvasZoom);
+      const pointerY = Math.max(0, (event.clientY - rect.top) / dagCanvasZoom);
       if (dagCanvasDraggingNodeId) {
-        const rawX = event.clientX - rect.left - dagCanvasDragOffsetRef.current.x;
-        const rawY = event.clientY - rect.top - dagCanvasDragOffsetRef.current.y;
+        const rawX = pointerX - dagCanvasDragOffsetRef.current.x;
+        const rawY = pointerY - dagCanvasDragOffsetRef.current.y;
         const x = Math.max(0, Math.round(rawX / DAG_CANVAS_SNAP) * DAG_CANVAS_SNAP);
         const y = Math.max(0, Math.round(rawY / DAG_CANVAS_SNAP) * DAG_CANVAS_SNAP);
         setComposerNodePositions((prev) => ({
@@ -964,8 +2151,8 @@ export default function WorkflowStudio() {
           prev
             ? {
                 ...prev,
-                x: Math.max(0, event.clientX - rect.left),
-                y: Math.max(0, event.clientY - rect.top),
+                x: pointerX,
+                y: pointerY,
               }
             : prev
         );
@@ -989,7 +2176,283 @@ export default function WorkflowStudio() {
       window.removeEventListener("mousemove", handleMove);
       window.removeEventListener("mouseup", handleUp);
     };
-  }, [dagCanvasDraggingNodeId, dagConnectorDrag]);
+  }, [dagCanvasDraggingNodeId, dagCanvasZoom, dagConnectorDrag]);
+
+  useEffect(() => {
+    const stage = studioWorkspaceStageRef.current;
+    if (!stage || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const updateSize = () => {
+      const rect = stage.getBoundingClientRect();
+      setStudioWorkspaceStageSize({
+        width: rect.width,
+        height: rect.height,
+      });
+    };
+    updateSize();
+    const observer = new ResizeObserver(() => {
+      updateSize();
+    });
+    observer.observe(stage);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!studioWorkspaceStageSize.width || !studioWorkspaceStageSize.height) {
+      return;
+    }
+    setFloatingStudioPanels((prev) => {
+      const defaults = createInitialFloatingStudioPanelLayouts(
+        studioWorkspaceStageSize.width,
+        studioWorkspaceStageSize.height
+      );
+      const seeded = floatingStudioPanelsInitializedRef.current
+        ? prev
+        : persistedFloatingStudioPanelsRef.current || defaults;
+      floatingStudioPanelsInitializedRef.current = true;
+      return FLOATING_STUDIO_PANEL_IDS.reduce<
+        Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+      >((acc, panelId) => {
+        const measured = floatingStudioPanelRefs.current[panelId];
+        acc[panelId] = syncFloatingStudioPanelLayoutToStage(
+          seeded[panelId],
+          defaults[panelId],
+          studioWorkspaceStageSize.width,
+          studioWorkspaceStageSize.height,
+          measured?.offsetWidth,
+          measured?.offsetHeight
+        );
+        return acc;
+      }, {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>);
+    });
+    if (persistedStudioBottomTrayRef.current) {
+      setStudioBottomTray((prev) => ({
+        activePanelId: persistedStudioBottomTrayRef.current?.activePanelId || prev.activePanelId,
+        height: clampNumber(
+          persistedStudioBottomTrayRef.current?.height || prev.height,
+          STUDIO_BOTTOM_TRAY_MIN_HEIGHT,
+          Math.min(STUDIO_BOTTOM_TRAY_MAX_HEIGHT, studioWorkspaceStageSize.height - 220)
+        ),
+        collapsed: Boolean(persistedStudioBottomTrayRef.current?.collapsed),
+      }));
+      persistedStudioBottomTrayRef.current = null;
+    } else {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        height: clampNumber(
+          prev.height,
+          STUDIO_BOTTOM_TRAY_MIN_HEIGHT,
+          Math.min(STUDIO_BOTTOM_TRAY_MAX_HEIGHT, studioWorkspaceStageSize.height - 220)
+        ),
+      }));
+    }
+  }, [studioWorkspaceStageSize.height, studioWorkspaceStageSize.width]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !floatingStudioPanelsInitializedRef.current) {
+      return;
+    }
+    const saveTimer = window.setTimeout(() => {
+      const panelsToPersist =
+        studioWorkspaceMode === "focus_graph" && focusGraphPanelSnapshotRef.current
+          ? focusGraphPanelSnapshotRef.current
+          : floatingStudioPanels;
+      window.localStorage.setItem(
+        STUDIO_WORKSPACE_LAYOUT_STORAGE_KEY,
+        JSON.stringify(
+          createPersistedStudioWorkspaceLayout({
+            panels: panelsToPersist,
+            bottomTray: studioBottomTray,
+          })
+        )
+      );
+    }, 120);
+    return () => {
+      window.clearTimeout(saveTimer);
+    };
+  }, [floatingStudioPanels, studioBottomTray, studioWorkspaceMode]);
+
+  useEffect(() => {
+    if (!activeStudioPanelMenuId) {
+      return;
+    }
+    const handleMouseDown = (event: MouseEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest(`[data-studio-panel-menu-root="${activeStudioPanelMenuId}"]`)) {
+        return;
+      }
+      setActiveStudioPanelMenuId(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setActiveStudioPanelMenuId(null);
+      }
+    };
+    window.addEventListener("mousedown", handleMouseDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", handleMouseDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [activeStudioPanelMenuId]);
+
+  useEffect(() => {
+    if (!floatingStudioPanelDrag) {
+      return;
+    }
+    const handleMove = (event: MouseEvent) => {
+      const stage = studioWorkspaceStageRef.current;
+      if (!stage) {
+        return;
+      }
+      const stageRect = stage.getBoundingClientRect();
+      setFloatingStudioPanels((prev) => {
+        const current = prev[floatingStudioPanelDrag.id];
+        const measured = floatingStudioPanelRefs.current[floatingStudioPanelDrag.id];
+        return {
+          ...prev,
+          [floatingStudioPanelDrag.id]: clampFloatingStudioPanelLayout(
+            {
+              ...current,
+              x: event.clientX - stageRect.left - floatingStudioPanelDrag.offsetX,
+              y: event.clientY - stageRect.top - floatingStudioPanelDrag.offsetY,
+            },
+            stageRect.width,
+            stageRect.height,
+            measured?.offsetWidth,
+            measured?.offsetHeight
+          ),
+        };
+      });
+    };
+
+    const handleUp = () => {
+      const stage = studioWorkspaceStageRef.current;
+      if (stage) {
+        const stageRect = stage.getBoundingClientRect();
+        setFloatingStudioPanels((prev) => ({
+          ...prev,
+          [floatingStudioPanelDrag.id]: snapFloatingStudioPanelLayout(
+            floatingStudioPanelDrag.id,
+            prev[floatingStudioPanelDrag.id],
+            stageRect.width,
+            stageRect.height
+          ),
+        }));
+      }
+      setFloatingStudioPanelDrag(null);
+    };
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [floatingStudioPanelDrag]);
+
+  useEffect(() => {
+    if (!floatingStudioPanelResize) {
+      return;
+    }
+    const handleMove = (event: MouseEvent) => {
+      const stage = studioWorkspaceStageRef.current;
+      if (!stage) {
+        return;
+      }
+      const stageRect = stage.getBoundingClientRect();
+      setFloatingStudioPanels((prev) => {
+        const current = prev[floatingStudioPanelResize.id];
+        if (
+          floatingStudioPanelResize.mode === "docked" &&
+          current.mode === "docked" &&
+          (current.dockZone === "left" || current.dockZone === "right")
+        ) {
+          const resizedLayout = resizeFloatingStudioPanelLayout(
+            current,
+            floatingStudioPanelResize.id,
+            floatingStudioPanelResize,
+            event.clientX,
+            event.clientY,
+            stageRect.width,
+            stageRect.height
+          );
+          return FLOATING_STUDIO_PANEL_IDS.reduce<
+            Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+          >((acc, panelId) => {
+            const panel = prev[panelId];
+            acc[panelId] =
+              panel.mode === "docked" && panel.dockZone === current.dockZone
+                ? {
+                    ...panel,
+                    width: resizedLayout.width,
+                  }
+                : panel;
+            return acc;
+          }, {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>);
+        }
+        return {
+          ...prev,
+          [floatingStudioPanelResize.id]: resizeFloatingStudioPanelLayout(
+            current,
+            floatingStudioPanelResize.id,
+            floatingStudioPanelResize,
+            event.clientX,
+            event.clientY,
+            stageRect.width,
+            stageRect.height
+          ),
+        };
+      });
+    };
+
+    const handleUp = () => {
+      setFloatingStudioPanelResize(null);
+    };
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [floatingStudioPanelResize]);
+
+  useEffect(() => {
+    if (!studioBottomTrayResize) {
+      return;
+    }
+    const handleMove = (event: MouseEvent) => {
+      const stage = studioWorkspaceStageRef.current;
+      if (!stage) {
+        return;
+      }
+      const stageRect = stage.getBoundingClientRect();
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        collapsed: false,
+        height: clampNumber(
+          studioBottomTrayResize.startHeight + (studioBottomTrayResize.startY - event.clientY),
+          STUDIO_BOTTOM_TRAY_MIN_HEIGHT,
+          Math.min(STUDIO_BOTTOM_TRAY_MAX_HEIGHT, stageRect.height - 220)
+        ),
+      }));
+    };
+
+    const handleUp = () => {
+      setStudioBottomTrayResize(null);
+    };
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [studioBottomTrayResize]);
 
   const setVisualChainNodes = (
     next: ComposerDraftNode[] | ((prev: ComposerDraftNode[]) => ComposerDraftNode[])
@@ -1019,9 +2482,61 @@ export default function WorkflowStudio() {
     if (!position) {
       return;
     }
-    const left = Math.max(0, position.x - Math.max(0, viewport.clientWidth - DAG_CANVAS_NODE_WIDTH) / 2);
-    const top = Math.max(0, position.y - Math.max(0, viewport.clientHeight - DAG_CANVAS_NODE_HEIGHT) / 2);
+    const scaledNodeWidth = DAG_CANVAS_NODE_WIDTH * dagCanvasZoom;
+    const scaledNodeHeight = DAG_CANVAS_NODE_HEIGHT * dagCanvasZoom;
+    const left = Math.max(
+      0,
+      position.x * dagCanvasZoom - Math.max(0, viewport.clientWidth - scaledNodeWidth) / 2
+    );
+    const top = Math.max(
+      0,
+      position.y * dagCanvasZoom - Math.max(0, viewport.clientHeight - scaledNodeHeight) / 2
+    );
     viewport.scrollTo({ left, top, behavior: "smooth" });
+  };
+
+  const setDagCanvasZoomLevel = (nextZoom: number) => {
+    const normalizedZoom = clampDagCanvasZoom(nextZoom);
+    if (normalizedZoom === dagCanvasZoom) {
+      return;
+    }
+    const viewport = dagCanvasViewportRef.current;
+    const focusX = viewport ? (viewport.scrollLeft + viewport.clientWidth / 2) / dagCanvasZoom : null;
+    const focusY = viewport ? (viewport.scrollTop + viewport.clientHeight / 2) / dagCanvasZoom : null;
+    setDagCanvasZoom(normalizedZoom);
+    if (focusX !== null && focusY !== null) {
+      requestAnimationFrame(() => {
+        const nextViewport = dagCanvasViewportRef.current;
+        if (!nextViewport) {
+          return;
+        }
+        nextViewport.scrollTo({
+          left: Math.max(0, focusX * normalizedZoom - nextViewport.clientWidth / 2),
+          top: Math.max(0, focusY * normalizedZoom - nextViewport.clientHeight / 2),
+        });
+      });
+    }
+  };
+
+  const zoomInDagCanvas = () => {
+    const nextZoom = clampDagCanvasZoom(dagCanvasZoom + DAG_CANVAS_ZOOM_STEP);
+    setDagCanvasZoomLevel(nextZoom);
+    if (nextZoom !== dagCanvasZoom) {
+      setStudioNotice(`Canvas zoom set to ${Math.round(nextZoom * 100)}%.`);
+    }
+  };
+
+  const zoomOutDagCanvas = () => {
+    const nextZoom = clampDagCanvasZoom(dagCanvasZoom - DAG_CANVAS_ZOOM_STEP);
+    setDagCanvasZoomLevel(nextZoom);
+    if (nextZoom !== dagCanvasZoom) {
+      setStudioNotice(`Canvas zoom set to ${Math.round(nextZoom * 100)}%.`);
+    }
+  };
+
+  const resetDagCanvasZoom = () => {
+    setDagCanvasZoomLevel(1);
+    setStudioNotice("Canvas zoom reset to 100%.");
   };
 
   const setVisualBindingFromSource = (
@@ -1447,6 +2962,41 @@ export default function WorkflowStudio() {
     );
   };
 
+  const upsertNodeOutputFromSchema = (nodeId: string, field: CapabilitySchemaField) => {
+    const normalizedPath = String(field.path || "").trim();
+    if (!normalizedPath) {
+      return;
+    }
+    const normalizedName = normalizedPath.split(/[.[\]]/)[0]?.trim() || normalizedPath;
+    setVisualChainNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId) {
+          return node;
+        }
+        const alreadyPresent = node.outputs.some(
+          (output) =>
+            output.path.trim() === normalizedPath ||
+            output.name.trim() === normalizedName
+        );
+        if (alreadyPresent) {
+          return node;
+        }
+        return {
+          ...node,
+          outputs: [
+            ...node.outputs,
+            {
+              ...createStudioOutput(),
+              name: normalizedName,
+              path: normalizedPath,
+              description: field.description || "",
+            },
+          ],
+        };
+      })
+    );
+  };
+
   const addNodeVariable = (nodeId: string) => {
     setVisualChainNodes((prev) =>
       prev.map((node) =>
@@ -1828,18 +3378,19 @@ export default function WorkflowStudio() {
     return true;
   };
 
-  const addDagEdge = (fromNodeId: string, toNodeId: string) => {
+  const addDagEdge = (fromNodeId: string, toNodeId: string, branchLabel?: string) => {
     if (!fromNodeId || !toNodeId || fromNodeId === toNodeId) {
       return;
     }
     setComposerDraft((prev) => {
       const sourceNode = prev.nodes.find((node) => node.id === fromNodeId);
-      const branchLabel = defaultBranchLabelForSourceNode(sourceNode, prev.edges);
+      const nextBranchLabel =
+        String(branchLabel || "").trim() || defaultBranchLabelForSourceNode(sourceNode, prev.edges);
       return {
         ...prev,
         edges: normalizeComposerEdges(prev.nodes, [
           ...prev.edges,
-          { fromNodeId, toNodeId, ...(branchLabel ? { branchLabel } : {}) },
+          { fromNodeId, toNodeId, ...(nextBranchLabel ? { branchLabel: nextBranchLabel } : {}) },
         ]),
       };
     });
@@ -1867,15 +3418,16 @@ export default function WorkflowStudio() {
     const rect = canvas.getBoundingClientRect();
     const current = composerNodePositions[nodeId] || defaultDagNodePosition(0);
     dagCanvasDragOffsetRef.current = {
-      x: event.clientX - rect.left - current.x,
-      y: event.clientY - rect.top - current.y,
+      x: Math.max(0, (event.clientX - rect.left) / dagCanvasZoom) - current.x,
+      y: Math.max(0, (event.clientY - rect.top) / dagCanvasZoom) - current.y,
     };
     setDagCanvasDraggingNodeId(nodeId);
   };
 
   const beginDagConnectorDrag = (
     event: React.MouseEvent<HTMLButtonElement>,
-    sourceNodeId: string
+    sourceNodeId: string,
+    options: { branchLabel?: string; sourcePortY?: number } = {}
   ) => {
     event.preventDefault();
     const canvas = dagCanvasRef.current;
@@ -1885,8 +3437,10 @@ export default function WorkflowStudio() {
     const rect = canvas.getBoundingClientRect();
     setDagConnectorDrag({
       sourceNodeId,
-      x: Math.max(0, event.clientX - rect.left),
-      y: Math.max(0, event.clientY - rect.top),
+      x: Math.max(0, (event.clientX - rect.left) / dagCanvasZoom),
+      y: Math.max(0, (event.clientY - rect.top) / dagCanvasZoom),
+      ...(options.branchLabel ? { branchLabel: options.branchLabel } : {}),
+      sourcePortY: options.sourcePortY ?? DAG_CANVAS_NODE_HEIGHT / 2,
     });
     setDagConnectorHoverTargetNodeId(null);
     setDagEdgeDraftSourceNodeId(sourceNodeId);
@@ -1894,100 +3448,9 @@ export default function WorkflowStudio() {
 
   const autoLayoutDagCanvas = () => {
     setComposerNodePositions(() => {
-      const next: Record<string, CanvasPoint> = {};
-      visualChainNodes.forEach((node, index) => {
-        next[node.id] = defaultDagNodePosition(index);
-      });
-      return next;
+      return buildAutoLayoutPositions(visualChainNodes, composerDraftEdges);
     });
     setStudioNotice("Auto-layout applied to canvas.");
-  };
-
-  const buildDeriveOutputBindings = (
-    context: Record<string, unknown>,
-    targetCapabilityId: string,
-    documentTypeHint: string
-  ): Record<string, ComposerInputBinding> => {
-    const extension = inferOutputExtensionForCapability(targetCapabilityId);
-    const topicValue =
-      typeof context.topic === "string" && context.topic.trim().length > 0
-        ? context.topic.trim()
-        : "generated_document";
-    const outputDirValue =
-      typeof context.output_dir === "string" && context.output_dir.trim().length > 0
-        ? context.output_dir.trim()
-        : "documents";
-    const todayValue =
-      typeof context.today === "string" && context.today.trim().length > 0
-        ? context.today.trim()
-        : new Date().toISOString().slice(0, 10);
-
-    return {
-      topic: { kind: "literal", value: topicValue },
-      output_dir: { kind: "literal", value: outputDirValue },
-      document_type: { kind: "literal", value: documentTypeHint || "document" },
-      output_extension: { kind: "literal", value: extension },
-      today: { kind: "literal", value: todayValue },
-    };
-  };
-
-  const insertDeriveOutputPathStepForNode = (nodeId: string) => {
-    const context = contextState.context;
-    setComposerDraft((prev) => {
-      const targetIndex = prev.nodes.findIndex((node) => node.id === nodeId);
-      if (targetIndex < 0) {
-        return prev;
-      }
-      const targetNode = prev.nodes[targetIndex];
-      if (targetNode.capabilityId === "document.output.derive") {
-        return prev;
-      }
-
-      const deriveNodeId = `studio-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const deriveNode: ComposerDraftNode = {
-        id: deriveNodeId,
-        taskName: uniqueTaskName("DeriveOutputPath", prev.nodes),
-        capabilityId: "document.output.derive",
-        outputPath: "path",
-        inputBindings: buildDeriveOutputBindings(
-          context,
-          targetNode.capabilityId,
-          targetNode.capabilityId.includes("runbook") ? "runbook" : "document"
-        ),
-        outputs: [],
-        variables: [],
-      };
-
-      const updatedTargetNode: ComposerDraftNode = {
-        ...targetNode,
-        inputBindings: {
-          ...targetNode.inputBindings,
-          path: {
-            kind: "step_output",
-            sourceNodeId: deriveNodeId,
-            sourcePath: "path",
-          },
-        },
-      };
-
-      const nextNodes = [
-        ...prev.nodes.slice(0, targetIndex),
-        deriveNode,
-        updatedTargetNode,
-        ...prev.nodes.slice(targetIndex + 1),
-      ];
-      const nextEdges = normalizeComposerEdges(nextNodes, [
-        ...prev.edges,
-        { fromNodeId: deriveNodeId, toNodeId: targetNode.id },
-      ]);
-
-      return {
-        ...prev,
-        nodes: nextNodes,
-        edges: nextEdges,
-      };
-    });
-    setSelectedDagNodeId(nodeId);
   };
 
   const visualChainNodesWithStatus = useMemo(() => {
@@ -2122,6 +3585,13 @@ export default function WorkflowStudio() {
     [selectedDagNodeId, visualChainNodes]
   );
 
+  const selectedCapability = useMemo<CapabilityItem | null>(() => {
+    if (!selectedDagNode || selectedDagNode.nodeKind === "control") {
+      return null;
+    }
+    return capabilityById.get(selectedDagNode.capabilityId) || null;
+  }, [capabilityById, selectedDagNode]);
+
   const selectedDagNodeStatus = useMemo(() => {
     if (!selectedDagNodeId) {
       return null;
@@ -2137,135 +3607,151 @@ export default function WorkflowStudio() {
       return [];
     }
 
-    const requiredStatusByField = new Map(
-      (selectedDagNodeStatus?.requiredStatus || []).map((status) => [status.field, status])
+    const context = contextState.context;
+    const schemaProperties = capabilityInputSchemaProperties(selectedCapability);
+    const requiredFieldSet = new Set(getCapabilityRequiredInputs(selectedCapability));
+    const schemaFields = Array.from(
+      new Set([...Object.keys(schemaProperties), ...Array.from(requiredFieldSet)])
     );
-    const capability = capabilityById.get(selectedDagNode.capabilityId);
-    const schemaProperties = capabilityInputSchemaProperties(capability);
     const customFields = Object.keys(selectedDagNode.inputBindings).filter(
-      (field) => !requiredStatusByField.has(field)
+      (field) => !requiredFieldSet.has(field) && !schemaFields.includes(field)
     );
 
-    const customFieldStatus = customFields.map((field) => {
-      const property = schemaProperties[field];
-      const schemaType = schemaPropertyTypeLabel(property);
+    const buildFieldStatus = (field: string, required: boolean, custom: boolean) => {
+      const property = schemaProperties[field] || null;
+      const schemaType = schemaPropertyTypeLabel(property || undefined);
       const schemaDescription =
         property && typeof property.description === "string"
           ? property.description
-          : "Custom Studio binding";
+          : custom
+            ? "Custom Studio binding"
+            : "";
       const binding = selectedDagNode.inputBindings[field];
       if (binding?.kind === "step_output") {
         const source = visualChainNodes.find((candidate) => candidate.id === binding.sourceNodeId);
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: "from_chain" as const,
           detail: source ? `${source.taskName}.${binding.sourcePath}` : binding.sourcePath,
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "literal") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.value.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.value.trim() ? "literal value" : "literal value missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "memory") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.name.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.name.trim()
             ? `memory:${binding.scope}/${binding.name}${binding.key ? `/${binding.key}` : ""}`
             : "memory name missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "workflow_input") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.inputKey.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.inputKey.trim()
             ? `workflow.input.${binding.inputKey}`
             : "workflow input key missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "workflow_variable") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.variableKey.trim() ? ("provided" as const) : ("missing" as const),
           detail: binding.variableKey.trim()
             ? `workflow.variable.${binding.variableKey}`
             : "workflow variable key missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
         };
       }
       if (binding?.kind === "context") {
         return {
           field,
-          required: false,
+          required,
+          custom,
           status: binding.path.trim() ? ("from_context" as const) : ("missing" as const),
           detail: binding.path.trim() || "context path missing",
           schemaType,
           schemaDescription,
+          schemaProperty: property,
+        };
+      }
+      if (isContextInputPresent(context[field])) {
+        return {
+          field,
+          required,
+          custom,
+          status: "from_context" as const,
+          detail: "context_json",
+          schemaType,
+          schemaDescription,
+          schemaProperty: property,
         };
       }
       return {
         field,
-        required: false,
+        required,
+        custom,
         status: "missing" as const,
         detail: "missing",
         schemaType,
         schemaDescription,
+        schemaProperty: property,
       };
-    });
+    };
+
+    const schemaFieldStatus = schemaFields.map((field) =>
+      buildFieldStatus(field, requiredFieldSet.has(field), false)
+    );
+    const customFieldStatus = customFields.map((field) => buildFieldStatus(field, false, true));
 
     return [
-      ...(selectedDagNodeStatus?.requiredStatus || []).map((status) => ({
-        ...status,
-        required: true,
-      })),
+      ...schemaFieldStatus.filter((field) => field.required),
+      ...schemaFieldStatus.filter((field) => !field.required),
       ...customFieldStatus,
     ];
-  }, [capabilityById, selectedDagNode, selectedDagNodeStatus, visualChainNodes]);
+  }, [contextState.context, selectedCapability, selectedDagNode, visualChainNodes]);
 
-  const canInsertDeriveForSelectedNode = useMemo(() => {
-    if (!selectedDagNode) {
-      return false;
-    }
-    if (selectedDagNode.nodeKind === "control") {
-      return false;
-    }
-    if (!capabilityById.has("document.output.derive")) {
-      return false;
-    }
-    if (selectedDagNode.capabilityId === "document.output.derive") {
-      return false;
-    }
-    const requiredInputs = getCapabilityRequiredInputs(capabilityById.get(selectedDagNode.capabilityId));
-    if (!requiredInputs.includes("path")) {
-      return false;
-    }
-    const pathBinding = selectedDagNode.inputBindings.path;
-    if (pathBinding?.kind === "step_output") {
-      const sourceNode = visualChainNodes.find((node) => node.id === pathBinding.sourceNodeId);
-      if (sourceNode?.capabilityId === "document.output.derive") {
-        return false;
-      }
-    }
-    return true;
-  }, [capabilityById, selectedDagNode, visualChainNodes]);
+  const selectedDagNodeOutputSchemaFields = useMemo(
+    () => capabilityOutputSchemaFields(selectedCapability),
+    [selectedCapability]
+  );
+
+  const studioOutputPathSuggestionsForNode = (node: ComposerDraftNode | undefined) =>
+    outputPathSuggestionsForNodeWithCapability(
+      node,
+      node ? capabilityById.get(node.capabilityId) : undefined
+    );
 
   const quickFixNodeBindings = (nodeId: string) => {
     const targetNode = visualChainNodes.find((node) => node.id === nodeId);
@@ -2429,20 +3915,26 @@ export default function WorkflowStudio() {
           }
           const edgeKey = `${edge.fromNodeId}->${edge.toNodeId}`;
           const startX = fromEntry.position.x + DAG_CANVAS_NODE_WIDTH;
-          const startY = fromEntry.position.y + DAG_CANVAS_NODE_HEIGHT / 2;
+          const startY = fromEntry.position.y + dagNodeOutputAnchorY(fromEntry.node, edge.branchLabel);
           const endX = toEntry.position.x;
           const endY = toEntry.position.y + DAG_CANVAS_NODE_HEIGHT / 2;
-          const controlX = (startX + endX) / 2;
-          const midX = controlX;
-          const midY = (startY + endY) / 2;
+          const route = buildDagEdgeRoute({
+            startX,
+            startY,
+            endX,
+            endY,
+            branchLabel: edge.branchLabel,
+          });
           return {
             ...edge,
             edgeKey,
             fromTaskName: fromEntry.node.taskName,
             toTaskName: toEntry.node.taskName,
-            path: `M ${startX} ${startY} C ${controlX} ${startY}, ${controlX} ${endY}, ${endX} ${endY}`,
-            midX,
-            midY,
+            path: route.path,
+            midX: route.midX,
+            midY: route.midY,
+            labelX: route.labelX,
+            labelY: route.labelY,
           };
         })
         .filter(
@@ -2457,6 +3949,8 @@ export default function WorkflowStudio() {
             path: string;
             midX: number;
             midY: number;
+            labelX: number;
+            labelY: number;
             branchLabel?: string;
           } => item !== null
         ),
@@ -2472,12 +3966,21 @@ export default function WorkflowStudio() {
       return null;
     }
     const startX = sourceEntry.position.x + DAG_CANVAS_NODE_WIDTH;
-    const startY = sourceEntry.position.y + DAG_CANVAS_NODE_HEIGHT / 2;
+    const startY =
+      sourceEntry.position.y +
+      (dagConnectorDrag.sourcePortY ??
+        dagNodeOutputAnchorY(sourceEntry.node, dagConnectorDrag.branchLabel));
     const endX = dagConnectorDrag.x;
     const endY = dagConnectorDrag.y;
-    const controlX = (startX + endX) / 2;
+    const route = buildDagEdgeRoute({
+      startX,
+      startY,
+      endX,
+      endY,
+      branchLabel: dagConnectorDrag.branchLabel,
+    });
     return {
-      path: `M ${startX} ${startY} C ${controlX} ${startY}, ${controlX} ${endY}, ${endX} ${endY}`,
+      path: route.path,
     };
   }, [dagCanvasNodeById, dagConnectorDrag]);
 
@@ -2515,7 +4018,7 @@ export default function WorkflowStudio() {
       : withWorkspaceUserContext(contextState.context);
     return {
       draft: {
-        summary: composerDraft.summary || "Workflow Studio draft",
+        summary: composerDraft.summary || "Workflow Builder draft",
         nodes: visualChainNodes.map((node) => ({
           id: node.id,
           taskName: node.taskName,
@@ -2548,7 +4051,7 @@ export default function WorkflowStudio() {
       : withWorkspaceUserContext(contextState.context);
     return {
       draft: {
-        summary: composerDraft.summary || "Workflow Studio draft",
+        summary: composerDraft.summary || "Workflow Builder draft",
         nodes: visualChainNodes.map((node) => ({
           id: node.id,
           taskName: node.taskName,
@@ -2580,7 +4083,7 @@ export default function WorkflowStudio() {
 
   const persistedWorkflowDraft = useMemo(
     () => ({
-      summary: composerDraft.summary || "Workflow Studio draft",
+      summary: composerDraft.summary || "Workflow Builder draft",
       goal: goal.trim() || undefined,
       contextJsonText: contextJson,
       nodePositions: composerNodePositions,
@@ -2598,6 +4101,7 @@ export default function WorkflowStudio() {
       })),
       edges: composerDraftEdges,
       workflowInterface,
+      runtimeSettings: workflowRuntimeSettings,
     }),
     [
       composerDraft.summary,
@@ -2607,6 +4111,7 @@ export default function WorkflowStudio() {
       goal,
       visualChainNodes,
       workflowInterface,
+      workflowRuntimeSettings,
     ]
   );
 
@@ -2627,6 +4132,7 @@ export default function WorkflowStudio() {
     setContextJson(initialContextJson());
     setComposerDraft(initialStudioDraft());
     setWorkflowInterface(initialWorkflowInterface());
+    setWorkflowRuntimeSettings(initialWorkflowRuntimeSettings());
     setComposerNodePositions({});
     setSavedWorkflowDefinition(null);
     setPublishedWorkflowVersion(null);
@@ -2638,6 +4144,17 @@ export default function WorkflowStudio() {
     setStudioNotice("Started a fresh studio draft.");
   };
 
+  useEffect(() => {
+    if (requestedStudioMode !== "new") {
+      return;
+    }
+    if (handledStudioRouteSelectionRef.current === "mode:new") {
+      return;
+    }
+    handledStudioRouteSelectionRef.current = "mode:new";
+    startFreshStudioDraft();
+  }, [requestedStudioMode]);
+
   const restoreWorkflowDefinition = (definition: WorkflowDefinition) => {
     const restored = restorePersistedWorkflowDraft(
       definition.draft,
@@ -2648,6 +4165,7 @@ export default function WorkflowStudio() {
     setContextJson(restored.contextJsonText);
     setComposerDraft(restored.composerDraft);
     setWorkflowInterface(restored.workflowInterface);
+    setWorkflowRuntimeSettings(restored.runtimeSettings);
     setComposerNodePositions(restored.nodePositions);
     setSavedWorkflowDefinition(definition);
     setPublishedWorkflowVersion(null);
@@ -2655,6 +4173,37 @@ export default function WorkflowStudio() {
     resetStudioTransientState();
     setStudioNotice(`Opened saved draft ${definition.title}.`);
   };
+
+  useEffect(() => {
+    if (
+      !demoDataDetected ||
+      handledDemoWorkflowSelectionRef.current ||
+      workflowDefinitionsLoading ||
+      requestedWorkflowDefinitionId ||
+      requestedWorkflowVersionId ||
+      requestedStudioMode ||
+      savedWorkflowDefinition
+    ) {
+      return;
+    }
+    const demoDefinition =
+      workflowDefinitions.find((definition) => definition.metadata?.source === "demo_data") ||
+      (workflowDefinitions.length === 1 ? workflowDefinitions[0] : null);
+    if (!demoDefinition) {
+      return;
+    }
+    handledDemoWorkflowSelectionRef.current = true;
+    restoreWorkflowDefinition(demoDefinition);
+  }, [
+    demoDataDetected,
+    requestedStudioMode,
+    requestedWorkflowDefinitionId,
+    requestedWorkflowVersionId,
+    restoreWorkflowDefinition,
+    savedWorkflowDefinition,
+    workflowDefinitions,
+    workflowDefinitionsLoading,
+  ]);
 
   const restoreWorkflowVersion = async (version: WorkflowVersion) => {
     let definition = savedWorkflowDefinition;
@@ -2693,6 +4242,7 @@ export default function WorkflowStudio() {
     setContextJson(restored.contextJsonText);
     setComposerDraft(restored.composerDraft);
     setWorkflowInterface(restored.workflowInterface);
+    setWorkflowRuntimeSettings(restored.runtimeSettings);
     setComposerNodePositions(restored.nodePositions);
     setSavedWorkflowDefinition(definition);
     setPublishedWorkflowVersion(version);
@@ -2700,6 +4250,212 @@ export default function WorkflowStudio() {
     resetStudioTransientState();
     setStudioNotice(`Restored workflow version v${version.version_number}.`);
   };
+
+  useEffect(() => {
+    const routeKey = `${requestedWorkflowDefinitionId}::${requestedWorkflowVersionId}`;
+    if (!requestedWorkflowDefinitionId && !requestedWorkflowVersionId) {
+      handledStudioRouteSelectionRef.current = "";
+      return;
+    }
+    if (handledStudioRouteSelectionRef.current === routeKey) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadRouteSelection = async () => {
+      try {
+        if (requestedWorkflowVersionId) {
+          const definitionId = requestedWorkflowDefinitionId;
+          if (!definitionId) {
+            throw new Error("Workflow version links must include a definition id.");
+          }
+
+          let definition =
+            workflowDefinitions.find((item) => item.id === definitionId) || null;
+          if (!definition) {
+            const definitionResponse = await fetch(
+              `${apiUrl}/workflows/definitions/${encodeURIComponent(definitionId)}`
+            );
+            const definitionBody = (await definitionResponse.json()) as
+              | WorkflowDefinition
+              | { detail?: unknown };
+            if (!definitionResponse.ok) {
+              const detail = (definitionBody as { detail?: unknown }).detail;
+              throw new Error(
+                typeof detail === "string"
+                  ? detail
+                  : `Workflow definition request failed (${definitionResponse.status}).`
+              );
+            }
+            definition = definitionBody as WorkflowDefinition;
+          }
+
+          const versionsResponse = await fetch(
+            `${apiUrl}/workflows/definitions/${encodeURIComponent(definition.id)}/versions`
+          );
+          const versionsBody = (await versionsResponse.json()) as
+            | WorkflowVersion[]
+            | { detail?: unknown };
+          if (!versionsResponse.ok) {
+            const detail = (versionsBody as { detail?: unknown }).detail;
+            throw new Error(
+              typeof detail === "string"
+                ? detail
+                : `Workflow version history request failed (${versionsResponse.status}).`
+            );
+          }
+          const matchingVersion = (Array.isArray(versionsBody) ? versionsBody : []).find(
+            (item) => item.id === requestedWorkflowVersionId
+          );
+          if (!matchingVersion) {
+            throw new Error("Requested workflow version could not be found.");
+          }
+          if (!cancelled) {
+            handledStudioRouteSelectionRef.current = routeKey;
+            await restoreWorkflowVersion(matchingVersion);
+          }
+          return;
+        }
+
+        const definitionId = requestedWorkflowDefinitionId;
+        if (!definitionId) {
+          return;
+        }
+        let definition = workflowDefinitions.find((item) => item.id === definitionId) || null;
+        if (!definition) {
+          const response = await fetch(
+            `${apiUrl}/workflows/definitions/${encodeURIComponent(definitionId)}`
+          );
+          const body = (await response.json()) as WorkflowDefinition | { detail?: unknown };
+          if (!response.ok) {
+            const detail = (body as { detail?: unknown }).detail;
+            throw new Error(
+              typeof detail === "string"
+                ? detail
+                : `Workflow definition request failed (${response.status}).`
+            );
+          }
+          definition = body as WorkflowDefinition;
+        }
+        if (!cancelled) {
+          handledStudioRouteSelectionRef.current = routeKey;
+          restoreWorkflowDefinition(definition);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          handledStudioRouteSelectionRef.current = routeKey;
+          setStudioNotice(
+            error instanceof Error ? error.message : "Failed to load workflow route selection."
+          );
+        }
+      }
+    };
+
+    void loadRouteSelection();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    requestedWorkflowDefinitionId,
+    requestedWorkflowVersionId,
+    restoreWorkflowDefinition,
+    restoreWorkflowVersion,
+    workflowDefinitions,
+  ]);
+
+  useEffect(() => {
+    const routeKey = `${requestedWorkflowDefinitionId}::${requestedWorkflowVersionId}`;
+    const definitionOrVersionPending =
+      (requestedWorkflowDefinitionId || requestedWorkflowVersionId) &&
+      handledStudioRouteSelectionRef.current !== routeKey;
+    const newModePending =
+      requestedStudioMode === "new" && handledStudioRouteSelectionRef.current !== "mode:new";
+    if (definitionOrVersionPending || newModePending) {
+      return;
+    }
+
+    const nextDefinitionId = activeWorkflowDefinitionId || "";
+    const nextVersionId = activeWorkflowVersionId || "";
+    if (
+      nextDefinitionId === requestedWorkflowDefinitionId &&
+      nextVersionId === requestedWorkflowVersionId &&
+      !requestedStudioMode
+    ) {
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (activeStudioSurface === "workbench") {
+      params.set("surface", "workbench");
+    }
+    if (nextDefinitionId) {
+      params.set("definition", nextDefinitionId);
+    }
+    if (nextVersionId) {
+      params.set("version", nextVersionId);
+    }
+    const nextUrl = params.size > 0 ? `${pathname}?${params.toString()}` : pathname;
+    router.replace(nextUrl, { scroll: false });
+  }, [
+    activeWorkflowDefinitionId,
+    activeWorkflowVersionId,
+    pathname,
+    requestedStudioMode,
+    activeStudioSurface,
+    requestedWorkflowDefinitionId,
+    requestedWorkflowVersionId,
+    router,
+  ]);
+
+  const switchStudioSurface = (
+    nextSurface: StudioSurface,
+    options?: { clearWorkflowSelection?: boolean }
+  ) => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (nextSurface === "workbench") {
+      params.set("surface", "workbench");
+    } else {
+      params.delete("surface");
+    }
+    if (options?.clearWorkflowSelection) {
+      params.delete("definition");
+      params.delete("version");
+      params.delete("mode");
+    }
+    const nextUrl = params.size > 0 ? `${pathname}?${params.toString()}` : pathname;
+    router.replace(nextUrl, { scroll: false });
+  };
+
+  useEffect(() => {
+    if (!pendingWorkbenchWorkflowDraft) {
+      return;
+    }
+    setGoal(pendingWorkbenchWorkflowDraft.goal);
+    setContextJson(pendingWorkbenchWorkflowDraft.contextJsonText);
+    setComposerDraft({
+      summary: pendingWorkbenchWorkflowDraft.summary,
+      nodes: pendingWorkbenchWorkflowDraft.nodes,
+      edges: normalizeComposerEdges(
+        pendingWorkbenchWorkflowDraft.nodes,
+        pendingWorkbenchWorkflowDraft.edges
+      ),
+    });
+    setWorkflowInterface(pendingWorkbenchWorkflowDraft.workflowInterface);
+    setWorkflowRuntimeSettings(
+      pendingWorkbenchWorkflowDraft.runtimeSettings || initialWorkflowRuntimeSettings()
+    );
+    setComposerNodePositions(pendingWorkbenchWorkflowDraft.nodePositions);
+    setSavedWorkflowDefinition(null);
+    setPublishedWorkflowVersion(null);
+    setLoadedWorkflowVersionId(null);
+    setWorkflowVersions([]);
+    setWorkflowTriggers([]);
+    setWorkflowRuns([]);
+    resetStudioTransientState();
+    setStudioNotice(pendingWorkbenchWorkflowDraft.notice || "Imported from workbench run.");
+    switchStudioSurface("workflow", { clearWorkflowSelection: true });
+    setPendingWorkbenchWorkflowDraft(null);
+  }, [pendingWorkbenchWorkflowDraft]);
 
   const saveWorkflowDefinition = async () => {
     if (contextState.invalid) {
@@ -2716,7 +4472,7 @@ export default function WorkflowStudio() {
           method: savedWorkflowDefinition ? "PUT" : "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            title: composerDraft.summary || goal.trim() || "Workflow Studio draft",
+            title: composerDraft.summary || goal.trim() || "Workflow Builder draft",
             goal: goal.trim(),
             context_json: withWorkspaceUserContext(contextState.context),
             draft: persistedWorkflowDraft,
@@ -2735,6 +4491,8 @@ export default function WorkflowStudio() {
       }
       const definition = body as WorkflowDefinition;
       setSavedWorkflowDefinition(definition);
+      setPublishedWorkflowVersion(null);
+      setLoadedWorkflowVersionId(null);
       void refreshWorkflowDefinitions();
       void refreshWorkflowTriggers(definition.id);
       void refreshWorkflowRuns(definition.id);
@@ -2817,78 +4575,6 @@ export default function WorkflowStudio() {
       );
     } catch (error) {
       setStudioNotice(error instanceof Error ? error.message : "Failed to run workflow version.");
-    } finally {
-      setWorkflowActionLoading(null);
-    }
-  };
-
-  const createManualWorkflowTrigger = async () => {
-    if (!activeWorkflowDefinitionId || !savedWorkflowDefinition) {
-      setStudioNotice("Save or open a workflow definition before creating a trigger.");
-      return;
-    }
-    setWorkflowActionLoading("save");
-    try {
-      const response = await fetch(
-        `${apiUrl}/workflows/definitions/${encodeURIComponent(activeWorkflowDefinitionId)}/triggers`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: `${savedWorkflowDefinition.title} manual trigger`,
-            trigger_type: "manual",
-            enabled: true,
-            config: { version_mode: "latest_published" },
-            user_id: workspaceUserId.trim() || undefined,
-            metadata: { source: "workflow_studio" },
-          }),
-        }
-      );
-      const body = (await response.json()) as WorkflowTrigger | { detail?: unknown };
-      if (!response.ok) {
-        const detail = (body as { detail?: unknown }).detail;
-        throw new Error(
-          typeof detail === "string"
-            ? detail
-            : `Create trigger failed (${response.status}).`
-        );
-      }
-      void refreshWorkflowTriggers(activeWorkflowDefinitionId);
-      setStudioNotice(`Created manual trigger ${(body as WorkflowTrigger).title}.`);
-    } catch (error) {
-      setStudioNotice(error instanceof Error ? error.message : "Failed to create workflow trigger.");
-    } finally {
-      setWorkflowActionLoading(null);
-    }
-  };
-
-  const invokeWorkflowTrigger = async (trigger: WorkflowTrigger) => {
-    setWorkflowActionLoading("run");
-    try {
-      const response = await fetch(
-        `${apiUrl}/workflows/triggers/${encodeURIComponent(trigger.id)}/invoke`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ priority: 0 }),
-        }
-      );
-      const body = (await response.json()) as WorkflowRunResult | { detail?: unknown };
-      if (!response.ok) {
-        const detail = (body as { detail?: unknown }).detail;
-        throw new Error(
-          typeof detail === "string"
-            ? detail
-            : `Trigger invoke failed (${response.status}).`
-        );
-      }
-      const result = body as WorkflowRunResult;
-      setPublishedWorkflowVersion(result.workflow_version);
-      setLoadedWorkflowVersionId(result.workflow_version.id);
-      void refreshWorkflowRuns(result.workflow_definition.id);
-      setStudioNotice(`Triggered job ${result.job.id} via ${trigger.title}.`);
-    } catch (error) {
-      setStudioNotice(error instanceof Error ? error.message : "Failed to invoke workflow trigger.");
     } finally {
       setWorkflowActionLoading(null);
     }
@@ -3297,363 +4983,1800 @@ export default function WorkflowStudio() {
     );
   };
 
-  return (
-    <div className="space-y-6">
-      <ScreenHeader
-        eyebrow="Agentic Workflow Studio"
-        title="Design DAGs before you run them."
-        description="Build visual workflows with a capability palette on the left, graph canvas in the middle, and node inspector plus compile preview on the right."
-        activeScreen="studio"
-        actions={
-          <>
-            <button
-              className={screenHeaderSecondaryActionClassName}
-              onClick={startFreshStudioDraft}
-            >
-              New Draft
-            </button>
-            <button
-              className={screenHeaderSecondaryActionClassName}
-              onClick={saveWorkflowDefinition}
-              disabled={workflowActionLoading !== null}
-            >
-              {workflowActionLoading === "save" ? "Saving..." : "Save Draft"}
-            </button>
-            <button
-              className={screenHeaderSecondaryActionClassName}
-              onClick={publishWorkflowVersion}
-              disabled={workflowActionLoading !== null}
-            >
-              {workflowActionLoading === "publish" ? "Publishing..." : "Publish Version"}
-            </button>
-            <button
-              className={screenHeaderSecondaryActionClassName}
-              onClick={runWorkflowVersion}
-              disabled={workflowActionLoading !== null}
-            >
-              {workflowActionLoading === "run" ? "Starting..." : "Run Workflow"}
-            </button>
-            <button
-              className={screenHeaderPrimaryActionClassName}
-              onClick={runChainPreflight}
-              disabled={composerCompileLoading || chainPreflightLoading || workflowActionLoading !== null}
-            >
-              {composerCompileLoading || chainPreflightLoading ? "Compiling..." : "Compile Preview"}
-            </button>
-          </>
-        }
-      >
-        <div className="mt-6 rounded-2xl border border-white/15 bg-white/10 px-4 py-4 text-white/95">
-          <div className="flex flex-wrap items-end gap-3">
-            <label className="min-w-[220px] flex-1">
-              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100">
-                Memory User ID
+  const workflowSetupPanel = (
+    <section className="px-3 py-3 text-slate-100">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100/68">
+            Workflow Setup
+          </div>
+          <h2 className="mt-1 text-base font-semibold tracking-[-0.02em] text-white">
+            Goal, context, and validation
+          </h2>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
+              goal.trim()
+                ? "border-emerald-300/25 bg-emerald-400/12 text-emerald-200"
+                : "border-white/10 bg-white/[0.05] text-slate-200"
+            }`}
+          >
+            {goal.trim() ? "goal set" : "goal empty"}
+          </span>
+          <span
+            className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
+              contextState.invalid
+                ? "border-rose-300/25 bg-rose-400/12 text-rose-200"
+                : "border-sky-300/25 bg-sky-400/12 text-sky-100"
+            }`}
+          >
+            {contextState.invalid ? "json invalid" : "json ready"}
+          </span>
+          <button
+            type="button"
+            className="rounded-full border border-white/10 bg-slate-950/16 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-white/16 hover:bg-slate-950/24"
+            onClick={() => setWorkflowSetupExpanded((prev) => !prev)}
+          >
+            {workflowSetupExpanded ? "Hide Setup" : "Expand Setup"}
+          </button>
+        </div>
+      </div>
+
+      <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+        <div className="rounded-2xl border border-white/8 bg-slate-950/14 px-3 py-2.5">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300/58">
+            Goal
+          </div>
+          <div className="mt-1 line-clamp-2 text-sm text-slate-100">
+            {goal.trim() || "Set the workflow objective."}
+          </div>
+        </div>
+        <div className="rounded-2xl border border-white/8 bg-slate-950/14 px-3 py-2.5">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300/58">
+            Draft
+          </div>
+          <div className="mt-1 line-clamp-2 text-sm text-slate-100">
+            {composerDraft.summary.trim() || "Workflow Builder draft"}
+          </div>
+        </div>
+        <div className="rounded-2xl border border-white/8 bg-slate-950/14 px-3 py-2.5">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300/58">
+            Context User
+          </div>
+          <div className="mt-1 truncate text-sm text-slate-100">
+            {workspaceUserId.trim() || "Not set"}
+          </div>
+        </div>
+        <div className="rounded-2xl border border-white/8 bg-slate-950/14 px-3 py-2.5">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300/58">
+            Context Paths
+          </div>
+          <div className="mt-1 text-sm text-slate-100">
+            {contextState.invalid ? "Unavailable" : `${contextPathSuggestions.length} detected`}
+          </div>
+        </div>
+        <div className="rounded-2xl border border-white/8 bg-slate-950/14 px-3 py-2.5">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300/58">
+            Execution Mode
+          </div>
+          <div className="mt-1 text-sm text-slate-100">
+            {workflowRuntimeSettings.executionMode === "adaptive" ? "Adaptive" : "Static"}
+          </div>
+          <div className="mt-1 text-[11px] text-slate-300/60">
+            Max replans {workflowRuntimeSettings.adaptivePolicy?.maxReplans ?? 2}
+          </div>
+        </div>
+      </div>
+
+      {workflowSetupExpanded ? (
+        <div className="mt-3 space-y-3 border-t border-white/8 pt-3">
+          <div className="grid gap-3 lg:grid-cols-4">
+            <label className="block">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-200/72">
+                Goal
               </div>
               <input
-                className="mt-2 w-full rounded-2xl border border-white/15 bg-white/10 px-3 py-2 text-sm text-white outline-none transition placeholder:text-white/45 focus:border-white/40 focus:bg-white/15"
+                className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950/18 px-3 py-2 text-sm text-white outline-none transition placeholder:text-slate-300/42 focus:border-sky-300/40 focus:bg-slate-950/28"
+                value={goal}
+                onChange={(event) => setGoal(event.target.value)}
+                placeholder="Generate a document pipeline with validation and render output"
+              />
+            </label>
+            <label className="block">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-200/72">
+                Draft Summary
+              </div>
+              <input
+                className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950/18 px-3 py-2 text-sm text-white outline-none transition placeholder:text-slate-300/42 focus:border-sky-300/40 focus:bg-slate-950/28"
+                value={composerDraft.summary}
+                onChange={(event) =>
+                  setComposerDraft((prev) => ({ ...prev, summary: event.target.value }))
+                }
+                placeholder="Workflow Builder draft"
+              />
+            </label>
+            <label className="block">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-200/72">
+                Context User ID
+              </div>
+              <input
+                className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950/18 px-3 py-2 text-sm text-white outline-none transition placeholder:text-slate-300/42 focus:border-sky-300/40 focus:bg-slate-950/28"
                 value={workspaceUserId}
                 onChange={(event) => setWorkspaceUserId(event.target.value)}
                 placeholder="narendersurabhi"
               />
+              <div className="mt-2 text-xs leading-5 text-slate-200/62">
+                User-scoped memory bindings inherit this id automatically unless a node overrides it
+                explicitly.
+              </div>
             </label>
-            <div className="max-w-xl text-xs leading-5 text-slate-200">
-              User-scoped memory bindings inherit this id automatically unless a node overrides
-              it explicitly.
-            </div>
+            <label className="block">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-200/72">
+                Execution Mode
+              </div>
+              <select
+                className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950/18 px-3 py-2 text-sm text-white outline-none transition focus:border-sky-300/40 focus:bg-slate-950/28"
+                value={workflowRuntimeSettings.executionMode || "static"}
+                onChange={(event) =>
+                  setWorkflowRuntimeSettings((prev) => ({
+                    executionMode: event.target.value === "adaptive" ? "adaptive" : "static",
+                    adaptivePolicy: {
+                      maxReplans: prev.adaptivePolicy?.maxReplans ?? 2,
+                    },
+                  }))
+                }
+              >
+                <option value="static">Static</option>
+                <option value="adaptive">Adaptive</option>
+              </select>
+              <div className="mt-2 text-xs leading-5 text-slate-200/62">
+                Adaptive mode only affects published workflow runs. Draft compile and preflight stay deterministic.
+              </div>
+            </label>
           </div>
-        </div>
-      </ScreenHeader>
 
-      {studioNotice ? (
-        <div className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-800">
-          {studioNotice}
+          <label className="block max-w-xs">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-200/72">
+              Max Adaptive Replans
+            </div>
+            <input
+              type="number"
+              min={0}
+              max={10}
+              className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950/18 px-3 py-2 text-sm text-white outline-none transition focus:border-sky-300/40 focus:bg-slate-950/28"
+              value={workflowRuntimeSettings.adaptivePolicy?.maxReplans ?? 2}
+              onChange={(event) =>
+                setWorkflowRuntimeSettings((prev) => ({
+                  executionMode: prev.executionMode || "static",
+                  adaptivePolicy: {
+                    maxReplans: Math.max(0, Math.min(10, Number(event.target.value) || 0)),
+                  },
+                }))
+              }
+            />
+            <div className="mt-2 text-xs leading-5 text-slate-200/62">
+              Used only when execution mode is adaptive.
+            </div>
+          </label>
+
+          <label className="block">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-200/72">
+                Context JSON
+              </div>
+              <div className="text-xs text-slate-300/55">
+                {contextState.invalid ? "Invalid JSON" : "Object ready"}
+              </div>
+            </div>
+            <textarea
+              className="mt-1 min-h-[180px] w-full rounded-[18px] border border-white/8 bg-[#233142] px-3 py-3 font-mono text-xs text-slate-100 outline-none transition placeholder:text-slate-400/40 focus:border-sky-300/40 focus:bg-[#1c2939]"
+              value={contextJson}
+              onChange={(event) => setContextJson(event.target.value)}
+            />
+          </label>
         </div>
       ) : null}
 
-      <div className="grid gap-6 xl:grid-cols-[320px_minmax(0,1fr)_360px]">
-            <StudioCapabilityPalette
-              capabilities={paletteCapabilities}
-              groups={paletteGroups}
-          loading={capabilityLoading}
-          error={capabilityError}
-          query={paletteQuery}
-          selectedGroup={paletteGroup}
-              onQueryChange={setPaletteQuery}
-              onGroupChange={setPaletteGroup}
-              onAddCapability={addCapabilityNodeToStudio}
-              onAddControl={addControlNodeToStudio}
-            />
+      <ComposerValidationPanel
+        preflightResult={chainPreflightResult}
+        compileLoading={composerCompileLoading || chainPreflightLoading}
+        issues={composerIssues}
+        needsValidation={visualChainNodes.length > 0}
+        onIssueClick={focusComposerValidationIssue}
+        activeIssue={activeComposerIssueFocus}
+        formatTimestamp={formatTimestamp}
+      />
+    </section>
+  );
 
-        <div className="space-y-6">
-          <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
-            <div className="grid gap-4 lg:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.9fr)]">
-              <label className="block">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                  Goal
-                </div>
-                <input
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:bg-white"
-                  value={goal}
-                  onChange={(event) => setGoal(event.target.value)}
-                  placeholder="Generate a document pipeline with validation and render output"
-                />
-              </label>
-              <label className="block">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                  Draft Summary
-                </div>
-                <input
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:bg-white"
-                  value={composerDraft.summary}
-                  onChange={(event) =>
-                    setComposerDraft((prev) => ({ ...prev, summary: event.target.value }))
-                  }
-                  placeholder="Workflow Studio draft"
-                />
-              </label>
+  const nodeInspectorPanel = (
+    <StudioNodeInspector
+      selectedDagNode={selectedDagNode}
+      selectedDagNodeStatus={selectedDagNodeStatus}
+      inputFields={selectedDagNodeInspectorFields}
+      selectedCapability={selectedCapability}
+      outputSchemaFields={selectedDagNodeOutputSchemaFields}
+      activeComposerIssueFocus={activeComposerIssueFocus}
+      inspectorBindingRefs={inspectorBindingRefs}
+      visualChainNodes={visualChainNodes}
+      outputPathSuggestionsForNode={studioOutputPathSuggestionsForNode}
+      contextPathSuggestions={contextPathSuggestions}
+      workflowInterface={workflowInterface}
+      autoWireNodeBindings={autoWireNodeBindings}
+      quickFixNodeBindings={quickFixNodeBindings}
+      setSelectedDagNodeId={setSelectedDagNodeId}
+      capabilityIdOptionsId="studio-capability-id-options"
+      compactMode={studioWorkspaceMode === "focus_graph"}
+      onDeleteNode={removeVisualChainNode}
+      updateNodeBasics={updateVisualChainNode}
+      setVisualBindingMode={setVisualBindingMode}
+      clearVisualBinding={clearVisualBinding}
+      removeCustomInputField={removeCustomInputField}
+      addCustomInputField={addCustomInputField}
+      updateVisualBindingSourceNode={updateVisualBindingSourceNode}
+      updateVisualBindingPath={updateVisualBindingPath}
+      updateVisualBindingLiteral={updateVisualBindingLiteral}
+      updateVisualBindingContextPath={updateVisualBindingContextPath}
+      updateVisualBindingMemory={updateVisualBindingMemory}
+      updateVisualBindingWorkflowInput={updateVisualBindingWorkflowInput}
+      updateVisualBindingWorkflowVariable={updateVisualBindingWorkflowVariable}
+      setVisualBindingFromPrevious={setVisualBindingFromPrevious}
+      addNodeOutput={addNodeOutput}
+      upsertNodeOutputFromSchema={upsertNodeOutputFromSchema}
+      updateNodeOutput={updateNodeOutput}
+      removeNodeOutput={removeNodeOutput}
+      addNodeVariable={addNodeVariable}
+      updateNodeVariable={updateNodeVariable}
+      removeNodeVariable={removeNodeVariable}
+      updateNodeControlConfig={updateNodeControlConfig}
+      addSwitchCase={addSwitchCase}
+      updateSwitchCase={updateSwitchCase}
+      removeSwitchCase={removeSwitchCase}
+    />
+  );
+
+  const workflowLibraryLauncherPanel = (
+    <section className="flex h-full flex-col px-3 py-3 text-slate-100">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-100/68">
+            Saved Workflows
+          </div>
+          <h3 className="mt-1 text-2xl text-white">Workflow Launcher</h3>
+        </div>
+        <button
+          className="rounded-full border border-white/12 bg-white/[0.05] px-3 py-1.5 text-xs font-semibold text-slate-100 transition hover:border-sky-300/40 hover:bg-white/[0.08]"
+          onClick={() => {
+            void refreshWorkflowDefinitions();
+            if (activeWorkflowDefinitionId) {
+              void refreshWorkflowVersions(activeWorkflowDefinitionId);
+              void refreshWorkflowTriggers(activeWorkflowDefinitionId);
+              void refreshWorkflowRuns(activeWorkflowDefinitionId);
+            }
+          }}
+        >
+          Refresh
+        </button>
+      </div>
+
+      <p className="mt-3 text-sm leading-6 text-slate-300/82">
+        Keep Studio focused on editing. Use the full Workflows page for version history, triggers,
+        run history, and draft management.
+      </p>
+
+      <div className="mt-4 flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.14em]">
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          drafts {workflowDefinitions.length}
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          versions {workflowVersions.length}
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          runs {workflowRuns.length}
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-slate-100">
+          {activeWorkflowVersionId ? "version linked" : "draft only"}
+        </span>
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300/60">
+          Current Workflow
+        </div>
+        {savedWorkflowDefinition ? (
+          <>
+            <div className="mt-2 truncate text-sm font-semibold text-white">
+              {savedWorkflowDefinition.title}
             </div>
-            <label className="mt-4 block">
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                  Context JSON
-                </div>
-                <div className="text-xs text-slate-500">
-                  {contextState.invalid ? "Invalid JSON" : "Object ready"}
-                </div>
-              </div>
-              <textarea
-                className="mt-1 min-h-[180px] w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3 font-mono text-xs text-slate-900 outline-none transition focus:border-slate-400 focus:bg-white"
-                value={contextJson}
-                onChange={(event) => setContextJson(event.target.value)}
-              />
-            </label>
-            <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                Steps <span className="font-semibold">{visualChainSummary.steps}</span>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                DAG edges <span className="font-semibold">{visualChainSummary.dagEdges}</span>
-              </div>
-              <div
-                className={`rounded-2xl border px-3 py-2 ${
-                  visualChainSummary.missingInputs > 0
-                    ? "border-rose-200 bg-rose-50 text-rose-700"
-                    : "border-emerald-200 bg-emerald-50 text-emerald-700"
+            <div className="mt-1 text-xs leading-5 text-slate-300/76">
+              {savedWorkflowDefinition.goal || "No goal recorded for this workflow."}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-400">
+              <span className="rounded-full bg-white/[0.06] px-2.5 py-1">
+                updated {formatTimestamp(savedWorkflowDefinition.updated_at)}
+              </span>
+              <span className="rounded-full bg-white/[0.06] px-2.5 py-1">
+                {activeWorkflowVersionId ? `version ${activeWorkflowVersionId.slice(0, 8)}` : "draft"}
+              </span>
+            </div>
+          </>
+        ) : (
+          <div className="mt-2 text-sm leading-6 text-slate-300/72">
+            Save a draft or open one from Workflows to make this Studio session shareable.
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 flex items-center justify-between gap-3">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300/75">
+          Recent Drafts
+        </div>
+        <Link
+          href="/workflows"
+          className="rounded-full border border-white/12 bg-white/[0.05] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
+        >
+          Open Workflows
+        </Link>
+      </div>
+
+      <div className="mt-3 flex-1 space-y-2 overflow-auto pr-1">
+        {workflowDefinitionsLoading ? (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3 text-sm text-slate-300/72">
+            Loading saved workflows...
+          </div>
+        ) : workflowDefinitionsError ? (
+          <div className="rounded-2xl border border-rose-300/24 bg-rose-400/10 px-3 py-3 text-sm text-rose-100">
+            {workflowDefinitionsError}
+          </div>
+        ) : workflowDefinitions.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-white/12 bg-white/[0.03] px-3 py-4 text-sm text-slate-300/72">
+            No saved workflows yet. Save this draft, then use Workflows for deeper history and
+            management.
+          </div>
+        ) : (
+          workflowDefinitions.slice(0, 4).map((definition) => {
+            const isActive = definition.id === activeWorkflowDefinitionId;
+            return (
+              <article
+                key={definition.id}
+                className={`rounded-2xl border px-3 py-3 ${
+                  isActive
+                    ? "border-sky-300/24 bg-sky-400/10"
+                    : "border-white/10 bg-white/[0.04]"
                 }`}
               >
-                Missing <span className="font-semibold">{visualChainSummary.missingInputs}</span>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700">
-                Context hits <span className="font-semibold">{visualChainSummary.contextInputs}</span>
-              </div>
-            </div>
-            <ComposerValidationPanel
-              preflightResult={chainPreflightResult}
-              compileLoading={composerCompileLoading || chainPreflightLoading}
-              issues={composerIssues}
-              needsValidation={visualChainNodes.length > 0}
-              onIssueClick={focusComposerValidationIssue}
-              activeIssue={activeComposerIssueFocus}
-              formatTimestamp={formatTimestamp}
-            />
-          </section>
-
-          <StudioWorkflowInterfacePanel
-            workflowInterface={workflowInterface}
-            contextPathSuggestions={contextPathSuggestions}
-            visualChainNodes={visualChainNodes}
-            outputPathSuggestionsForNode={outputPathSuggestionsForNode}
-            onAddInput={addWorkflowInputDefinition}
-            onUpdateInput={updateWorkflowInputDefinition}
-            onRemoveInput={removeWorkflowInputDefinition}
-            onAddVariable={addWorkflowVariableDefinition}
-            onUpdateVariable={updateWorkflowVariableDefinition}
-            onRemoveVariable={removeWorkflowVariableDefinition}
-            onAddOutput={addWorkflowOutputDefinition}
-            onUpdateOutput={updateWorkflowOutputDefinition}
-            onRemoveOutput={removeWorkflowOutputDefinition}
-          />
-
-          <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                  Canvas
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-white">
+                      {definition.title}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-300/70">
+                      updated {formatTimestamp(definition.updated_at)}
+                    </div>
+                  </div>
+                  {isActive ? (
+                    <span className="rounded-full border border-sky-300/24 bg-sky-400/12 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-sky-100">
+                      Active
+                    </span>
+                  ) : null}
                 </div>
-                <h2 className="mt-1 font-display text-2xl text-slate-900">Workflow Graph</h2>
-              </div>
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <div className="line-clamp-2 text-xs leading-5 text-slate-300/76">
+                    {definition.goal || "No goal recorded for this workflow."}
+                  </div>
+                  <button
+                    className="rounded-full border border-white/12 bg-white/[0.05] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
+                    onClick={() => restoreWorkflowDefinition(definition)}
+                  >
+                    Open
+                  </button>
+                </div>
+              </article>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+
+  const getNextFloatingStudioPanelZIndex = (
+    panels: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+  ) => Math.max(...FLOATING_STUDIO_PANEL_IDS.map((panelId) => panels[panelId].zIndex)) + 1;
+
+  const syncStudioPanelsToStage = (
+    panels: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>,
+    stageWidth: number,
+    stageHeight: number
+  ) => {
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    return FLOATING_STUDIO_PANEL_IDS.reduce<Record<FloatingStudioPanelId, FloatingStudioPanelLayout>>(
+      (acc, panelId) => {
+        const measured = floatingStudioPanelRefs.current[panelId];
+        const defaultLayout =
+          panels[panelId].mode === "docked" && panels[panelId].dockZone !== defaults[panelId].dockZone
+            ? { ...defaults[panelId], dockZone: panels[panelId].dockZone }
+            : defaults[panelId];
+        acc[panelId] = syncFloatingStudioPanelLayoutToStage(
+          panels[panelId],
+          defaultLayout,
+          stageWidth,
+          stageHeight,
+          measured?.offsetWidth,
+          measured?.offsetHeight
+        );
+        return acc;
+      },
+      {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+    );
+  };
+
+  const buildFocusGraphPanelLayouts = (
+    panels: Record<FloatingStudioPanelId, FloatingStudioPanelLayout>,
+    stageWidth: number,
+    stageHeight: number,
+    preserveInspector: boolean
+  ) => {
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    return FLOATING_STUDIO_PANEL_IDS.reduce<Record<FloatingStudioPanelId, FloatingStudioPanelLayout>>(
+      (acc, panelId) => {
+        const current = panels[panelId];
+        if (panelId === "inspector" && preserveInspector) {
+          acc[panelId] = syncFloatingStudioPanelLayoutToStage(
+            {
+              ...current,
+              mode: "docked",
+              dockZone: "right",
+              minimized: false,
+            },
+            defaults.inspector,
+            stageWidth,
+            stageHeight
+          );
+          return acc;
+        }
+        acc[panelId] =
+          current.mode === "floating"
+            ? clampFloatingStudioPanelLayout(
+                {
+                  ...current,
+                  minimized: true,
+                },
+                stageWidth,
+                stageHeight
+              )
+            : syncFloatingStudioPanelLayoutToStage(
+                {
+                  ...current,
+                  minimized: true,
+                },
+                current.dockZone === defaults[panelId].dockZone
+                  ? defaults[panelId]
+                  : { ...defaults[panelId], dockZone: current.dockZone },
+                stageWidth,
+                stageHeight
+              );
+        return acc;
+      },
+      {} as Record<FloatingStudioPanelId, FloatingStudioPanelLayout>
+    );
+  };
+
+  useEffect(() => {
+    if (!selectedDagNodeId) {
+      return;
+    }
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    setFloatingStudioPanels((prev) => {
+      const inspector = prev.inspector;
+      const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+      if (studioWorkspaceMode === "focus_graph") {
+        return {
+          ...prev,
+          inspector: syncFloatingStudioPanelLayoutToStage(
+            {
+              ...inspector,
+              mode: "docked",
+              dockZone: "right",
+              minimized: false,
+            },
+            defaults.inspector,
+            stageWidth,
+            stageHeight
+          ),
+        };
+      }
+      if (
+        inspector.mode !== "docked" ||
+        inspector.dockZone !== "right" ||
+        inspector.minimized
+      ) {
+        return {
+          ...prev,
+          inspector: syncFloatingStudioPanelLayoutToStage(
+            {
+              ...inspector,
+              mode: "docked",
+              dockZone: "right",
+              minimized: false,
+            },
+            defaults.inspector,
+            stageWidth,
+            stageHeight
+          ),
+        };
+      }
+      return prev;
+    });
+  }, [
+    selectedDagNodeId,
+    studioWorkspaceMode,
+    studioWorkspaceStageSize.height,
+    studioWorkspaceStageSize.width,
+  ]);
+
+  const bringFloatingStudioPanelToFront = (panelId: FloatingStudioPanelId) => {
+    setFloatingStudioPanels((prev) => {
+      if (prev[panelId].mode !== "floating") {
+        return prev;
+      }
+      const nextZIndex = getNextFloatingStudioPanelZIndex(prev);
+      return {
+        ...prev,
+        [panelId]: {
+          ...prev[panelId],
+          zIndex: nextZIndex,
+        },
+      };
+    });
+  };
+
+  const setFloatingStudioPanelDocked = (
+    panelId: FloatingStudioPanelId,
+    dockZone: Exclude<StudioDockZone, "overlay" | "none">
+  ) => {
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    setFloatingStudioPanels((prev) => ({
+      ...prev,
+      [panelId]: syncFloatingStudioPanelLayoutToStage(
+        {
+          ...prev[panelId],
+          mode: "docked",
+          dockZone,
+          minimized: false,
+        },
+        { ...defaults[panelId], dockZone },
+        stageWidth,
+        stageHeight
+      ),
+    }));
+    if (dockZone === "bottom") {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        activePanelId: panelId,
+        collapsed: false,
+      }));
+    }
+  };
+
+  const setFloatingStudioPanelFloating = (panelId: FloatingStudioPanelId) => {
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    setFloatingStudioPanels((prev) => {
+      const current = prev[panelId];
+      const nextZIndex = getNextFloatingStudioPanelZIndex(prev);
+      return {
+        ...prev,
+        [panelId]: clampFloatingStudioPanelLayout(
+          {
+            ...defaults[panelId],
+            ...current,
+            minimized: false,
+            mode: "floating",
+            dockZone: current.dockZone === "none" ? defaults[panelId].dockZone : current.dockZone,
+            zIndex: nextZIndex,
+          },
+          stageWidth,
+          stageHeight
+        ),
+      };
+    });
+  };
+
+  const revealStudioPanel = (
+    panelId: FloatingStudioPanelId,
+    dockZone?: Exclude<StudioDockZone, "overlay" | "none">
+  ) => {
+    if (dockZone) {
+      setFloatingStudioPanelDocked(panelId, dockZone);
+    } else {
+      setFloatingStudioPanelMinimized(panelId, false);
+    }
+    if (dockZone === "bottom" || floatingStudioPanels[panelId].dockZone === "bottom") {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        activePanelId: panelId,
+        collapsed: false,
+      }));
+    }
+  };
+
+  const setFloatingStudioPanelMinimized = (
+    panelId: FloatingStudioPanelId,
+    minimized: boolean
+  ) => {
+    setFloatingStudioPanels((prev) => {
+      const current = prev[panelId];
+      if (current.minimized === minimized) {
+        return prev;
+      }
+      if (
+        !studioWorkspaceStageSize.width ||
+        !studioWorkspaceStageSize.height ||
+        current.mode !== "floating"
+      ) {
+        return {
+          ...prev,
+          [panelId]: {
+            ...current,
+            minimized,
+          },
+        };
+      }
+      return {
+        ...prev,
+        [panelId]: clampFloatingStudioPanelLayout(
+          {
+            ...current,
+            minimized,
+          },
+          studioWorkspaceStageSize.width,
+          studioWorkspaceStageSize.height
+        ),
+      };
+    });
+  };
+
+  const toggleFloatingStudioPanelMinimized = (panelId: FloatingStudioPanelId) => {
+    setFloatingStudioPanels((prev) => {
+      const current = prev[panelId];
+      const nextMinimized = !current.minimized;
+      if (
+        !studioWorkspaceStageSize.width ||
+        !studioWorkspaceStageSize.height ||
+        current.mode !== "floating"
+      ) {
+        return {
+          ...prev,
+          [panelId]: {
+            ...current,
+            minimized: nextMinimized,
+          },
+        };
+      }
+      return {
+        ...prev,
+        [panelId]: clampFloatingStudioPanelLayout(
+          {
+            ...current,
+            minimized: nextMinimized,
+          },
+          studioWorkspaceStageSize.width,
+          studioWorkspaceStageSize.height
+        ),
+      };
+    });
+  };
+
+  const toggleFloatingStudioPanelMode = (panelId: FloatingStudioPanelId) => {
+    const current = floatingStudioPanels[panelId];
+    if (current.mode === "floating") {
+      const nextDockZone: Exclude<StudioDockZone, "overlay" | "none"> =
+        current.dockZone === "none" || current.dockZone === "overlay"
+          ? (STUDIO_DOCK_ZONE_DEFAULTS[panelId].dockZone as Exclude<
+              StudioDockZone,
+              "overlay" | "none"
+            >)
+          : current.dockZone;
+      setFloatingStudioPanelDocked(
+        panelId,
+        nextDockZone
+      );
+      return;
+    }
+    setFloatingStudioPanelFloating(panelId);
+  };
+
+  const restoreFloatingStudioPanel = (panelId: FloatingStudioPanelId) => {
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    setFloatingStudioPanels((prev) => {
+      const current = prev[panelId];
+      const nextZIndex =
+        current.mode === "floating" ? getNextFloatingStudioPanelZIndex(prev) : current.zIndex;
+      return {
+        ...prev,
+        [panelId]:
+          current.mode === "floating"
+            ? clampFloatingStudioPanelLayout(
+                {
+                  ...defaults[panelId],
+                  mode: "floating",
+                  dockZone:
+                    current.dockZone === "none" ? defaults[panelId].dockZone : current.dockZone,
+                  minimized: false,
+                  zIndex: nextZIndex,
+                },
+                stageWidth,
+                stageHeight
+              )
+            : syncFloatingStudioPanelLayoutToStage(
+                {
+                  ...defaults[panelId],
+                  minimized: false,
+                  zIndex: nextZIndex,
+                },
+                defaults[panelId],
+                stageWidth,
+                stageHeight
+              ),
+      };
+    });
+  };
+
+  const resetFloatingStudioWorkspaceLayout = () => {
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    const defaults = createInitialFloatingStudioPanelLayouts(stageWidth, stageHeight);
+    focusGraphPanelSnapshotRef.current = null;
+    setStudioWorkspaceMode("default");
+    setActiveStudioPanelMenuId(null);
+    setStudioBottomTray(initialStudioBottomTrayState());
+    setFloatingStudioPanels(defaults);
+    setStudioNotice("Workspace layout reset.");
+  };
+
+  const enterFocusGraphMode = () => {
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    setActiveStudioPanelMenuId(null);
+    setFloatingStudioPanels((prev) => {
+      focusGraphPanelSnapshotRef.current = prev;
+      return buildFocusGraphPanelLayouts(
+        prev,
+        stageWidth,
+        stageHeight,
+        Boolean(selectedDagNodeId)
+      );
+    });
+    setStudioWorkspaceMode("focus_graph");
+    setStudioNotice("Focus Graph mode enabled. Press F to restore the workspace.");
+  };
+
+  const exitFocusGraphMode = () => {
+    const stageWidth = studioWorkspaceStageSize.width || 1440;
+    const stageHeight = studioWorkspaceStageSize.height || 1040;
+    const snapshot = focusGraphPanelSnapshotRef.current;
+    setActiveStudioPanelMenuId(null);
+    setStudioWorkspaceMode("default");
+    if (!snapshot) {
+      setStudioNotice("Focus Graph mode cleared.");
+      return;
+    }
+    setFloatingStudioPanels(syncStudioPanelsToStage(snapshot, stageWidth, stageHeight));
+    focusGraphPanelSnapshotRef.current = null;
+    setStudioNotice("Workspace layout restored.");
+  };
+
+  const toggleFocusGraphMode = () => {
+    if (studioWorkspaceMode === "focus_graph") {
+      exitFocusGraphMode();
+      return;
+    }
+    enterFocusGraphMode();
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) {
+        return;
+      }
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      if (isTypingTarget(event.target)) {
+        return;
+      }
+      const normalizedKey = event.key.toLowerCase();
+      if (normalizedKey === "f") {
+        event.preventDefault();
+        toggleFocusGraphMode();
+        return;
+      }
+      if (normalizedKey === "escape") {
+        event.preventDefault();
+        setActiveStudioPanelMenuId(null);
+        setDagEdgeDraftSourceNodeId(null);
+        setDagConnectorDrag(null);
+        setDagCanvasDraggingNodeId(null);
+        setDagConnectorHoverTargetNodeId(null);
+        setSelectedDagNodeId(null);
+        setStudioNotice("Transient graph interactions cleared.");
+        return;
+      }
+      if (normalizedKey === "0") {
+        event.preventDefault();
+        resetDagCanvasZoom();
+        return;
+      }
+      if (!event.shiftKey) {
+        return;
+      }
+      if (event.code === "Digit1") {
+        event.preventDefault();
+        revealStudioPanel("palette", "left");
+        return;
+      }
+      if (event.code === "Digit2") {
+        if (!selectedDagNode) {
+          return;
+        }
+        event.preventDefault();
+        revealStudioPanel("inspector", "right");
+        return;
+      }
+      if (event.code === "Digit3") {
+        event.preventDefault();
+        revealStudioPanel("interface", "bottom");
+        setStudioBottomTray((prev) => ({
+          ...prev,
+          activePanelId: "interface",
+          collapsed: false,
+        }));
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [
+    floatingStudioPanels,
+    selectedDagNode,
+    selectedDagNodeId,
+    studioWorkspaceMode,
+    studioWorkspaceStageSize.height,
+    studioWorkspaceStageSize.width,
+  ]);
+
+  const beginFloatingStudioPanelDrag = (
+    panelId: FloatingStudioPanelId,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    const panel = floatingStudioPanelRefs.current[panelId];
+    if (!panel || floatingStudioPanels[panelId].mode !== "floating") {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const panelRect = panel.getBoundingClientRect();
+    bringFloatingStudioPanelToFront(panelId);
+    setFloatingStudioPanelDrag({
+      id: panelId,
+      offsetX: event.clientX - panelRect.left,
+      offsetY: event.clientY - panelRect.top,
+    });
+  };
+
+  const beginFloatingStudioPanelResize = (
+    panelId: FloatingStudioPanelId,
+    direction: FloatingStudioPanelResizeDirection,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    const panel = floatingStudioPanelRefs.current[panelId];
+    const layout = floatingStudioPanels[panelId];
+    const canResizeDockedPanel =
+      layout.mode === "docked" &&
+      (layout.dockZone === "left" || layout.dockZone === "right") &&
+      (direction === "e" || direction === "w");
+    if ((layout.mode === "floating" && !panel) || (layout.mode !== "floating" && !canResizeDockedPanel)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (layout.mode === "floating") {
+      bringFloatingStudioPanelToFront(panelId);
+    }
+    setFloatingStudioPanelResize({
+      id: panelId,
+      direction,
+      mode: layout.mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: layout.x,
+      startTop: layout.y,
+      startWidth: layout.width,
+      startHeight: layout.height,
+    });
+  };
+
+  const renderDockedStudioPanel = (
+    panelId: FloatingStudioPanelId,
+    title: string,
+    content: ReactNode,
+    options: { bodyClassName?: string; badge?: string; panelDomId?: string } = {}
+  ) => {
+    const layout = floatingStudioPanels[panelId];
+    const isMinimized = layout.minimized;
+    return (
+      <div
+        id={options.panelDomId}
+        key={`docked-studio-panel-${panelId}`}
+        className="flex h-full min-h-0 flex-col overflow-hidden rounded-[24px] border border-white/12 bg-[linear-gradient(180deg,rgba(37,49,61,0.86),rgba(16,24,34,0.9))] shadow-[0_18px_36px_rgba(15,23,42,0.24)] backdrop-blur-xl"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-white/8 bg-[rgba(9,16,27,0.46)] px-3 py-2">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5">
               <button
-                className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-900 hover:text-slate-900 disabled:opacity-50"
-                onClick={autoLayoutDagCanvas}
-                disabled={visualChainNodes.length === 0}
-              >
-                Auto Layout
-              </button>
+                type="button"
+                aria-label={isMinimized ? `Open ${title}` : `Minimize ${title}`}
+                title={isMinimized ? "Open panel" : "Minimize panel"}
+                className="h-3 w-3 rounded-full bg-[#f6cf58] shadow-[inset_0_1px_0_rgba(255,255,255,0.34),0_0_0_1px_rgba(125,77,0,0.2)] transition hover:brightness-105"
+                onClick={() => toggleFloatingStudioPanelMinimized(panelId)}
+              />
+              <button
+                type="button"
+                aria-label={`Restore ${title}`}
+                title="Reset panel"
+                className="h-3 w-3 rounded-full bg-[#50d16e] shadow-[inset_0_1px_0_rgba(255,255,255,0.28),0_0_0_1px_rgba(6,95,70,0.2)] transition hover:brightness-105"
+                onClick={() => restoreFloatingStudioPanel(panelId)}
+              />
             </div>
+            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-100">
+              {title}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className="rounded-full border border-white/10 bg-white/[0.06] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-white/16 hover:bg-white/[0.1]"
+              onClick={() => toggleFloatingStudioPanelMode(panelId)}
+            >
+              Float
+            </button>
+            {renderStudioPanelActionMenu(panelId)}
+            {options.badge ? (
+              <div className="rounded-full border border-white/10 bg-white/[0.06] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+                {options.badge}
+              </div>
+            ) : null}
+          </div>
+        </div>
+        {!isMinimized ? (
+          <div className={`min-h-0 flex-1 overflow-auto ${options.bodyClassName || ""}`.trim()}>
+            {content}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
 
-            <ComposerDagCanvas
-              visualChainNodes={visualChainNodes}
-              dagEdgeDraftSourceNodeId={dagEdgeDraftSourceNodeId}
-              setDagEdgeDraftSourceNodeId={setDagEdgeDraftSourceNodeId}
-              setDagConnectorDrag={setDagConnectorDrag}
-              setDagConnectorHoverTargetNodeId={setDagConnectorHoverTargetNodeId}
-              autoLayoutDagCanvas={autoLayoutDagCanvas}
-              dagCanvasViewportRef={dagCanvasViewportRef}
-              dagCanvasRef={dagCanvasRef}
-              dagCanvasSurface={dagCanvasSurface}
-              dagCanvasEdges={dagCanvasEdges}
-              hoveredDagEdgeKey={hoveredDagEdgeKey}
-              setHoveredDagEdgeKey={setHoveredDagEdgeKey}
-              removeDagEdge={removeDagEdge}
-              dagConnectorPreview={dagConnectorPreview}
-              dagCanvasNodes={dagCanvasNodes}
-              composerDraftEdges={composerDraftEdges}
-              dagNodeAdjacency={dagNodeAdjacency}
-              visualChainNodeStatusById={visualChainNodeStatusById as Map<
-                string,
-                { missingCount: number; requiredCount: number }
-              >}
-              selectedDagNodeId={selectedDagNodeId}
-              setSelectedDagNodeId={setSelectedDagNodeId}
-              dagConnectorDrag={dagConnectorDrag}
-              dagCanvasDraggingNodeId={dagCanvasDraggingNodeId}
-              dagConnectorHoverTargetNodeId={dagConnectorHoverTargetNodeId}
-              addDagEdge={addDagEdge}
-              beginDagNodeDrag={beginDagNodeDrag}
-              isInteractiveCanvasTarget={isInteractiveCanvasTarget}
-              beginDagConnectorDrag={beginDagConnectorDrag}
-              centerDagNodeInView={centerDagNodeInView}
-              nodeWidth={DAG_CANVAS_NODE_WIDTH}
-              nodeHeight={DAG_CANVAS_NODE_HEIGHT}
+  const renderFloatingStudioPanel = (
+    panelId: FloatingStudioPanelId,
+    title: string,
+    content: ReactNode,
+    options: { bodyClassName?: string; badge?: string; panelDomId?: string } = {}
+  ) => {
+    const layout = floatingStudioPanels[panelId];
+    const isMinimized = layout.minimized;
+    return (
+      <div
+        id={options.panelDomId}
+        ref={(node) => {
+          floatingStudioPanelRefs.current[panelId] = node;
+        }}
+        key={`floating-studio-panel-${panelId}`}
+        className="pointer-events-auto absolute flex flex-col overflow-hidden rounded-[24px] border border-white/12 bg-[linear-gradient(180deg,rgba(40,53,67,0.62),rgba(19,28,39,0.72))] shadow-[0_28px_64px_rgba(15,23,42,0.34)] backdrop-blur-xl"
+        style={{
+          left: layout.x,
+          top: layout.y,
+          width: layout.width,
+          height: isMinimized ? FLOATING_STUDIO_PANEL_HEADER_HEIGHT : layout.height,
+          zIndex: layout.zIndex,
+        }}
+        onMouseDown={() => bringFloatingStudioPanelToFront(panelId)}
+      >
+        <div
+          className="flex cursor-grab items-center justify-between gap-3 border-b border-white/8 bg-[rgba(9,16,27,0.38)] px-3 py-2 active:cursor-grabbing"
+          onMouseDown={(event) => beginFloatingStudioPanelDrag(panelId, event)}
+        >
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                aria-label={isMinimized ? `Open ${title}` : `Minimize ${title}`}
+                title={isMinimized ? "Open panel" : "Minimize panel"}
+                className="h-3 w-3 rounded-full bg-[#f6cf58] shadow-[inset_0_1px_0_rgba(255,255,255,0.34),0_0_0_1px_rgba(125,77,0,0.2)] transition hover:brightness-105"
+                onMouseDown={(event) => {
+                  event.stopPropagation();
+                }}
+                onClick={() => toggleFloatingStudioPanelMinimized(panelId)}
+              />
+              <button
+                type="button"
+                aria-label={`Restore ${title}`}
+                title="Restore panel"
+                className="h-3 w-3 rounded-full bg-[#50d16e] shadow-[inset_0_1px_0_rgba(255,255,255,0.28),0_0_0_1px_rgba(6,95,70,0.2)] transition hover:brightness-105"
+                onMouseDown={(event) => {
+                  event.stopPropagation();
+                }}
+                onClick={() => restoreFloatingStudioPanel(panelId)}
+              />
+            </div>
+            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-100">
+              {title}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className="rounded-full border border-white/10 bg-white/[0.06] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-white/16 hover:bg-white/[0.1]"
+              onMouseDown={(event) => {
+                event.stopPropagation();
+              }}
+              onClick={() => toggleFloatingStudioPanelMode(panelId)}
+            >
+              Dock
+            </button>
+            {renderStudioPanelActionMenu(panelId, { stopMouseDownPropagation: true })}
+            {options.badge ? (
+              <div className="rounded-full border border-white/10 bg-white/[0.06] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+                {options.badge}
+              </div>
+            ) : null}
+          </div>
+        </div>
+        {!isMinimized ? (
+          <div className={`min-h-0 flex-1 overflow-auto ${options.bodyClassName || ""}`.trim()}>
+            {content}
+          </div>
+        ) : null}
+        {!isMinimized ? (
+          <>
+            {FLOATING_STUDIO_PANEL_RESIZE_HANDLES.map((handle) => (
+              <div
+                key={`${panelId}-${handle.direction}`}
+                className={`${handle.className} transition hover:bg-white/[0.06]`.trim()}
+                onMouseDown={(event) =>
+                  beginFloatingStudioPanelResize(panelId, handle.direction, event)
+                }
+                title="Resize panel"
+              />
+            ))}
+          </>
+        ) : null}
+      </div>
+    );
+  };
+
+  const workspaceStageWidth = studioWorkspaceStageSize.width || 1440;
+  const workspaceStageHeight = studioWorkspaceStageSize.height || 1040;
+  const dockedRightPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "docked" &&
+      floatingStudioPanels[panelId].dockZone === "right" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const dockedLeftPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "docked" &&
+      floatingStudioPanels[panelId].dockZone === "left" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const dockedBottomPanelIds = STUDIO_PANEL_DISPLAY_ORDER.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "docked" &&
+      floatingStudioPanels[panelId].dockZone === "bottom" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const minimizedWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+  const floatingWorkspacePanelIds = FLOATING_STUDIO_PANEL_IDS.filter(
+    (panelId) =>
+      floatingStudioPanels[panelId].mode === "floating" &&
+      !floatingStudioPanels[panelId].minimized &&
+      (panelId !== "inspector" || Boolean(selectedDagNode))
+  );
+
+  useEffect(() => {
+    if (dockedBottomPanelIds.length === 0) {
+      return;
+    }
+    if (!dockedBottomPanelIds.includes(studioBottomTray.activePanelId)) {
+      setStudioBottomTray((prev) => ({
+        ...prev,
+        activePanelId: dockedBottomPanelIds[0],
+      }));
+    }
+  }, [dockedBottomPanelIds, studioBottomTray.activePanelId]);
+
+  const workspacePanelRects = resolveWorkspacePanelRects(
+    floatingStudioPanels,
+    workspaceStageWidth,
+    workspaceStageHeight,
+    {
+      showInspector: Boolean(selectedDagNode),
+      showMinimizedShelf: FLOATING_STUDIO_PANEL_IDS.some(
+        (panelId) => floatingStudioPanels[panelId].minimized && (panelId !== "inspector" || Boolean(selectedDagNode))
+      ),
+      showBottomTray: dockedBottomPanelIds.length > 0,
+      bottomTrayHeight: studioBottomTray.collapsed
+        ? STUDIO_BOTTOM_TRAY_COLLAPSED_HEIGHT
+        : studioBottomTray.height,
+    }
+  );
+  const leftDockRect = workspacePanelRects.leftDock;
+  const rightDockRect = workspacePanelRects.rightDock;
+  const bottomDockRect = workspacePanelRects.bottomDock;
+  const minimizedShelfRect = workspacePanelRects.minimizedShelf;
+  const getWorkspacePanelTitle = (panelId: FloatingStudioPanelId) => STUDIO_PANEL_TITLES[panelId];
+  const getWorkspacePanelBadge = (panelId: FloatingStudioPanelId) => {
+    switch (panelId) {
+      case "compile":
+        return composerCompileLoading || chainPreflightLoading ? "busy" : "ready";
+      case "interface":
+        return `${workflowInterface.inputs.length}/${workflowInterface.outputs.length}`;
+      case "library":
+        return savedWorkflowDefinition ? "linked" : "browse";
+      default:
+        return null;
+    }
+  };
+  const renderStudioPanelActionMenu = (
+    panelId: FloatingStudioPanelId,
+    options: { stopMouseDownPropagation?: boolean } = {}
+  ) => {
+    const isOpen = activeStudioPanelMenuId === panelId;
+    const current = floatingStudioPanels[panelId];
+    return (
+      <div
+        data-studio-panel-menu-root={panelId}
+        className="relative"
+        onMouseDown={(event) => {
+          if (options.stopMouseDownPropagation) {
+            event.stopPropagation();
+          }
+        }}
+      >
+        <button
+          type="button"
+          className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
+            isOpen
+              ? "border-sky-300/35 bg-sky-400/18 text-sky-50"
+              : "border-white/10 bg-white/[0.06] text-slate-100 hover:border-white/16 hover:bg-white/[0.1]"
+          }`}
+          aria-label={`${getWorkspacePanelTitle(panelId)} menu`}
+          aria-expanded={isOpen}
+          onClick={() =>
+            setActiveStudioPanelMenuId((prev) => (prev === panelId ? null : panelId))
+          }
+        >
+          Panel
+        </button>
+        {isOpen ? (
+          <div className="absolute right-0 top-full z-40 mt-2 w-44 overflow-hidden rounded-2xl border border-white/12 bg-[rgba(12,19,31,0.96)] p-1 shadow-[0_24px_48px_rgba(2,6,23,0.4)] backdrop-blur-xl">
+            {STUDIO_PANEL_ALLOWED_DOCK_ZONES[panelId].map((dockZone) => {
+              const isActiveDock =
+                current.mode === "docked" && current.dockZone === dockZone && !current.minimized;
+              return (
+                <button
+                  key={`${panelId}-${dockZone}`}
+                  type="button"
+                  disabled={isActiveDock}
+                  className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:bg-white/[0.08] disabled:cursor-default disabled:opacity-45"
+                  onClick={() => {
+                    setFloatingStudioPanelDocked(panelId, dockZone);
+                    setActiveStudioPanelMenuId(null);
+                  }}
+                >
+                  <span>{STUDIO_DOCK_ZONE_LABELS[dockZone]}</span>
+                  {isActiveDock ? <span className="text-sky-100/72">Active</span> : null}
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              disabled={current.mode === "floating" && !current.minimized}
+              className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:bg-white/[0.08] disabled:cursor-default disabled:opacity-45"
+              onClick={() => {
+                setFloatingStudioPanelFloating(panelId);
+                setActiveStudioPanelMenuId(null);
+              }}
+            >
+              <span>Float</span>
+            </button>
+            <button
+              type="button"
+              disabled={current.minimized}
+              className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:bg-white/[0.08] disabled:cursor-default disabled:opacity-45"
+              onClick={() => {
+                setFloatingStudioPanelMinimized(panelId, true);
+                setActiveStudioPanelMenuId(null);
+              }}
+            >
+              <span>Minimize</span>
+            </button>
+            <button
+              type="button"
+              className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:bg-white/[0.08]"
+              onClick={() => {
+                restoreFloatingStudioPanel(panelId);
+                setActiveStudioPanelMenuId(null);
+              }}
+            >
+              <span>Restore Defaults</span>
+            </button>
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+  const getWorkspacePanelDefinition = (panelId: FloatingStudioPanelId) => {
+    if (panelId === "inspector" && !selectedDagNode) {
+      return null;
+    }
+
+    switch (panelId) {
+      case "palette":
+        return {
+          title: getWorkspacePanelTitle("palette"),
+          content: (
+            <div className="h-full">
+              <StudioCapabilityPalette
+                capabilities={paletteCapabilities}
+                groups={paletteGroups}
+                loading={capabilityLoading}
+                error={capabilityError}
+                query={paletteQuery}
+                selectedGroup={paletteGroup}
+                onQueryChange={setPaletteQuery}
+                onGroupChange={setPaletteGroup}
+                onAddCapability={addCapabilityNodeToStudio}
+                onAddControl={addControlNodeToStudio}
+              />
+            </div>
+          ),
+          panelDomId: "studio-palette-section",
+          bodyClassName: "overflow-hidden p-0",
+        } as const;
+      case "compile":
+        return {
+          title: getWorkspacePanelTitle("compile"),
+          content: (
+            <StudioCompilePanel
+              compileLoading={composerCompileLoading || chainPreflightLoading}
+              compileResult={composerCompileResult}
+              preflightResult={chainPreflightResult}
+              issues={composerIssues}
+              draftPayloadPreview={draftPayloadPreview}
+              onCompile={runChainPreflight}
             />
+          ),
+          badge: getWorkspacePanelBadge("compile") || undefined,
+        } as const;
+      case "setup":
+        return {
+          title: getWorkspacePanelTitle("setup"),
+          content: workflowSetupPanel,
+        } as const;
+      case "interface":
+        return {
+          title: getWorkspacePanelTitle("interface"),
+          content: (
+            <StudioWorkflowInterfacePanel
+              workflowInterface={workflowInterface}
+              contextPathSuggestions={contextPathSuggestions}
+              visualChainNodes={visualChainNodes}
+              outputPathSuggestionsForNode={studioOutputPathSuggestionsForNode}
+              onAddInput={addWorkflowInputDefinition}
+              onUpdateInput={updateWorkflowInputDefinition}
+              onRemoveInput={removeWorkflowInputDefinition}
+              onAddVariable={addWorkflowVariableDefinition}
+              onUpdateVariable={updateWorkflowVariableDefinition}
+              onRemoveVariable={removeWorkflowVariableDefinition}
+              onAddOutput={addWorkflowOutputDefinition}
+              onUpdateOutput={updateWorkflowOutputDefinition}
+              onRemoveOutput={removeWorkflowOutputDefinition}
+            />
+          ),
+          badge: getWorkspacePanelBadge("interface") || undefined,
+        } as const;
+      case "library":
+        return {
+          title: getWorkspacePanelTitle("library"),
+          content: workflowLibraryLauncherPanel,
+          panelDomId: "studio-library-section",
+          bodyClassName: "overflow-hidden p-0",
+          badge: getWorkspacePanelBadge("library") || undefined,
+        } as const;
+      case "inspector":
+        return {
+          title: getWorkspacePanelTitle("inspector"),
+          content: nodeInspectorPanel,
+          panelDomId: "studio-inspector-section",
+          bodyClassName: "transition-opacity duration-200 motion-reduce:transition-none",
+        } as const;
+      default:
+        return null;
+    }
+  };
 
-            <div className="mt-4 flex flex-wrap gap-2">
-              {visualChainNodes.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-5 text-sm text-slate-500">
-                  Add capabilities from the palette to start shaping a DAG.
-                </div>
-              ) : (
-                visualChainNodes.map((node, index) => {
-                  const isSelected = selectedDagNodeId === node.id;
-                  return (
-                    <div
-                      key={`studio-node-chip-${node.id}`}
-                      className={`flex items-center gap-2 rounded-full border px-3 py-2 text-sm ${
-                        isSelected
-                          ? "border-sky-300 bg-sky-50 text-sky-900"
-                          : "border-slate-200 bg-slate-50 text-slate-700"
+  const renderWorkspacePanel = (panelId: FloatingStudioPanelId) => {
+    const definition = getWorkspacePanelDefinition(panelId);
+    if (!definition) {
+      return null;
+    }
+    const renderer =
+      floatingStudioPanels[panelId].mode === "floating"
+        ? renderFloatingStudioPanel
+        : renderDockedStudioPanel;
+    return renderer(panelId, definition.title, definition.content, {
+      badge: definition.badge,
+      panelDomId: definition.panelDomId,
+      bodyClassName: definition.bodyClassName,
+    });
+  };
+
+  const activeBottomTrayPanelId =
+    dockedBottomPanelIds.includes(studioBottomTray.activePanelId)
+      ? studioBottomTray.activePanelId
+      : dockedBottomPanelIds[0];
+  const activeBottomTrayDefinition = activeBottomTrayPanelId
+    ? getWorkspacePanelDefinition(activeBottomTrayPanelId)
+    : null;
+
+  const beginStudioBottomTrayResize = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!bottomDockRect || studioBottomTray.collapsed) {
+      return;
+    }
+    event.preventDefault();
+    setStudioBottomTrayResize({
+      startY: event.clientY,
+      startHeight: studioBottomTray.height,
+    });
+  };
+
+  const toggleStudioBottomTrayCollapsed = () => {
+    setStudioBottomTray((prev) => ({
+      ...prev,
+      collapsed: !prev.collapsed,
+    }));
+  };
+
+  const studioShellTitle =
+    activeStudioSurface === "workbench"
+      ? "Process Flow Designer"
+      : `Workflow Builder: ${composerDraft.summary.trim() || "Pipeline Alpha"}`;
+  const studioShellBreadcrumbLabel =
+    activeStudioSurface === "workbench"
+      ? "Process Flow Designer"
+      : composerDraft.summary.trim() || "Workflow Builder draft";
+
+  return (
+    <AppShell
+      activeScreen="studio"
+      title={studioShellTitle}
+      breadcrumbs={[
+        { label: "Project", href: "/project" },
+        { label: "Workflows", href: "/workflows" },
+        { label: studioShellBreadcrumbLabel },
+      ]}
+      actions={
+        <>
+          <div className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-white/[0.04] p-1">
+            {(["workflow", "workbench"] as StudioSurface[]).map((surface) => (
+              <button
+                key={surface}
+                type="button"
+                className={`rounded-lg px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+                  activeStudioSurface === surface
+                    ? "bg-sky-400/18 text-sky-50"
+                    : "text-slate-100 hover:bg-white/[0.08]"
+                }`}
+                onClick={() => switchStudioSurface(surface)}
+              >
+                {surface === "workflow" ? "builder" : "canvas"}
+              </button>
+            ))}
+          </div>
+          {activeStudioSurface === "workflow" ? (
+            <>
+              <button
+                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08]"
+                onClick={startFreshStudioDraft}
+              >
+                New Workflow
+              </button>
+              <button
+                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={saveWorkflowDefinition}
+                disabled={workflowActionLoading !== null}
+              >
+                {workflowActionLoading === "save" ? "Saving..." : "Save"}
+              </button>
+              <button
+                className="rounded-xl border border-white/12 bg-white/[0.04] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-100 transition hover:border-sky-300/35 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={publishWorkflowVersion}
+                disabled={workflowActionLoading !== null}
+              >
+                {workflowActionLoading === "publish" ? "Publishing..." : "Publish"}
+              </button>
+              <button
+                className="rounded-xl border border-slate-200/18 bg-slate-950/25 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-white transition hover:border-white/30 hover:bg-slate-950/35 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={runWorkflowVersion}
+                disabled={workflowActionLoading !== null}
+              >
+                {workflowActionLoading === "run" ? "Starting..." : "Run Workflow"}
+              </button>
+            </>
+          ) : null}
+        </>
+      }
+    >
+      {activeStudioSurface === "workflow" && studioNotice ? (
+        <div className="mb-4 rounded-[24px] border border-sky-300/15 bg-sky-400/10 px-4 py-3 text-sm text-sky-50">
+          {studioNotice}
+        </div>
+      ) : null}
+      <section
+        className={`relative ${activeStudioSurface === "workflow" ? "block" : "hidden"}`}
+        aria-hidden={activeStudioSurface !== "workflow"}
+      >
+              <div className="relative">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-sky-100/72">
+                      Workflow Builder
+                    </div>
+                    <h2 className="mt-1 text-[30px] font-semibold tracking-[-0.03em] text-white">
+                      Process Flow Designer
+                    </h2>
+                    <p className="mt-1 max-w-3xl text-[13px] leading-5 text-slate-200/74">
+                      Map business logic into clear steps, decisions, tools, and AI actions before
+                      running the automation.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em]">
+                    <button
+                      type="button"
+                      className={`rounded-full border px-3 py-1 transition ${
+                        studioWorkspaceMode === "focus_graph"
+                          ? "border-sky-300/35 bg-sky-400/18 text-sky-50"
+                          : "border-white/10 bg-white/[0.05] text-slate-100 hover:border-white/16 hover:bg-white/[0.08]"
+                      }`}
+                      onClick={toggleFocusGraphMode}
+                    >
+                      {studioWorkspaceMode === "focus_graph" ? "exit focus" : "focus graph"}
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-slate-100 transition hover:border-white/16 hover:bg-white/[0.08]"
+                      onClick={resetFloatingStudioWorkspaceLayout}
+                    >
+                      reset layout
+                    </button>
+                    <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-slate-100">
+                      steps {visualChainSummary.steps}
+                    </span>
+                    <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-slate-100">
+                      edges {visualChainSummary.dagEdges}
+                    </span>
+                    <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-slate-100">
+                      zoom {Math.round(dagCanvasZoom * 100)}%
+                    </span>
+                    <span
+                      className={`rounded-full border px-3 py-1 ${
+                        visualChainSummary.missingInputs > 0
+                          ? "border-rose-300/25 bg-rose-400/12 text-rose-100"
+                          : "border-emerald-300/25 bg-emerald-400/12 text-emerald-100"
                       }`}
                     >
-                      <button onClick={() => setSelectedDagNodeId(node.id)}>
-                        {index + 1}. {node.taskName}
-                      </button>
-                      <button
-                        className="rounded-full border border-current px-1.5 py-0 text-[11px]"
-                        onClick={() => removeVisualChainNode(node.id)}
-                        title="Remove step"
-                      >
-                        ×
-                      </button>
+                      {visualChainSummary.missingInputs > 0
+                        ? `missing ${visualChainSummary.missingInputs}`
+                        : "inputs ready"}
+                    </span>
+                  </div>
+                </div>
+
+                <div
+                  ref={studioWorkspaceStageRef}
+                  id="studio-graph-section"
+                  className={`relative mt-4 h-[calc(100vh-184px)] min-h-[980px] overflow-hidden rounded-[30px] bg-[linear-gradient(180deg,rgba(75,92,109,0.58),rgba(45,57,71,0.72))] shadow-[0_22px_56px_rgba(15,23,42,0.16)] ${
+                    studioWorkspaceMode === "focus_graph"
+                      ? "ring-2 ring-sky-300/25"
+                      : "ring-1 ring-white/10"
+                  }`}
+                >
+                  <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-100/58">
+                    {studioWorkspaceMode === "focus_graph"
+                      ? "Focus Graph active. Press F to restore your workspace."
+                      : "Minimized panels collapse into the stage shelf so the graph stays clear"}
+                  </div>
+
+                  <div
+                    className="absolute"
+                    style={{
+                      left: workspacePanelRects.graph.x,
+                      top: workspacePanelRects.graph.y,
+                      width: workspacePanelRects.graph.width,
+                      height: workspacePanelRects.graph.height,
+                    }}
+                  >
+                    <ComposerDagCanvas
+                      visualChainNodes={visualChainNodes}
+                      dagEdgeDraftSourceNodeId={dagEdgeDraftSourceNodeId}
+                      setDagEdgeDraftSourceNodeId={setDagEdgeDraftSourceNodeId}
+                      setDagConnectorDrag={setDagConnectorDrag}
+                      setDagConnectorHoverTargetNodeId={setDagConnectorHoverTargetNodeId}
+                      autoLayoutDagCanvas={autoLayoutDagCanvas}
+                      dagCanvasViewportRef={dagCanvasViewportRef}
+                      dagCanvasRef={dagCanvasRef}
+                      dagCanvasSurface={dagCanvasSurface}
+                      dagCanvasEdges={dagCanvasEdges}
+                      hoveredDagEdgeKey={hoveredDagEdgeKey}
+                      setHoveredDagEdgeKey={setHoveredDagEdgeKey}
+                      removeDagEdge={removeDagEdge}
+                      dagConnectorPreview={dagConnectorPreview}
+                      dagCanvasNodes={dagCanvasNodes}
+                      composerDraftEdges={composerDraftEdges}
+                      dagNodeAdjacency={dagNodeAdjacency}
+                      visualChainNodeStatusById={visualChainNodeStatusById as Map<
+                        string,
+                        { missingCount: number; requiredCount: number }
+                      >}
+                      selectedDagNodeId={selectedDagNodeId}
+                      setSelectedDagNodeId={setSelectedDagNodeId}
+                      dagConnectorDrag={dagConnectorDrag}
+                      dagCanvasDraggingNodeId={dagCanvasDraggingNodeId}
+                      dagConnectorHoverTargetNodeId={dagConnectorHoverTargetNodeId}
+                      addDagEdge={addDagEdge}
+                      beginDagNodeDrag={beginDagNodeDrag}
+                      isInteractiveCanvasTarget={isInteractiveCanvasTarget}
+                      beginDagConnectorDrag={beginDagConnectorDrag}
+                      centerDagNodeInView={centerDagNodeInView}
+                      nodeWidth={DAG_CANVAS_NODE_WIDTH}
+                      nodeHeight={DAG_CANVAS_NODE_HEIGHT}
+                      dagCanvasZoom={dagCanvasZoom}
+                      showToolbar
+                      showBlueprintPreview
+                      onZoomIn={zoomInDagCanvas}
+                      onZoomOut={zoomOutDagCanvas}
+                      zoomInDisabled={dagCanvasZoom >= DAG_CANVAS_ZOOM_MAX}
+                      zoomOutDisabled={dagCanvasZoom <= DAG_CANVAS_ZOOM_MIN}
+                      onToggleFocusGraph={toggleFocusGraphMode}
+                      focusGraphActive={studioWorkspaceMode === "focus_graph"}
+                      onRunWorkflow={runWorkflowVersion}
+                      runWorkflowPending={workflowActionLoading === "run"}
+                      runWorkflowDisabled={workflowActionLoading !== null}
+                    />
+                  </div>
+
+                  {leftDockRect && dockedLeftPanelIds.length > 0 ? (
+                    <div
+                      className="pointer-events-auto absolute flex flex-col gap-3 overflow-y-auto pr-1"
+                      style={{
+                        left: leftDockRect.x,
+                        top: leftDockRect.y,
+                        width: leftDockRect.width + 6,
+                        height: leftDockRect.height,
+                      }}
+                    >
+                      <div
+                        className="absolute inset-y-0 right-0 z-20 w-2 cursor-ew-resize transition hover:bg-white/[0.08]"
+                        onMouseDown={(event) =>
+                          beginFloatingStudioPanelResize(dockedLeftPanelIds[0], "e", event)
+                        }
+                        title="Resize left dock"
+                      />
+                      {dockedLeftPanelIds.map((panelId) => (
+                        <div
+                          key={`docked-left-panel-${panelId}`}
+                          style={{
+                            height: getFloatingStudioPanelActiveHeight(floatingStudioPanels[panelId]),
+                            minHeight: FLOATING_STUDIO_PANEL_HEADER_HEIGHT,
+                          }}
+                        >
+                          {renderWorkspacePanel(panelId)}
+                        </div>
+                      ))}
                     </div>
-                  );
-                })
-              )}
-            </div>
-          </section>
-        </div>
+                  ) : null}
 
-        <div className="space-y-6">
-          <StudioWorkflowLibrary
-            workflowDefinitions={workflowDefinitions}
-            workflowDefinitionsLoading={workflowDefinitionsLoading}
-            workflowDefinitionsError={workflowDefinitionsError}
-            workflowVersions={workflowVersions}
-            workflowVersionsLoading={workflowVersionsLoading}
-            workflowVersionsError={workflowVersionsError}
-            workflowTriggers={workflowTriggers}
-            workflowTriggersLoading={workflowTriggersLoading}
-            workflowTriggersError={workflowTriggersError}
-            workflowRuns={workflowRuns}
-            workflowRunsLoading={workflowRunsLoading}
-            workflowRunsError={workflowRunsError}
-            activeWorkflowDefinitionId={activeWorkflowDefinitionId}
-            activeWorkflowVersionId={activeWorkflowVersionId}
-            onRefresh={() => {
-              void refreshWorkflowDefinitions();
-              if (activeWorkflowDefinitionId) {
-                void refreshWorkflowVersions(activeWorkflowDefinitionId);
-                void refreshWorkflowTriggers(activeWorkflowDefinitionId);
-                void refreshWorkflowRuns(activeWorkflowDefinitionId);
-              }
-            }}
-            onOpenDefinition={restoreWorkflowDefinition}
-            onOpenVersion={(version) => {
-              void restoreWorkflowVersion(version);
-            }}
-            onCreateManualTrigger={createManualWorkflowTrigger}
-            onInvokeTrigger={(trigger) => {
-              void invokeWorkflowTrigger(trigger);
-            }}
-          />
+                  {rightDockRect && dockedRightPanelIds.length > 0 ? (
+                    <div
+                      className="pointer-events-auto absolute flex flex-col gap-3 overflow-y-auto pr-1"
+                      style={{
+                        left: rightDockRect.x,
+                        top: rightDockRect.y,
+                        width: rightDockRect.width + 6,
+                        height: rightDockRect.height,
+                      }}
+                    >
+                      <div
+                        className="absolute inset-y-0 left-0 z-20 w-2 cursor-ew-resize transition hover:bg-white/[0.08]"
+                        onMouseDown={(event) =>
+                          beginFloatingStudioPanelResize(dockedRightPanelIds[0], "w", event)
+                        }
+                        title="Resize right dock"
+                      />
+                      {dockedRightPanelIds.map((panelId) => (
+                        <div
+                          key={`docked-right-panel-${panelId}`}
+                          style={{
+                            height: getFloatingStudioPanelActiveHeight(floatingStudioPanels[panelId]),
+                            minHeight: FLOATING_STUDIO_PANEL_HEADER_HEIGHT,
+                          }}
+                        >
+                          {renderWorkspacePanel(panelId)}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
 
-          <StudioNodeInspector
-            selectedDagNode={selectedDagNode}
-            selectedDagNodeStatus={selectedDagNodeStatus}
-            inputFields={selectedDagNodeInspectorFields}
-            activeComposerIssueFocus={activeComposerIssueFocus}
-            inspectorBindingRefs={inspectorBindingRefs}
-            visualChainNodes={visualChainNodes}
-            outputPathSuggestionsForNode={outputPathSuggestionsForNode}
-            contextPathSuggestions={contextPathSuggestions}
-            workflowInterface={workflowInterface}
-            autoWireNodeBindings={autoWireNodeBindings}
-            quickFixNodeBindings={quickFixNodeBindings}
-            setSelectedDagNodeId={setSelectedDagNodeId}
-            capabilityIdOptionsId="studio-capability-id-options"
-            onDeleteNode={removeVisualChainNode}
-            updateNodeBasics={updateVisualChainNode}
-            setVisualBindingMode={setVisualBindingMode}
-            clearVisualBinding={clearVisualBinding}
-            removeCustomInputField={removeCustomInputField}
-            addCustomInputField={addCustomInputField}
-            updateVisualBindingSourceNode={updateVisualBindingSourceNode}
-            updateVisualBindingPath={updateVisualBindingPath}
-            updateVisualBindingLiteral={updateVisualBindingLiteral}
-            updateVisualBindingContextPath={updateVisualBindingContextPath}
-            updateVisualBindingMemory={updateVisualBindingMemory}
-            updateVisualBindingWorkflowInput={updateVisualBindingWorkflowInput}
-            updateVisualBindingWorkflowVariable={updateVisualBindingWorkflowVariable}
-            setVisualBindingFromPrevious={setVisualBindingFromPrevious}
-            canInsertDeriveOutputPath={canInsertDeriveForSelectedNode}
-            onInsertDeriveOutputPath={insertDeriveOutputPathStepForNode}
-            addNodeOutput={addNodeOutput}
-            updateNodeOutput={updateNodeOutput}
-            removeNodeOutput={removeNodeOutput}
-            addNodeVariable={addNodeVariable}
-            updateNodeVariable={updateNodeVariable}
-            removeNodeVariable={removeNodeVariable}
-            updateNodeControlConfig={updateNodeControlConfig}
-            addSwitchCase={addSwitchCase}
-            updateSwitchCase={updateSwitchCase}
-            removeSwitchCase={removeSwitchCase}
-          />
+                  {bottomDockRect && dockedBottomPanelIds.length > 0 ? (
+                    <div
+                      className="pointer-events-auto absolute"
+                      style={{
+                        left: bottomDockRect.x,
+                        top: bottomDockRect.y,
+                        width: bottomDockRect.width,
+                        height: bottomDockRect.height,
+                      }}
+                    >
+                      <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-[24px] border border-white/12 bg-[linear-gradient(180deg,rgba(37,49,61,0.88),rgba(16,24,34,0.92))] shadow-[0_18px_36px_rgba(15,23,42,0.24)] backdrop-blur-xl">
+                        <div
+                          className="h-2 cursor-ns-resize transition hover:bg-white/[0.08]"
+                          onMouseDown={beginStudioBottomTrayResize}
+                          title="Resize bottom tray"
+                        />
+                        <div className="flex items-center justify-between gap-3 border-b border-white/8 bg-[rgba(9,16,27,0.46)] px-3 py-2">
+                          <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
+                            {dockedBottomPanelIds.map((panelId) => {
+                              const badge = getWorkspacePanelBadge(panelId);
+                              const isActive = activeBottomTrayPanelId === panelId;
+                              return (
+                                <button
+                                  key={`studio-bottom-tray-tab-${panelId}`}
+                                  type="button"
+                                  className={`flex shrink-0 items-center gap-2 rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
+                                    isActive
+                                      ? "border-sky-300/35 bg-sky-400/18 text-sky-50"
+                                      : "border-white/10 bg-white/[0.05] text-slate-100 hover:border-white/16 hover:bg-white/[0.08]"
+                                  }`}
+                                  onClick={() =>
+                                    setStudioBottomTray((prev) => ({
+                                      ...prev,
+                                      activePanelId: panelId,
+                                      collapsed: false,
+                                    }))
+                                  }
+                                >
+                                  <span>{getWorkspacePanelTitle(panelId)}</span>
+                                  {badge ? (
+                                    <span className="rounded-full border border-white/10 bg-white/[0.08] px-2 py-0.5 text-[9px] tracking-[0.18em] text-slate-200">
+                                      {badge}
+                                    </span>
+                                  ) : null}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              className="rounded-full border border-white/10 bg-white/[0.06] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-white/16 hover:bg-white/[0.1]"
+                              onClick={toggleStudioBottomTrayCollapsed}
+                            >
+                              {studioBottomTray.collapsed ? "Expand" : "Collapse"}
+                            </button>
+                          </div>
+                        </div>
+                        {!studioBottomTray.collapsed && activeBottomTrayDefinition ? (
+                          <div
+                            id={activeBottomTrayDefinition.panelDomId}
+                            className={`min-h-0 flex-1 overflow-auto ${
+                              activeBottomTrayDefinition.bodyClassName || ""
+                            }`.trim()}
+                          >
+                            {activeBottomTrayDefinition.content}
+                          </div>
+                        ) : (
+                          <div className="flex h-full items-center justify-between px-4 py-3 text-xs uppercase tracking-[0.18em] text-slate-300/68">
+                            <span>
+                              {activeBottomTrayPanelId
+                                ? `${getWorkspacePanelTitle(activeBottomTrayPanelId)} ready`
+                                : "Bottom tray ready"}
+                            </span>
+                            <span>Shift+3</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
 
-          <StudioCompilePanel
-            compileLoading={composerCompileLoading || chainPreflightLoading}
-            compileResult={composerCompileResult}
-            preflightResult={chainPreflightResult}
-            issues={composerIssues}
-            draftPayloadPreview={draftPayloadPreview}
-            onCompile={runChainPreflight}
-          />
-        </div>
-      </div>
+                  {minimizedShelfRect && minimizedWorkspacePanelIds.length > 0 ? (
+                    <div
+                      className="pointer-events-auto absolute"
+                      style={{
+                        left: minimizedShelfRect.x,
+                        top: minimizedShelfRect.y,
+                        width: minimizedShelfRect.width,
+                        height: minimizedShelfRect.height,
+                      }}
+                    >
+                      <div className="flex h-full items-center gap-3 overflow-x-auto rounded-[22px] border border-white/10 bg-[rgba(9,16,27,0.52)] px-3 shadow-[0_18px_40px_rgba(15,23,42,0.2)] backdrop-blur-xl">
+                        <div className="shrink-0 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-100/62">
+                          Minimized
+                        </div>
+                        <div className="flex min-w-0 items-center gap-2">
+                          {minimizedWorkspacePanelIds.map((panelId) => {
+                            const title = getWorkspacePanelTitle(panelId);
+                            const badge = getWorkspacePanelBadge(panelId);
+                            return (
+                              <button
+                                key={`minimized-panel-${panelId}`}
+                                type="button"
+                                className="flex shrink-0 items-center gap-2 rounded-full border border-white/10 bg-white/[0.06] px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-sky-300/30 hover:bg-white/[0.11]"
+                                aria-label={`Restore ${title}`}
+                                title={`Restore ${title}`}
+                                onClick={() => setFloatingStudioPanelMinimized(panelId, false)}
+                              >
+                                <span>{title}</span>
+                                {badge ? (
+                                  <span className="rounded-full border border-white/10 bg-white/[0.08] px-2 py-0.5 text-[9px] tracking-[0.18em] text-slate-200">
+                                    {badge}
+                                  </span>
+                                ) : null}
+                                <span className="text-[9px] tracking-[0.18em] text-sky-100/78">
+                                  Restore
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {floatingWorkspacePanelIds.map((panelId) => renderWorkspacePanel(panelId))}
+                </div>
+              </div>
+      </section>
+
+      {workbenchSurfaceMounted ? (
+        <StudioWorkbenchSurface
+          active={activeStudioSurface === "workbench"}
+          workspaceUserId={workspaceUserId}
+          onPromoteWorkflowDraft={setPendingWorkbenchWorkflowDraft}
+        />
+      ) : null}
 
       <datalist id="studio-capability-id-options">
         {availableCapabilities.map((item) => (
           <option key={`studio-capability-id-option-${item.id}`} value={item.id} />
         ))}
       </datalist>
-    </div>
+    </AppShell>
   );
 }

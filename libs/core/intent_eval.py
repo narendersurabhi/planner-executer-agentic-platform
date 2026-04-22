@@ -6,6 +6,8 @@ from typing import Any, Callable, Mapping
 
 import yaml
 
+from . import intent_contract
+
 
 @dataclass(frozen=True)
 class IntentEvalCase:
@@ -14,6 +16,12 @@ class IntentEvalCase:
     expected_intents: tuple[str, ...]
     expected_capabilities: tuple[str, ...]
     expected_capabilities_by_segment: tuple[tuple[str, ...], ...]
+    intent_context: Mapping[str, Any] | None = None
+    expected_profile_intent: str | None = None
+    expected_missing_inputs: tuple[str, ...] = ()
+    expected_requires_clarification: bool | None = None
+    expected_clarification_mode: str | None = None
+    expected_disagreement_reason: str | None = None
 
 
 def _coerce_string_list(value: Any) -> list[str]:
@@ -39,6 +47,12 @@ def _coerce_segment_capability_lists(value: Any) -> tuple[tuple[str, ...], ...]:
         if text:
             normalized.append((text,))
     return tuple(normalized)
+
+
+def _coerce_mapping(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return dict(value)
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -75,6 +89,62 @@ def _score_sets(expected: set[str], predicted: set[str]) -> dict[str, float]:
     }
 
 
+def _coerce_report_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(mode="json", exclude_none=True)
+        if isinstance(dumped, Mapping):
+            return dict(dumped)
+    return {}
+
+
+def _normalized_required_input_keys(values: Any) -> list[str]:
+    normalized: list[str] = []
+    raw_values: list[str]
+    if isinstance(values, tuple):
+        raw_values = _coerce_string_list(list(values))
+    else:
+        raw_values = _coerce_string_list(values)
+    for raw_value in raw_values:
+        key = intent_contract.normalize_required_input_key(raw_value)
+        if key and key not in normalized:
+            normalized.append(key)
+    return normalized
+
+
+def _flatten_envelope_capabilities(envelope: Mapping[str, Any] | None) -> list[str]:
+    envelope_map = envelope if isinstance(envelope, Mapping) else {}
+    ordered: list[str] = []
+    seen_segment_ids: set[str] = set()
+    candidate_capabilities = (
+        envelope_map.get("candidate_capabilities")
+        if isinstance(envelope_map.get("candidate_capabilities"), Mapping)
+        else {}
+    )
+    graph_map = envelope_map.get("graph") if isinstance(envelope_map.get("graph"), Mapping) else {}
+    segments = graph_map.get("segments") if isinstance(graph_map.get("segments"), list) else []
+    for raw_segment in segments:
+        if not isinstance(raw_segment, Mapping):
+            continue
+        segment_id = str(raw_segment.get("id") or "").strip()
+        segment_capabilities: list[str] = []
+        if segment_id and isinstance(candidate_capabilities.get(segment_id), list):
+            seen_segment_ids.add(segment_id)
+            segment_capabilities = _coerce_string_list(candidate_capabilities.get(segment_id))
+        if not segment_capabilities:
+            segment_capabilities = _coerce_string_list(raw_segment.get("suggested_capabilities"))
+        ordered.extend(segment_capabilities)
+
+    for raw_segment_id, raw_capabilities in candidate_capabilities.items():
+        segment_id = str(raw_segment_id or "").strip()
+        if not segment_id or segment_id in seen_segment_ids:
+            continue
+        ordered.extend(_coerce_string_list(raw_capabilities))
+    return _unique(ordered)
+
+
 def load_intent_eval_cases(path: Path) -> list[IntentEvalCase]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, Mapping):
@@ -93,6 +163,20 @@ def load_intent_eval_cases(path: Path) -> list[IntentEvalCase]:
         expected_capabilities_by_segment = _coerce_segment_capability_lists(
             raw_case.get("expected_capabilities_by_segment")
         )
+        expected_profile_intent = str(raw_case.get("expected_profile_intent") or "").strip() or None
+        expected_missing_inputs = tuple(_coerce_string_list(raw_case.get("expected_missing_inputs")))
+        expected_requires_clarification_raw = raw_case.get("expected_requires_clarification")
+        expected_requires_clarification = (
+            bool(expected_requires_clarification_raw)
+            if isinstance(expected_requires_clarification_raw, bool)
+            else None
+        )
+        expected_clarification_mode = (
+            str(raw_case.get("expected_clarification_mode") or "").strip() or None
+        )
+        expected_disagreement_reason = (
+            str(raw_case.get("expected_disagreement_reason") or "").strip() or None
+        )
         if not case_id or not goal:
             continue
         cases.append(
@@ -102,6 +186,12 @@ def load_intent_eval_cases(path: Path) -> list[IntentEvalCase]:
                 expected_intents=expected_intents,
                 expected_capabilities=expected_capabilities,
                 expected_capabilities_by_segment=expected_capabilities_by_segment,
+                intent_context=_coerce_mapping(raw_case.get("intent_context")),
+                expected_profile_intent=expected_profile_intent,
+                expected_missing_inputs=expected_missing_inputs,
+                expected_requires_clarification=expected_requires_clarification,
+                expected_clarification_mode=expected_clarification_mode,
+                expected_disagreement_reason=expected_disagreement_reason,
             )
         )
     if not cases:
@@ -210,10 +300,124 @@ def evaluate_intent_case(
     }
 
 
+def evaluate_intent_normalization_case(
+    case: IntentEvalCase,
+    envelope: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    envelope_map = envelope if isinstance(envelope, Mapping) else {}
+    profile_map = envelope_map.get("profile") if isinstance(envelope_map.get("profile"), Mapping) else {}
+    clarification_map = (
+        envelope_map.get("clarification")
+        if isinstance(envelope_map.get("clarification"), Mapping)
+        else {}
+    )
+    trace_map = envelope_map.get("trace") if isinstance(envelope_map.get("trace"), Mapping) else {}
+    disagreement_map = (
+        trace_map.get("disagreement") if isinstance(trace_map.get("disagreement"), Mapping) else {}
+    )
+
+    predicted_capabilities = _flatten_envelope_capabilities(envelope_map)
+    expected_capability_set = set(case.expected_capabilities)
+    predicted_capability_set = set(predicted_capabilities)
+    capability_alignment = (
+        bool(expected_capability_set.intersection(predicted_capability_set))
+        if expected_capability_set
+        else True
+    )
+    top_capability = predicted_capabilities[0] if predicted_capabilities else None
+
+    expected_missing = set(_normalized_required_input_keys(case.expected_missing_inputs))
+    actual_missing = _normalized_required_input_keys(
+        clarification_map.get("missing_inputs") or profile_map.get("missing_slots")
+    )
+    missing_scores = _score_sets(expected_missing, set(actual_missing))
+
+    actual_profile_intent = str(profile_map.get("intent") or "").strip() or None
+    actual_requires_clarification = bool(
+        clarification_map.get("needs_clarification", profile_map.get("needs_clarification"))
+    )
+    actual_clarification_mode = (
+        str(
+            clarification_map.get("clarification_mode")
+            or profile_map.get("clarification_mode")
+            or ""
+        ).strip()
+        or None
+    )
+    actual_disagreement_reason = (
+        str(disagreement_map.get("reason_code") or "").strip() or None
+    )
+    expected_disagreement = bool(
+        case.expected_disagreement_reason
+        or case.expected_clarification_mode == "intent_disagreement"
+    )
+
+    return {
+        "profile_intent": {
+            "expected": case.expected_profile_intent,
+            "actual": actual_profile_intent,
+            "match": (
+                actual_profile_intent == case.expected_profile_intent
+                if case.expected_profile_intent is not None
+                else None
+            ),
+        },
+        "capability_alignment": {
+            "expected_capabilities": list(case.expected_capabilities),
+            "predicted_capabilities": predicted_capabilities,
+            "matched": capability_alignment,
+            "top_capability": top_capability,
+            "top_capability_match": (
+                bool(top_capability and top_capability in expected_capability_set)
+                if top_capability is not None
+                else False
+            ),
+        },
+        "missing_inputs": {
+            "expected": sorted(expected_missing),
+            "actual": actual_missing,
+            "precision": missing_scores["precision"],
+            "recall": missing_scores["recall"],
+            "f1": missing_scores["f1"],
+            "tp": int(missing_scores["tp"]),
+            "fp": int(missing_scores["fp"]),
+            "fn": int(missing_scores["fn"]),
+        },
+        "clarification": {
+            "expected_requires_clarification": case.expected_requires_clarification,
+            "actual_requires_clarification": actual_requires_clarification,
+            "requires_clarification_match": (
+                actual_requires_clarification == case.expected_requires_clarification
+                if case.expected_requires_clarification is not None
+                else None
+            ),
+            "expected_mode": case.expected_clarification_mode,
+            "actual_mode": actual_clarification_mode,
+            "mode_match": (
+                actual_clarification_mode == case.expected_clarification_mode
+                if case.expected_clarification_mode is not None
+                else None
+            ),
+        },
+        "disagreement": {
+            "expected_reason": case.expected_disagreement_reason,
+            "actual_reason": actual_disagreement_reason,
+            "reason_match": (
+                actual_disagreement_reason == case.expected_disagreement_reason
+                if case.expected_disagreement_reason is not None
+                else None
+            ),
+            "expected": expected_disagreement,
+            "clarification_triggered": actual_clarification_mode == "intent_disagreement",
+        },
+    }
+
+
 def evaluate_intent_cases(
     cases: list[IntentEvalCase],
     *,
     decompose_goal: Callable[[str], Mapping[str, Any]],
+    normalize_goal_intent: Callable[[str, Mapping[str, Any] | None], Any] | None = None,
     top_k: int = 3,
     allowed_capability_ids: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -227,6 +431,21 @@ def evaluate_intent_cases(
     ordered_intent_total = 0
     invalid_capabilities_total = 0
     predicted_capabilities_total = 0
+    normalization_profile_hits = 0
+    normalization_profile_total = 0
+    normalization_alignment_hits = 0
+    normalization_alignment_total = 0
+    normalization_missing_tp = 0
+    normalization_missing_fp = 0
+    normalization_missing_fn = 0
+    normalization_clarification_hits = 0
+    normalization_clarification_total = 0
+    normalization_mode_hits = 0
+    normalization_mode_total = 0
+    normalization_disagreement_hits = 0
+    normalization_disagreement_total = 0
+    normalization_disagreement_reason_hits = 0
+    normalization_disagreement_reason_total = 0
 
     for case in cases:
         graph = decompose_goal(case.goal)
@@ -236,6 +455,41 @@ def evaluate_intent_cases(
             top_k=top_k,
             allowed_capability_ids=allowed_capability_ids,
         )
+        if normalize_goal_intent is not None:
+            envelope = _coerce_report_mapping(
+                normalize_goal_intent(case.goal, case.intent_context)
+            )
+            normalization_result = evaluate_intent_normalization_case(case, envelope)
+            result["normalization"] = normalization_result
+            profile_match = normalization_result["profile_intent"]["match"]
+            if profile_match is not None:
+                normalization_profile_total += 1
+                normalization_profile_hits += int(bool(profile_match))
+            normalization_alignment_total += 1
+            normalization_alignment_hits += int(
+                bool(normalization_result["capability_alignment"]["matched"])
+            )
+            normalization_missing_tp += int(normalization_result["missing_inputs"]["tp"])
+            normalization_missing_fp += int(normalization_result["missing_inputs"]["fp"])
+            normalization_missing_fn += int(normalization_result["missing_inputs"]["fn"])
+            clarification_match = normalization_result["clarification"]["requires_clarification_match"]
+            if clarification_match is not None:
+                normalization_clarification_total += 1
+                normalization_clarification_hits += int(bool(clarification_match))
+            mode_match = normalization_result["clarification"]["mode_match"]
+            if mode_match is not None:
+                normalization_mode_total += 1
+                normalization_mode_hits += int(bool(mode_match))
+            disagreement_expected = bool(normalization_result["disagreement"]["expected"])
+            if disagreement_expected:
+                normalization_disagreement_total += 1
+                normalization_disagreement_hits += int(
+                    bool(normalization_result["disagreement"]["clarification_triggered"])
+                )
+            disagreement_reason_match = normalization_result["disagreement"]["reason_match"]
+            if disagreement_reason_match is not None:
+                normalization_disagreement_reason_total += 1
+                normalization_disagreement_reason_hits += int(bool(disagreement_reason_match))
         case_results.append(result)
 
         intent_tp += int(result["intent"]["tp"])
@@ -305,6 +559,75 @@ def evaluate_intent_cases(
             "total": ordered_intent_total,
         },
     }
+    if normalize_goal_intent is not None:
+        normalization_missing_precision = _safe_div(
+            normalization_missing_tp,
+            normalization_missing_tp + normalization_missing_fp,
+        )
+        normalization_missing_recall = _safe_div(
+            normalization_missing_tp,
+            normalization_missing_tp + normalization_missing_fn,
+        )
+        normalization_missing_f1 = (
+            _safe_div(
+                2 * normalization_missing_precision * normalization_missing_recall,
+                normalization_missing_precision + normalization_missing_recall,
+            )
+            if (normalization_missing_precision + normalization_missing_recall) > 0
+            else 0.0
+        )
+        summary["normalization"] = {
+            "case_count": len(case_results),
+            "profile_intent_accuracy": _safe_div(
+                normalization_profile_hits,
+                normalization_profile_total,
+            ),
+            "profile_intent_hits": normalization_profile_hits,
+            "profile_intent_total": normalization_profile_total,
+            "capability_alignment_rate": _safe_div(
+                normalization_alignment_hits,
+                normalization_alignment_total,
+            ),
+            "capability_alignment_hits": normalization_alignment_hits,
+            "capability_alignment_total": normalization_alignment_total,
+            "missing_inputs": {
+                "precision": normalization_missing_precision,
+                "recall": normalization_missing_recall,
+                "f1": normalization_missing_f1,
+                "tp": normalization_missing_tp,
+                "fp": normalization_missing_fp,
+                "fn": normalization_missing_fn,
+            },
+            "requires_clarification_accuracy": _safe_div(
+                normalization_clarification_hits,
+                normalization_clarification_total,
+            ),
+            "requires_clarification_hits": normalization_clarification_hits,
+            "requires_clarification_total": normalization_clarification_total,
+            "clarification_mode_accuracy": _safe_div(
+                normalization_mode_hits,
+                normalization_mode_total,
+            ),
+            "clarification_mode_hits": normalization_mode_hits,
+            "clarification_mode_total": normalization_mode_total,
+            "disagreement_clarification_rate": (
+                _safe_div(normalization_disagreement_hits, normalization_disagreement_total)
+                if normalization_disagreement_total > 0
+                else 1.0
+            ),
+            "disagreement_clarification_hits": normalization_disagreement_hits,
+            "disagreement_clarification_total": normalization_disagreement_total,
+            "disagreement_reason_accuracy": (
+                _safe_div(
+                    normalization_disagreement_reason_hits,
+                    normalization_disagreement_reason_total,
+                )
+                if normalization_disagreement_reason_total > 0
+                else 1.0
+            ),
+            "disagreement_reason_hits": normalization_disagreement_reason_hits,
+            "disagreement_reason_total": normalization_disagreement_reason_total,
+        }
 
     return {
         "summary": summary,

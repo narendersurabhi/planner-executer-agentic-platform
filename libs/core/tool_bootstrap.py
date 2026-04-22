@@ -50,3 +50,7 @@ def build_default_registry(
         llm_provider=llm_provider,
         service_name=service_name,
     )
+
+
+def build_planner_support_tool_specs() -> list:
+    return tool_catalog.build_planner_support_tool_specs()

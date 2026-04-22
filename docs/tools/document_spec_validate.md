@@ -38,5 +38,5 @@ Strict vs non-strict:
 
 Typical planner usage:
 1) Call `document_spec_validate` on the generated DocumentSpec.
-2) If valid, call `docx_generate_from_spec` to render the .docx.
+2) If valid, call `docx_render_from_spec` to render the .docx.
 3) If invalid, regenerate or fix the spec before rendering.

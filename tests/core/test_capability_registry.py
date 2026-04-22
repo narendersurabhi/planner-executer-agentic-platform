@@ -69,3 +69,14 @@ def test_resolve_capability_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert capability_registry.resolve_capability_mode() == "enabled"
     monkeypatch.setenv("CAPABILITY_MODE", "weird")
     assert capability_registry.resolve_capability_mode() == "disabled"
+
+
+def test_default_registry_consolidates_llm_prompt_generate_into_llm_text_generate() -> None:
+    registry = capability_registry.load_capability_registry()
+
+    spec = registry.require("llm.text.generate")
+
+    assert registry.get("llm.prompt.generate") is None
+    assert spec.input_schema_ref == "llm_text_generate_capability_input"
+    assert spec.output_schema_ref == "llm_text_generate_capability_output"
+    assert spec.adapters[0].tool_name == "llm_generate_with_context"

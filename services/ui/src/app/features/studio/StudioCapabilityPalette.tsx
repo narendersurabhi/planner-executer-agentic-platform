@@ -1,7 +1,13 @@
 "use client";
 
+import { useMemo, useState } from "react";
+
+import {
+  WorkflowNodePlateIcon,
+  resolveWorkflowNodeVisual,
+} from "../../components/workflow/WorkflowNodeIcon";
 import type { CapabilityItem, StudioControlKind } from "./types";
-import { getCapabilityRequiredInputs } from "./utils";
+import { getCapabilityRequiredInputs, taskNameFromCapability } from "./utils";
 
 type StudioCapabilityPaletteProps = {
   capabilities: CapabilityItem[];
@@ -16,6 +22,67 @@ type StudioCapabilityPaletteProps = {
   onAddControl: (kind: StudioControlKind) => void;
 };
 
+type PaletteControlItem = {
+  description: string;
+  kind: StudioControlKind;
+  title: string;
+};
+
+type PaletteSection =
+  | {
+      id: string;
+      kind: "control";
+      title: string;
+      items: PaletteControlItem[];
+    }
+  | {
+      id: string;
+      kind: "capability";
+      title: string;
+      items: CapabilityItem[];
+    };
+
+const inputClassName =
+  "w-full rounded-xl border border-white/10 bg-slate-950/20 px-3 py-2 text-sm text-white outline-none transition placeholder:text-slate-300/45 focus:border-sky-300/35 focus:bg-slate-950/28";
+
+const panelClassName =
+  "rounded-[16px] border border-white/10 bg-[linear-gradient(180deg,rgba(26,36,48,0.78),rgba(35,46,59,0.86))] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]";
+
+const formatPaletteLabel = (value: string) => {
+  const acronyms = new Set(["ai", "api", "csv", "html", "json", "llm", "pdf", "sql", "ui", "url", "xml"]);
+  return value
+    .trim()
+    .split(/[\s/_-]+/)
+    .filter(Boolean)
+    .map((segment) => {
+      const lower = segment.toLowerCase();
+      if (acronyms.has(lower)) {
+        return lower.toUpperCase();
+      }
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join(" ");
+};
+
+const hexToRgba = (hex: string, alpha: number) => {
+  const normalized = hex.replace("#", "");
+  const expanded =
+    normalized.length === 3
+      ? normalized
+          .split("")
+          .map((char) => `${char}${char}`)
+          .join("")
+      : normalized;
+  const value = Number.parseInt(expanded, 16);
+  if (!Number.isFinite(value)) {
+    return `rgba(148, 163, 184, ${alpha})`;
+  }
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+};
+
 export default function StudioCapabilityPalette({
   capabilities,
   groups,
@@ -28,145 +95,275 @@ export default function StudioCapabilityPalette({
   onAddCapability,
   onAddControl,
 }: StudioCapabilityPaletteProps) {
-  const controlNodes: Array<{
-    kind: StudioControlKind;
-    title: string;
-    description: string;
-  }> = [
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const hasFilters = normalizedQuery.length > 0 || selectedGroup !== "all";
+  const controlNodes: PaletteControlItem[] = [
     { kind: "if", title: "If", description: "Single-condition branch gate." },
-    { kind: "if_else", title: "If / Else", description: "Binary branch with true and false paths." },
-    { kind: "switch", title: "Switch", description: "Route by expression and named cases." },
-    { kind: "parallel", title: "Parallel", description: "Design fan-out or fan-in branch groups." },
+    { kind: "if_else", title: "If / Else", description: "True/false branch split." },
+    { kind: "switch", title: "Switch", description: "Route by named cases." },
+    { kind: "parallel", title: "Parallel", description: "Fan-out or fan-in branches." },
   ];
 
+  const visibleControlNodes = useMemo(
+    () =>
+      normalizedQuery
+        ? controlNodes.filter((item) =>
+            [item.title, item.description, item.kind].join(" ").toLowerCase().includes(normalizedQuery)
+          )
+        : controlNodes,
+    [normalizedQuery]
+  );
+
+  const capabilitySections = useMemo(() => {
+    const grouped = new Map<string, CapabilityItem[]>();
+    capabilities.forEach((item) => {
+      const groupName = item.group?.trim() || "Ungrouped";
+      const items = grouped.get(groupName) || [];
+      items.push(item);
+      grouped.set(groupName, items);
+    });
+    return Array.from(grouped.entries())
+      .map(([groupName, items]) => ({
+        id: `group-${groupName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+        title: formatPaletteLabel(groupName),
+        items: [...items].sort((left, right) => left.id.localeCompare(right.id)),
+      }))
+      .sort((left, right) => left.title.localeCompare(right.title));
+  }, [capabilities]);
+
+  const sections: PaletteSection[] = useMemo(() => {
+    const next: PaletteSection[] = [];
+    if (visibleControlNodes.length > 0) {
+      next.push({
+        id: "control-flow",
+        kind: "control",
+        title: "Control Flow",
+        items: visibleControlNodes,
+      });
+    }
+    capabilitySections.forEach((section) => {
+      next.push({
+        id: section.id,
+        kind: "capability",
+        title: section.title,
+        items: section.items,
+      });
+    });
+    return next;
+  }, [capabilitySections, visibleControlNodes]);
+
+  const visibleNodeCount = visibleControlNodes.length + capabilities.length;
+
+  const toggleSection = (sectionId: string) => {
+    setCollapsedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(sectionId)) {
+        next.delete(sectionId);
+      } else {
+        next.add(sectionId);
+      }
+      return next;
+    });
+  };
+
   return (
-    <aside className="rounded-[28px] border border-slate-200 bg-white/90 p-4 shadow-sm backdrop-blur">
-      <div className="flex items-start justify-between gap-3">
+    <aside className="flex h-full min-h-0 flex-col px-3 py-3 text-slate-100">
+      <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
-            Capability Palette
+          <div className="text-[12px] font-semibold uppercase tracking-[0.16em] text-slate-300/76">
+            Palette Scope
           </div>
-          <h2 className="mt-1 font-display text-2xl text-slate-900">Build From Catalog</h2>
+          <div className="mt-1 text-[15px] font-semibold text-white">
+            {selectedGroup === "all" ? "All sections" : formatPaletteLabel(selectedGroup)}
+          </div>
         </div>
-        <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] text-slate-600">
-          {capabilities.length} visible
+        <div className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+          {visibleNodeCount} nodes
         </div>
       </div>
 
-      <div className="mt-4 grid gap-3">
-        <label className="block">
-          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-            Search
-          </div>
-          <input
-            className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:bg-white"
-            value={query}
-            onChange={(event) => onQueryChange(event.target.value)}
-            placeholder="document, github, validate..."
-          />
-        </label>
-        <label className="block">
-          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-            Group
-          </div>
+      <div className="mt-3 grid gap-2.5">
+        <input
+          className={inputClassName}
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          placeholder="Search nodes"
+        />
+        <div className="flex items-center gap-2">
           <select
-            className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:bg-white"
+            className={`${inputClassName} min-w-0 flex-1 pr-8`}
             value={selectedGroup}
             onChange={(event) => onGroupChange(event.target.value)}
           >
             <option value="all">All groups</option>
             {groups.map((group) => (
               <option key={`studio-group-${group}`} value={group}>
-                {group}
+                {formatPaletteLabel(group)}
               </option>
             ))}
           </select>
-        </label>
+          {hasFilters ? (
+            <button
+              type="button"
+              className="shrink-0 rounded-xl border border-white/10 bg-white/[0.05] px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-100 transition hover:border-white/18 hover:bg-white/[0.08]"
+              onClick={() => {
+                onQueryChange("");
+                onGroupChange("all");
+              }}
+            >
+              Clear
+            </button>
+          ) : null}
+        </div>
       </div>
 
-      {loading ? <div className="mt-4 text-sm text-slate-500">Loading capability catalog...</div> : null}
-      {error ? <div className="mt-4 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</div> : null}
+      {loading ? (
+        <div className="mt-3 rounded-[14px] border border-sky-300/15 bg-sky-400/10 px-3 py-2 text-sm text-sky-100">
+          Loading capability catalog...
+        </div>
+      ) : null}
+      {error ? (
+        <div className="mt-3 rounded-[14px] border border-rose-300/20 bg-rose-400/10 px-3 py-2 text-sm text-rose-100">
+          {error}
+        </div>
+      ) : null}
 
-      <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50/70 p-4">
-        <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-amber-700">
-          Control Flow
-        </div>
-        <div className="mt-1 text-sm text-amber-900">
-          Studio-only flow nodes for branching and parallel orchestration design.
-        </div>
-        <div className="mt-3 grid gap-3">
-          {controlNodes.map((item) => (
-            <div
-              key={`studio-control-${item.kind}`}
-              className="rounded-2xl border border-amber-200 bg-white/80 px-4 py-3"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold text-slate-900">{item.title}</div>
-                  <div className="mt-1 text-xs text-slate-600">{item.description}</div>
-                </div>
+      <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
+        <div className="space-y-3 pb-1">
+          {sections.map((section) => {
+            const isCollapsed = collapsedSections.has(section.id);
+            const isControlSection = section.kind === "control";
+            return (
+              <section
+                key={section.id}
+                className={`${panelClassName} ${
+                  isControlSection
+                    ? "border-amber-300/18 bg-[linear-gradient(180deg,rgba(120,84,24,0.22),rgba(39,50,63,0.84))]"
+                    : ""
+                }`}
+              >
                 <button
-                  className="shrink-0 rounded-full border border-amber-300 bg-white px-3 py-1 text-[11px] font-semibold text-amber-700 transition hover:border-amber-500"
-                  onClick={() => onAddControl(item.kind)}
+                  type="button"
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                  onClick={() => toggleSection(section.id)}
                 >
-                  Add
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="mt-4 space-y-3">
-        {capabilities.length === 0 && !loading ? (
-          <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-5 text-sm text-slate-500">
-            No capabilities match this filter.
-          </div>
-        ) : null}
-        {capabilities.map((item) => {
-          const requiredInputs = getCapabilityRequiredInputs(item);
-          return (
-            <div
-              key={`studio-capability-${item.id}`}
-              className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-slate-900">{item.id}</div>
-                  <div className="mt-1 text-xs text-slate-500">
-                    {[item.group || "ungrouped", item.subgroup || null].filter(Boolean).join(" / ")}
+                  <div>
+                    <div
+                      className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${
+                        isControlSection ? "text-amber-100/88" : "text-slate-300/78"
+                      }`}
+                    >
+                      {section.title}
+                    </div>
                   </div>
-                </div>
-                <button
-                  className="shrink-0 rounded-full border border-slate-300 bg-white px-3 py-1 text-[11px] font-semibold text-slate-700 transition hover:border-slate-900 hover:text-slate-900"
-                  onClick={() => onAddCapability(item.id)}
-                  disabled={!item.enabled}
-                >
-                  Add
+                  <div className="flex items-center gap-2">
+                    <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+                      {section.items.length}
+                    </span>
+                    <span className="flex h-6 w-6 items-center justify-center rounded-lg border border-white/10 bg-white/[0.04] text-[12px] text-slate-200">
+                      {isCollapsed ? "+" : "−"}
+                    </span>
+                  </div>
                 </button>
-              </div>
-              {item.description ? (
-                <div className="mt-2 line-clamp-3 text-sm text-slate-600">{item.description}</div>
-              ) : null}
-              <div className="mt-3 flex flex-wrap gap-2">
-                <span className="rounded-full bg-slate-900 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-white">
-                  {item.risk_tier || "unknown"}
-                </span>
-                <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-600">
-                  required {requiredInputs.length}
-                </span>
-                {item.tags.slice(0, 3).map((tag) => (
-                  <span
-                    key={`studio-capability-tag-${item.id}-${tag}`}
-                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] text-slate-600"
-                  >
-                    {tag}
-                  </span>
-                ))}
-              </div>
+
+                {isCollapsed ? null : (
+                  <div className="mt-3 space-y-2.5">
+                    {section.kind === "control"
+                      ? section.items.map((item) => {
+                          const visual = resolveWorkflowNodeVisual({
+                            nodeKind: "control",
+                            controlKind: item.kind,
+                            taskName: item.title,
+                          });
+                          return (
+                            <button
+                              key={`studio-control-${item.kind}`}
+                              type="button"
+                              className="group flex w-full items-center gap-3 rounded-[14px] border px-3 py-2.5 text-left transition hover:border-white/22 hover:bg-white/[0.06]"
+                              style={{
+                                borderColor: hexToRgba(visual.stroke, 0.28),
+                                background: `linear-gradient(180deg, ${hexToRgba(
+                                  visual.fill,
+                                  0.18
+                                )} 0%, rgba(26,35,46,0.58) 100%)`,
+                              }}
+                              onClick={() => onAddControl(item.kind)}
+                            >
+                              <WorkflowNodePlateIcon visual={visual} size={36} />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-[13px] font-semibold text-white">
+                                  {item.title}
+                                </div>
+                                <div className="mt-0.5 truncate text-[11px] text-slate-300/76">
+                                  {item.description}
+                                </div>
+                              </div>
+                              <span className="flex h-8 w-8 items-center justify-center rounded-xl border border-white/12 bg-white/[0.04] text-lg leading-none text-slate-100 transition group-hover:border-sky-300/30 group-hover:bg-sky-400/12">
+                                +
+                              </span>
+                            </button>
+                          );
+                        })
+                      : section.items.map((item) => {
+                          const requiredInputs = getCapabilityRequiredInputs(item);
+                          const visual = resolveWorkflowNodeVisual({
+                            capabilityId: item.id,
+                            taskName: item.id,
+                          });
+                          return (
+                            <button
+                              key={`studio-capability-${item.id}`}
+                              type="button"
+                              className="group flex w-full items-center gap-3 rounded-[14px] border px-3 py-2.5 text-left transition hover:border-white/22 hover:bg-white/[0.06] disabled:cursor-not-allowed"
+                              style={{
+                                borderColor: hexToRgba(visual.stroke, item.enabled ? 0.26 : 0.14),
+                                background: item.enabled
+                                  ? `linear-gradient(180deg, ${hexToRgba(
+                                      visual.fill,
+                                      0.16
+                                    )} 0%, rgba(26,35,46,0.56) 100%)`
+                                  : "linear-gradient(180deg, rgba(71,85,105,0.16) 0%, rgba(26,35,46,0.44) 100%)",
+                                opacity: item.enabled ? 1 : 0.56,
+                              }}
+                              onClick={() => onAddCapability(item.id)}
+                              disabled={!item.enabled}
+                            >
+                              <WorkflowNodePlateIcon visual={visual} size={36} />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-[13px] font-semibold text-white">
+                                  {taskNameFromCapability(item.id)}
+                                </div>
+                                <div className="mt-0.5 truncate text-[11px] text-slate-300/76">
+                                  {item.id}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {requiredInputs.length > 0 ? (
+                                  <span className="rounded-full border border-white/10 bg-white/[0.05] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+                                    {requiredInputs.length} req
+                                  </span>
+                                ) : null}
+                                <span className="flex h-8 w-8 items-center justify-center rounded-xl border border-white/12 bg-white/[0.04] text-lg leading-none text-slate-100 transition group-hover:border-sky-300/30 group-hover:bg-sky-400/12">
+                                  +
+                                </span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                  </div>
+                )}
+              </section>
+            );
+          })}
+
+          {capabilities.length === 0 && !loading ? (
+            <div className="rounded-[16px] border border-dashed border-white/12 bg-white/[0.03] px-4 py-5 text-sm text-slate-300/72">
+              No capability nodes match the current filters.
             </div>
-          );
-        })}
+          ) : null}
+        </div>
       </div>
     </aside>
   );

@@ -32,7 +32,6 @@ class CoreOpsHandlers:
     artifact_copy: PayloadHandler
     workspace_copy: PayloadHandler
     artifact_move: PayloadHandler
-    derive_output_path: PayloadHandler
     derive_output_filename: PayloadHandler
     run_tests: PayloadHandler
     search_text: PayloadHandler
@@ -684,52 +683,6 @@ def register_core_ops_tools(
                 tool_intent=ToolIntent.io,
             ),
             handler=handlers.workspace_copy,
-        )
-    )
-
-    registry.register(
-        Tool(
-            spec=ToolSpec(
-                name="derive_output_path",
-                description="Derive a generic filesystem-safe output path for generated artifacts",
-                usage_guidance=(
-                    "Use for capability-driven document rendering where naming should be generic and deterministic. "
-                    "Provide topic and output_dir. "
-                    "document_type is optional metadata and defaults to 'document'. "
-                    "Optionally provide today/date (YYYY-MM-DD). "
-                    "Optionally provide output_extension (or file_extension/extension/format); "
-                    "if omitted, document_type can be used as extension when it is a known format, "
-                    "otherwise default extension is docx."
-                ),
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "topic": {"type": "string", "minLength": 1},
-                        "today": {"type": "string", "minLength": 4},
-                        "date": {"type": "string", "minLength": 4},
-                        "output_dir": {"type": "string", "minLength": 1},
-                        "document_type": {"type": "string", "minLength": 1},
-                        "output_extension": {"type": "string"},
-                        "file_extension": {"type": "string"},
-                        "extension": {"type": "string"},
-                        "format": {"type": "string"},
-                    },
-                    "required": ["topic", "output_dir"],
-                },
-                output_schema={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "document_type": {"type": "string"},
-                        "output_extension": {"type": "string"},
-                    },
-                    "required": ["path"],
-                },
-                timeout_s=5,
-                risk_level=RiskLevel.low,
-                tool_intent=ToolIntent.io,
-            ),
-            handler=handlers.derive_output_path,
         )
     )
 

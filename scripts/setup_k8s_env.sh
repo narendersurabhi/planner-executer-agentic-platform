@@ -6,26 +6,66 @@ usage() {
 Usage:
   scripts/setup_k8s_env.sh
 
-Creates or updates the awe-config ConfigMap and awe-secrets Secret from .env.
+Creates or updates the awe-config ConfigMap and awe-secrets Secret from an env file.
+
+Optional env:
+  ENV_FILE=.env
+  DEFAULT_ENV_FILE=.env.example
+  K8S_NAMESPACE=awe
 EOF
 }
 
-if [[ ! -f .env ]]; then
-  echo ".env missing" >&2
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+env_file="${ENV_FILE:-.env}"
+default_env_file="${DEFAULT_ENV_FILE:-.env.example}"
+namespace="${K8S_NAMESPACE:-awe}"
+
+if [[ ! -f "$env_file" ]]; then
+  echo "$env_file missing" >&2
   exit 1
 fi
 
+warn() {
+  echo "WARN: $*" >&2
+}
+
+merge_env_assignments() {
+  local file
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$file" || true
+  done | awk -F= '{ lines[$1] = $0 } END { for (key in lines) print lines[key] }'
+}
+
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  grep -E "^${key}=" "$file" | tail -n 1 | cut -d= -f2- || true
+}
+
+env_sources=()
+if [[ -f "$default_env_file" && "$default_env_file" != "$env_file" ]]; then
+  env_sources+=("$default_env_file")
+fi
+env_sources+=("$env_file")
+
 # Ensure target namespace exists before applying ConfigMap/Secret.
-kubectl get namespace awe >/dev/null 2>&1 || kubectl create namespace awe
+kubectl get namespace "$namespace" >/dev/null 2>&1 || kubectl create namespace "$namespace"
 
 tmp_env=$(mktemp)
-trap 'rm -f "$tmp_env"' EXIT
+tmp_merged=$(mktemp)
+trap 'rm -f "$tmp_env" "$tmp_merged"' EXIT
 
-# Build ConfigMap input from .env but keep secrets out of ConfigMap.
-grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env \
-  | grep -Ev '^(OPENAI_API_KEY|GITHUB_TOKEN|GITHUB_CLASSIC_TOKEN|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)=' >"$tmp_env"
+merge_env_assignments "${env_sources[@]}" >"$tmp_merged"
 
-# Ensure K8s service DNS defaults exist when .env is compose-focused.
+# Build ConfigMap input from env sources but keep secrets out of ConfigMap.
+grep -Ev '^(OPENAI_API_KEY|GITHUB_TOKEN|GITHUB_CLASSIC_TOKEN|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|GEMINI_API_KEY|QDRANT_API_KEY|RAG_RETRIEVER_MCP_TOKEN)=' "$tmp_merged" >"$tmp_env" || true
+
+# Ensure K8s service DNS defaults exist when the env file is compose-focused.
 if ! grep -q '^DATABASE_URL=' "$tmp_env"; then
   echo "DATABASE_URL=postgresql://postgres:postgres@postgres:5432/agentic" >>"$tmp_env"
 fi
@@ -111,21 +151,35 @@ if ! grep -q '^RAG_PAYLOAD_WORKSPACE_ID_KEY=' "$tmp_env"; then
   echo "RAG_PAYLOAD_WORKSPACE_ID_KEY=workspace_id" >>"$tmp_env"
 fi
 
-kubectl create configmap awe-config --from-env-file="$tmp_env" --dry-run=client -o yaml | kubectl apply -n awe -f -
+kubectl create configmap awe-config --from-env-file="$tmp_env" --dry-run=client -o yaml | kubectl apply -n "$namespace" -f -
 
-OPENAI_KEY=$(grep -E '^OPENAI_API_KEY=' .env | cut -d= -f2-)
-GITHUB_CLASSIC_TOKEN=$(grep -E '^GITHUB_CLASSIC_TOKEN=' .env | cut -d= -f2-)
-GITHUB_TOKEN=$(grep -E '^GITHUB_TOKEN=' .env | cut -d= -f2-)
-AWS_ACCESS_KEY_ID=$(grep -E '^AWS_ACCESS_KEY_ID=' .env | cut -d= -f2-)
-AWS_SECRET_ACCESS_KEY=$(grep -E '^AWS_SECRET_ACCESS_KEY=' .env | cut -d= -f2-)
+OPENAI_KEY=$(read_env_value OPENAI_API_KEY "$tmp_merged")
+GITHUB_CLASSIC_TOKEN=$(read_env_value GITHUB_CLASSIC_TOKEN "$tmp_merged")
+GITHUB_TOKEN=$(read_env_value GITHUB_TOKEN "$tmp_merged")
+AWS_ACCESS_KEY_ID=$(read_env_value AWS_ACCESS_KEY_ID "$tmp_merged")
+AWS_SECRET_ACCESS_KEY=$(read_env_value AWS_SECRET_ACCESS_KEY "$tmp_merged")
+AWS_SESSION_TOKEN=$(read_env_value AWS_SESSION_TOKEN "$tmp_merged")
+GEMINI_API_KEY=$(read_env_value GEMINI_API_KEY "$tmp_merged")
+QDRANT_API_KEY=$(read_env_value QDRANT_API_KEY "$tmp_merged")
+RAG_RETRIEVER_MCP_TOKEN=$(read_env_value RAG_RETRIEVER_MCP_TOKEN "$tmp_merged")
+LLM_PROVIDER=$(read_env_value LLM_PROVIDER "$tmp_env")
+RAG_EMBEDDING_PROVIDER=$(read_env_value RAG_EMBEDDING_PROVIDER "$tmp_env")
 
 if [[ -n "$GITHUB_CLASSIC_TOKEN" ]]; then
   GITHUB_TOKEN="$GITHUB_CLASSIC_TOKEN"
 fi
 
-if [[ -z "$OPENAI_KEY" || -z "$GITHUB_TOKEN" || -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
-  echo "OPENAI_API_KEY, GITHUB_CLASSIC_TOKEN or GITHUB_TOKEN, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY must be set in .env" >&2
-  exit 1
+if [[ "$LLM_PROVIDER" == "gemini" && -z "$GEMINI_API_KEY" ]]; then
+  warn "GEMINI_API_KEY is empty while LLM_PROVIDER=gemini; Gemini-backed requests will fail."
+fi
+if [[ ("$LLM_PROVIDER" == "openai" || "$LLM_PROVIDER" == "openai_compatible" || "$RAG_EMBEDDING_PROVIDER" == "openai") && -z "$OPENAI_KEY" ]]; then
+  warn "OPENAI_API_KEY is empty while OpenAI-backed generation or embeddings are configured."
+fi
+if [[ -z "$GITHUB_TOKEN" ]]; then
+  warn "GITHUB_TOKEN is empty; github-mcp may fail readiness and GitHub-backed tools will be unavailable."
+fi
+if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
+  warn "AWS credentials are incomplete; S3-backed document storage will be unavailable."
 fi
 
 kubectl create secret generic awe-secrets \
@@ -133,4 +187,8 @@ kubectl create secret generic awe-secrets \
   --from-literal=GITHUB_TOKEN="$GITHUB_TOKEN" \
   --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
   --from-literal=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-  --dry-run=client -o yaml | kubectl apply -n awe -f -
+  --from-literal=AWS_SESSION_TOKEN="$AWS_SESSION_TOKEN" \
+  --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
+  --from-literal=QDRANT_API_KEY="$QDRANT_API_KEY" \
+  --from-literal=RAG_RETRIEVER_MCP_TOKEN="$RAG_RETRIEVER_MCP_TOKEN" \
+  --dry-run=client -o yaml | kubectl apply -n "$namespace" -f -

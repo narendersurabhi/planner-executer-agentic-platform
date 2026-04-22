@@ -31,7 +31,7 @@ Built-in tools:
 - sleep
 - http_fetch (optional)
 - docx_render (requires output_path)
-- docx_generate_from_spec
+- docx_render_from_spec
 - document_spec_validate
 
 Docx render schema pattern:

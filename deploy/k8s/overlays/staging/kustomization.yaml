@@ -1,0 +1,76 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: awe-staging
+resources:
+  - ../../namespace.yaml
+  - ../../configmap.yaml
+  - ../../pvc-postgres.yaml
+  - ../../pvc-redis.yaml
+  - ../../pvc-qdrant.yaml
+  - ../../pvc-shared.yaml
+  - ../../postgres.yaml
+  - ../../redis.yaml
+  - ../../qdrant.yaml
+  - ../../jaeger.yaml
+  - ../../github-mcp.yaml
+  - ../../coder.yaml
+  - ../../rag-retriever-mcp.yaml
+  - ../../planner.yaml
+  - ../../policy.yaml
+  - ../../worker.yaml
+  - ../../api.yaml
+  - ../../ui.yaml
+  - ../../hpa-api.yaml
+  - ../../hpa-coder.yaml
+configMapGenerator:
+  - name: capability-registry
+    files:
+      - capability_registry.yaml=../../../../config/capability_registry.yaml
+  - name: mcp-servers-config
+    files:
+      - mcp_servers.yaml=../../../../config/mcp_servers.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+images:
+  - name: ghcr.io/your-org/awe-api
+    newName: ghcr.io/your-org/awe-api
+    newTag: latest
+  - name: ghcr.io/your-org/awe-planner
+    newName: ghcr.io/your-org/awe-planner
+    newTag: latest
+  - name: ghcr.io/your-org/awe-worker
+    newName: ghcr.io/your-org/awe-worker
+    newTag: latest
+  - name: ghcr.io/your-org/awe-coder
+    newName: ghcr.io/your-org/awe-coder
+    newTag: latest
+  - name: ghcr.io/your-org/awe-rag-retriever-mcp
+    newName: ghcr.io/your-org/awe-rag-retriever-mcp
+    newTag: latest
+  - name: ghcr.io/your-org/awe-ui
+    newName: ghcr.io/your-org/awe-ui
+    newTag: latest
+  - name: ghcr.io/your-org/awe-policy
+    newName: ghcr.io/your-org/awe-policy
+    newTag: latest
+patches:
+  - path: patch-namespace.yaml
+    target:
+      kind: Namespace
+      name: awe
+  - path: patch-api.yaml
+    target:
+      kind: Deployment
+      name: api
+  - path: patch-planner.yaml
+    target:
+      kind: Deployment
+      name: planner
+  - path: patch-ui.yaml
+    target:
+      kind: Deployment
+      name: ui
+  - path: patch-ui-service.yaml
+    target:
+      kind: Service
+      name: ui

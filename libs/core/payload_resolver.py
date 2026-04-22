@@ -6,9 +6,29 @@ from typing import Any, Dict
 
 from jsonschema import Draft202012Validator
 
+from libs.core import planner_contracts
+
 
 class ToolInputReferenceError(ValueError):
     """Raised when a tool input reference cannot be resolved."""
+
+
+_DOCUMENT_SPEC_GENERATION_TOOL_NAMES = {
+    "llm_generate_document_spec",
+    "document.spec.generate",
+    "llm_generate_document_spec_from_markdown",
+    "document.spec.generate_from_markdown",
+}
+
+_DOCUMENT_SPEC_FINAL_ARTIFACT_KEYS = {
+    "path",
+    "output_path",
+    "filename",
+    "file_name",
+    "output_filename",
+    "format",
+    "output_format",
+}
 
 
 def resolve_tool_inputs(
@@ -94,6 +114,23 @@ def resolve_tool_payload(
     payload = _merge_payload_from_task(payload, task_payload, instruction)
     payload = _fill_payload_from_context(payload, context)
     payload = _promote_document_job_fields(payload, tool_name=tool_name)
+    payload = _canonicalize_render_path_aliases(payload, tool_name=tool_name)
+    payload = _drop_document_spec_final_artifact_fields(payload, tool_name=tool_name)
+    if tool_name == "llm_generate_with_context":
+        normalized: dict[str, Any] = {"prompt": str(payload.get("prompt") or "")}
+        if "context" in payload:
+            normalized["context"] = payload.get("context")
+        elif context:
+            normalized["context"] = context
+        if isinstance(payload.get("system_prompt"), str) and str(payload.get("system_prompt")).strip():
+            normalized["system_prompt"] = str(payload.get("system_prompt"))
+        temperature = payload.get("temperature")
+        if isinstance(temperature, (int, float)) and not isinstance(temperature, bool):
+            normalized["temperature"] = temperature
+        max_output_tokens = payload.get("max_output_tokens")
+        if isinstance(max_output_tokens, int) and not isinstance(max_output_tokens, bool):
+            normalized["max_output_tokens"] = max_output_tokens
+        return normalized
     if tool_name == "llm_generate":
         base_text = payload.get("text") or payload.get("prompt") or instruction
         if context:
@@ -165,6 +202,7 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
             "instruction",
             "markdown_text",
             "topic",
+            "main_topic",
             "audience",
             "tone",
             "today",
@@ -181,12 +219,19 @@ def _fill_payload_from_context(payload: dict, context: dict) -> dict:
             "job_description",
             "output_dir",
             "document_type",
+            "path",
+            "output_path",
+            "filename",
+            "file_name",
+            "output_filename",
         ):
             if key in filled:
                 continue
             value = job_context.get(key)
             if isinstance(value, str) and value.strip():
                 filled[key] = value
+    if "topic" not in filled and isinstance(filled.get("main_topic"), str) and filled["main_topic"].strip():
+        filled["topic"] = filled["main_topic"].strip()
     if "document_spec" not in filled:
         doc = _extract_document_spec_from_context(context)
         if isinstance(doc, dict):
@@ -230,6 +275,7 @@ def _promote_document_job_fields(
     for key in (
         "instruction",
         "topic",
+        "main_topic",
         "audience",
         "tone",
         "today",
@@ -240,6 +286,10 @@ def _promote_document_job_fields(
         value = job.get(key)
         if isinstance(value, str) and value.strip():
             promoted[key] = value
+    if "topic" not in promoted and isinstance(promoted.get("main_topic"), str):
+        main_topic = str(promoted.get("main_topic") or "").strip()
+        if main_topic:
+            promoted["topic"] = main_topic
     return promoted
 
 
@@ -248,6 +298,7 @@ def normalize_reference_payload_for_validation(
     *,
     dependency_defaults: dict[str, Any] | None = None,
     unknown_default: Any = "__dependency__",
+    tool_name: str | None = None,
 ) -> dict[str, Any]:
     defaults = dependency_defaults or {}
 
@@ -267,7 +318,42 @@ def normalize_reference_payload_for_validation(
     normalized = _normalize(dict(payload))
     if isinstance(normalized, dict):
         normalized = _promote_document_job_fields(normalized)
+        normalized = _canonicalize_render_path_aliases(normalized, tool_name=tool_name)
+        normalized = _drop_document_spec_final_artifact_fields(normalized, tool_name=tool_name)
     return normalized
+
+
+def _canonicalize_render_path_aliases(
+    payload: dict[str, Any],
+    *,
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    if not planner_contracts.is_render_request_id(tool_name):
+        return dict(payload)
+    canonical = dict(payload)
+    path_value = canonical.get("path")
+    if isinstance(path_value, str) and path_value.strip():
+        return canonical
+    for key in ("output_path", "filename", "file_name", "output_filename"):
+        value = canonical.get(key)
+        if isinstance(value, str) and value.strip():
+            canonical["path"] = value.strip()
+            break
+    return canonical
+
+
+def _drop_document_spec_final_artifact_fields(
+    payload: dict[str, Any],
+    *,
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    if str(tool_name or "").strip().lower() not in _DOCUMENT_SPEC_GENERATION_TOOL_NAMES:
+        return dict(payload)
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _DOCUMENT_SPEC_FINAL_ARTIFACT_KEYS
+    }
 
 
 def _resolve_payload_references(value: Any, context: dict[str, Any], *, strict: bool) -> Any:

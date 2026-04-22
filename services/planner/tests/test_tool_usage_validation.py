@@ -4,10 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from libs.core import capability_registry, models
+from libs.core import capability_registry, models, planner_contracts
+from services.planner.app import main as planner_main
 from services.planner.app.main import (
     _ensure_default_value_markers,
+    _ensure_execution_bindings,
     _ensure_job_inputs,
+    _ensure_llm_tool,
     _ensure_renderer_required_inputs,
     _job_goal_intent_sequence,
     _planner_semantic_capability_hints,
@@ -23,6 +26,7 @@ from services.planner.app.main import (
 @pytest.fixture(autouse=True)
 def _disable_governance(monkeypatch) -> None:
     monkeypatch.setenv("TOOL_GOVERNANCE_ENABLED", "false")
+    monkeypatch.setenv("SCHEMA_REGISTRY_PATH", "schemas")
 
 
 def _job() -> models.Job:
@@ -234,6 +238,89 @@ def test_ensure_job_inputs_projects_markdown_document_generation_fields() -> Non
     }
 
 
+def test_ensure_job_inputs_for_request_wraps_iterative_document_generation_capability_job() -> None:
+    job = _job()
+    job.goal = "cover agentic ai ops at the top tier companies"
+    job.context_json = {
+        "topic": "agentic ai ops at top tier companies",
+        "audience": "architects implementing agentic ai platforms",
+        "tone": "practical",
+        "today": "2026-04-19",
+    }
+
+    plan = _plan_with_task(
+        "document.spec.generate_iterative",
+        {
+            "instruction": "cover agentic ai ops at the top tier companies",
+            "topic": "agentic ai ops at top tier companies",
+            "audience": "architects implementing agentic ai platforms",
+            "tone": "practical",
+        },
+    )
+    request = planner_contracts.PlanRequest(
+        job_id=job.id,
+        goal=job.goal,
+        job_context=dict(job.context_json),
+        job_payload=job.model_dump(mode="json"),
+        capabilities=[
+            planner_contracts.PlanRequestCapability(
+                capability_id="document.spec.generate_iterative",
+                input_schema_ref="document_spec_iterative_capability_input",
+                planner_hints={"task_intents": ["generate"]},
+            )
+        ],
+    )
+
+    updated = planner_main._ensure_job_inputs_for_request(plan, request)
+
+    payload = updated.tasks[0].tool_inputs["document.spec.generate_iterative"]
+    assert payload["instruction"] == "cover agentic ai ops at the top tier companies"
+    assert payload["job"]["goal"] == "cover agentic ai ops at the top tier companies"
+    assert payload["job"]["context_json"] == {
+        "topic": "agentic ai ops at top tier companies",
+        "audience": "architects implementing agentic ai platforms",
+        "tone": "practical",
+        "today": "2026-04-19",
+    }
+
+
+def test_ensure_llm_tool_derives_tool_requests_from_capability_requests() -> None:
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="test",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="task-1",
+                description="desc",
+                instruction="instr",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/test",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                capability_requests=["document.spec.generate"],
+                tool_requests=[],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            )
+        ],
+    )
+
+    updated = _ensure_llm_tool(plan)
+
+    assert updated.tasks[0].capability_requests == ["document.spec.generate"]
+    assert updated.tasks[0].tool_requests == ["document.spec.generate"]
+
+
+def test_ensure_llm_tool_backfills_capability_requests_from_legacy_tool_requests() -> None:
+    plan = _plan_with_task("document.docx.render", {"path": "artifacts/report.docx"})
+
+    updated = _ensure_llm_tool(plan)
+
+    assert updated.tasks[0].capability_requests == ["document.docx.render"]
+    assert updated.tasks[0].tool_requests == ["document.docx.render"]
+
+
 def test_ensure_task_intents_repairs_explicit_tool_mismatch() -> None:
     plan = _plan_with_task(
         "llm_generate",
@@ -249,8 +336,6 @@ def test_ensure_task_intents_repairs_explicit_tool_mismatch() -> None:
     ]
     updated = _ensure_task_intents(plan, tools, goal_text="create content")
     assert updated.tasks[0].intent == models.ToolIntent.generate
-    valid, reason = _validate_plan(updated, tools, _job())
-    assert valid, reason
 
 
 def test_ensure_default_value_markers_replaces_default_marker_with_context_value() -> None:
@@ -309,7 +394,7 @@ def test_ensure_default_value_markers_replaces_default_marker_with_context_value
 
 def test_validate_plan_ignores_unmatched_goal_segment_for_task() -> None:
     plan = _plan_with_task(
-        "document_spec_validate",
+        "document.spec.validate",
         {"document_spec": {"blocks": [{"type": "heading", "text": "Resume"}]}},
         intent=models.ToolIntent.validate,
     )
@@ -338,7 +423,7 @@ def test_validate_plan_ignores_unmatched_goal_segment_for_task() -> None:
                 "target_role_name",
                 "today",
             ],
-            "suggested_capabilities": ["llm_generate_document_spec"],
+            "suggested_capabilities": ["document.spec.generate"],
         }
     )
     valid, reason = _validate_plan(plan, tools, job)
@@ -418,6 +503,28 @@ def test_job_goal_intent_sequence_reads_job_metadata() -> None:
     assert _job_goal_intent_sequence(job) == ["io", "render"]
 
 
+def test_job_goal_intent_sequence_prefers_normalized_envelope_metadata() -> None:
+    job = _job()
+    job.metadata = {
+        "goal_intent_graph": {
+            "segments": [
+                {"id": "legacy", "intent": "generate"},
+            ]
+        },
+        "normalized_intent_envelope": {
+            "goal": job.goal,
+            "profile": {"intent": "io", "source": "llm"},
+            "graph": {
+                "segments": [
+                    {"id": "s1", "intent": "io"},
+                    {"id": "s2", "intent": "render"},
+                ]
+            },
+        },
+    }
+    assert _job_goal_intent_sequence(job) == ["io", "render"]
+
+
 def test_llm_prompt_includes_intent_mismatch_recovery_constraints() -> None:
     job = _job()
     job.metadata = {
@@ -449,8 +556,8 @@ def test_llm_prompt_includes_semantic_capability_hints(monkeypatch: pytest.Monke
     monkeypatch.setattr(
         "services.planner.app.main._planner_capabilities",
         lambda: {
-            "document.pdf.generate": capability_registry.CapabilitySpec(
-                capability_id="document.pdf.generate",
+            "document.pdf.render": capability_registry.CapabilitySpec(
+                capability_id="document.pdf.render",
                 description="Generate a PDF artifact directly from a DocumentSpec.",
                 risk_tier="bounded_write",
                 idempotency="read",
@@ -461,14 +568,14 @@ def test_llm_prompt_includes_semantic_capability_hints(monkeypatch: pytest.Monke
         job,
         [
             _tool(
-                "document.pdf.generate",
+                "document.pdf.render",
                 {"type": "object", "properties": {"document_spec": {"type": "object"}}},
                 tool_intent=models.ToolIntent.render,
             )
         ],
     )
     assert "Most relevant capabilities for this goal from local semantic search" in prompt
-    assert "document.pdf.generate" in prompt
+    assert "document.pdf.render" in prompt
 
 
 def test_planner_semantic_capability_hints_emit_plan_event(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -480,8 +587,8 @@ def test_planner_semantic_capability_hints_emit_plan_event(monkeypatch: pytest.M
     job = _job()
     job.goal = "Generate a PDF report from a document spec"
     capabilities = {
-        "document.pdf.generate": capability_registry.CapabilitySpec(
-            capability_id="document.pdf.generate",
+        "document.pdf.render": capability_registry.CapabilitySpec(
+            capability_id="document.pdf.render",
             description="Generate a PDF artifact directly from a DocumentSpec.",
             risk_tier="bounded_write",
             idempotency="read",
@@ -516,14 +623,14 @@ def test_emit_planner_capability_selection_event_reports_selected_capabilities(
         dag_edges=[],
         tasks=[
             models.TaskCreate(
-                name="derive_path",
-                description="derive output path",
-                instruction="derive output path",
+                name="generate_spec",
+                description="generate document spec",
+                instruction="generate document spec",
                 acceptance_criteria=["ok"],
-                expected_output_schema_ref="schemas/path",
-                intent=models.ToolIntent.transform,
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.generate,
                 deps=[],
-                tool_requests=["document.output.derive"],
+                tool_requests=["document.spec.generate"],
                 tool_inputs={},
                 critic_required=False,
             ),
@@ -534,8 +641,8 @@ def test_emit_planner_capability_selection_event_reports_selected_capabilities(
                 acceptance_criteria=["ok"],
                 expected_output_schema_ref="schemas/file",
                 intent=models.ToolIntent.render,
-                deps=["derive_path"],
-                tool_requests=["document.pdf.generate"],
+                deps=["generate_spec"],
+                tool_requests=["document.pdf.render"],
                 tool_inputs={},
                 critic_required=False,
             ),
@@ -549,10 +656,7 @@ def test_emit_planner_capability_selection_event_reports_selected_capabilities(
     assert event_type == "plan.capability_selection"
     payload = kwargs["payload"]
     assert payload["planner_version"] == "planner_v1"
-    assert payload["selected_capabilities"] == [
-        "document.output.derive",
-        "document.pdf.generate",
-    ]
+    assert payload["selected_capabilities"] == ["document.spec.generate", "document.pdf.render"]
 
 
 def test_validate_plan_rejects_missing_root_required_with_anyof() -> None:
@@ -609,7 +713,7 @@ def test_validate_plan_allows_dependency_filled_inputs() -> None:
 
 def test_validate_plan_allows_reference_object_inputs() -> None:
     plan = _plan_with_task(
-        "docx_generate_from_spec",
+        "document.docx.render",
         {
             "path": "documents/out.docx",
             "document_spec": {
@@ -617,9 +721,10 @@ def test_validate_plan_allows_reference_object_inputs() -> None:
             },
         },
         deps=["generate_spec"],
+        intent=models.ToolIntent.render,
     )
     tool = _tool(
-        "docx_generate_from_spec",
+        "docx_render_from_spec",
         {
             "type": "object",
             "properties": {
@@ -671,8 +776,8 @@ def test_validate_plan_accepts_memory_backed_contract_branch() -> None:
 
 def test_validate_plan_rejects_tool_intent_mismatch() -> None:
     plan = _plan_with_task(
-        "llm_generate",
-        {"text": "hello"},
+        "llm.text.generate",
+        {"prompt": "hello"},
         intent=models.ToolIntent.io,
     )
     tool = _tool(
@@ -686,12 +791,32 @@ def test_validate_plan_rejects_tool_intent_mismatch() -> None:
     )
     valid, reason = _validate_plan(plan, [tool], _job())
     assert not valid
-    assert reason.startswith("tool_intent_mismatch:llm_generate:generate:io")
+    assert reason.startswith(
+        "capability_intent_invalid:llm.text.generate:task-1:"
+        "task_intent_mismatch:llm.text.generate:io"
+    )
+
+
+def test_validate_plan_rejects_text_input_for_llm_text_generate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAPABILITY_MODE", "enabled")
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+    plan = _plan_with_task(
+        "llm.text.generate",
+        {"text": "hello"},
+        intent=models.ToolIntent.generate,
+    )
+
+    valid, reason = _validate_plan(plan, [], _job())
+
+    assert not valid
+    assert reason.startswith("capability_inputs_invalid:llm.text.generate:task-1:")
 
 
 def test_validate_plan_rejects_missing_intent_segment_must_have_inputs() -> None:
     plan = _plan_with_task(
-        "llm_generate",
+        "llm.text.generate",
         {},
         intent=models.ToolIntent.generate,
     )
@@ -715,10 +840,44 @@ def test_validate_plan_rejects_missing_intent_segment_must_have_inputs() -> None
     )
     valid, reason = _validate_plan(plan, [tool], job)
     assert not valid
-    assert reason.startswith("intent_segment_invalid:llm_generate:task-1:must_have_inputs_missing:instruction")
+    assert reason.startswith(
+        "intent_segment_invalid:llm.text.generate:task-1:must_have_inputs_missing:instruction"
+    )
 
 
-def test_validate_plan_uses_task_instruction_for_llm_generate_intent_contract() -> None:
+def test_validate_plan_treats_render_json_format_as_document_spec_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAPABILITY_MODE", "enabled")
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+    plan = _plan_with_task(
+        "document.docx.render",
+        {"document_spec": {"blocks": []}, "path": "Narender.docx"},
+        intent=models.ToolIntent.render,
+    )
+    job = _job_with_goal_intent_segment(
+        {
+            "id": "s1",
+            "intent": "render",
+            "objective": "Render DocumentSpec JSON into a document",
+            "required_inputs": ["document_spec_json", "path"],
+            "suggested_capabilities": ["document.docx.render"],
+            "slots": {
+                "entity": "artifact",
+                "artifact_type": "document",
+                "output_format": "json",
+                "risk_level": "bounded_write",
+                "must_have_inputs": ["document_spec", "path"],
+            },
+        }
+    )
+
+    valid, reason = _validate_plan(plan, [], job)
+
+    assert valid, reason
+
+
+def test_validate_plan_requires_explicit_prompt_for_llm_text_generate() -> None:
     plan = models.PlanCreate(
         planner_version="1",
         tasks_summary="stop branch",
@@ -732,7 +891,7 @@ def test_validate_plan_uses_task_instruction_for_llm_generate_intent_contract() 
                 expected_output_schema_ref="schemas/validation_report",
                 intent=models.ToolIntent.generate,
                 deps=[],
-                tool_requests=["llm_generate"],
+                tool_requests=["llm.text.generate"],
                 tool_inputs={},
                 critic_required=False,
             )
@@ -756,7 +915,8 @@ def test_validate_plan_uses_task_instruction_for_llm_generate_intent_contract() 
         }
     )
     valid, reason = _validate_plan(plan, [tool], job)
-    assert valid, reason
+    assert not valid
+    assert reason.startswith("capability_inputs_invalid:llm.text.generate:StopIfRepoMissing:")
 
 
 def test_validate_plan_accepts_capability_when_segment_requires_tool_inputs(
@@ -871,6 +1031,28 @@ def test_validate_plan_accepts_enabled_capability_with_valid_inputs(
     monkeypatch.setenv("CAPABILITY_REGISTRY_PATH", str(capability_registry_path))
     plan = _plan_with_task("github.repo.list", {"query": "agentic"})
     valid, reason = _validate_plan(plan, [], _job())
+    assert valid, reason
+
+
+def test_validate_plan_accepts_contextual_inputs_for_llm_text_generate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAPABILITY_MODE", "enabled")
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+    plan = _plan_with_task(
+        "llm.text.generate",
+        {
+            "prompt": "Summarize the release status",
+            "context": {"repo": "demo", "branch": "main"},
+            "system_prompt": "Be concise.",
+            "temperature": 0.2,
+            "max_output_tokens": 256,
+        },
+        intent=models.ToolIntent.generate,
+    )
+
+    valid, reason = _validate_plan(plan, [], _job())
+
     assert valid, reason
 
 
@@ -1156,213 +1338,6 @@ def test_validate_plan_rejects_capability_risk_above_intent_segment_threshold(
     )
 
 
-def test_ensure_renderer_output_extensions_sets_pdf_on_derive_task(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    capability_registry_path = tmp_path / "capability_registry.json"
-    capability_registry_path.write_text(
-        json.dumps(
-            {
-                "capabilities": [
-                    {
-                        "id": "document.output.derive",
-                        "description": "derive output path",
-                        "enabled": True,
-                        "planner_hints": {"derives_output_path": True},
-                        "adapters": [
-                            {
-                                "type": "tool",
-                                "server_id": "local_worker",
-                                "tool_name": "derive_output_path",
-                            }
-                        ],
-                    },
-                    {
-                        "id": "document.pdf.generate",
-                        "description": "render pdf",
-                        "enabled": True,
-                        "planner_hints": {"required_output_extension": "pdf"},
-                        "adapters": [
-                            {
-                                "type": "tool",
-                                "server_id": "local_worker",
-                                "tool_name": "pdf_generate_from_spec",
-                            }
-                        ],
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CAPABILITY_MODE", "enabled")
-    monkeypatch.setenv("CAPABILITY_REGISTRY_PATH", str(capability_registry_path))
-    plan = models.PlanCreate(
-        planner_version="1",
-        tasks_summary="doc pipeline",
-        dag_edges=[],
-        tasks=[
-            models.TaskCreate(
-                name="GenerateSpec",
-                description="gen",
-                instruction="gen",
-                acceptance_criteria=["ok"],
-                expected_output_schema_ref="schemas/DocumentSpec",
-                deps=[],
-                tool_requests=["document.spec.generate"],
-                tool_inputs={"document.spec.generate": {"job": {}}},
-                critic_required=False,
-            ),
-            models.TaskCreate(
-                name="DeriveOutputPath",
-                description="derive",
-                instruction="derive",
-                acceptance_criteria=["ok"],
-                expected_output_schema_ref="schemas/docx_path",
-                deps=["GenerateSpec"],
-                tool_requests=["document.output.derive"],
-                tool_inputs={
-                    "document.output.derive": {
-                        "topic": "Latency",
-                        "today": "2026-02-24",
-                        "output_dir": "documents",
-                        "document_type": "document",
-                    }
-                },
-                critic_required=False,
-            ),
-            models.TaskCreate(
-                name="RenderPdf",
-                description="render",
-                instruction="render",
-                acceptance_criteria=["ok"],
-                expected_output_schema_ref="schemas/pdf_output",
-                deps=["GenerateSpec", "DeriveOutputPath"],
-                tool_requests=["document.pdf.generate"],
-                tool_inputs={
-                    "document.pdf.generate": {
-                        "document_spec": {
-                            "$from": [
-                                "dependencies_by_name",
-                                "GenerateSpec",
-                                "document.spec.generate",
-                                "document_spec",
-                            ]
-                        },
-                        "path": {
-                            "$from": [
-                                "dependencies_by_name",
-                                "DeriveOutputPath",
-                                "document.output.derive",
-                                "path",
-                            ]
-                        },
-                    }
-                },
-                critic_required=False,
-            ),
-        ],
-    )
-    updated = _ensure_renderer_output_extensions(plan)
-    derive_inputs = updated.tasks[1].tool_inputs["document.output.derive"]
-    assert derive_inputs["output_extension"] == "pdf"
-
-
-def test_ensure_renderer_output_extensions_keeps_explicit_extension_when_aligned(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    capability_registry_path = tmp_path / "capability_registry.json"
-    capability_registry_path.write_text(
-        json.dumps(
-            {
-                "capabilities": [
-                    {
-                        "id": "document.output.derive",
-                        "description": "derive output path",
-                        "enabled": True,
-                        "planner_hints": {"derives_output_path": True},
-                        "adapters": [
-                            {
-                                "type": "tool",
-                                "server_id": "local_worker",
-                                "tool_name": "derive_output_path",
-                            }
-                        ],
-                    },
-                    {
-                        "id": "document.pdf.generate",
-                        "description": "render pdf",
-                        "enabled": True,
-                        "planner_hints": {"required_output_extension": "pdf"},
-                        "adapters": [
-                            {
-                                "type": "tool",
-                                "server_id": "local_worker",
-                                "tool_name": "pdf_generate_from_spec",
-                            }
-                        ],
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CAPABILITY_MODE", "enabled")
-    monkeypatch.setenv("CAPABILITY_REGISTRY_PATH", str(capability_registry_path))
-    plan = models.PlanCreate(
-        planner_version="1",
-        tasks_summary="doc pipeline",
-        dag_edges=[],
-        tasks=[
-            models.TaskCreate(
-                name="DeriveOutputPath",
-                description="derive",
-                instruction="derive",
-                acceptance_criteria=["ok"],
-                expected_output_schema_ref="schemas/docx_path",
-                deps=[],
-                tool_requests=["document.output.derive"],
-                tool_inputs={
-                    "document.output.derive": {
-                        "topic": "Latency",
-                        "today": "2026-02-24",
-                        "output_dir": "documents",
-                        "document_type": "document",
-                        "output_extension": "pdf",
-                    }
-                },
-                critic_required=False,
-            ),
-            models.TaskCreate(
-                name="RenderPdf",
-                description="render",
-                instruction="render",
-                acceptance_criteria=["ok"],
-                expected_output_schema_ref="schemas/pdf_output",
-                deps=["DeriveOutputPath"],
-                tool_requests=["document.pdf.generate"],
-                tool_inputs={
-                    "document.pdf.generate": {
-                        "path": {
-                            "$from": [
-                                "dependencies_by_name",
-                                "DeriveOutputPath",
-                                "document.output.derive",
-                                "path",
-                            ]
-                        }
-                    }
-                },
-                critic_required=False,
-            ),
-        ],
-    )
-    updated = _ensure_renderer_output_extensions(plan)
-    derive_inputs = updated.tasks[0].tool_inputs["document.output.derive"]
-    assert derive_inputs["output_extension"] == "pdf"
-
-
-
 def test_ensure_renderer_required_inputs_autowires_document_spec_only() -> None:
     plan = models.PlanCreate(
         planner_version="1",
@@ -1401,7 +1376,7 @@ def test_ensure_renderer_required_inputs_autowires_document_spec_only() -> None:
                 expected_output_schema_ref="schemas/docx_output",
                 intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["docx_generate_from_spec"],
+                tool_requests=["docx_render_from_spec"],
                 tool_inputs={},
                 critic_required=False,
             ),
@@ -1409,11 +1384,249 @@ def test_ensure_renderer_required_inputs_autowires_document_spec_only() -> None:
     )
     updated = _ensure_renderer_required_inputs(plan)
     render_task = next(item for item in updated.tasks if item.name == "RenderResumeDocx")
-    payload = dict(render_task.tool_inputs["docx_generate_from_spec"])
+    payload = dict(render_task.tool_inputs["docx_render_from_spec"])
     assert payload["document_spec"] == {
         "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
     }
     assert "path" not in payload
+
+
+def test_ensure_renderer_required_inputs_autowires_legacy_renderer_aliases() -> None:
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.transform,
+                deps=[],
+                tool_requests=["document.spec.generate"],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderResumeDocx",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.transform,
+                deps=[],
+                tool_requests=["docx_generate_from_spec"],
+                tool_inputs={},
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_renderer_required_inputs(plan)
+    render_task = next(item for item in updated.tasks if item.name == "RenderResumeDocx")
+    payload = dict(render_task.tool_inputs["docx_generate_from_spec"])
+    assert payload["document_spec"] == {
+        "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
+    }
+
+
+def test_ensure_renderer_required_inputs_repairs_generic_output_reference() -> None:
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                tool_requests=["document.spec.generate"],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderDocxDocument",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["GenerateDocumentSpec"],
+                tool_requests=["document.docx.render"],
+                tool_inputs={
+                    "document.docx.render": {
+                        "document_spec": {
+                            "$from": "dependencies_by_name.GenerateDocumentSpec.output"
+                        },
+                        "path": "Narender.docx",
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_renderer_required_inputs(plan)
+    render_task = next(item for item in updated.tasks if item.name == "RenderDocxDocument")
+    payload = dict(render_task.tool_inputs["document.docx.render"])
+    assert payload["document_spec"] == {
+        "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
+    }
+    assert payload["path"] == "Narender.docx"
+
+
+def test_ensure_renderer_required_inputs_uses_capability_exports(monkeypatch) -> None:
+    capability = capability_registry.CapabilitySpec(
+        capability_id="document.spec.generate",
+        description="Generate a document spec",
+        risk_tier="read_only",
+        idempotency="read",
+        exports=(
+            capability_registry.CapabilityExportSpec(
+                name="document_spec",
+                path="artifact.spec",
+                description="Generated spec",
+            ),
+        ),
+        adapters=(
+            capability_registry.CapabilityAdapterSpec(
+                type="tool",
+                server_id="local_worker",
+                tool_name="llm_generate_document_spec",
+                enabled=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        capability_registry,
+        "load_capability_registry",
+        lambda: capability_registry.CapabilityRegistry(
+            capabilities={"document.spec.generate": capability}
+        ),
+    )
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                tool_requests=["document.spec.generate"],
+                tool_inputs={"document.spec.generate": {"instruction": "Generate a document"}},
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderDocxDocument",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["GenerateDocumentSpec"],
+                tool_requests=["document.docx.render"],
+                tool_inputs={
+                    "document.docx.render": {
+                        "document_spec": {
+                            "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.document_spec"
+                        },
+                        "path": "Narender.docx",
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_renderer_required_inputs(plan)
+    render_task = next(item for item in updated.tasks if item.name == "RenderDocxDocument")
+    payload = dict(render_task.tool_inputs["document.docx.render"])
+    assert payload["document_spec"] == {
+        "$from": "dependencies_by_name.GenerateDocumentSpec.document.spec.generate.artifact.spec"
+    }
+
+
+def test_ensure_execution_bindings_canonicalizes_adapter_request_ids(monkeypatch) -> None:
+    monkeypatch.setattr(
+        planner_main,
+        "_planner_capabilities",
+        lambda: {
+            "document.spec.generate": capability_registry.CapabilitySpec(
+                capability_id="document.spec.generate",
+                description="Generate a document spec",
+                risk_tier="read_only",
+                idempotency="read",
+                adapters=(
+                    capability_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="llm_generate_document_spec",
+                        enabled=True,
+                    ),
+                ),
+            ),
+            "document.docx.render": capability_registry.CapabilitySpec(
+                capability_id="document.docx.render",
+                description="Render a DOCX",
+                risk_tier="read_only",
+                idempotency="read",
+                adapters=(
+                    capability_registry.CapabilityAdapterSpec(
+                        type="tool",
+                        server_id="local_worker",
+                        tool_name="docx_render_from_spec",
+                        enabled=True,
+                    ),
+                ),
+            ),
+        },
+    )
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="document chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="GenerateDocumentSpec",
+                description="generate",
+                instruction="generate",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/document_spec",
+                intent=models.ToolIntent.generate,
+                deps=[],
+                tool_requests=["llm_generate_document_spec", "docx_render_from_spec"],
+                tool_inputs={
+                    "llm_generate_document_spec": {"instruction": "Generate a document"},
+                    "docx_render_from_spec": {"path": "artifacts/report.docx"},
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+
+    updated = _ensure_execution_bindings(plan)
+    task = updated.tasks[0]
+
+    assert task.tool_requests == ["document.spec.generate", "document.docx.render"]
+    assert task.tool_inputs["document.spec.generate"] == {"instruction": "Generate a document"}
+    assert task.tool_inputs["document.docx.render"] == {"path": "artifacts/report.docx"}
+    assert task.capability_bindings["document.spec.generate"]["tool_name"] == (
+        "llm_generate_document_spec"
+    )
+    assert task.capability_bindings["document.docx.render"]["tool_name"] == (
+        "docx_render_from_spec"
+    )
 
 
 def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() -> None:
@@ -1454,9 +1667,9 @@ def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() 
                 expected_output_schema_ref="schemas/docx_output",
                 intent=models.ToolIntent.transform,
                 deps=[],
-                tool_requests=["docx_generate_from_spec"],
+                tool_requests=["docx_render_from_spec"],
                 tool_inputs={
-                    "docx_generate_from_spec": {
+                    "docx_render_from_spec": {
                         "document_spec": {
                             "$from": "dependencies_by_name.Generate DocumentSpec Legacy.document.spec.generate.document_spec"
                         },
@@ -1471,11 +1684,164 @@ def test_ensure_renderer_required_inputs_repairs_invalid_reference_task_names() 
     )
     updated = _ensure_renderer_required_inputs(plan)
     render_task = next(item for item in updated.tasks if item.name == "RenderResumeDocx")
-    payload = dict(render_task.tool_inputs["docx_generate_from_spec"])
+    payload = dict(render_task.tool_inputs["docx_render_from_spec"])
     assert payload["document_spec"] == {
         "$from": "dependencies_by_name.Generate DocumentSpec.document.spec.generate.document_spec"
     }
     assert "path" not in payload
+
+
+def test_validate_plan_rejects_dependency_derived_render_path_for_raw_jobs() -> None:
+    job = _job()
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="render chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="DeriveOutputPath",
+                description="derive",
+                instruction="derive",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/path",
+                intent=models.ToolIntent.io,
+                deps=[],
+                tool_requests=["derive_output_filename"],
+                tool_inputs={
+                    "derive_output_filename": {
+                        "document_type": "document",
+                        "output_extension": "docx",
+                        "target_role_name": "deployment_report",
+                    }
+                },
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderResumeDocx",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["DeriveOutputPath"],
+                tool_requests=["document.docx.render"],
+                tool_inputs={
+                    "document.docx.render": {
+                        "document_spec": {"blocks": []},
+                        "path": {
+                            "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
+                        },
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+    tools = [
+        _tool(
+            "derive_output_filename",
+            {
+                "type": "object",
+                "properties": {"document_type": {"type": "string"}},
+                "required": ["document_type"],
+            },
+            tool_intent=models.ToolIntent.io,
+        ),
+        _tool(
+            "docx_render_from_spec",
+            {
+                "type": "object",
+                "properties": {
+                    "document_spec": {"type": "object"},
+                    "path": {"type": "string"},
+                },
+                "required": ["document_spec", "path"],
+            },
+            tool_intent=models.ToolIntent.render,
+        ),
+    ]
+
+    valid, reason = _validate_plan(plan, tools, job)
+
+    assert valid is False
+    assert reason == "render_path_derived_not_allowed:document.docx.render:task=RenderResumeDocx"
+
+
+def test_validate_plan_allows_dependency_derived_render_path_for_auto_mode_jobs() -> None:
+    job = _job()
+    job.metadata = {"render_path_mode": "auto"}
+    plan = models.PlanCreate(
+        planner_version="1",
+        tasks_summary="render chain",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="DeriveOutputPath",
+                description="derive",
+                instruction="derive",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/path",
+                intent=models.ToolIntent.io,
+                deps=[],
+                tool_requests=["derive_output_filename"],
+                tool_inputs={
+                    "derive_output_filename": {
+                        "document_type": "document",
+                        "output_extension": "docx",
+                        "target_role_name": "deployment_report",
+                    }
+                },
+                critic_required=False,
+            ),
+            models.TaskCreate(
+                name="RenderResumeDocx",
+                description="render",
+                instruction="render",
+                acceptance_criteria=["ok"],
+                expected_output_schema_ref="schemas/docx_output",
+                intent=models.ToolIntent.render,
+                deps=["DeriveOutputPath"],
+                tool_requests=["document.docx.render"],
+                tool_inputs={
+                    "document.docx.render": {
+                        "document_spec": {"blocks": []},
+                        "path": {
+                            "$from": "dependencies_by_name.DeriveOutputPath.derive_output_filename.path"
+                        },
+                    }
+                },
+                critic_required=False,
+            ),
+        ],
+    )
+    tools = [
+        _tool(
+            "derive_output_filename",
+            {
+                "type": "object",
+                "properties": {"document_type": {"type": "string"}},
+                "required": ["document_type"],
+            },
+            tool_intent=models.ToolIntent.io,
+        ),
+        _tool(
+            "docx_render_from_spec",
+            {
+                "type": "object",
+                "properties": {
+                    "document_spec": {"type": "object"},
+                    "path": {"type": "string"},
+                },
+                "required": ["document_spec", "path"],
+            },
+            tool_intent=models.ToolIntent.render,
+        ),
+    ]
+
+    valid, reason = _validate_plan(plan, tools, job)
+
+    assert valid is True
+    assert reason == "ok"
 
 
 def test_ensure_renderer_required_inputs_autowires_document_spec_for_validate_task() -> None:

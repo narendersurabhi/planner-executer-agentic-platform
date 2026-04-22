@@ -86,7 +86,7 @@ def test_execute_capability_allows_read_only_native_tool(monkeypatch) -> None:
 
 def test_execute_capability_rejects_non_read_only(monkeypatch) -> None:
     spec = capability_registry.CapabilitySpec(
-        capability_id="document.docx.generate",
+        capability_id="document.docx.render",
         description="Render DOCX",
         risk_tier="bounded_write",
         idempotency="write",
@@ -95,19 +95,19 @@ def test_execute_capability_rejects_non_read_only(monkeypatch) -> None:
     monkeypatch.setattr(
         chat_execution_service.capability_registry,
         "load_capability_registry",
-        lambda: capability_registry.CapabilityRegistry({"document.docx.generate": spec}),
+        lambda: capability_registry.CapabilityRegistry({"document.docx.render": spec}),
     )
 
     executor = chat_execution_service.ChatDirectExecutor(
         registry=_FakeRegistry(),
         config=chat_execution_service.ChatDirectExecutionConfig(
-            allowed_capabilities={"document.docx.generate"}
+            allowed_capabilities={"document.docx.render"}
         ),
     )
 
     try:
         executor.execute_capability(
-            capability_id="document.docx.generate",
+            capability_id="document.docx.render",
             arguments={},
             trace_id="trace-1",
         )

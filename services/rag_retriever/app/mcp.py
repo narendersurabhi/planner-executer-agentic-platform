@@ -8,7 +8,10 @@ from mcp.server.fastmcp.server import TransportSecuritySettings
 
 from rag_retriever_core import (
     EnsureCollectionRequest,
+    IndexMarkdownRequest,
+    IndexWorkspaceDirectoryRequest,
     IndexWorkspaceFileRequest,
+    RerankRequest,
     RetrieverError,
     RetrieveRequest,
     UpsertTextEntry,
@@ -63,6 +66,25 @@ def create_mcp_asgi_app(service: Any, logger: Any):
             result = service.retrieve(request)
         except RetrieverError as exc:
             logger.error("rag_retrieve_failed", extra={"error": exc.detail})
+            raise RuntimeError(exc.detail) from exc
+        return result.model_dump()
+
+    @mcp.tool()
+    def rerank(
+        query: str,
+        matches: list[dict[str, Any]],
+        top_k: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            result = service.rerank(
+                RerankRequest(
+                    query=query,
+                    matches=matches,
+                    top_k=top_k,
+                )
+            )
+        except RetrieverError as exc:
+            logger.error("rag_rerank_failed", extra={"error": exc.detail})
             raise RuntimeError(exc.detail) from exc
         return result.model_dump()
 
@@ -157,6 +179,86 @@ def create_mcp_asgi_app(service: Any, logger: Any):
             )
         except RetrieverError as exc:
             logger.error("rag_index_workspace_file_failed", extra={"error": exc.detail})
+            raise RuntimeError(exc.detail) from exc
+        return result.model_dump()
+
+    @mcp.tool()
+    def index_markdown(
+        markdown_text: str,
+        collection_name: str | None = None,
+        ensure_collection: bool = True,
+        document_id: str | None = None,
+        source_uri: str | None = None,
+        namespace: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        chunk_size_chars: int | None = None,
+        chunk_overlap_chars: int | None = None,
+        max_chunks: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            result = service.index_markdown(
+                IndexMarkdownRequest(
+                    markdown_text=markdown_text,
+                    collection_name=collection_name,
+                    ensure_collection=ensure_collection,
+                    document_id=document_id,
+                    source_uri=source_uri,
+                    namespace=namespace,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    chunk_size_chars=chunk_size_chars,
+                    chunk_overlap_chars=chunk_overlap_chars,
+                    max_chunks=max_chunks,
+                    metadata=metadata or {},
+                )
+            )
+        except RetrieverError as exc:
+            logger.error("rag_index_markdown_failed", extra={"error": exc.detail})
+            raise RuntimeError(exc.detail) from exc
+        return result.model_dump()
+
+    @mcp.tool()
+    def index_workspace_directory(
+        directory_path: str,
+        collection_name: str | None = None,
+        ensure_collection: bool = True,
+        namespace: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        recursive: bool = True,
+        extensions: list[str] | None = None,
+        max_files: int | None = None,
+        chunk_size_chars: int | None = None,
+        chunk_overlap_chars: int | None = None,
+        max_chunks_per_file: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            result = service.index_workspace_directory(
+                IndexWorkspaceDirectoryRequest(
+                    directory_path=directory_path,
+                    collection_name=collection_name,
+                    ensure_collection=ensure_collection,
+                    namespace=namespace,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    recursive=recursive,
+                    extensions=extensions,
+                    max_files=max_files,
+                    chunk_size_chars=chunk_size_chars,
+                    chunk_overlap_chars=chunk_overlap_chars,
+                    max_chunks_per_file=max_chunks_per_file,
+                    metadata=metadata or {},
+                )
+            )
+        except RetrieverError as exc:
+            logger.error("rag_index_workspace_directory_failed", extra={"error": exc.detail})
             raise RuntimeError(exc.detail) from exc
         return result.model_dump()
 

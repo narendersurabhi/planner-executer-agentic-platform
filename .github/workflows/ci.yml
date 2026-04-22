@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install uv
+        run: pip install uv
       - name: Install deps
         run: |
           pip install ruff mypy pytest httpx
@@ -40,5 +42,22 @@ jobs:
         run: PYTHONPATH=. pytest
       - name: Intent Eval Gate
         run: make eval-intent-gate
+      - name: Chat Boundary Eval Gate
+        run: make eval-chat-boundary-gate
+      - name: Chat Clarification Eval Gate
+        run: make eval-chat-clarification-gate
+      - name: DeepEval Agent Gate
+        run: make eval-deepeval-gate
+        continue-on-error: true
+      - name: Upload DeepEval Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepeval-agent-reports
+          if-no-files-found: ignore
+          path: |
+            artifacts/evals/deepeval_chat_report.json
+            artifacts/evals/deepeval_planner_report.json
+            artifacts/evals/deepeval_gate_report.json
       - name: Docker build
         run: docker compose build
