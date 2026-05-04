@@ -1,0 +1,22 @@
+[
+  {
+    "op": "add",
+    "path": "/spec/template/spec/nodeSelector",
+    "value": {
+      "awe.shared-workspace": "true"
+    }
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/volumes",
+    "value": [
+      {
+        "name": "shared-data",
+        "hostPath": {
+          "path": "/var/awe-shared",
+          "type": "DirectoryOrCreate"
+        }
+      }
+    ]
+  }
+]

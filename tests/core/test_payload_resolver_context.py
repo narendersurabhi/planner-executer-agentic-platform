@@ -37,7 +37,7 @@ def test_resolve_tool_inputs_with_dependency_reference_path() -> None:
         }
     }
     tool_inputs = {
-        "docx_generate_from_spec": {
+        "docx_render_from_spec": {
             "path": "documents/latency.docx",
             "document_spec": {
                 "$from": "dependencies_by_name.GenerateSpec.llm_generate_document_spec.document_spec"
@@ -45,14 +45,14 @@ def test_resolve_tool_inputs_with_dependency_reference_path() -> None:
         }
     }
     resolved, errors = resolve_tool_inputs_with_errors(
-        ["docx_generate_from_spec"],
+        ["docx_render_from_spec"],
         "Render the document",
         context,
         {},
         tool_inputs,
     )
     assert errors == {}
-    assert resolved["docx_generate_from_spec"]["document_spec"]["title"] == "Latency Guide"
+    assert resolved["docx_render_from_spec"]["document_spec"]["title"] == "Latency Guide"
 
 
 def test_resolve_tool_inputs_with_reference_default() -> None:
@@ -77,21 +77,21 @@ def test_resolve_tool_inputs_with_reference_default() -> None:
 
 def test_resolve_tool_inputs_reports_missing_reference() -> None:
     tool_inputs = {
-        "docx_generate_from_spec": {
+        "docx_render_from_spec": {
             "path": "documents/out.docx",
             "document_spec": {"$from": "dependencies_by_name.MissingTask.output.document_spec"},
         }
     }
     resolved, errors = resolve_tool_inputs_with_errors(
-        ["docx_generate_from_spec"],
+        ["docx_render_from_spec"],
         "Render document",
         {"dependencies_by_name": {}},
         {},
         tool_inputs,
     )
     assert resolved == {}
-    assert "docx_generate_from_spec" in errors
-    assert "reference resolution failed" in errors["docx_generate_from_spec"]
+    assert "docx_render_from_spec" in errors
+    assert "reference resolution failed" in errors["docx_render_from_spec"]
 
 
 def test_normalize_reference_payload_for_validation_uses_dependency_default() -> None:

@@ -10,6 +10,14 @@ capabilities:
     tags:
       - github
       - repository
+    planner_hints:
+      chat_collectible_fields: [query]
+      chat_field_descriptions:
+        query: Search text describing the repositories to list or search for.
+      chat_field_questions:
+        query: What exact search query should I use?
+      chat_field_aliases:
+        query: [query, github_query]
     enabled: true
     adapters:
       - type: mcp
@@ -63,6 +71,14 @@ capabilities:
       - issues
       - pull-requests
       - search
+    planner_hints:
+      chat_collectible_fields: [query]
+      chat_field_descriptions:
+        query: Search text describing the issues or pull requests to find.
+      chat_field_questions:
+        query: What exact search query should I use?
+      chat_field_aliases:
+        query: [query, github_query, contextual_information, grounding_facts, retrieved_content]
     enabled: true
     adapters:
       - type: mcp
@@ -687,6 +703,34 @@ capabilities:
         retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
+  - id: rag.retrieve.rerank
+    description: Rerank retrieved RAG matches with deterministic lexical and metadata-aware scoring.
+    risk_tier: read_only
+    idempotency: read
+    group: rag
+    subgroup: retrieval
+    input_schema_ref: rag_rerank_capability_input
+    output_schema_ref: rag_rerank_capability_output
+    tags:
+      - rag
+      - retrieval
+      - rerank
+      - grounding
+      - citations
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: rerank
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 20
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
   - id: rag.collection.ensure
     description: Ensure a Qdrant collection exists with the configured vector shape and payload indexes.
     risk_tier: bounded_write
@@ -771,25 +815,61 @@ capabilities:
         retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
-  - id: document.output.derive
-    description: Derive a generic safe relative output path for generated document artifacts (set output_extension for pdf/md/etc.).
-    risk_tier: read_only
-    idempotency: read
-    group: documents
-    subgroup: output
-    input_schema_ref: document_derive_output_path_capability_input
-    output_schema_ref: ""
+  - id: rag.index.markdown
+    description: Section-chunk markdown text by headings, embed it, and upsert it into Qdrant.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_markdown_capability_input
+    output_schema_ref: rag_index_markdown_capability_output
     tags:
-      - documents
-      - path
-      - artifacts
-    planner_hints:
-      derives_output_path: true
+      - rag
+      - markdown
+      - qdrant
+      - indexing
+      - embeddings
     enabled: true
     adapters:
-      - type: tool
-        server_id: local_worker
-        tool_name: derive_output_path
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: index_markdown
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 90
+        max_retries: 1
+        retry_sleep_s: 0.25
+        arg_map: {}
+        enabled: true
+  - id: rag.index.workspace_directory
+    description: Walk a bounded shared-workspace directory, chunk eligible files, and upsert them into Qdrant.
+    risk_tier: bounded_write
+    idempotency: write
+    group: rag
+    subgroup: indexing
+    input_schema_ref: rag_index_workspace_directory_capability_input
+    output_schema_ref: rag_index_workspace_directory_capability_output
+    tags:
+      - rag
+      - workspace
+      - directory
+      - qdrant
+      - indexing
+      - embeddings
+    enabled: true
+    adapters:
+      - type: mcp
+        server_id: rag_retriever_qdrant
+        tool_name: index_workspace_directory
+        route_paths:
+          - /mcp
+          - /mcp/rpc
+          - /mcp/rpc/mcp
+        timeout_s: 120
+        max_retries: 1
+        retry_sleep_s: 0.25
         arg_map: {}
         enabled: true
   - id: document.spec.generate
@@ -799,12 +879,44 @@ capabilities:
     group: documents
     subgroup: generation
     input_schema_ref: document_spec_generate_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_spec_capability_output
     tags:
       - documents
       - spec
       - generation
       - llm
+    exports:
+      - name: document_spec
+        path: document_spec
+        description: Generated DocumentSpec artifact for downstream validation and rendering.
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_output_format_tokens:
+        pdf: pdf
+        docx: docx
+        word: docx
+        microsoft_word: docx
+        markdown: md
+        md: md
+        json: json
+        csv: csv
+        xlsx: xlsx
+        html: html
+        txt: txt
+        text: txt
+      chat_field_questions:
+        instruction: What should this specifically cover?
+        topic: What is the main topic or title?
+        audience: Who is the target audience?
+        tone: What tone should it use (for example practical, formal, conversational, or executive)?
+      chat_field_aliases:
+        instruction: [instruction, content, document_instructions, document_spec_content, rendered_document_content, user_clarification, user_goal]
+        topic: [topic, main_topic, document_title, title, subject, document_intent_title, document_topic, document_topic_summary, topic_context, topic_description, topic_query]
+        audience: [audience, target_role_name, role_name]
+        tone: [tone]
+        output_format: [output_format, format, target_format]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -819,13 +931,31 @@ capabilities:
     group: documents
     subgroup: generation
     input_schema_ref: document_spec_generate_from_markdown_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_spec_capability_output
     tags:
       - documents
       - spec
       - generation
       - markdown
       - llm
+    exports:
+      - name: document_spec
+        path: document_spec
+        description: Generated DocumentSpec artifact derived from markdown input.
+    planner_hints:
+      chat_collectible_fields: [markdown_text, topic, audience, tone]
+      chat_field_questions:
+        markdown_text: What Markdown content should I use?
+        topic: What is the main topic or title?
+        audience: Who is the target audience?
+        tone: What tone should it use (for example practical, formal, conversational, or executive)?
+      chat_field_aliases:
+        markdown_text: [markdown_text, content, text]
+        topic: [topic, main_topic, document_title, title, subject, document_intent_title, document_topic, document_topic_summary, topic_context, topic_description, topic_query]
+        audience: [audience, target_role_name, role_name]
+        tone: [tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -840,12 +970,16 @@ capabilities:
     group: documents
     subgroup: generation
     input_schema_ref: document_spec_improve_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_spec_capability_output
     tags:
       - documents
       - spec
       - improve
       - llm
+    exports:
+      - name: document_spec
+        path: document_spec
+        description: Improved DocumentSpec artifact for downstream validation and rendering.
     enabled: true
     adapters:
       - type: tool
@@ -860,12 +994,16 @@ capabilities:
     group: documents
     subgroup: generation
     input_schema_ref: document_spec_repair_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_spec_capability_output
     tags:
       - documents
       - spec
       - repair
       - llm
+    exports:
+      - name: document_spec
+        path: document_spec
+        description: Repaired DocumentSpec artifact for downstream validation and rendering.
     enabled: true
     adapters:
       - type: tool
@@ -880,12 +1018,39 @@ capabilities:
     group: documents
     subgroup: generation
     input_schema_ref: document_spec_iterative_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_spec_iterative_capability_output
     tags:
       - documents
       - spec
       - iterative
       - llm
+    exports:
+      - name: document_spec
+        path: document_spec
+        description: Final DocumentSpec artifact produced by iterative generation.
+      - name: validation_report
+        path: validation_report
+        description: Validation report for the final DocumentSpec.
+      - name: iterations
+        path: iterations
+        description: Iteration count used to reach the final DocumentSpec.
+      - name: reached_threshold
+        path: reached_threshold
+        description: Whether the iterative process reached the acceptance threshold.
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_questions:
+        instruction: What should this specifically cover?
+        topic: What is the main topic or title?
+        audience: Who is the target audience?
+        tone: What tone should it use (for example practical, formal, conversational, or executive)?
+      chat_field_aliases:
+        instruction: [instruction, content, document_instructions, document_spec_content, rendered_document_content, user_clarification, user_goal]
+        topic: [topic, main_topic, document_title, title, subject, document_intent_title, document_topic, document_topic_summary, topic_context, topic_description, topic_query]
+        audience: [audience, target_role_name, role_name]
+        tone: [tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -900,12 +1065,39 @@ capabilities:
     group: documents
     subgroup: generation
     input_schema_ref: document_runbook_iterative_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_spec_iterative_capability_output
     tags:
       - documents
       - runbook
       - iterative
       - llm
+    exports:
+      - name: document_spec
+        path: document_spec
+        description: Final runbook DocumentSpec artifact produced by iterative generation.
+      - name: validation_report
+        path: validation_report
+        description: Validation report for the final runbook DocumentSpec.
+      - name: iterations
+        path: iterations
+        description: Iteration count used to reach the final runbook DocumentSpec.
+      - name: reached_threshold
+        path: reached_threshold
+        description: Whether the iterative process reached the acceptance threshold.
+    planner_hints:
+      chat_collectible_fields: [instruction, topic, audience, tone]
+      chat_field_questions:
+        instruction: What should this specifically cover?
+        topic: What is the main topic or title?
+        audience: Who is the target audience?
+        tone: What tone should it use (for example practical, formal, conversational, or executive)?
+      chat_field_aliases:
+        instruction: [instruction, content, document_instructions, document_spec_content, rendered_document_content, user_clarification, user_goal]
+        topic: [topic, main_topic, document_title, title, subject, document_intent_title, document_topic, document_topic_summary, topic_context, topic_description, topic_query]
+        audience: [audience, target_role_name, role_name]
+        tone: [tone]
+      chat_field_examples:
+        tone: [practical, concise, technical, formal, conversational, executive]
     enabled: true
     adapters:
       - type: tool
@@ -920,11 +1112,17 @@ capabilities:
     group: documents
     subgroup: specs
     input_schema_ref: document_spec_validate_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_spec_validate_capability_output
     tags:
       - documents
       - spec
       - validation
+    exports:
+      - name: validation_report
+        path: "$"
+        description: Validation report describing whether the DocumentSpec is ready for downstream use.
+    planner_hints:
+      task_intents: [validate]
     enabled: true
     adapters:
       - type: tool
@@ -932,25 +1130,83 @@ capabilities:
         tool_name: document_spec_validate
         arg_map: {}
         enabled: true
-  - id: document.docx.generate
-    description: Generate a DOCX artifact directly from a DocumentSpec.
+  - id: derive_output_filename
+    description: Derive a safe output path for a rendered document artifact.
+    risk_tier: read_only
+    idempotency: read
+    group: documents
+    subgroup: paths
+    input_schema_ref: document_derive_output_path_capability_input
+    output_schema_ref: document_derive_output_path_capability_output
+    tags:
+      - documents
+      - path
+      - filename
+      - transform
+    exports:
+      - name: path
+        path: path
+        description: Derived filesystem-safe output path for downstream renderers.
+    planner_hints:
+      task_intents: [io, transform]
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or destination path for the rendered document artifact.
+      chat_field_questions:
+        path: What output path or filename should be used?
+      chat_field_aliases:
+        path: [path, output_path, filename, file_name, output_filename, filepath, output_dir, output_directory, output_file_path, output_filepath, target_directory, document_name]
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.docx", "workspace/Kubernetes AI Deployments.docx", "artifacts/report.docx"]
+    enabled: true
+    adapters:
+      - type: tool
+        server_id: local_worker
+        tool_name: derive_output_filename
+        arg_map: {}
+        enabled: true
+  - id: document.docx.render
+    description: Render a DOCX artifact directly from a DocumentSpec.
     risk_tier: bounded_write
     idempotency: safe_write
     group: documents
     subgroup: rendering
     input_schema_ref: document_docx_generate_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_docx_generate_capability_output
     tags:
       - documents
       - docx
       - render
+    aliases:
+      - document.docx.generate
+    exports:
+      - name: path
+        path: path
+        description: Rendered DOCX artifact path.
+      - name: bytes_written
+        path: bytes_written
+        description: Number of bytes written to the rendered DOCX artifact.
     planner_hints:
+      task_intents: [render]
       required_output_extension: docx
+      chat_output_format_tokens:
+        docx: docx
+        word: docx
+        microsoft_word: docx
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or path where the rendered DOCX should be saved.
+      chat_field_questions:
+        path: What output path or filename should be used?
+      chat_field_aliases:
+        path: [path, output_path, filename, file_name, output_filename, filepath, output_dir, output_directory, output_file_path, output_filepath, target_directory, document_name]
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.docx", "workspace/Kubernetes AI Deployments.docx", "artifacts/report.docx"]
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
-        tool_name: docx_generate_from_spec
+        tool_name: docx_render_from_spec
         arg_map: {}
         enabled: true
   - id: document.docx.render_template
@@ -960,12 +1216,16 @@ capabilities:
     group: documents
     subgroup: rendering
     input_schema_ref: document_docx_render_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_docx_render_capability_output
     tags:
       - documents
       - docx
       - template
       - render
+    exports:
+      - name: path
+        path: path
+        description: Rendered DOCX artifact path.
     enabled: true
     adapters:
       - type: tool
@@ -973,25 +1233,46 @@ capabilities:
         tool_name: docx_render
         arg_map: {}
         enabled: true
-  - id: document.pdf.generate
-    description: Generate a PDF artifact directly from a DocumentSpec.
+  - id: document.pdf.render
+    description: Render a PDF artifact directly from a DocumentSpec.
     risk_tier: bounded_write
     idempotency: safe_write
     group: documents
     subgroup: rendering
     input_schema_ref: document_pdf_generate_capability_input
-    output_schema_ref: ""
+    output_schema_ref: document_pdf_generate_capability_output
     tags:
       - documents
       - pdf
       - render
+    aliases:
+      - document.pdf.generate
+    exports:
+      - name: path
+        path: path
+        description: Rendered PDF artifact path.
+      - name: bytes_written
+        path: bytes_written
+        description: Number of bytes written to the rendered PDF artifact.
     planner_hints:
+      task_intents: [render]
       required_output_extension: pdf
+      chat_output_format_tokens:
+        pdf: pdf
+      chat_collectible_fields: [path]
+      chat_field_descriptions:
+        path: Output filename or path where the rendered PDF should be saved.
+      chat_field_questions:
+        path: What output path or filename should be used?
+      chat_field_aliases:
+        path: [path, output_path, filename, file_name, output_filename, filepath, output_dir, output_directory, output_file_path, output_filepath, target_directory, document_name]
+      chat_field_examples:
+        path: ["Kubernetes AI Deployments.pdf", "workspace/Kubernetes AI Deployments.pdf", "artifacts/report.pdf"]
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
-        tool_name: pdf_generate_from_spec
+        tool_name: pdf_render_from_spec
         arg_map: {}
         enabled: true
   - id: openapi.spec.generate_iterative
@@ -1046,6 +1327,8 @@ capabilities:
       - utility
       - json
       - transform
+    planner_hints:
+      task_intents: [transform]
     enabled: true
     adapters:
       - type: tool
@@ -1054,23 +1337,27 @@ capabilities:
         arg_map: {}
         enabled: true
   - id: llm.text.generate
-    description: Generate free-form text with the configured LLM.
+    description: Generate free-form text from a prompt with optional context and generation controls.
     risk_tier: read_only
     idempotency: read
     group: llm
     subgroup: text
     input_schema_ref: llm_text_generate_capability_input
-    output_schema_ref: ""
+    output_schema_ref: llm_text_generate_capability_output
     tags:
       - llm
       - text
+      - prompt
+      - context
       - generation
       - high_cost
+    planner_hints:
+      task_intents: [generate]
     enabled: true
     adapters:
       - type: tool
         server_id: local_worker
-        tool_name: llm_generate
+        tool_name: llm_generate_with_context
         arg_map: {}
         enabled: true
   - id: codegen.generate
@@ -1086,6 +1373,20 @@ capabilities:
       - coding-agent
       - generation
       - write
+    planner_hints:
+      task_intents: [generate]
+      chat_collectible_fields: [goal, workspace_path]
+      chat_required_fields: [goal]
+      chat_field_questions:
+        goal: What should this repository or workspace be used for?
+        workspace_path: Where in the workspace should I create it?
+      chat_field_aliases:
+        goal: [goal, user_goal]
+        workspace_path: [workspace_path, workspace, target_directory, output_directory]
+      chat_thread_hints:
+        action_tokens: [create, generate, write, make, build, produce]
+        artifact_tokens: [repo, repository, app, application, website, web, html, css, javascript, countdown, workspace, file, files]
+        continuation_tokens: [use, basic, html, css, javascript, minimalistic, minimalist, show, count, countdown, save, workspace, go, ahead, create, start, yes, no]
     enabled: true
     adapters:
       - type: tool
@@ -1106,6 +1407,20 @@ capabilities:
       - coding-agent
       - autonomous
       - write
+    planner_hints:
+      task_intents: [generate]
+      chat_collectible_fields: [goal, workspace_path]
+      chat_required_fields: [goal, workspace_path]
+      chat_field_questions:
+        goal: What should this repository or workspace be used for?
+        workspace_path: Where in the workspace should I create it?
+      chat_field_aliases:
+        goal: [goal, user_goal]
+        workspace_path: [workspace_path, workspace, target_directory, output_directory]
+      chat_thread_hints:
+        action_tokens: [create, generate, write, make, build, produce]
+        artifact_tokens: [repo, repository, app, application, website, web, html, css, javascript, countdown, workspace, file, files]
+        continuation_tokens: [use, basic, html, css, javascript, minimalistic, minimalist, show, count, countdown, save, workspace, go, ahead, create, start, yes, no]
     enabled: true
     adapters:
       - type: tool

@@ -31,6 +31,101 @@ class RetrieveResponse(BaseModel):
     matches: list[RetrieveMatch]
 
 
+class RerankRequest(BaseModel):
+    query: str = Field(min_length=1)
+    matches: list[RetrieveMatch] = Field(min_length=1, max_length=50)
+    top_k: int | None = Field(default=None, ge=1, le=20)
+
+
+class RerankMatch(BaseModel):
+    chunk_id: str
+    document_id: str
+    text: str
+    score: float
+    rerank_score: float
+    metadata: dict[str, Any]
+    source_uri: str
+
+
+class RerankResponse(BaseModel):
+    strategy: str
+    matches: list[RerankMatch]
+
+
+class DocumentListRequest(BaseModel):
+    collection_name: str | None = None
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    query: str | None = None
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class DocumentSummary(BaseModel):
+    document_id: str
+    source_uri: str
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    chunk_count: int
+    chunking_strategy: str | None = None
+    content_type: str | None = None
+    filename: str | None = None
+    path: str | None = None
+    repo: str | None = None
+    indexed_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentListResponse(BaseModel):
+    collection_name: str
+    truncated: bool = False
+    scanned_point_count: int = 0
+    documents: list[DocumentSummary]
+
+
+class DocumentChunksRequest(BaseModel):
+    collection_name: str | None = None
+    document_id: str = Field(min_length=1)
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    limit: int = Field(default=500, ge=1, le=2000)
+
+
+class DocumentChunk(BaseModel):
+    chunk_id: str
+    document_id: str
+    source_uri: str
+    text: str
+    chunk_index: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentChunksResponse(BaseModel):
+    collection_name: str
+    document: DocumentSummary
+    chunks: list[DocumentChunk]
+
+
+class DeleteDocumentRequest(BaseModel):
+    collection_name: str | None = None
+    document_id: str = Field(min_length=1)
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+
+
+class DeleteDocumentResponse(BaseModel):
+    collection_name: str
+    document_id: str
+    deleted_chunk_count: int
+
+
 class EnsureCollectionRequest(BaseModel):
     collection_name: str | None = None
     vector_size: int | None = Field(default=None, ge=1)
@@ -101,3 +196,71 @@ class IndexWorkspaceFileResponse(BaseModel):
     chunk_count: int
     upserted_count: int
     chunk_ids: list[str]
+
+
+class IndexMarkdownRequest(BaseModel):
+    markdown_text: str = Field(min_length=1)
+    collection_name: str | None = None
+    ensure_collection: bool = True
+    document_id: str | None = None
+    source_uri: str | None = None
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    chunk_size_chars: int | None = Field(default=None, ge=200, le=20000)
+    chunk_overlap_chars: int | None = Field(default=None, ge=0, le=5000)
+    max_chunks: int | None = Field(default=None, ge=1, le=1000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IndexMarkdownResponse(BaseModel):
+    collection_name: str
+    document_id: str
+    source_uri: str
+    section_count: int
+    chunk_count: int
+    upserted_count: int
+    chunk_ids: list[str]
+
+
+class IndexWorkspaceDirectoryRequest(BaseModel):
+    directory_path: str = Field(min_length=1)
+    collection_name: str | None = None
+    ensure_collection: bool = True
+    namespace: str | None = None
+    tenant_id: str | None = None
+    user_id: str | None = None
+    workspace_id: str | None = None
+    recursive: bool = True
+    extensions: list[str] | None = None
+    max_files: int | None = Field(default=None, ge=1, le=500)
+    chunk_size_chars: int | None = Field(default=None, ge=200, le=20000)
+    chunk_overlap_chars: int | None = Field(default=None, ge=0, le=5000)
+    max_chunks_per_file: int | None = Field(default=None, ge=1, le=1000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IndexWorkspaceDirectoryFileResult(BaseModel):
+    path: str
+    document_id: str
+    strategy: str
+    chunk_count: int
+    upserted_count: int
+    chunk_ids: list[str]
+
+
+class IndexWorkspaceDirectorySkippedFile(BaseModel):
+    path: str
+    reason: str
+
+
+class IndexWorkspaceDirectoryResponse(BaseModel):
+    collection_name: str
+    directory_path: str
+    indexed_file_count: int
+    skipped_file_count: int
+    total_chunk_count: int
+    total_upserted_count: int
+    files: list[IndexWorkspaceDirectoryFileResult]
+    skipped: list[IndexWorkspaceDirectorySkippedFile]

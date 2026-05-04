@@ -25,6 +25,9 @@ type StudioWorkflowInterfacePanelProps = {
   onRemoveOutput: (outputId: string) => void;
 };
 
+const interfacePanelClassName =
+  "h-full px-3 py-3 text-slate-100 [&_.border-slate-200]:border-white/10 [&_.border-slate-300]:border-white/12 [&_.border-sky-200]:border-sky-300/25 [&_.border-emerald-200]:border-emerald-300/25 [&_.border-rose-200]:border-rose-300/25 [&_.bg-slate-50]:bg-white/[0.04] [&_.bg-slate-100]:bg-white/[0.07] [&_.bg-white]:bg-white/[0.05] [&_.bg-sky-50]:bg-sky-400/10 [&_.bg-emerald-50]:bg-emerald-400/10 [&_.bg-rose-50]:bg-rose-400/10 [&_.text-slate-900]:text-white [&_.text-slate-800]:text-slate-100 [&_.text-slate-700]:text-slate-200 [&_.text-slate-600]:text-slate-300/82 [&_.text-slate-500]:text-slate-400 [&_.text-sky-700]:text-sky-100 [&_.text-emerald-700]:text-emerald-100 [&_.text-rose-700]:text-rose-100 [&_input]:text-white [&_select]:text-white [&_textarea]:text-white [&_code]:rounded-md [&_code]:bg-black/20 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:text-sky-100";
+
 const workflowBindingMode = (
   binding: WorkflowBinding | null | undefined,
   fallback: "none" | "literal" | "context" | "memory" | "secret" = "none"
@@ -105,21 +108,21 @@ export default function StudioWorkflowInterfacePanel({
   onRemoveOutput,
 }: StudioWorkflowInterfacePanelProps) {
   return (
-    <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
+    <section className={interfacePanelClassName}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-            Workflow Interface
+          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100/68">
+            Workflow Inputs
           </div>
-          <h2 className="mt-1 font-display text-2xl text-slate-900">Inputs, Variables, Outputs</h2>
-          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-            Define the workflow contract once, then bind nodes to workflow-level inputs and variables
-            instead of depending on raw <code>context_json</code>.
+          <h2 className="mt-1 text-[22px] font-semibold tracking-[-0.03em] text-white">Workflow Request Contract</h2>
+          <p className="mt-1.5 max-w-3xl text-sm leading-5 text-slate-300/78">
+            Define the information this workflow needs once, then reuse it across the steps instead
+            of re-entering raw context.
           </p>
         </div>
       </div>
 
-      <div className="mt-6 space-y-6">
+      <div className="mt-5 space-y-5">
         <div>
           <div className="flex items-center justify-between gap-3">
             <div>

@@ -87,14 +87,29 @@ class TaskExecutionRequest(BaseModel):
     intent_source: str | None = None
     intent_confidence: float | None = None
     intent_segment: workflow_contracts.IntentGraphSegment | None = None
+    replay_context: dict[str, Any] = Field(default_factory=dict)
     dependency_artifacts: dict[str, Any] = Field(default_factory=dict)
-    retry_policy: str | None = None
+    retry_policy: dict[str, Any] = Field(default_factory=dict)
     source_payload: dict[str, Any] = Field(default_factory=dict, exclude=True)
     requests: list[TaskExecutionStep] = Field(default_factory=list)
 
     @property
     def tool_requests(self) -> list[str]:
         return [request.request_id for request in self.requests]
+
+    @property
+    def capability_requests(self) -> list[str]:
+        items: list[str] = []
+        for request in self.requests:
+            capability_id = (
+                request.capability_binding.capability_id
+                if request.capability_binding and request.capability_binding.capability_id
+                else request.request_id
+            )
+            normalized = _string_value(capability_id)
+            if normalized:
+                items.append(normalized)
+        return items
 
     @property
     def tool_inputs(self) -> dict[str, dict[str, Any]]:
@@ -123,6 +138,7 @@ class TaskDispatchPayload(BaseModel):
     rework_count: int = 0
     max_reworks: int = 0
     assigned_to: str | None = None
+    capability_requests: list[str] = Field(default_factory=list)
     tool_requests: list[str] = Field(default_factory=list)
     tool_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     capability_bindings: dict[str, CapabilityBinding] = Field(default_factory=dict)
@@ -132,6 +148,8 @@ class TaskDispatchPayload(BaseModel):
     intent_source: str | None = None
     intent_confidence: float | None = None
     intent_segment: workflow_contracts.IntentGraphSegment | None = None
+    replay_context: dict[str, Any] = Field(default_factory=dict)
+    retry_policy: dict[str, Any] = Field(default_factory=dict)
     context: dict[str, Any] = Field(default_factory=dict)
     correlation_id: str = ""
     trace_id: str = ""
@@ -174,6 +192,7 @@ def build_task_execution_request(
     )
     context_value = payload.get("context")
     dependency_artifacts_value = payload.get("dependency_artifacts")
+    replay_context_value = payload.get("replay_context")
     return TaskExecutionRequest(
         task_id=_string_value(payload.get("task_id")),
         job_id=_string_value(payload.get("job_id")),
@@ -189,12 +208,17 @@ def build_task_execution_request(
         intent_source=_string_value(payload.get("intent_source")) or None,
         intent_confidence=_intent_confidence(payload.get("intent_confidence")),
         intent_segment=_intent_segment(payload),
+        replay_context=(
+            dict(replay_context_value)
+            if isinstance(replay_context_value, Mapping)
+            else {}
+        ),
         dependency_artifacts=(
             dict(dependency_artifacts_value)
             if isinstance(dependency_artifacts_value, Mapping)
             else {}
         ),
-        retry_policy=_string_value(payload.get("retry_policy")) or None,
+        retry_policy=dict(payload.get("retry_policy")) if isinstance(payload.get("retry_policy"), Mapping) else {},
         source_payload=payload,
         requests=[
             TaskExecutionStep(
@@ -251,6 +275,7 @@ def build_task_dispatch_payload(
             "rework_count": _int_or_default(payload.get("rework_count"), 0),
             "max_reworks": _int_or_default(payload.get("max_reworks"), 0),
             "assigned_to": _string_value(payload.get("assigned_to")) or None,
+            "capability_requests": execution_request.capability_requests,
             "tool_requests": execution_request.tool_requests,
             "tool_inputs": execution_request.tool_inputs,
             "capability_bindings": capability_bindings,
@@ -260,6 +285,8 @@ def build_task_dispatch_payload(
             "intent_source": execution_request.intent_source,
             "intent_confidence": execution_request.intent_confidence,
             "intent_segment": execution_request.intent_segment,
+            "replay_context": execution_request.replay_context,
+            "retry_policy": execution_request.retry_policy,
             "context": execution_request.context,
             "correlation_id": correlation_id,
             "trace_id": trace_id,

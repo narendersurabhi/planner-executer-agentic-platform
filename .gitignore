@@ -4,6 +4,8 @@ __pycache__/
 node_modules/
 .next/
 .env
+.env.staging
+.env.production
 *.sqlite
 /workspace/
 /artifacts/
@@ -27,3 +29,6 @@ templates/
 ./artifacts
 ./templates
 ./workspace
+scripts/largest_paths_cleanup.sh
+./test.db
+./text.md

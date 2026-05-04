@@ -74,6 +74,58 @@ To copy generated files from worker `/shared` to your local checkout:
 make k8s-sync-shared
 ```
 
+## Staging profile
+
+For a staging deployment, use `deploy/k8s/overlays/staging`. It is designed to work either in a dedicated staging cluster or in a shared cluster under the `awe-staging` namespace.
+
+For the full staging runbook, including Docker Desktop staging and regression gating before production promotion, see `docs/staging-deployment.md`.
+For the GitHub Actions release pipeline and required deployment secrets, see `docs/cicd-pipeline.md`.
+
+Create a sparse `.env.staging` with only staging overrides and secrets; missing non-secret values fall back to `.env.example` when `setup_k8s_env.sh` renders the ConfigMap.
+
+Example:
+
+```bash
+cat <<'EOF' > .env.staging
+LLM_PROVIDER=gemini
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=<key>
+GITHUB_TOKEN=<token>
+NEXT_PUBLIC_DEV_TOOLS=false
+CHAT_ROUTING_CALIBRATOR_ENABLED=true
+CHAT_ROUTING_CALIBRATOR_LIVE=false
+CHAT_ROUTING_CALIBRATOR_MIN_PROBABILITY=0.65
+CHAT_ROUTING_CALIBRATOR_MIN_MARGIN=0.08
+EOF
+```
+
+Deploy:
+
+```bash
+STAGING_IMAGE_OWNER=narendersurabhi STAGING_IMAGE_TAG=<tag> make k8s-up-staging
+```
+
+This flow:
+
+- applies the staging overlay into namespace `awe-staging`
+- creates or updates `awe-config` and `awe-secrets` from `.env.staging`
+- pins the workloads to `$(STAGING_IMAGE_REGISTRY)/$(STAGING_IMAGE_OWNER)/awe-*:$(STAGING_IMAGE_TAG)`
+- waits for the main service rollouts to complete
+
+The staging overlay keeps `ui` as `ClusterIP`, so test it with port-forward:
+
+```bash
+kubectl port-forward -n awe-staging svc/ui 3001:80
+```
+
+Then open `http://localhost:3001`.
+
+Safe teardown keeps PVCs:
+
+```bash
+make k8s-delete-staging
+```
+
 ## 5) Enable queue-depth autoscaling for workers (KEDA, optional)
 
 Install KEDA in your cluster, then apply:

@@ -17,6 +17,20 @@
     "subgroup": {"type": "string"},
     "input_schema_ref": {"type": "string"},
     "output_schema_ref": {"type": "string"},
+    "exports": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "path": {"type": "string"},
+          "description": {"type": "string"},
+          "required": {"type": "boolean"}
+        },
+        "required": ["name", "path"],
+        "additionalProperties": true
+      }
+    },
     "enabled": {"type": "boolean"},
     "tags": {
       "type": "array",

@@ -3,12 +3,38 @@
   "title": "LlmTextGenerateCapabilityInput",
   "type": "object",
   "properties": {
-    "text": {"type": "string", "minLength": 1},
-    "prompt": {"type": "string", "minLength": 1}
+    "prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "context": {
+      "oneOf": [
+        {"type": "object"},
+        {"type": "array"},
+        {"type": "string"},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "null"}
+      ]
+    },
+    "system_prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "temperature": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "max_output_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16384
+    }
   },
-  "anyOf": [
-    {"required": ["text"]},
-    {"required": ["prompt"]}
-  ],
+  "required": ["prompt"],
+  "not": {
+    "required": ["text"]
+  },
   "additionalProperties": true
 }

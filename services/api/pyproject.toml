@@ -3,6 +3,7 @@ name = "agentic-api"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+  "alembic>=1.13",
   "fastapi>=0.110",
   "uvicorn>=0.27",
   "sqlalchemy>=2.0",

@@ -1,4 +1,9 @@
+import { demoResponse } from "./demoData";
+
 const API_PROXY_TARGET = (process.env.API_PROXY_TARGET || "http://api:8000").replace(/\/+$/, "");
+const DEMO_MODE = process.env.UI_DEMO_DATA === "true" || process.env.NEXT_PUBLIC_DEMO_DATA === "true";
+const DEMO_FALLBACK =
+  process.env.NODE_ENV !== "production" && process.env.UI_DEMO_FALLBACK !== "false";
 
 function buildUpstreamUrl(path: string[] | undefined, requestUrl: string): string {
   const normalizedPath = Array.isArray(path) ? path.join("/") : "";
@@ -24,6 +29,11 @@ function copyResponseHeaders(headers: Headers): Headers {
 }
 
 async function proxy(request: Request, path: string[] | undefined): Promise<Response> {
+  const demoRequest = request.clone();
+  const explicitDemoResponse = DEMO_MODE ? await demoResponse(request.clone(), path) : null;
+  if (explicitDemoResponse) {
+    return explicitDemoResponse;
+  }
   const upstreamUrl = buildUpstreamUrl(path, request.url);
   const method = request.method.toUpperCase();
   const init: RequestInit = {
@@ -34,12 +44,20 @@ async function proxy(request: Request, path: string[] | undefined): Promise<Resp
   if (method !== "GET" && method !== "HEAD") {
     init.body = await request.text();
   }
-  const upstream = await fetch(upstreamUrl, init);
-  return new Response(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: copyResponseHeaders(upstream.headers),
-  });
+  try {
+    const upstream = await fetch(upstreamUrl, init);
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: copyResponseHeaders(upstream.headers),
+    });
+  } catch (error) {
+    const fallbackResponse = DEMO_FALLBACK ? await demoResponse(demoRequest, path) : null;
+    if (fallbackResponse) {
+      return fallbackResponse;
+    }
+    throw error;
+  }
 }
 
 export async function GET(

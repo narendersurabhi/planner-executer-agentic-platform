@@ -62,14 +62,36 @@ Planner -> API
 Policy and Critic are optional guardrail/rework services
 ```
 
+Related design docs:
+
+- [`docs/target-architecture.md`](docs/target-architecture.md)
+- [`docs/intent-planning-tool-calling-architecture.md`](docs/intent-planning-tool-calling-architecture.md)
+- [`docs/intent-normalization-architecture.md`](docs/intent-normalization-architecture.md)
+- [`docs/intent-normalization-implementation-plan.md`](docs/intent-normalization-implementation-plan.md)
+- [`docs/user-feedback-implementation-plan.md`](docs/user-feedback-implementation-plan.md)
+- [`docs/user-feedback-analytics-implementation-plan.md`](docs/user-feedback-analytics-implementation-plan.md)
+- [`docs/feedback-model-optimization-playbook.md`](docs/feedback-model-optimization-playbook.md)
+- [`docs/top-companies-intent-planning-patterns.md`](docs/top-companies-intent-planning-patterns.md)
+- [`docs/top-companies-intent-normalization-patterns.md`](docs/top-companies-intent-normalization-patterns.md)
+- [`docs/top-companies-minimum-agent-capabilities.md`](docs/top-companies-minimum-agent-capabilities.md)
+
 ## Application Services
 
-- `api`: control plane for chat, jobs, plans, workflow definitions/versions/triggers/runs, memory APIs, downloads, and SSE
+- `api`: control plane for chat, jobs, plans, workflow definitions/versions/triggers/runs, memory APIs, feedback APIs, downloads, and SSE
 - `planner`: builds typed task DAGs for planner-led jobs
 - `worker`: executes ready tasks through tool and capability runtimes, including memory-aware payload resolution
 - `policy`: optional policy gate service
 - `critic`: optional rework/review service
-- `ui`: Next.js frontend for Home, Chat, Compose, Studio, and Memory
+- `ui`: Next.js frontend for Home, Chat, Compose, Studio, Memory, and feedback insights
+
+## Recent Platform Features
+
+- Hybrid capability discovery and intent routing: chat and planner use a mix of heuristics, lexical search, and vector-backed retrieval to improve capability relevance and fuzzy intent matching.
+- Canonical render capabilities: document rendering is now modeled as `document.docx.render` and `document.pdf.render`, with compatibility aliases for legacy `*.generate` identifiers.
+- Explicit render-path enforcement for raw API automation: raw `/plans/preflight` and raw planner execution require explicit caller-provided render paths for DOCX/PDF rendering, while chat and Workflow Studio still support auto-derived filenames.
+- Profile-aware chat memory: chat can bind server-derived user identity, hydrate exact `user_profile` data, and promote safe explicit preferences into long-term memory with redaction and schema controls.
+- User feedback loop: the UI collects explicit feedback for chat responses, intent understanding, plans, and final outcomes, and the API stores snapshots plus normalized dimensions for analysis.
+- Feedback analytics and dataset export: operators can inspect `GET /feedback/summary`, export negative and partial examples with `GET /feedback/examples`, and use the resulting JSONL slices for evals, prompt tuning, and model selection.
 
 ## Tooling Architecture
 
@@ -197,6 +219,8 @@ make test
 make lint
 make typecheck
 make eval-intent
+make eval-capability-search
+make eval-chat-boundary
 ```
 
 These Make targets now run through `uv`, so you do not need to preinstall `pytest`, `ruff`, `mypy`, or the Python runtime dependencies manually.
@@ -233,13 +257,32 @@ These Make targets now run through `uv`, so you do not need to preinstall `pytes
 - `make eval-intent-gate`
 - `make eval-capability-search`
 - `make eval-capability-search-gate`
+- `make eval-chat-boundary`
+- `make eval-chat-boundary-gate`
+- `make eval-deepeval-chat`
+- `make eval-deepeval-planner`
+- `make eval-deepeval-gate`
+- `make eval-deepeval-staging-replay`
 - `make k8s-up-local`
 - `make k8s-apply-local`
 - `make k8s-down-local`
 - `make k8s-restart-local`
+- `make k8s-up-staging`
+- `make k8s-up-production`
 - `make k8s-sync-workspace`
 - `make k8s-sync-artifacts`
 - `make k8s-sync-shared`
+
+## CI/CD
+
+The repo ships with a Docker plus Kubernetes GitHub Actions pipeline.
+
+- CI: `.github/workflows/ci.yml`
+- Staging release: `.github/workflows/release-staging.yml`
+- Production promotion: `.github/workflows/promote-production.yml`
+- Staging regression gate: `.github/workflows/staging-routing-gate.yml`
+
+Setup details and required secrets are documented in [docs/cicd-pipeline.md](/Users/narendersurabhi/planner-executer-agentic-platform/docs/cicd-pipeline.md).
 
 ## Intent Eval Harness
 
@@ -262,6 +305,112 @@ make eval-intent-gate
 ```
 
 The Make targets above are the recommended path because they wrap the required dependencies with `uv`.
+
+## Chat Boundary Eval Harness
+
+Use the gold-set harness to keep `response_first` chat boundary behavior stable as routing rules evolve.
+
+Gold cases:
+
+- `eval/chat_boundary_gold.yaml`
+
+Run locally:
+
+```bash
+make eval-chat-boundary
+```
+
+Run the live staging-style regression against an API environment:
+
+```bash
+make eval-chat-boundary-live
+```
+
+Override the target environment without editing the script:
+
+```bash
+CHAT_BOUNDARY_LIVE_BASE_URL=https://staging.example.internal \
+CHAT_BOUNDARY_LIVE_BEARER_TOKEN=... \
+CHAT_BOUNDARY_LIVE_MIN_PASS_RATE=1.0 \
+make eval-chat-boundary-live
+```
+
+CI gate (thresholded):
+
+```bash
+make eval-chat-boundary-gate
+```
+
+GitHub Actions staging gate:
+
+- Workflow: `.github/workflows/staging-routing-gate.yml`
+- Environment secret: `STAGING_API_BASE_URL`
+- Optional environment secret: `STAGING_API_BEARER_TOKEN`
+- Supports manual `workflow_dispatch` and reusable `workflow_call`
+- Uploads `artifacts/evals/chat_boundary_live_report.json` as a build artifact
+- Can also export `/feedback/examples` from staging, build `artifacts/evals/chat_routing_feedback.jsonl`, write `training/chat_routing_reranker_train.jsonl`, and train `artifacts/evals/chat_routing_calibrator.json`
+
+Build routing calibrator artifacts from an API environment:
+
+```bash
+CHAT_ROUTING_FEEDBACK_BASE_URL=https://staging.example.internal \
+CHAT_ROUTING_FEEDBACK_BEARER_TOKEN=... \
+CHAT_ROUTING_FEEDBACK_LIMIT=5000 \
+CHAT_ROUTING_CALIBRATOR_MIN_EXAMPLES=10 \
+make build-chat-routing-calibrator-from-api
+```
+
+Replay the trained calibrator against exported routing feedback to see whether disagreements look better or worse than deterministic routing:
+
+```bash
+make eval-chat-routing-calibrator
+```
+
+Router calibration controls:
+
+- `CHAT_ROUTING_CALIBRATOR_ENABLED=true`
+- `CHAT_ROUTING_CALIBRATOR_LIVE=false`
+- `CHAT_ROUTING_CALIBRATOR_MIN_PROBABILITY=0.65`
+- `CHAT_ROUTING_CALIBRATOR_MIN_MARGIN=0.08`
+
+## DeepEval Agent Gates
+
+DeepEval runs as a second evaluation layer for `chat + planner` without replacing the existing repo-native gold-set gates.
+
+Run locally:
+
+```bash
+make eval-deepeval-chat
+make eval-deepeval-planner
+make eval-deepeval-gate
+```
+
+Replay staging feedback slices:
+
+```bash
+DEEPEVAL_STAGING_BASE_URL=https://staging.example.internal \
+DEEPEVAL_STAGING_BEARER_TOKEN=... \
+make eval-deepeval-staging-replay
+```
+
+Artifacts:
+
+- `artifacts/evals/deepeval_chat_report.json`
+- `artifacts/evals/deepeval_planner_report.json`
+- `artifacts/evals/deepeval_gate_report.json`
+- `artifacts/evals/deepeval_staging_replay_report.json`
+
+Core controls:
+
+- `DEEPEVAL_ENABLED=false`
+- `DEEPEVAL_MODE=local`
+- `DEEPEVAL_JUDGE_PROVIDER=mock`
+- `DEEPEVAL_JUDGE_MODEL=...`
+- `DEEPEVAL_JUDGE_API_KEY=...`
+- `DEEPEVAL_MIN_CHAT_SCORE=0.95`
+- `DEEPEVAL_MIN_PLANNER_SCORE=0.90`
+
+When `DEEPEVAL_ENABLED=false` or `DEEPEVAL_JUDGE_PROVIDER=mock`, the harness still writes normalized reports using deterministic local metrics. When `DEEPEVAL_ENABLED=true` with a real judge provider, the same harness adds DeepEval judge metrics on top of those baseline metrics.
 
 ## Kubernetes
 
@@ -312,6 +461,26 @@ kubectl port-forward -n awe svc/prometheus 9090:9090
 - [AI Agents as Capabilities](docs/agent-capabilities.md)
 - [RAG Playbook](docs/rag-playbook.md)
 - [Semantic Memory](docs/semantic-memory.md)
+- [Feedback, Evaluation, and Fine-Tuning Playbook](docs/feedback-model-optimization-playbook.md)
+
+## Chat, Memory, and Feedback
+
+- Chat remains conversational by default, but it can also surface assistant-visible capabilities, answer scoped capability questions such as "what can you do related to GitHub?", and hand off to a safe direct capability when appropriate.
+- Chat sessions can bind a server-derived user identity when present, hydrate exact `user_profile` memory, and write safe profile updates without trusting client-provided `user_id` fields.
+- Long-term memory stays split by purpose:
+  - `user_profile` for exact structured preferences
+  - `semantic_memory` for reusable facts and patterns
+  - `interaction_summaries` / `interaction_summaries_compact` for compact conversation summaries
+- The UI can capture explicit feedback on:
+  - assistant chat messages
+  - intent understanding
+  - generated plans
+  - final job outcomes
+- Operators can use:
+  - `GET /feedback/summary` for aggregate rates and breakdowns
+  - `GET /feedback/examples` for negative/partial example export
+  - `GET /feedback/chat-boundary/review` for a lightweight queue of likely boundary misroutes
+  - the Feedback Insights panel in the UI for quick operational review
 
 ## Worker Reliability and Scaling
 
@@ -360,6 +529,11 @@ Workspace download endpoint:
 - Metrics:
   - API exposes `/metrics`
   - Planner, worker, policy, and coder also expose Prometheus metrics endpoints in the deployed stack
+  - Feedback collection exports:
+    - `feedback_submitted_total{target_type,sentiment}`
+    - `feedback_reason_total{target_type,reason_code}`
+    - `feedback_summary_requests_total`
+    - `feedback_examples_export_total`
 - Tracing:
   - OTLP tracing is supported via `OTEL_EXPORTER_OTLP_ENDPOINT`
   - Worker currently configures OTLP trace export explicitly
@@ -432,6 +606,10 @@ curl -X POST http://localhost:18000/chat/sessions/<session_id>/messages \
 
 - `GET /chat/sessions/{session_id}`
 
+When server-side identity is available, chat binds the authenticated user to the session and can use profile-aware memory hydration. Explicit feedback for a session is available through:
+
+- `GET /chat/sessions/{session_id}/feedback`
+
 ### Workflows
 
 Create a workflow definition:
@@ -488,6 +666,40 @@ curl -X POST http://localhost:18000/memory/semantic/search \
 - `DELETE /memory/delete?...`
 - `POST /memory/semantic/write`
 
+Memory notes:
+
+- `user_profile` is the canonical exact store for stable user preferences and profile attributes.
+- `semantic_memory` and compact interaction summaries are used for fuzzy retrieval and reuse.
+- Feedback-driven optimization and eval export are separate from memory; feedback lives in its own first-class store.
+
+### Feedback
+
+Submit explicit feedback for a rated artifact:
+
+```bash
+curl -X POST http://localhost:18000/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"target_type":"chat_message","target_id":"<message_id>","sentiment":"negative","reason_codes":["missed_request"],"comment":"It ignored the main ask."}'
+```
+
+Inspect aggregate feedback health and export reusable eval examples:
+
+```bash
+curl "http://localhost:18000/feedback/summary?target_type=plan"
+
+curl "http://localhost:18000/feedback/examples?target_type=chat_message&sentiment=negative&format=jsonl" \
+  > eval/chat_feedback_negative.jsonl
+
+curl "http://localhost:18000/feedback/chat-boundary/review?review_label=likely_false_chat_reply"
+```
+
+- `GET /feedback`
+- `GET /feedback/summary`
+- `GET /feedback/examples`
+- `GET /feedback/chat-boundary/review`
+- `GET /jobs/{job_id}/feedback`
+- `GET /chat/sessions/{session_id}/feedback`
+
 ### Composer and Capabilities
 
 Compile a Studio/composer draft:
@@ -505,11 +717,21 @@ curl -X POST http://localhost:18000/composer/compile \
 - `POST /intent/decompose`
 - `POST /plans/preflight`
 
+Capability and planning notes:
+
+- Capability search and chat capability discovery support lexical plus vector-backed relevance for fuzzier queries.
+- Canonical render capability IDs are `document.docx.render` and `document.pdf.render`.
+- Raw `/plans/preflight` and raw API automation require explicit caller-provided render paths for render tasks.
+- Chat and Workflow Studio can still auto-derive output filenames for render flows.
+
 ## LLM Planner and Worker Modes
 
-Docker Compose runs planner and worker in OpenAI-backed LLM mode. Before `make up`, set the OpenAI values consumed by the Compose file:
+Docker Compose runs planner and worker in LLM mode. Before `make up`, choose one provider contract.
+
+For OpenAI:
 
 ```bash
+LLM_PROVIDER=openai
 OPENAI_MODEL=<model>
 OPENAI_API_KEY=<key>
 OPENAI_BASE_URL=https://api.openai.com
@@ -519,7 +741,44 @@ OPENAI_TIMEOUT_S=60
 OPENAI_MAX_RETRIES=2
 ```
 
-In Docker Compose, `planner` and `worker` modes are fixed by `docker-compose.yml` as `PLANNER_MODE=llm`, `WORKER_MODE=llm`, and `LLM_PROVIDER=openai`.
+For an OpenAI fine-tuned model, keep `LLM_PROVIDER=openai` and set `OPENAI_MODEL` to the fine-tuned model ID.
+
+For a fine-tuned or self-hosted model behind an OpenAI-compatible Chat Completions endpoint:
+
+```bash
+LLM_PROVIDER=openai_compatible
+OPENAI_MODEL=<model>
+OPENAI_API_KEY=<key>
+OPENAI_BASE_URL=<chat-completions-compatible-base-url>
+OPENAI_TIMEOUT_S=60
+OPENAI_MAX_RETRIES=2
+```
+
+For Gemini:
+
+```bash
+LLM_PROVIDER=gemini
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=<key>
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+OPENAI_TIMEOUT_S=60
+OPENAI_MAX_RETRIES=2
+```
+
+In Docker Compose, `planner` and `worker` modes are fixed by `docker-compose.yml` as `PLANNER_MODE=llm` and `WORKER_MODE=llm`; `LLM_PROVIDER` selects OpenAI, Gemini, or mock provider behavior.
+
+The API also supports narrower model knobs for chat and intent paths:
+
+```bash
+CHAT_ROUTER_MODEL=<model>
+CHAT_RESPONSE_MODEL=<model>
+CHAT_PENDING_CORRECTION_MODEL=<model>
+CHAT_CLARIFICATION_NORMALIZER_MODEL=<lighter-model>
+INTENT_ASSESS_MODEL=<model>
+INTENT_DECOMPOSE_MODEL=<model>
+```
+
+Use those knobs when you want to swap or fine-tune only one subsystem instead of changing the entire stack-wide `OPENAI_MODEL`. See [Feedback, Evaluation, and Fine-Tuning Playbook](docs/feedback-model-optimization-playbook.md) for the recommended rollout pattern.
 
 If you are not using Docker Compose and want a reduced local path for isolated development, you can still run individual services or tests in mock/rule-based modes explicitly through environment overrides.
 

@@ -8,9 +8,9 @@ def test_build_task_execution_request_normalizes_payload() -> None:
         "correlation_id": "trace-1",
         "instruction": "Render the final document",
         "context": {"job_context": {"title": "Quarterly Review"}},
-        "tool_requests": ["docx_generate_from_spec", "github.repo.list"],
+        "tool_requests": ["docx_render_from_spec", "github.repo.list"],
         "tool_inputs": {
-            "docx_generate_from_spec": {"path": "artifacts/report.docx"},
+            "docx_render_from_spec": {"path": "artifacts/report.docx"},
             "github.repo.list": {"owner": "narendersurabhi", "repo": "scientific-agent-lab"},
         },
         "intent": "Render",
@@ -36,8 +36,8 @@ def test_build_task_execution_request_normalizes_payload() -> None:
     assert request.intent == "render"
     assert request.attempts == 1
     assert request.max_attempts == 4
-    assert request.tool_requests == ["docx_generate_from_spec", "github.repo.list"]
-    assert request.tool_inputs["docx_generate_from_spec"]["path"] == "artifacts/report.docx"
+    assert request.tool_requests == ["docx_render_from_spec", "github.repo.list"]
+    assert request.tool_inputs["docx_render_from_spec"]["path"] == "artifacts/report.docx"
     assert request.requests[1].resolved_inputs == {
         "owner": "narendersurabhi",
         "repo": "scientific-agent-lab",
@@ -79,15 +79,15 @@ def test_build_task_dispatch_payload_normalizes_and_roundtrips_execution_fields(
             "plan_id": "plan-1",
             "correlation_id": "corr-1",
             "instruction": "Render the final report",
-            "tool_requests": ["docx_generate_from_spec"],
+            "tool_requests": ["docx_render_from_spec"],
             "tool_inputs": {
-                "docx_generate_from_spec": {"path": "artifacts/report.docx"}
+                "docx_render_from_spec": {"path": "artifacts/report.docx"}
             },
             "attempts": 0,
             "max_attempts": 0,
             "critic_required": 0,
             "tool_inputs_resolved": True,
-            "tool_inputs_validation": {"docx_generate_from_spec": "missing document_spec"},
+            "tool_inputs_validation": {"docx_render_from_spec": "missing document_spec"},
         },
         default_max_attempts=3,
     )
@@ -98,13 +98,13 @@ def test_build_task_dispatch_payload_normalizes_and_roundtrips_execution_fields(
     assert payload.correlation_id == "corr-1"
     assert payload.attempts == 1
     assert payload.max_attempts == 3
-    assert payload.tool_requests == ["docx_generate_from_spec"]
-    assert payload.tool_inputs["docx_generate_from_spec"]["path"] == "artifacts/report.docx"
+    assert payload.tool_requests == ["docx_render_from_spec"]
+    assert payload.tool_inputs["docx_render_from_spec"]["path"] == "artifacts/report.docx"
     assert payload.critic_required is False
     assert payload.tool_inputs_resolved is True
     request = execution_contracts.build_task_execution_request(payload.model_dump(mode="json"))
     assert request.trace_id == "corr-1"
-    assert request.tool_inputs["docx_generate_from_spec"]["path"] == "artifacts/report.docx"
+    assert request.tool_inputs["docx_render_from_spec"]["path"] == "artifacts/report.docx"
 
 
 def test_embed_capability_bindings_preserves_plain_tool_inputs() -> None:

@@ -9,28 +9,19 @@ def test_build_reranker_training_examples_uses_completed_or_selected_positives()
                 "correlation_id": "corr-1",
                 "search_queries": ["render a pdf report"],
                 "retrieved_capabilities": [
-                    "document.pdf.generate",
-                    "document.output.derive",
+                    "document.spec.generate",
+                    "document.pdf.render",
                     "llm.text.generate",
                 ],
-                "selected_capabilities": [
-                    "document.output.derive",
-                    "document.pdf.generate",
-                ],
+                "selected_capabilities": ["document.spec.generate", "document.pdf.render"],
                 "executed_capabilities": [
-                    {"id": "document.output.derive", "status": "completed"},
-                    {"id": "document.pdf.generate", "status": "completed"},
+                    {"id": "document.spec.generate", "status": "completed"},
+                    {"id": "document.pdf.render", "status": "completed"},
                 ],
                 "execution_succeeded": True,
                 "planner_override": [],
-                "retrieved_selected": [
-                    "document.output.derive",
-                    "document.pdf.generate",
-                ],
-                "retrieved_executed": [
-                    "document.output.derive",
-                    "document.pdf.generate",
-                ],
+                "retrieved_selected": ["document.spec.generate", "document.pdf.render"],
+                "retrieved_executed": ["document.spec.generate", "document.pdf.render"],
                 "hard_negative_ids": ["llm.text.generate"],
             }
         ]
@@ -40,6 +31,6 @@ def test_build_reranker_training_examples_uses_completed_or_selected_positives()
     assert examples[0]["query"] == "render a pdf report"
     assert examples[0]["negative_capability_ids"] == ["llm.text.generate"]
     assert {entry["positive_capability_id"] for entry in examples} == {
-        "document.output.derive",
-        "document.pdf.generate",
+        "document.spec.generate",
+        "document.pdf.render",
     }

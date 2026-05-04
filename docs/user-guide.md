@@ -85,11 +85,20 @@ Chat can currently resolve a turn into one of these modes:
 - `respond`: normal conversation, no tool or workflow
 - `tool_call`: direct safe read-only capability execution
 - `ask_clarification`: the request likely needs execution, but more detail is needed
+- `run_workflow`: invoke an already published Studio workflow when chat already has a workflow reference
 - `submit_job`: create a normal job and let the platform run it
 
 Practical notes:
 
 - Chat only uses direct tools for bounded, safe, usually read-only actions.
+- Chat can start a published Studio workflow directly when `context_json` includes one of:
+  - `workflow_trigger_id`
+  - `workflow_version_id`
+  - `workflow_definition_id`
+- If the target workflow has required workflow-interface inputs that are still missing, chat asks follow-up clarification questions before starting the run.
+- When chat is waiting on one workflow input, the user can reply with `use default`, `leave blank`, or `skip it` to leave that input unset and let workflow defaults or optional behavior apply when available.
+- When a chat-started workflow finishes, chat appends a final assistant message with the workflow result when it can resolve one cleanly. Declared workflow outputs win; otherwise chat falls back to a displayable last-step output such as generated text.
+- Non-control fields in `context_json` are passed through as workflow run context. Use `workflow_inputs` for workflow interface inputs and `workflow_context_json` for explicit context overrides.
 - If a request needs a multi-step workflow, chat creates a job instead of improvising a hidden workflow.
 - If you enable context attachment, Compose context is sent along with the chat turn.
 
@@ -185,6 +194,15 @@ Currently supported execution control patterns:
 - `parallel` with `fan_out`
 - `parallel` with `fan_in`
 
+Expression support for `if` and `if_else` is intentionally narrow:
+
+- allowed roots: `context.*`, `workflow.input.*`, `workflow.variable.*`
+- allowed forms:
+  - truthy check like `context.approval`
+  - equality like `workflow.input.mode == "publish"`
+  - inequality like `workflow.variable.channel != "email"`
+- workflow input and variable references must match declared keys from the workflow interface
+
 Current limitation:
 
 - `switch` can still appear as an authoring concept, but is not yet lowered into executable runtime behavior
@@ -253,8 +271,8 @@ Recommended path:
 
 1. Use `document.spec.generate`
 2. Use `document.spec.validate`
-3. Use `document.output.derive`
-4. Use `document.docx.generate` or `document.pdf.generate`
+3. Set an explicit output `path`
+4. Use `document.docx.render` or `document.pdf.render`
 
 Important note:
 
@@ -269,8 +287,8 @@ Recommended path:
 
 1. `document.spec.generate_from_markdown`
 2. `document.spec.validate`
-3. `document.output.derive`
-4. `document.docx.generate`
+3. Set an explicit output `path`
+4. `document.docx.render`
 
 ### 3. Inspect a GitHub Repository
 
@@ -318,9 +336,10 @@ Use when you want grounded retrieval over your own indexed chunks.
 Recommended path:
 
 1. `rag.collection.ensure`
-2. `rag.index.upsert_texts` or `rag.index.workspace_file`
+2. `rag.index.upsert_texts`, `rag.index.workspace_file`, `rag.index.markdown`, or `rag.index.workspace_directory`
 3. `rag.retrieve`
-4. optional answer-generation step
+4. optional `rag.retrieve.rerank`
+5. optional answer-generation step
 
 Use `tenant_id`, `workspace_id`, `user_id`, and `namespace` consistently at both index time and retrieval time.
 
