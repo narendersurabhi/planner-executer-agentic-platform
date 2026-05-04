@@ -66,7 +66,25 @@ DEFAULT_MEMORY_SPECS: List[MemorySpec] = [
             "Compacted interaction summaries for token-efficient planning and intent inference."
         ),
         scope=MemoryScope.session,
-        schema_def={"type": "object"},
+        schema_def={
+            "type": "object",
+            "properties": {
+                "interaction_summaries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "action": {"type": "string"},
+                            "facts": {"type": "array", "items": {"type": "string"}},
+                            "evidence": {"type": "array", "items": {"type": "string"}},
+                            "speculation": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["action", "facts"],
+                    },
+                }
+            },
+        },
         ttl_seconds=30 * 24 * 60 * 60,
         read_roles=["planner", "worker", "api"],
         write_roles=["api"],
@@ -75,7 +93,21 @@ DEFAULT_MEMORY_SPECS: List[MemorySpec] = [
         name="user_profile",
         description="Stable user preferences and profile attributes.",
         scope=MemoryScope.user,
-        schema_def={"type": "object"},
+        schema_def={
+            "type": "object",
+            "properties": {
+                "preferences": {
+                    "type": "object",
+                    "properties": {
+                        "preferred_output_format": {"type": "string"},
+                        "response_verbosity": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "updated_at": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
         ttl_seconds=None,
         read_roles=["planner", "worker", "api"],
         write_roles=["api"],
@@ -87,7 +119,23 @@ DEFAULT_MEMORY_SPECS: List[MemorySpec] = [
             "reasoning support."
         ),
         scope=MemoryScope.user,
-        schema_def={"type": "object"},
+        schema_def={
+            "type": "object",
+            "properties": {
+                "type": {"type": "string"},
+                "namespace": {"type": "string"},
+                "subject": {"type": "string"},
+                "fact": {"type": "string"},
+                "aliases": {"type": "array", "items": {"type": "string"}},
+                "keywords": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number"},
+                "source": {"type": "string"},
+                "source_ref": {"type": "string"},
+                "reasoning": {"type": "string"},
+                "query_text": {"type": "string"},
+            },
+            "required": ["namespace", "subject", "fact", "query_text"],
+        },
         ttl_seconds=None,
         read_roles=["planner", "worker", "api"],
         write_roles=["api", "worker"],

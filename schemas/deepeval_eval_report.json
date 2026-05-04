@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/deepeval_eval_report.json",
+  "title": "DeepEval Eval Report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "surface",
+    "source_dataset_id",
+    "case_count",
+    "pass_count",
+    "pass_rate",
+    "overall_score",
+    "threshold_passed",
+    "failing_case_ids",
+    "judge_metrics_summary",
+    "deterministic_metrics_summary",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "deepeval_eval_report_v1"
+    },
+    "surface": {
+      "type": "string"
+    },
+    "source_dataset_id": {
+      "type": "string"
+    },
+    "source_dataset_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "case_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pass_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pass_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "overall_score": {
+      "type": "number"
+    },
+    "threshold": {
+      "type": ["number", "null"]
+    },
+    "threshold_passed": {
+      "type": "boolean"
+    },
+    "failing_case_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "judge_metrics_summary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "count", "pass_rate", "error_count"],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "average_score": {
+            "type": ["number", "null"]
+          },
+          "pass_rate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "error_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "threshold": {
+            "type": ["number", "null"]
+          },
+          "evaluation_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "total_cost": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "deterministic_metrics_summary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "count", "average_score", "min_score", "max_score"],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "average_score": {
+            "type": "number"
+          },
+          "min_score": {
+            "type": "number"
+          },
+          "max_score": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "cost_summary": {
+      "type": "object"
+    },
+    "latency_summary": {
+      "type": "object"
+    },
+    "deterministic_summary": {
+      "type": "object"
+    },
+    "deepeval": {
+      "type": "object"
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "case_id",
+          "surface",
+          "source_dataset_id",
+          "passed",
+          "overall_score",
+          "local_score",
+          "judge_metrics",
+          "local_scores"
+        ],
+        "properties": {
+          "case_id": {
+            "type": "string"
+          },
+          "surface": {
+            "type": "string"
+          },
+          "source_dataset_id": {
+            "type": "string"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "overall_score": {
+            "type": "number"
+          },
+          "judge_score": {
+            "type": ["number", "null"]
+          },
+          "local_score": {
+            "type": "number"
+          },
+          "judge_metrics": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "local_scores": {
+            "type": "object"
+          },
+          "metadata": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -74,8 +74,6 @@ type ComposerStepInspectorProps = {
     patch: { scope?: "job" | "global"; name?: string; key?: string }
   ) => void;
   setVisualBindingFromPrevious: (nodeId: string, field: string) => void;
-  canInsertDeriveOutputPath: boolean;
-  onInsertDeriveOutputPath: (nodeId: string) => void;
 };
 
 export default function ComposerStepInspector({
@@ -96,8 +94,6 @@ export default function ComposerStepInspector({
   updateVisualBindingContextPath,
   updateVisualBindingMemory,
   setVisualBindingFromPrevious,
-  canInsertDeriveOutputPath,
-  onInsertDeriveOutputPath,
 }: ComposerStepInspectorProps) {
   if (!selectedDagNode) {
     return (
@@ -112,7 +108,7 @@ export default function ComposerStepInspector({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">
-            Node Inspector
+            Step Inspector
           </div>
           <div className="text-xs font-semibold text-slate-800">{selectedDagNode.taskName}</div>
           <div className="text-[11px] text-slate-500">{selectedDagNode.capabilityId}</div>
@@ -130,14 +126,6 @@ export default function ComposerStepInspector({
             onClick={() => quickFixNodeBindings(selectedDagNode.id)}
           >
             Quick Fix Missing
-          </button>
-          <button
-            className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700 disabled:opacity-40"
-            onClick={() => onInsertDeriveOutputPath(selectedDagNode.id)}
-            disabled={!canInsertDeriveOutputPath}
-            title="Insert document.output.derive before this step and wire path input"
-          >
-            Insert Derive Path
           </button>
           <button
             className="rounded-md border border-slate-300 px-2 py-1 text-[11px] text-slate-700"

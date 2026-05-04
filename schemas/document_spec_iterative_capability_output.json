@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentSpecIterativeCapabilityOutput",
+  "type": "object",
+  "properties": {
+    "document_spec": {
+      "type": "object"
+    },
+    "validation_report": {
+      "type": "object"
+    },
+    "iterations": {
+      "type": "integer"
+    },
+    "reached_threshold": {
+      "type": "boolean"
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "iteration": {"type": "integer"},
+          "valid": {"type": "boolean"},
+          "error_count": {"type": "integer"},
+          "warning_count": {"type": "integer"}
+        },
+        "required": ["iteration", "valid", "error_count", "warning_count"],
+        "additionalProperties": true
+      }
+    }
+  },
+  "required": [
+    "document_spec",
+    "validation_report",
+    "iterations",
+    "reached_threshold",
+    "history"
+  ],
+  "additionalProperties": true
+}

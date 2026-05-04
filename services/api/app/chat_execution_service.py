@@ -152,6 +152,10 @@ def _tool_name_for_capability(spec: capability_registry.CapabilitySpec) -> str:
     return spec.adapters[0].tool_name
 
 
+def tool_name_for_capability(spec: capability_registry.CapabilitySpec) -> str:
+    return _tool_name_for_capability(spec)
+
+
 def _format_chat_direct_result(
     capability_id: str,
     output: dict[str, Any],
@@ -247,3 +251,16 @@ def _format_chat_direct_result(
     if len(rendered) > max_preview_chars:
         return rendered[:max_preview_chars] + "\n\n[truncated]"
     return rendered
+
+
+def format_chat_direct_result(
+    capability_id: str,
+    output: dict[str, Any],
+    *,
+    max_preview_chars: int = 1_500,
+) -> str:
+    return _format_chat_direct_result(
+        capability_id,
+        output,
+        max_preview_chars=max_preview_chars,
+    )

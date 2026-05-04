@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 import redis
 
-from libs.core import events, llm_provider, logging as core_logging, models, tool_bootstrap
+from libs.core import events, llm_provider, logging as core_logging, models, run_specs, tool_bootstrap
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class PlannerRuntimeConfig:
 class PlannerExecutionContext:
     provider: llm_provider.LLMProvider | None
     tool_specs: list[models.ToolSpec]
+    planner_tool_specs: list[models.ToolSpec]
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,11 @@ def resolve_execution_context(config: PlannerRuntimeConfig) -> PlannerExecutionC
             http_fetch_enabled=False,
             service_name="planner",
         )
+    planner_tool_specs = tool_bootstrap.build_planner_support_tool_specs()
     return PlannerExecutionContext(
         provider=provider,
         tool_specs=registry.list_specs(),
+        planner_tool_specs=planner_tool_specs,
     )
 
 
@@ -159,13 +162,18 @@ def process_stream_entry(
         return
     try:
         plan = callbacks.plan_job(job)
+        run_spec = run_specs.plan_to_run_spec(plan, kind=models.RunKind.planner)
         correlation_id = str(payload.get("correlation_id", str(uuid.uuid4())))
         emit_plan_event(
             redis_client,
             "plan.created",
             job_id=job.id,
             correlation_id=correlation_id,
-            payload=plan.model_dump(),
+            payload={
+                **plan.model_dump(mode="json"),
+                "job_id": job.id,
+                "run_spec": run_spec.model_dump(mode="json"),
+            },
         )
         emit_planner_capability_selection_event(
             redis_client,

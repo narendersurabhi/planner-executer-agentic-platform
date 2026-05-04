@@ -47,6 +47,58 @@ def register_llm_text_tool(
     )
 
 
+def register_llm_contextual_text_tool(
+    registry,
+    *,
+    timeout_s: int,
+    handler: PayloadHandler,
+) -> None:
+    registry.register(
+        Tool(
+            spec=ToolSpec(
+                name="llm_generate_with_context",
+                description="Generate text with an LLM using an explicit prompt and context payload",
+                usage_guidance=(
+                    "Use when the workflow should pass a prompt and a separate context object "
+                    "or string explicitly. Provide 'prompt', optional 'context', and optional "
+                    "'system_prompt', 'temperature', or 'max_output_tokens'. Returns the raw "
+                    "completion in the 'text' field."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "minLength": 1},
+                        "context": {
+                            "oneOf": [
+                                {"type": "object"},
+                                {"type": "array"},
+                                {"type": "string"},
+                                {"type": "number"},
+                                {"type": "boolean"},
+                                {"type": "null"},
+                            ]
+                        },
+                        "system_prompt": {"type": "string", "minLength": 1},
+                        "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+                        "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": 16384},
+                    },
+                    "required": ["prompt"],
+                    "not": {"required": ["text"]},
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                timeout_s=timeout_s,
+                risk_level=RiskLevel.high,
+                tool_intent=ToolIntent.generate,
+            ),
+            handler=handler,
+        )
+    )
+
+
 def register_coding_agent_tools(
     registry,
     *,
@@ -229,6 +281,4 @@ def register_coding_agent_tools(
                 handler=handler_publish_pr,
             )
         )
-
-
 

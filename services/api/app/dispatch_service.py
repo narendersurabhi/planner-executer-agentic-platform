@@ -18,6 +18,7 @@ from libs.core import (
     models,
     orchestrator,
     payload_resolver,
+    planner_contracts,
 )
 from .models import EventOutboxRecord, JobRecord, TaskRecord
 
@@ -47,6 +48,7 @@ class ApiDispatchCallbacks:
     stream_for_event: Callable[[str], str]
     resolve_task_deps: Callable[[list[TaskRecord]], list[models.Task]]
     build_task_context: Callable[[str, Mapping[str, Any], Mapping[str, str], dict[str, Any]], dict[str, Any]]
+    project_execution_context: Callable[[str, Mapping[str, Any], Mapping[str, Any] | None], dict[str, Any]]
     coerce_task_intent_profiles: Callable[[Mapping[str, Any]], dict[str, dict[str, Any]]]
     normalize_task_intent_profile_segment: Callable[[Any], Mapping[str, Any] | None]
     refresh_job_status: Callable[[str], None]
@@ -239,14 +241,28 @@ def task_payload_from_record(
     callbacks: ApiDispatchCallbacks,
 ) -> dict[str, Any]:
     raw_tool_inputs = record.tool_inputs if isinstance(record.tool_inputs, dict) else {}
-    capability_bindings = execution_contracts.normalize_capability_bindings(
+    enabled_capabilities = _enabled_capabilities()
+    source_request_ids = list(record.tool_requests or [])
+    normalized_bindings = execution_contracts.normalize_capability_bindings(
         {"tool_inputs": raw_tool_inputs},
-        request_ids=record.tool_requests or [],
-        capabilities=_enabled_capabilities(),
+        request_ids=source_request_ids,
+        capabilities=enabled_capabilities,
+    )
+    compiled = planner_contracts.compile_task_request_payloads(
+        tool_requests=source_request_ids,
+        tool_inputs=execution_contracts.strip_execution_metadata_from_tool_inputs(
+            raw_tool_inputs
+        ),
+        capability_bindings=normalized_bindings,
+        capabilities=enabled_capabilities,
     )
     execution_gates = execution_contracts.normalize_execution_gates(
         {"tool_inputs": raw_tool_inputs},
-        request_ids=record.tool_requests or [],
+        request_ids=source_request_ids,
+    )
+    execution_gates = planner_contracts.rewrite_request_keyed_mapping(
+        execution_gates,
+        compiled.request_id_rewrites,
     )
     payload: dict[str, Any] = {
         "task_id": record.id,
@@ -264,12 +280,19 @@ def task_payload_from_record(
         "max_attempts": record.max_attempts or 0,
         "rework_count": record.rework_count or 0,
         "max_reworks": record.max_reworks or 0,
+        "retry_policy": {
+            "max_attempts": record.max_attempts or 1,
+            "max_reworks": record.max_reworks or 0,
+            "retry_class": "standard",
+            "retryable_errors": [],
+            "backoff_seconds": 0.0,
+            "backoff_multiplier": 1.0,
+            "jitter_seconds": 0.0,
+        },
         "assigned_to": record.assigned_to,
-        "tool_requests": record.tool_requests or [],
-        "tool_inputs": execution_contracts.strip_execution_metadata_from_tool_inputs(
-            raw_tool_inputs
-        ),
-        "capability_bindings": capability_bindings,
+        "tool_requests": compiled.request_ids or source_request_ids,
+        "tool_inputs": compiled.tool_inputs,
+        "capability_bindings": compiled.capability_bindings,
         "execution_gates": execution_gates,
         "critic_required": bool(record.critic_required),
         "intent": record.intent,
@@ -376,8 +399,18 @@ def enqueue_ready_tasks(
             else {}
         )
         job_goal = job_record.goal if job_record and isinstance(job_record.goal, str) else ""
+        job_metadata = (
+            job_record.metadata_json
+            if job_record and isinstance(job_record.metadata_json, dict)
+            else {}
+        )
+        projected_job_context = callbacks.project_execution_context(
+            job_goal,
+            job_context,
+            job_metadata,
+        )
         task_intent_profiles = callbacks.coerce_task_intent_profiles(
-            job_record.metadata_json if job_record and isinstance(job_record.metadata_json, dict) else {}
+            job_metadata
         )
         tasks = callbacks.resolve_task_deps(task_records)
         task_map = {task.id: task for task in tasks}
@@ -409,7 +442,12 @@ def enqueue_ready_tasks(
                 if runtime.config.policy_gate_enabled:
                     record.status = models.TaskStatus.blocked.value
                     record.updated_at = now
-                    context = callbacks.build_task_context(record.id, task_map, id_to_name, job_context)
+                    context = callbacks.build_task_context(
+                        record.id,
+                        task_map,
+                        id_to_name,
+                        projected_job_context,
+                    )
                     payload = task_payload_from_record(
                         record,
                         correlation_id,
@@ -424,7 +462,12 @@ def enqueue_ready_tasks(
                 record.attempts = next_attempt
                 record.status = models.TaskStatus.ready.value
                 record.updated_at = now
-                context = callbacks.build_task_context(record.id, task_map, id_to_name, job_context)
+                context = callbacks.build_task_context(
+                    record.id,
+                    task_map,
+                    id_to_name,
+                    projected_job_context,
+                )
                 payload = task_payload_from_record(
                     record,
                     correlation_id,

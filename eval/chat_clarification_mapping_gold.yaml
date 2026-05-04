@@ -1,0 +1,59 @@
+cases:
+  - id: audience_answer_advances_queue
+    content: Senior software engineers
+    active_field_before: audience
+    active_field_after: tone
+    resolved_fields:
+      - audience
+    expected_restarted: false
+    expected_resolved_active_field: true
+    expected_queue_advanced: true
+    notes: A direct audience answer should resolve the active field and advance to tone.
+  - id: tone_answer_advances_queue
+    content: practical
+    active_field_before: tone
+    active_field_after: path
+    resolved_fields:
+      - tone
+    expected_restarted: false
+    expected_resolved_active_field: true
+    expected_queue_advanced: true
+    notes: A terse tone answer should resolve tone and advance the queue.
+  - id: output_format_redirect_stays_in_flow
+    content: Actually make it DOCX instead
+    active_field_before: output_format
+    active_field_after: path
+    resolved_fields:
+      - output_format
+    expected_restarted: false
+    expected_resolved_active_field: true
+    expected_queue_advanced: true
+    notes: Redirect wording that still answers output_format should stay in the current clarification flow.
+  - id: opportunistic_extra_field_does_not_advance
+    content: save it as medic.docx in the workspace
+    active_field_before: audience
+    active_field_after: audience
+    resolved_fields:
+      - path
+    expected_restarted: false
+    expected_resolved_active_field: false
+    expected_queue_advanced: false
+    notes: Non-active-field capture should not incorrectly advance the queue.
+  - id: redirect_to_new_document_request_restarts
+    content: Actually make this a PDF checklist instead
+    active_field_before: tone
+    active_field_after:
+    resolved_fields: []
+    expected_restarted: true
+    expected_resolved_active_field: false
+    expected_queue_advanced: false
+    notes: A strong redirect to a new artifact request should restart the clarification frame.
+  - id: redirect_to_new_search_request_restarts
+    content: Instead search GitHub issues for kubelet errors
+    active_field_before: audience
+    active_field_after:
+    resolved_fields: []
+    expected_restarted: true
+    expected_resolved_active_field: false
+    expected_queue_advanced: false
+    notes: A redirect to a different execution family should restart instead of filling the current slot.

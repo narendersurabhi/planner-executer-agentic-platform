@@ -51,26 +51,26 @@ export default function ComposerValidationPanel({
       : "Validation required"
     : "No chain validation required";
   const statusClass = !needsValidation
-    ? "text-slate-700 font-semibold"
+    ? "text-slate-200 font-semibold"
     : isValid
-      ? "text-emerald-700 font-semibold"
-      : "text-rose-700 font-semibold";
+      ? "text-emerald-300 font-semibold"
+      : "text-rose-300 font-semibold";
 
   return (
-    <div className="mt-2 rounded-lg border border-slate-200 bg-white px-2 py-2 text-[11px]">
+    <div className="mt-3 rounded-[24px] border border-white/10 bg-white/[0.04] px-3 py-3 text-[11px] text-slate-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
       <div className="flex items-center justify-between gap-2">
         <div className={statusClass}>{statusText}</div>
-        <div className="text-slate-500">{formatTimestamp(preflightResult?.checkedAt)}</div>
+        <div className="text-slate-400">{formatTimestamp(preflightResult?.checkedAt)}</div>
       </div>
-      {compileLoading ? <div className="mt-2 text-slate-500">Compiling draft...</div> : null}
+      {compileLoading ? <div className="mt-2 text-slate-400">Compiling draft...</div> : null}
       {issues.length > 0 ? (
         <div className="mt-2 space-y-1">
-          <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.15em] text-slate-500">
+          <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.15em] text-slate-400">
             <span>Issues</span>
-            <span className="rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] text-rose-700">
+            <span className="rounded-full border border-rose-300/25 bg-rose-400/12 px-1.5 py-0.5 text-[10px] text-rose-200">
               errors: {errorCount}
             </span>
-            <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">
+            <span className="rounded-full border border-amber-300/25 bg-amber-400/12 px-1.5 py-0.5 text-[10px] text-amber-200">
               warnings: {warningCount}
             </span>
           </div>
@@ -81,14 +81,14 @@ export default function ComposerValidationPanel({
               (!activeIssue.field || !issue.field || issue.field === activeIssue.field);
             const issueClass =
               issue.severity === "warning"
-                ? "text-amber-700 border-amber-200 hover:bg-amber-50"
-                : "text-rose-700 border-rose-200 hover:bg-rose-50";
+                ? "text-amber-100 border-amber-300/25 bg-amber-400/10 hover:bg-amber-400/14"
+                : "text-rose-100 border-rose-300/25 bg-rose-400/10 hover:bg-rose-400/14";
             return (
               <button
                 key={`composer-issue-${idx}`}
                 type="button"
                 className={`w-full rounded-md border px-2 py-1 text-left transition ${
-                  isActive ? "ring-2 ring-sky-100" : ""
+                  isActive ? "ring-2 ring-sky-300/30" : ""
                 } ${issueClass}`}
                 onClick={() => onIssueClick(issue)}
                 title={issue.nodeId ? "Focus node in DAG canvas" : "Issue detail"}
@@ -101,11 +101,10 @@ export default function ComposerValidationPanel({
           })}
         </div>
       ) : (
-        <div className="mt-2 text-slate-500">
+        <div className="mt-2 text-slate-400">
           {needsValidation ? "No issues detected." : "Add one or more chain steps to enable validation."}
         </div>
       )}
     </div>
   );
 }
-

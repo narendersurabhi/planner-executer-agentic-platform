@@ -11,6 +11,7 @@ from libs.core.llm_provider import (
     LLMProviderError,
     LLMRequest,
     LLMResponse,
+    OpenAIChatCompletionsProvider,
     OpenAIProvider,
     parse_json_object,
 )
@@ -125,6 +126,100 @@ def test_openai_provider_builds_request_payload_from_llm_request() -> None:
         "max_output_tokens": 42,
         "metadata": {"component": "coder", "goal_len": "9"},
     }
+
+
+def test_openai_chat_completions_provider_builds_messages_payload() -> None:
+    provider = OpenAIChatCompletionsProvider(
+        api_key="test-key",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        temperature=0.3,
+        max_output_tokens=128,
+        provider_label="Gemini",
+    )
+
+    payload = provider._build_payload(  # type: ignore[attr-defined]
+        LLMRequest(
+            prompt="hello",
+            system_prompt="system message",
+            temperature=0.1,
+            max_output_tokens=42,
+            metadata={"component": "planner"},
+        )
+    )
+
+    assert payload == {
+        "model": "gemini-2.5-flash",
+        "messages": [
+            {"role": "system", "content": "system message"},
+            {"role": "user", "content": "hello"},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 42,
+    }
+
+
+def test_openai_chat_completions_provider_keeps_metadata_for_non_gemini_base_url() -> None:
+    provider = OpenAIChatCompletionsProvider(
+        api_key="test-key",
+        model="gpt-4.1-mini",
+        base_url="https://api.openai.com/v1",
+        temperature=0.3,
+        max_output_tokens=128,
+    )
+
+    payload = provider._build_payload(  # type: ignore[attr-defined]
+        LLMRequest(
+            prompt="hello",
+            system_prompt="system message",
+            temperature=0.1,
+            max_output_tokens=42,
+            metadata={"component": "planner"},
+        )
+    )
+
+    assert payload == {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": "system message"},
+            {"role": "user", "content": "hello"},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 42,
+        "metadata": {"component": "planner"},
+    }
+
+
+def test_resolve_provider_supports_gemini_env(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+
+    provider = llm_provider_module.resolve_provider(
+        "gemini",
+        api_key="openai-key",
+        model="gpt-5-mini",
+        base_url="https://api.openai.com",
+    )
+
+    assert isinstance(provider, OpenAIChatCompletionsProvider)
+    assert provider.api_key == "gemini-key"
+    assert provider.model == "gemini-2.5-flash"
+    assert provider.base_url == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def test_resolve_provider_supports_openai_compatible_endpoint() -> None:
+    provider = llm_provider_module.resolve_provider(
+        "openai_compatible",
+        api_key="custom-key",
+        model="fine-tuned-model",
+        base_url="https://llm.example.test/v1",
+    )
+
+    assert isinstance(provider, OpenAIChatCompletionsProvider)
+    assert provider.api_key == "custom-key"
+    assert provider.model == "fine-tuned-model"
+    assert provider.base_url == "https://llm.example.test/v1"
 
 
 def test_openai_provider_retries_retryable_connection_error(monkeypatch) -> None:

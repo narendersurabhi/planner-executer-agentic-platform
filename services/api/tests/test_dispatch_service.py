@@ -81,7 +81,10 @@ def test_enqueue_ready_tasks_emits_via_callback() -> None:
     callbacks = dispatch_service.ApiDispatchCallbacks(
         stream_for_event=main._stream_for_event,
         resolve_task_deps=main._resolve_task_deps,
-        build_task_context=lambda *_args: {},
+        build_task_context=lambda _task_id, _task_map, _id_to_name, job_context: {
+            "job_context": dict(job_context),
+        },
+        project_execution_context=lambda _goal, _context, _metadata: {"projected": True},
         coerce_task_intent_profiles=lambda _metadata: {},
         normalize_task_intent_profile_segment=lambda segment: segment,
         refresh_job_status=refreshed.append,
@@ -105,4 +108,5 @@ def test_enqueue_ready_tasks_emits_via_callback() -> None:
     assert emitted
     assert emitted[0][0] == "task.ready"
     assert emitted[0][1]["task_id"] == task_id
+    assert emitted[0][1]["context"]["job_context"] == {"projected": True}
     assert refreshed == [job_id]

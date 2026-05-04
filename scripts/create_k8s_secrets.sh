@@ -21,6 +21,7 @@ kubectl get namespace awe >/dev/null 2>&1 || kubectl create namespace awe
 OPENAI_KEY=$(grep -E '^OPENAI_API_KEY=' .env | cut -d= -f2-)
 GITHUB_CLASSIC_TOKEN=$(grep -E '^GITHUB_CLASSIC_TOKEN=' .env | cut -d= -f2-)
 GITHUB_TOKEN=$(grep -E '^GITHUB_TOKEN=' .env | cut -d= -f2-)
+GEMINI_API_KEY=$(grep -E '^GEMINI_API_KEY=' .env | cut -d= -f2-)
 
 if [[ -n "$GITHUB_CLASSIC_TOKEN" ]]; then
   GITHUB_TOKEN="$GITHUB_CLASSIC_TOKEN"
@@ -35,4 +36,5 @@ kubectl create secret generic awe-secrets \
   -n awe \
   --from-literal=OPENAI_API_KEY="$OPENAI_KEY" \
   --from-literal=GITHUB_TOKEN="$GITHUB_TOKEN" \
+  --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
   --dry-run=client -o yaml | kubectl apply -n awe -f -

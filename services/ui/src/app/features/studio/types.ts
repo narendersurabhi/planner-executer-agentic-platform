@@ -38,6 +38,88 @@ export type CapabilityCatalog = {
   items: CapabilityItem[];
 };
 
+export type AgentDefinition = {
+  id: string;
+  name: string;
+  description?: string | null;
+  agent_capability_id: string;
+  instructions: string;
+  default_goal: string;
+  default_workspace_path?: string | null;
+  default_constraints: string[];
+  default_max_steps?: number | null;
+  model_config: Record<string, unknown>;
+  allowed_capability_ids: string[];
+  memory_policy: Record<string, unknown>;
+  guardrail_policy: Record<string, unknown>;
+  workspace_policy: Record<string, unknown>;
+  enabled: boolean;
+  user_id?: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentDefinitionCreateRequest = {
+  name: string;
+  description?: string | null;
+  agent_capability_id: string;
+  instructions: string;
+  default_goal?: string;
+  default_workspace_path?: string | null;
+  default_constraints?: string[];
+  default_max_steps?: number | null;
+  model_config?: Record<string, unknown>;
+  allowed_capability_ids?: string[];
+  memory_policy?: Record<string, unknown>;
+  guardrail_policy?: Record<string, unknown>;
+  workspace_policy?: Record<string, unknown>;
+  user_id?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type AgentDefinitionUpdateRequest = Partial<
+  AgentDefinitionCreateRequest & {
+    enabled: boolean;
+  }
+>;
+
+export type AgentDefinitionVersionPublishRequest = {
+  version_note?: string | null;
+  published_by?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type AgentDefinitionVersion = {
+  id: string;
+  agent_definition_id: string;
+  version_number: number;
+  name: string;
+  description?: string | null;
+  agent_capability_id: string;
+  instructions: string;
+  default_goal: string;
+  default_workspace_path?: string | null;
+  default_constraints: string[];
+  default_max_steps?: number | null;
+  model_config: Record<string, unknown>;
+  allowed_capability_ids: string[];
+  memory_policy: Record<string, unknown>;
+  guardrail_policy: Record<string, unknown>;
+  workspace_policy: Record<string, unknown>;
+  definition_metadata: Record<string, unknown>;
+  version_metadata: Record<string, unknown>;
+  enabled: boolean;
+  user_id?: string | null;
+  published_by?: string | null;
+  version_note?: string | null;
+  definition_created_at?: string | null;
+  definition_updated_at?: string | null;
+  created_at: string;
+};
+
+export type StudioSurface = "workflow" | "workbench";
+
 export type ComposerInputBinding =
   | {
       kind: "step_output";
@@ -195,6 +277,24 @@ export type WorkflowInterface = {
   outputs: WorkflowOutputDefinition[];
 };
 
+export type WorkflowRuntimeSettings = {
+  executionMode?: "static" | "adaptive";
+  adaptivePolicy?: {
+    maxReplans?: number;
+  };
+};
+
+export type AdaptiveReplanStatus = {
+  active_plan_id?: string | null;
+  pending_replan?: boolean;
+  pending_replan_reason?: string | null;
+  max_replans?: number;
+  replans_used?: number;
+  replans_remaining?: number;
+  can_manual_replan?: boolean;
+  replan_block_reason?: string | null;
+};
+
 export type StudioPersistedWorkflowDraft = {
   summary?: string;
   goal?: string;
@@ -203,7 +303,118 @@ export type StudioPersistedWorkflowDraft = {
   nodes?: ComposerDraftNode[];
   edges?: ComposerDraftEdge[];
   workflowInterface?: WorkflowInterface;
+  runtimeSettings?: WorkflowRuntimeSettings;
 };
+
+export type WorkbenchConversionDiagnostic = {
+  code: string;
+  message: string;
+  stepId?: string;
+  field?: string;
+};
+
+export type ReplayableCapabilityDraft = {
+  sourceRunId: string;
+  sourceStepId: string;
+  title: string;
+  goal: string;
+  userId: string;
+  contextJson: Record<string, unknown>;
+  capabilityId: string;
+  inputs: Record<string, unknown>;
+  retryPolicy: Record<string, unknown>;
+  notice: string;
+};
+
+export type WorkbenchReplayResult =
+  | {
+      replayable: true;
+      draft: ReplayableCapabilityDraft;
+    }
+  | {
+      replayable: false;
+      reason: string;
+      diagnostics: WorkbenchConversionDiagnostic[];
+    };
+
+export type WorkbenchForkTargetMode =
+  | "capability"
+  | "agent_structured"
+  | "agent_raw";
+
+export type WorkbenchAgentStructuredStepDraft = {
+  stepId: string;
+  name: string;
+  description: string;
+  instruction: string;
+  capabilityId: string;
+  dependsOn: string[];
+  inputBindings: Record<string, unknown>;
+  retryPolicy: Record<string, unknown>;
+};
+
+export type WorkbenchAgentStructuredDraft = {
+  sourceRunId: string;
+  title: string;
+  goal: string;
+  userId: string;
+  contextJson: Record<string, unknown>;
+  steps: WorkbenchAgentStructuredStepDraft[];
+  notice: string;
+};
+
+export type WorkbenchAgentRawDraft = {
+  sourceRunId: string;
+  title: string;
+  goal: string;
+  userId: string;
+  contextJson: Record<string, unknown>;
+  runSpec: Record<string, unknown>;
+  reason: string;
+  notice: string;
+};
+
+export type WorkbenchForkResult =
+  | {
+      mode: "capability";
+      draft: ReplayableCapabilityDraft;
+      diagnostics: WorkbenchConversionDiagnostic[];
+    }
+  | {
+      mode: "agent_structured";
+      draft: WorkbenchAgentStructuredDraft;
+      diagnostics: WorkbenchConversionDiagnostic[];
+    }
+  | {
+      mode: "agent_raw";
+      draft: WorkbenchAgentRawDraft;
+      diagnostics: WorkbenchConversionDiagnostic[];
+    };
+
+export type WorkbenchWorkflowPromotionDraft = StudioPersistedWorkflowDraft & {
+  summary: string;
+  goal: string;
+  contextJsonText: string;
+  nodePositions: Record<string, CanvasPoint>;
+  nodes: ComposerDraftNode[];
+  edges: ComposerDraftEdge[];
+  workflowInterface: WorkflowInterface;
+  sourceRunId: string;
+  sourceTitle: string;
+  notice: string;
+};
+
+export type WorkbenchWorkflowPromotionResult =
+  | {
+      promotable: true;
+      draft: WorkbenchWorkflowPromotionDraft;
+      diagnostics: WorkbenchConversionDiagnostic[];
+    }
+  | {
+      promotable: false;
+      reason: string;
+      diagnostics: WorkbenchConversionDiagnostic[];
+    };
 
 export type ComposerCompileDiagnostic = {
   code: string;
@@ -220,6 +431,7 @@ export type ComposerCompileResponse = {
     warnings: ComposerCompileDiagnostic[];
   };
   plan: Record<string, unknown> | null;
+  run_spec?: Record<string, unknown> | null;
   preflight_errors: Record<string, string>;
 };
 
@@ -258,6 +470,7 @@ export type WorkflowVersion = {
   context_json: Record<string, unknown>;
   draft: StudioPersistedWorkflowDraft;
   compiled_plan: Record<string, unknown>;
+  run_spec?: Record<string, unknown>;
   user_id?: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
@@ -287,7 +500,14 @@ export type WorkflowRun = {
   job_id: string;
   plan_id: string;
   job_status?: string | null;
+  job_error?: string | null;
+  latest_task_id?: string | null;
+  latest_task_name?: string | null;
+  latest_task_error?: string | null;
   user_id?: string | null;
+  planning_mode?: "static" | "adaptive" | string;
+  current_revision_number?: number;
+  adaptive_status?: AdaptiveReplanStatus;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
@@ -301,6 +521,9 @@ export type WorkflowRunResult = {
     id: string;
     goal: string;
     status: string;
+    planning_mode?: "static" | "adaptive" | string;
+    current_revision_number?: number;
+    adaptive_status?: AdaptiveReplanStatus;
     metadata?: Record<string, unknown>;
   };
   plan: {

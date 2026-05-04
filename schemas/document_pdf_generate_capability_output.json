@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentPdfGenerateCapabilityOutput",
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "bytes_written": {
+      "type": "integer"
+    }
+  },
+  "required": ["path", "bytes_written"],
+  "additionalProperties": true
+}

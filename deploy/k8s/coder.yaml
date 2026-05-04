@@ -30,6 +30,12 @@ spec:
                   name: awe-secrets
                   key: OPENAI_API_KEY
                   optional: true
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: awe-secrets
+                  key: GEMINI_API_KEY
+                  optional: true
           resources:
             requests:
               cpu: 150m

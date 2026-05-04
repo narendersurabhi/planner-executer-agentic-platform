@@ -23,12 +23,21 @@ type StudioWorkflowLibraryProps = {
   workflowRunsError: string | null;
   activeWorkflowDefinitionId: string | null;
   activeWorkflowVersionId: string | null;
+  deletingWorkflowDefinitionId: string | null;
   onRefresh: () => void;
+  onSelectDefinition?: (definition: WorkflowDefinition) => void;
   onOpenDefinition: (definition: WorkflowDefinition) => void;
+  onDeleteDefinition: (definition: WorkflowDefinition) => void;
+  openDefinitionLabel?: string;
+  onSelectVersion?: (version: WorkflowVersion) => void;
   onOpenVersion: (version: WorkflowVersion) => void;
+  openVersionLabel?: string;
   onCreateManualTrigger: () => void;
   onInvokeTrigger: (trigger: WorkflowTrigger) => void;
 };
+
+const libraryPanelClassName =
+  "rounded-[32px] border border-[#22304a] bg-[linear-gradient(180deg,rgba(15,23,42,0.98),rgba(9,17,27,0.96))] p-4 text-slate-100 shadow-[0_24px_60px_rgba(2,8,23,0.24)] [&_.border-slate-200]:border-white/10 [&_.border-slate-300]:border-white/12 [&_.border-sky-200]:border-sky-300/25 [&_.border-emerald-200]:border-emerald-300/25 [&_.border-amber-200]:border-amber-300/25 [&_.border-rose-200]:border-rose-300/25 [&_.bg-slate-50]:bg-white/[0.04] [&_.bg-slate-100]:bg-white/[0.07] [&_.bg-slate-200]:bg-white/[0.07] [&_.bg-white]:bg-white/[0.05] [&_.bg-sky-50]:bg-sky-400/10 [&_.bg-emerald-50]:bg-emerald-400/10 [&_.bg-amber-50]:bg-amber-400/10 [&_.bg-amber-100]:bg-amber-400/12 [&_.bg-rose-50]:bg-rose-400/10 [&_.bg-rose-100]:bg-rose-400/12 [&_.bg-sky-100]:bg-sky-400/12 [&_.bg-emerald-100]:bg-emerald-400/12 [&_.text-slate-900]:text-white [&_.text-slate-700]:text-slate-200 [&_.text-slate-600]:text-slate-300/82 [&_.text-slate-500]:text-slate-400 [&_.text-amber-700]:text-amber-100 [&_.text-amber-800]:text-amber-100 [&_.text-amber-900]:text-amber-50 [&_.text-rose-700]:text-rose-100 [&_.text-rose-800]:text-rose-100 [&_.text-rose-900]:text-rose-50 [&_.text-sky-700]:text-sky-100 [&_.text-emerald-700]:text-emerald-100 [&_article]:border-white/10 [&_article]:bg-white/[0.04]";
 
 export default function StudioWorkflowLibrary({
   workflowDefinitions,
@@ -45,36 +54,41 @@ export default function StudioWorkflowLibrary({
   workflowRunsError,
   activeWorkflowDefinitionId,
   activeWorkflowVersionId,
+  deletingWorkflowDefinitionId,
   onRefresh,
+  onSelectDefinition,
   onOpenDefinition,
+  onDeleteDefinition,
+  openDefinitionLabel = "Open Draft",
+  onSelectVersion,
   onOpenVersion,
+  openVersionLabel = "Restore Version",
   onCreateManualTrigger,
   onInvokeTrigger,
 }: StudioWorkflowLibraryProps) {
   return (
-    <section className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm">
+    <section className={libraryPanelClassName}>
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
-            Workflow Library
+          <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-100/68">
+            Saved Workflows
           </div>
-          <h3 className="mt-1 font-display text-2xl text-slate-900">Saved Drafts</h3>
+          <h3 className="mt-1 font-display text-2xl text-white">Workflow Versions</h3>
         </div>
         <button
-          className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-900 hover:text-slate-900"
+          className="rounded-full border border-white/12 bg-white/[0.05] px-4 py-2 text-sm font-semibold text-slate-100 transition hover:border-sky-300/40 hover:bg-white/[0.08]"
           onClick={onRefresh}
         >
           Refresh
         </button>
       </div>
 
-      <p className="mt-3 text-sm leading-6 text-slate-600">
-        Reopen saved workflow definitions into the editor, then inspect or restore published
-        versions for the active draft.
+      <p className="mt-3 text-sm leading-6 text-slate-300/82">
+        Manage reusable workflow definitions, versions, triggers, and published automations.
       </p>
 
       <div className="mt-4">
-        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300/75">
           Definitions
         </div>
         {workflowDefinitionsLoading ? (
@@ -100,7 +114,10 @@ export default function StudioWorkflowLibrary({
                     isActive
                       ? "border-sky-200 bg-sky-50/80"
                       : "border-slate-200 bg-slate-50/70"
-                  }`}
+                  } ${onSelectDefinition ? "cursor-pointer transition hover:border-sky-300/35" : ""}`}
+                  onClick={() => {
+                    onSelectDefinition?.(definition);
+                  }}
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
@@ -130,9 +147,22 @@ export default function StudioWorkflowLibrary({
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       className="rounded-full border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-900 hover:text-slate-900"
-                      onClick={() => onOpenDefinition(definition)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onOpenDefinition(definition);
+                      }}
                     >
-                      Open Draft
+                      {openDefinitionLabel}
+                    </button>
+                    <button
+                      className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:border-rose-400 hover:text-rose-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onDeleteDefinition(definition);
+                      }}
+                      disabled={deletingWorkflowDefinitionId === definition.id}
+                    >
+                      {deletingWorkflowDefinitionId === definition.id ? "Deleting..." : "Delete"}
                     </button>
                   </div>
                 </article>
@@ -243,7 +273,10 @@ export default function StudioWorkflowLibrary({
                     isActive
                       ? "border-emerald-200 bg-emerald-50/80"
                       : "border-slate-200 bg-slate-50/70"
-                  }`}
+                  } ${onSelectVersion ? "cursor-pointer transition hover:border-emerald-300/35" : ""}`}
+                  onClick={() => {
+                    onSelectVersion?.(version);
+                  }}
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div>
@@ -266,9 +299,12 @@ export default function StudioWorkflowLibrary({
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       className="rounded-full border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-900 hover:text-slate-900"
-                      onClick={() => onOpenVersion(version)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onOpenVersion(version);
+                      }}
                     >
-                      Restore Version
+                      {openVersionLabel}
                     </button>
                   </div>
                 </article>
@@ -342,6 +378,24 @@ export default function StudioWorkflowLibrary({
                     </span>
                   ) : null}
                 </div>
+                {run.latest_task_error ? (
+                  <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-3 py-3 text-xs leading-5 text-rose-700">
+                    <div className="font-semibold uppercase tracking-[0.14em] text-rose-800">
+                      Latest Task Error
+                    </div>
+                    <div className="mt-1 text-rose-900">
+                      {run.latest_task_name ? `${run.latest_task_name}: ` : null}
+                      {run.latest_task_error}
+                    </div>
+                  </div>
+                ) : run.job_error ? (
+                  <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs leading-5 text-amber-800">
+                    <div className="font-semibold uppercase tracking-[0.14em] text-amber-900">
+                      Run Error
+                    </div>
+                    <div className="mt-1">{run.job_error}</div>
+                  </div>
+                ) : null}
               </article>
             ))}
           </div>

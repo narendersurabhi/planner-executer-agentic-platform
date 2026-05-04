@@ -16,10 +16,9 @@ tool_governance:
         - llm_iterative_improve_runbook_spec
         - llm_iterative_improve_openapi_spec
         - document_spec_validate
-        - docx_generate_from_spec
-        - pdf_generate_from_spec
+        - docx_render_from_spec
+        - pdf_render_from_spec
         - docx_render
-        - derive_output_path
         - derive_output_filename
         - file_read_text
         - list_files
@@ -54,10 +53,9 @@ tool_governance:
         - llm_iterative_improve_runbook_spec
         - llm_iterative_improve_openapi_spec
         - document_spec_validate
-        - docx_generate_from_spec
-        - pdf_generate_from_spec
+        - docx_render_from_spec
+        - pdf_render_from_spec
         - docx_render
-        - derive_output_path
         - derive_output_filename
         - file_read_text
         - file_write_text
@@ -75,6 +73,8 @@ tool_governance:
         - workspace_copy
         - workspace_read_text
         - workspace_list_files
+        - memory_read
+        - memory_semantic_search
         - coding_agent_generate
         - coding_agent_autonomous
         - coding_agent_publish_pr
@@ -106,10 +106,9 @@ tool_governance:
         - llm_iterative_improve_runbook_spec
         - llm_iterative_improve_openapi_spec
         - document_spec_validate
-        - docx_generate_from_spec
-        - pdf_generate_from_spec
+        - docx_render_from_spec
+        - pdf_render_from_spec
         - docx_render
-        - derive_output_path
         - derive_output_filename
         - file_read_text
         - list_files

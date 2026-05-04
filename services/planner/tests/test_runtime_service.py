@@ -70,12 +70,23 @@ def test_resolve_execution_context_uses_llm_provider_when_enabled(monkeypatch) -
         input_schema={},
         output_schema={},
     )
+    planner_tool = models.ToolSpec(
+        name="search_capabilities",
+        description="search capabilities",
+        input_schema={},
+        output_schema={},
+    )
 
     monkeypatch.setattr(runtime_service.llm_provider, "resolve_provider", lambda *args, **kwargs: provider)
     monkeypatch.setattr(
         runtime_service.tool_bootstrap,
         "build_default_registry",
         lambda **kwargs: _FakeRegistry([tool]),
+    )
+    monkeypatch.setattr(
+        runtime_service.tool_bootstrap,
+        "build_planner_support_tool_specs",
+        lambda: [planner_tool],
     )
 
     context = runtime_service.resolve_execution_context(
@@ -89,6 +100,7 @@ def test_resolve_execution_context_uses_llm_provider_when_enabled(monkeypatch) -
 
     assert context.provider is provider
     assert context.tool_specs[0].name == "llm_generate"
+    assert context.planner_tool_specs[0].name == "search_capabilities"
 
 
 def test_process_stream_entry_emits_created_and_selection_events() -> None:
@@ -116,4 +128,7 @@ def test_process_stream_entry_emits_created_and_selection_events() -> None:
     selected = json.loads(fake_redis.added[1][1]["data"])
     assert fake_redis.added[0][0] == events.PLAN_STREAM
     assert created["type"] == "plan.created"
+    assert created["payload"]["job_id"] == "job-1"
+    assert created["payload"]["run_spec"]["kind"] == models.RunKind.planner.value
+    assert created["payload"]["run_spec"]["steps"][0]["name"] == "TaskA"
     assert selected["type"] == "plan.capability_selection"

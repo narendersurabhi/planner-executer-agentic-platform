@@ -54,3 +54,60 @@ def test_capability_allowlist_dry_run_does_not_block(monkeypatch):
     assert decision.mode == "dry_run"
     assert decision.violated is True
     assert decision.reason == "dry_run:not_in_global_enabled"
+
+
+def test_capability_registry_resolves_legacy_render_aliases(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+
+    assert registry.require("document.docx.generate").capability_id == "document.docx.render"
+    assert registry.require("document.pdf.generate").capability_id == "document.pdf.render"
+
+
+def test_capability_registry_parses_document_validate_output_contract(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+    spec = registry.require("document.spec.validate")
+
+    assert spec.output_schema_ref == "document_spec_validate_capability_output"
+    assert len(spec.exports) == 1
+    assert spec.exports[0].name == "validation_report"
+    assert spec.exports[0].path == "$"
+
+
+def test_capability_allowlist_canonicalizes_legacy_render_aliases(monkeypatch):
+    monkeypatch.setenv("CAPABILITY_GOVERNANCE_ENABLED", "true")
+    monkeypatch.setenv("CAPABILITY_GOVERNANCE_MODE", "enforce")
+    monkeypatch.setenv("ENABLED_CAPABILITIES", "document.pdf.render")
+    monkeypatch.delenv("DISABLED_CAPABILITIES", raising=False)
+    monkeypatch.delenv("WORKER_ENABLED_CAPABILITIES", raising=False)
+    monkeypatch.delenv("WORKER_DISABLED_CAPABILITIES", raising=False)
+
+    decision = capability_registry.evaluate_capability_allowlist("document.pdf.generate", "worker")
+
+    assert decision.allowed is True
+    assert decision.reason == "allowed"
+
+
+def test_planner_collectible_inputs_prefer_registry_hints(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+
+    assert capability_registry.planner_collectible_inputs_for_capability(
+        "document.pdf.render",
+        registry=registry,
+    ) == ["path"]
+
+
+def test_planner_collectible_inputs_fallback_to_schema_required(monkeypatch):
+    monkeypatch.delenv("CAPABILITY_REGISTRY_PATH", raising=False)
+
+    registry = capability_registry.load_capability_registry()
+
+    assert capability_registry.planner_collectible_inputs_for_capability(
+        "llm.text.generate",
+        registry=registry,
+    ) == ["prompt"]
