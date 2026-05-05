@@ -1,7 +1,7 @@
 """add agent definition registry table
 
-Revision ID: 20260422_add_agent_definitions
-Revises: 20260412_add_execution_request_leases
+Revision ID: 20260422_agent_defs
+Revises: 20260412_exec_request_leases
 Create Date: 2026-04-22
 """
 
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260422_add_agent_definitions"
-down_revision = "20260412_add_execution_request_leases"
+revision = "20260422_agent_defs"
+down_revision = "20260412_exec_request_leases"
 branch_labels = None
 depends_on = None
 

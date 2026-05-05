@@ -1,7 +1,7 @@
 """add immutable agent definition versions
 
-Revision ID: 20260422_add_agent_definition_versions
-Revises: 20260422_add_agent_definitions
+Revision ID: 20260422_agent_def_versions
+Revises: 20260422_agent_defs
 Create Date: 2026-04-22
 """
 
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260422_add_agent_definition_versions"
-down_revision = "20260422_add_agent_definitions"
+revision = "20260422_agent_def_versions"
+down_revision = "20260422_agent_defs"
 branch_labels = None
 depends_on = None
 

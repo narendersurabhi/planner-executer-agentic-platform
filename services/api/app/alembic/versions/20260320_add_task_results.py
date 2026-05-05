@@ -1,7 +1,7 @@
 """add durable task results table
 
 Revision ID: 20260320_add_task_results
-Revises: 20260317_add_workflow_triggers_and_runs
+Revises: 20260317_workflow_triggers_runs
 Create Date: 2026-03-20
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "20260320_add_task_results"
-down_revision = "20260317_add_workflow_triggers_and_runs"
+down_revision = "20260317_workflow_triggers_runs"
 branch_labels = None
 depends_on = None
 

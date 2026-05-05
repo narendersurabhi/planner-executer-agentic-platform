@@ -1,7 +1,7 @@
 """backfill legacy document render capability and tool identifiers
 
-Revision ID: 20260322_backfill_render_identifiers
-Revises: 20260320_add_runtime_observability
+Revision ID: 20260322_render_id_backfill
+Revises: 20260320_runtime_obs
 Create Date: 2026-03-22
 """
 
@@ -13,8 +13,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260322_backfill_render_identifiers"
-down_revision = "20260320_add_runtime_observability"
+revision = "20260322_render_id_backfill"
+down_revision = "20260320_runtime_obs"
 branch_labels = None
 depends_on = None
 

@@ -1,6 +1,6 @@
 """add workflow definition and version tables
 
-Revision ID: 20260317_add_workflow_definitions
+Revision ID: 20260317_workflow_defs
 Revises: 20260204_add_task_tool_inputs
 Create Date: 2026-03-17
 """
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260317_add_workflow_definitions"
+revision = "20260317_workflow_defs"
 down_revision = "20260204_add_task_tool_inputs"
 branch_labels = None
 depends_on = None

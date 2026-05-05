@@ -1,7 +1,7 @@
 """add execution request lease and heartbeat fields
 
-Revision ID: 20260412_add_execution_request_leases
-Revises: 20260412_add_canonical_runs_shadow
+Revision ID: 20260412_exec_request_leases
+Revises: 20260412_runs_shadow
 Create Date: 2026-04-12
 """
 
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260412_add_execution_request_leases"
-down_revision = "20260412_add_canonical_runs_shadow"
+revision = "20260412_exec_request_leases"
+down_revision = "20260412_runs_shadow"
 branch_labels = None
 depends_on = None
 

@@ -7238,6 +7238,34 @@ def test_plan_preflight_accepts_explicit_prompt_for_llm_text_generate() -> None:
     assert errors == {}
 
 
+def test_plan_preflight_treats_clarification_llm_step_as_generate() -> None:
+    plan = models.PlanCreate(
+        planner_version="test",
+        tasks_summary="clarify document input",
+        dag_edges=[],
+        tasks=[
+            models.TaskCreate(
+                name="ClarifyDocumentInstruction",
+                description="Clarify the document instruction before generating the document.",
+                instruction="Clarify the document instruction and ask for any missing details.",
+                acceptance_criteria=["done"],
+                expected_output_schema_ref="",
+                deps=[],
+                tool_requests=["llm.text.generate"],
+                tool_inputs={
+                    "llm.text.generate": {
+                        "prompt": "Clarify the document instruction and ask for any missing details.",
+                    }
+                },
+                critic_required=False,
+            )
+        ],
+    )
+
+    errors = main._compile_plan_preflight(plan, job_context={})
+    assert errors == {}
+
+
 def test_plan_preflight_uses_synthesized_github_query_for_intent_segment_contract() -> None:
     plan = models.PlanCreate(
         planner_version="test",

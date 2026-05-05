@@ -1484,6 +1484,13 @@ def _infer_intent_from_text_with_source(
     source: str,
 ) -> TaskIntentInference:
     normalized = text.lower()
+    if _objective_is_clarification_step(text):
+        confidence = 0.86 if source == _INTENT_SOURCE_TASK_TEXT else 0.78
+        return TaskIntentInference(
+            intent=models.ToolIntent.generate.value,
+            source=source,
+            confidence=confidence,
+        )
     if "pull request" in normalized or re.search(r"\bpr\b", normalized):
         if _contains_any(normalized, ("create", "open", "submit", "raise")):
             confidence = 0.9 if source == _INTENT_SOURCE_TASK_TEXT else 0.82

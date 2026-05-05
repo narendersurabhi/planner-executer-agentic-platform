@@ -6,11 +6,13 @@ import StudioWorkbenchIcon from "./StudioWorkbenchIcon";
 import {
   createAgentDefinition,
   deleteAgentDefinition,
+  fetchAgentDefinitionVersions,
   fetchAgentDefinitions,
   fetchCapabilityCatalog,
   fetchRunDebugger,
   launchAgentRun,
   launchCapabilityRun,
+  publishAgentDefinitionVersion,
   searchCapabilities,
   updateAgentDefinition,
   type CapabilitySearchItem,
@@ -21,6 +23,7 @@ import { mapDebuggerStepToReplayDraft, mapRunToWorkbenchFork, mapRunToWorkflowPr
 import type {
   AgentDefinition,
   AgentDefinitionCreateRequest,
+  AgentDefinitionVersion,
   CapabilityItem,
   ReplayableCapabilityDraft,
   StudioSurface,
@@ -261,7 +264,9 @@ function splitConstraintList(value: string): string[] {
     .filter(Boolean);
 }
 
-function createAgentProfileInputDraft(definition: AgentDefinition): CapabilityInputDraft {
+function createAgentProfileInputDraft(
+  definition: AgentDefinition | AgentDefinitionVersion
+): CapabilityInputDraft {
   const inputDraft: CapabilityInputDraft = {};
   if (definition.default_goal.trim()) {
     inputDraft.goal = definition.default_goal;
@@ -306,7 +311,9 @@ function createAgentStepDraft(capabilityId = "", role: AgentStepRole = "step"): 
   };
 }
 
-function createAgentStepDraftFromDefinition(definition: AgentDefinition): AgentStepDraft {
+function createAgentStepDraftFromDefinition(
+  definition: AgentDefinition | AgentDefinitionVersion
+): AgentStepDraft {
   const capabilityId = definition.agent_capability_id || DEFAULT_AGENT_CAPABILITY_ID;
   const inputDraft = createAgentProfileInputDraft(definition);
   const draft = createAgentStepDraft(capabilityId, "agent");
@@ -323,6 +330,12 @@ function createAgentStepDraftFromDefinition(definition: AgentDefinition): AgentS
 
 function sortAgentDefinitions(definitions: AgentDefinition[]): AgentDefinition[] {
   return [...definitions].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+}
+
+function sortAgentDefinitionVersions(
+  versions: AgentDefinitionVersion[]
+): AgentDefinitionVersion[] {
+  return [...versions].sort((left, right) => right.version_number - left.version_number);
 }
 
 function buildCapabilityRunSpecPreview(
@@ -585,10 +598,16 @@ export default function StudioWorkbenchSurface({
   const [agentDefinitionsLoading, setAgentDefinitionsLoading] = useState(false);
   const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
   const [selectedAgentDefinitionId, setSelectedAgentDefinitionId] = useState("");
+  const [agentDefinitionVersions, setAgentDefinitionVersions] = useState<AgentDefinitionVersion[]>([]);
+  const [agentDefinitionVersionsLoading, setAgentDefinitionVersionsLoading] = useState(false);
+  const [agentDefinitionVersionsError, setAgentDefinitionVersionsError] = useState<string | null>(null);
+  const [selectedAgentDefinitionVersionId, setSelectedAgentDefinitionVersionId] = useState("");
+  const [agentProfileVersionNote, setAgentProfileVersionNote] = useState("");
   const [agentProfileName, setAgentProfileName] = useState("");
   const [agentProfileDescription, setAgentProfileDescription] = useState("");
   const [agentProfileError, setAgentProfileError] = useState<string | null>(null);
   const [agentProfileSaving, setAgentProfileSaving] = useState(false);
+  const [agentProfilePublishing, setAgentProfilePublishing] = useState(false);
   const [agentProfileDeleting, setAgentProfileDeleting] = useState(false);
   const [launchLoading, setLaunchLoading] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
@@ -672,6 +691,48 @@ export default function StudioWorkbenchSurface({
   }, [workspaceUserId]);
 
   useEffect(() => {
+    if (!selectedAgentDefinitionId) {
+      setAgentDefinitionVersions([]);
+      setSelectedAgentDefinitionVersionId("");
+      setAgentDefinitionVersionsError(null);
+      setAgentDefinitionVersionsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const loadAgentDefinitionVersions = async () => {
+      setAgentDefinitionVersionsLoading(true);
+      setAgentDefinitionVersionsError(null);
+      try {
+        const response = await fetchAgentDefinitionVersions(selectedAgentDefinitionId);
+        if (cancelled) {
+          return;
+        }
+        const sortedVersions = sortAgentDefinitionVersions(response);
+        setAgentDefinitionVersions(sortedVersions);
+        setSelectedAgentDefinitionVersionId((current) =>
+          sortedVersions.some((version) => version.id === current) ? current : ""
+        );
+      } catch (error) {
+        if (!cancelled) {
+          setAgentDefinitionVersions([]);
+          setSelectedAgentDefinitionVersionId("");
+          setAgentDefinitionVersionsError(
+            error instanceof Error ? error.message : "Failed to load published versions."
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setAgentDefinitionVersionsLoading(false);
+        }
+      }
+    };
+    void loadAgentDefinitionVersions();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedAgentDefinitionId]);
+
+  useEffect(() => {
     const query = deferredCatalogQuery.trim();
     if (!query) {
       setCatalogSearchItems([]);
@@ -730,6 +791,14 @@ export default function StudioWorkbenchSurface({
   const selectedAgentDefinition = useMemo(
     () => agentDefinitions.find((definition) => definition.id === selectedAgentDefinitionId) ?? null,
     [agentDefinitions, selectedAgentDefinitionId]
+  );
+
+  const selectedAgentDefinitionVersion = useMemo(
+    () =>
+      agentDefinitionVersions.find(
+        (version) => version.id === selectedAgentDefinitionVersionId
+      ) ?? null,
+    [agentDefinitionVersions, selectedAgentDefinitionVersionId]
   );
 
   const groupOptions = useMemo(
@@ -1021,6 +1090,7 @@ export default function StudioWorkbenchSurface({
     setWorkbenchMode("agent");
     setAgentEditorMode("structured");
     setSelectedAgentDefinitionId(definition.id);
+    setSelectedAgentDefinitionVersionId("");
     setAgentProfileName(definition.name);
     setAgentProfileDescription(definition.description ?? "");
     setAgentTitle(definition.name || "Agent workbench run");
@@ -1032,6 +1102,26 @@ export default function StudioWorkbenchSurface({
     setWorkbenchBanner({
       tone: "info",
       message: `Loaded agent profile '${definition.name}'.`,
+    });
+  };
+
+  const applyAgentDefinitionVersionDraft = (version: AgentDefinitionVersion) => {
+    const primaryStep = createAgentStepDraftFromDefinition(version);
+    setWorkbenchMode("agent");
+    setAgentEditorMode("structured");
+    setSelectedAgentDefinitionId(version.agent_definition_id);
+    setSelectedAgentDefinitionVersionId(version.id);
+    setAgentProfileName(version.name);
+    setAgentProfileDescription(version.description ?? "");
+    setAgentTitle(version.name || "Agent workbench run");
+    setAgentGoal(version.default_goal || "");
+    setAgentUserId(version.user_id || workspaceUserId);
+    setAgentSteps([primaryStep]);
+    setAgentProfileError(null);
+    setLaunchError(null);
+    setWorkbenchBanner({
+      tone: "info",
+      message: `Loaded published version v${version.version_number} of '${version.name}'.`,
     });
   };
 
@@ -1094,6 +1184,9 @@ export default function StudioWorkbenchSurface({
     setWorkbenchMode("agent");
     setAgentEditorMode("structured");
     setSelectedAgentDefinitionId("");
+    setSelectedAgentDefinitionVersionId("");
+    setAgentDefinitionVersions([]);
+    setAgentProfileVersionNote("");
     setAgentProfileName("");
     setAgentProfileDescription("");
     setAgentTitle("Agent workbench run");
@@ -1125,6 +1218,7 @@ export default function StudioWorkbenchSurface({
         )
       );
       setSelectedAgentDefinitionId(updated.id);
+      setSelectedAgentDefinitionVersionId("");
       setAgentProfileName(updated.name);
       setAgentProfileDescription(updated.description ?? "");
       setWorkbenchBanner({
@@ -1153,6 +1247,8 @@ export default function StudioWorkbenchSurface({
         ])
       );
       setSelectedAgentDefinitionId(created.id);
+      setSelectedAgentDefinitionVersionId("");
+      setAgentDefinitionVersions([]);
       setAgentProfileName(created.name);
       setAgentProfileDescription(created.description ?? "");
       setWorkbenchBanner({
@@ -1165,6 +1261,54 @@ export default function StudioWorkbenchSurface({
       );
     } finally {
       setAgentProfileSaving(false);
+    }
+  };
+
+  const handlePublishAgentProfile = async () => {
+    if (!selectedAgentDefinitionId) {
+      setAgentProfileError("Save the profile before publishing a version.");
+      return;
+    }
+    setAgentProfilePublishing(true);
+    setAgentProfileError(null);
+    try {
+      const payload = buildAgentDefinitionPayload();
+      const updated = await updateAgentDefinition(selectedAgentDefinitionId, payload);
+      setAgentDefinitions((current) =>
+        sortAgentDefinitions(
+          current.map((definition) =>
+            definition.id === updated.id ? updated : definition
+          )
+        )
+      );
+      const published = await publishAgentDefinitionVersion(updated.id, {
+        version_note: agentProfileVersionNote.trim() || null,
+        published_by: agentUserId.trim() || workspaceUserId.trim() || null,
+        metadata: {
+          surface: "studio_workbench",
+        },
+      });
+      setAgentDefinitionVersions((current) =>
+        sortAgentDefinitionVersions([
+          published,
+          ...current.filter((version) => version.id !== published.id),
+        ])
+      );
+      setSelectedAgentDefinitionId(updated.id);
+      setSelectedAgentDefinitionVersionId(published.id);
+      setAgentProfileName(published.name);
+      setAgentProfileDescription(published.description ?? "");
+      setAgentProfileVersionNote("");
+      setWorkbenchBanner({
+        tone: "info",
+        message: `Published '${published.name}' as version v${published.version_number}.`,
+      });
+    } catch (error) {
+      setAgentProfileError(
+        error instanceof Error ? error.message : "Failed to publish agent profile."
+      );
+    } finally {
+      setAgentProfilePublishing(false);
     }
   };
 
@@ -1184,6 +1328,9 @@ export default function StudioWorkbenchSurface({
         current.filter((definition) => definition.id !== selectedAgentDefinitionId)
       );
       setSelectedAgentDefinitionId("");
+      setSelectedAgentDefinitionVersionId("");
+      setAgentDefinitionVersions([]);
+      setAgentProfileVersionNote("");
       setAgentProfileName("");
       setAgentProfileDescription("");
       setWorkbenchBanner({
@@ -1235,6 +1382,9 @@ export default function StudioWorkbenchSurface({
     }
     setWorkbenchMode("agent");
     setSelectedAgentDefinitionId("");
+    setSelectedAgentDefinitionVersionId("");
+    setAgentDefinitionVersions([]);
+    setAgentProfileVersionNote("");
     setAgentProfileName("");
     setAgentProfileDescription("");
     setAgentProfileError(null);
@@ -1509,6 +1659,9 @@ export default function StudioWorkbenchSurface({
           run_spec: agentRunSpecPreview.value,
           ...(selectedAgentDefinitionId
             ? { agent_definition_id: selectedAgentDefinitionId }
+            : {}),
+          ...(selectedAgentDefinitionVersionId
+            ? { agent_definition_version_id: selectedAgentDefinitionVersionId }
             : {}),
         });
       }
@@ -1935,7 +2088,11 @@ export default function StudioWorkbenchSurface({
                       <div>
                         <div className="text-sm font-semibold text-white">Agent Profile</div>
                         <div className="mt-1 text-xs leading-5 text-slate-300/78">
-                          {selectedAgentDefinition
+                          {selectedAgentDefinitionVersion
+                            ? `Published v${selectedAgentDefinitionVersion.version_number} from ${new Date(
+                                selectedAgentDefinitionVersion.created_at
+                              ).toLocaleString()}`
+                            : selectedAgentDefinition
                             ? `Saved profile updated ${new Date(
                                 selectedAgentDefinition.updated_at
                               ).toLocaleString()}`
@@ -1943,7 +2100,11 @@ export default function StudioWorkbenchSurface({
                         </div>
                       </div>
                       <span className="rounded-full border border-sky-300/22 bg-sky-400/12 px-2 py-1 text-[10px] uppercase tracking-[0.14em] text-sky-100">
-                        {agentDefinitionsLoading ? "loading" : `${agentDefinitions.length} saved`}
+                        {selectedAgentDefinitionVersion
+                          ? `v${selectedAgentDefinitionVersion.version_number}`
+                          : agentDefinitionsLoading
+                          ? "loading"
+                          : `${agentDefinitions.length} saved`}
                       </span>
                     </div>
                     <div className="mt-3 grid gap-3 lg:grid-cols-2">
@@ -1957,6 +2118,8 @@ export default function StudioWorkbenchSurface({
                             const nextId = event.target.value;
                             if (!nextId) {
                               setSelectedAgentDefinitionId("");
+                              setSelectedAgentDefinitionVersionId("");
+                              setAgentDefinitionVersions([]);
                               setAgentProfileName("");
                               setAgentProfileDescription("");
                               setAgentProfileError(null);
@@ -1980,6 +2143,39 @@ export default function StudioWorkbenchSurface({
                       </label>
                       <label className="text-xs text-slate-200">
                         <span className="mb-1 block uppercase tracking-[0.16em] text-slate-300/74">
+                          Published version
+                        </span>
+                        <select
+                          value={selectedAgentDefinitionVersionId}
+                          onChange={(event) => {
+                            const nextVersionId = event.target.value;
+                            if (!nextVersionId) {
+                              setSelectedAgentDefinitionVersionId("");
+                              if (selectedAgentDefinition) {
+                                applyAgentDefinitionDraft(selectedAgentDefinition);
+                              }
+                              return;
+                            }
+                            const version =
+                              agentDefinitionVersions.find((item) => item.id === nextVersionId) ?? null;
+                            if (version) {
+                              applyAgentDefinitionVersionDraft(version);
+                            }
+                          }}
+                          disabled={!selectedAgentDefinitionId || agentDefinitionVersionsLoading}
+                          className="w-full rounded-xl border border-white/10 bg-slate-950/45 px-3 py-2 text-sm text-white outline-none transition focus:border-sky-300/35 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <option value="">Draft / latest profile</option>
+                          {agentDefinitionVersions.map((version) => (
+                            <option key={version.id} value={version.id}>
+                              v{version.version_number}
+                              {version.version_note ? ` - ${version.version_note}` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-xs text-slate-200">
+                        <span className="mb-1 block uppercase tracking-[0.16em] text-slate-300/74">
                           Profile name
                         </span>
                         <input
@@ -1997,6 +2193,17 @@ export default function StudioWorkbenchSurface({
                           value={agentProfileDescription}
                           onChange={(event) => setAgentProfileDescription(event.target.value)}
                           className="w-full rounded-xl border border-white/10 bg-slate-950/45 px-3 py-2 text-sm text-white outline-none transition focus:border-sky-300/35"
+                        />
+                      </label>
+                      <label className="text-xs text-slate-200 lg:col-span-2">
+                        <span className="mb-1 block uppercase tracking-[0.16em] text-slate-300/74">
+                          Publish note
+                        </span>
+                        <input
+                          value={agentProfileVersionNote}
+                          onChange={(event) => setAgentProfileVersionNote(event.target.value)}
+                          disabled={!selectedAgentDefinitionId}
+                          className="w-full rounded-xl border border-white/10 bg-slate-950/45 px-3 py-2 text-sm text-white outline-none transition focus:border-sky-300/35 disabled:cursor-not-allowed disabled:opacity-50"
                         />
                       </label>
                     </div>
@@ -2026,6 +2233,18 @@ export default function StudioWorkbenchSurface({
                       </button>
                       <button
                         type="button"
+                        className="rounded-xl border border-emerald-300/24 bg-emerald-400/14 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-emerald-50 transition hover:border-emerald-300/36 disabled:cursor-not-allowed disabled:opacity-50"
+                        onClick={() => void handlePublishAgentProfile()}
+                        disabled={
+                          !selectedAgentDefinitionId ||
+                          agentProfileSaving ||
+                          agentProfilePublishing
+                        }
+                      >
+                        {agentProfilePublishing ? "Publishing..." : "Publish version"}
+                      </button>
+                      <button
+                        type="button"
                         className="rounded-xl border border-rose-300/18 bg-rose-400/12 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-rose-100 transition hover:border-rose-300/28 disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => void handleDeleteAgentProfile()}
                         disabled={!selectedAgentDefinitionId || agentProfileDeleting}
@@ -2033,6 +2252,11 @@ export default function StudioWorkbenchSurface({
                         {agentProfileDeleting ? "Deleting..." : "Delete"}
                       </button>
                     </div>
+                    {agentDefinitionVersionsError ? (
+                      <div className="mt-3 rounded-2xl border border-rose-300/18 bg-rose-400/12 px-3 py-3 text-xs text-rose-100">
+                        {agentDefinitionVersionsError}
+                      </div>
+                    ) : null}
                     {agentDefinitionsError ? (
                       <div className="mt-3 rounded-2xl border border-rose-300/18 bg-rose-400/12 px-3 py-3 text-xs text-rose-100">
                         {agentDefinitionsError}

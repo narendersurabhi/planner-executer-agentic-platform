@@ -1,7 +1,7 @@
 """add feedback records
 
 Revision ID: 20260324_add_feedback_records
-Revises: 20260322_backfill_render_identifiers
+Revises: 20260322_render_id_backfill
 Create Date: 2026-03-24
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision = "20260324_add_feedback_records"
-down_revision = "20260322_backfill_render_identifiers"
+down_revision = "20260322_render_id_backfill"
 branch_labels = None
 depends_on = None
 

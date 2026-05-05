@@ -1,6 +1,6 @@
 """add canonical run shadow tables
 
-Revision ID: 20260412_add_canonical_runs_shadow
+Revision ID: 20260412_runs_shadow
 Revises: 20260324_add_feedback_records
 Create Date: 2026-04-12
 """
@@ -11,7 +11,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260412_add_canonical_runs_shadow"
+revision = "20260412_runs_shadow"
 down_revision = "20260324_add_feedback_records"
 branch_labels = None
 depends_on = None

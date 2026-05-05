@@ -1,7 +1,7 @@
 """add workflow trigger and run tables
 
-Revision ID: 20260317_add_workflow_triggers_and_runs
-Revises: 20260317_add_workflow_definitions
+Revision ID: 20260317_workflow_triggers_runs
+Revises: 20260317_workflow_defs
 Create Date: 2026-03-17
 """
 
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260317_add_workflow_triggers_and_runs"
-down_revision = "20260317_add_workflow_definitions"
+revision = "20260317_workflow_triggers_runs"
+down_revision = "20260317_workflow_defs"
 branch_labels = None
 depends_on = None
 

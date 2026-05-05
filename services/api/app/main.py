@@ -22,6 +22,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from prometheus_client import Counter, make_asgi_app
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from libs.core import (
@@ -4004,12 +4005,31 @@ def _plan_derived_normalized_intent_envelope(
     plan: models.PlanCreate,
     source: str,
 ) -> workflow_contracts.NormalizedIntentEnvelope:
+    try:
+        capability_map = capability_registry.load_capability_registry().enabled_capabilities()
+    except Exception:  # noqa: BLE001
+        capability_map = {}
     segments: list[workflow_contracts.IntentGraphSegment] = []
     candidate_capabilities: dict[str, list[str]] = {}
     intent_order: list[str] = []
     for index, task in enumerate(plan.tasks):
         request_ids = _task_request_ids_for_preflight(task)
         task_intent = _preflight_task_intent(task, goal_text=goal) or "io"
+        risk_level = "read_only"
+        risk_rank = 0
+        for request_id in request_ids:
+            capability = capability_map.get(request_id)
+            if capability is None:
+                continue
+            candidate_risk = _workbench_capability_risk_level(capability)
+            candidate_rank = {
+                "read_only": 0,
+                "bounded_write": 1,
+                "high_risk_write": 2,
+            }.get(candidate_risk, 0)
+            if candidate_rank > risk_rank:
+                risk_level = candidate_risk
+                risk_rank = candidate_rank
         objective = (
             str(task.instruction or "").strip()
             or str(task.description or "").strip()
@@ -4018,7 +4038,7 @@ def _plan_derived_normalized_intent_envelope(
         )
         segment_id = f"s{index + 1}"
         slots = intent_contract.normalize_intent_segment_slots(
-            raw_slots={"must_have_inputs": []},
+            raw_slots={"must_have_inputs": [], "risk_level": risk_level},
             intent=task_intent,
             objective=objective,
             required_inputs=(),
@@ -16354,6 +16374,22 @@ def _sync_execution_request_snapshot(
         )
         now = _utcnow()
         status = "invalid" if task_payload.get("tool_inputs_validation") else "prepared"
+
+        def apply_snapshot(target: ExecutionRequestRecord) -> None:
+            target.run_id = run_id
+            target.job_id = job_id
+            target.step_id = task_id
+            target.request_id = request_id
+            target.capability_id = capability_id
+            target.attempt_number = attempts
+            target.status = status
+            target.request_json = execution_request.model_dump(mode="json", exclude_none=True)
+            target.retry_policy_json = retry_policy
+            target.policy_snapshot_json = _policy_snapshot_from_payload(task_payload)
+            target.context_provenance_json = _context_provenance_from_payload(task_payload)
+            target.deadline_at = _deadline_at_from_retry_policy(retry_policy, base_time=now)
+            target.updated_at = now
+
         if record is None:
             record = ExecutionRequestRecord(
                 id=record_id,
@@ -16378,20 +16414,20 @@ def _sync_execution_request_snapshot(
                 updated_at=now,
             )
             db.add(record)
-        record.run_id = run_id
-        record.job_id = job_id
-        record.step_id = task_id
-        record.request_id = request_id
-        record.capability_id = capability_id
-        record.attempt_number = attempts
-        record.status = status
-        record.request_json = execution_request.model_dump(mode="json", exclude_none=True)
-        record.retry_policy_json = retry_policy
-        record.policy_snapshot_json = _policy_snapshot_from_payload(task_payload)
-        record.context_provenance_json = _context_provenance_from_payload(task_payload)
-        record.deadline_at = _deadline_at_from_retry_policy(retry_policy, base_time=now)
-        record.updated_at = now
-        db.commit()
+        apply_snapshot(record)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing_record = (
+                db.query(ExecutionRequestRecord)
+                .filter(ExecutionRequestRecord.id == record_id)
+                .first()
+            )
+            if existing_record is None:
+                raise
+            apply_snapshot(existing_record)
+            db.commit()
 
 
 def _update_execution_request_status(
@@ -20940,15 +20976,24 @@ def _workbench_validate_agent_run_spec(
     for step in run_spec.steps:
         capability_id = str(step.capability_request.capability_id or "").strip().lower()
         request_id = str(step.capability_request.request_id or "").strip().lower()
-        if capability_id == "llm.text.generate" or request_id == "llm.text.generate":
+        if _workbench_step_hydrates_prompt(capability_id, request_id):
             bindings = dict(step.input_bindings or {})
             prompt_value = bindings.get("prompt")
             has_prompt = (
                 prompt_value is not None
                 and (not isinstance(prompt_value, str) or bool(prompt_value.strip()))
             )
+            goal_value = bindings.get("goal")
+            goal_text = str(goal_value or "").strip() if isinstance(goal_value, str) else ""
             instruction = str(step.instruction or "").strip()
-            if not has_prompt and instruction:
+            if not has_prompt and goal_text:
+                bindings["prompt"] = goal_text
+                step = step.model_copy(update={"input_bindings": bindings})
+            elif (
+                not has_prompt
+                and (capability_id == "llm.text.generate" or request_id == "llm.text.generate")
+                and instruction
+            ):
                 bindings["prompt"] = instruction
                 step = step.model_copy(update={"input_bindings": bindings})
         normalized_steps.append(step)
@@ -21039,6 +21084,21 @@ def _workbench_missing_binding_value(value: Any) -> bool:
     if isinstance(value, str):
         return not bool(value.strip())
     return False
+
+
+def _workbench_step_hydrates_prompt(capability_id: str, request_id: str) -> bool:
+    identifiers = {
+        str(capability_id or "").strip().lower(),
+        str(request_id or "").strip().lower(),
+    }
+    return any(
+        identifier == "llm.text.generate"
+        or identifier == "codegen.autonomous"
+        or identifier.endswith(".autonomous")
+        or ".autonomous." in identifier
+        for identifier in identifiers
+        if identifier
+    )
 
 
 def _workbench_step_canonical_capability_id(step: models.StepSpec) -> str:
@@ -21260,6 +21320,13 @@ def _workbench_apply_agent_definition_defaults(
         if _workbench_missing_binding_value(input_bindings.get("max_steps")):
             if definition.default_max_steps is not None:
                 input_bindings["max_steps"] = int(definition.default_max_steps)
+        if _workbench_step_hydrates_prompt(
+            str(primary_step.capability_request.capability_id or ""),
+            str(primary_step.capability_request.request_id or ""),
+        ) and _workbench_missing_binding_value(input_bindings.get("prompt")):
+            prompt_value = input_bindings.get("goal") or effective_goal or definition.instructions
+            if not _workbench_missing_binding_value(prompt_value):
+                input_bindings["prompt"] = str(prompt_value).strip()
 
         primary_updates: dict[str, Any] = {"input_bindings": input_bindings}
         if not str(primary_step.instruction or "").strip():
@@ -21320,8 +21387,29 @@ def _workbench_launch_run(
     effective_goal = str(goal or "").strip() or plan.tasks_summary or title or "Workbench run"
     effective_title = str(title or "").strip() or effective_goal
     use_postgres_scheduler = STUDIO_RUN_SCHEDULER_ENABLED
-    serialized_run_spec = run_spec.model_dump(mode="json")
     run_metadata = dict(run_spec.metadata or {})
+    if (
+        run_metadata.get("workbench_mode") == "agent"
+        and not isinstance(run_metadata.get("normalized_intent_envelope"), Mapping)
+        and not isinstance(run_metadata.get("goal_intent_graph"), Mapping)
+    ):
+        workbench_envelope = _plan_derived_normalized_intent_envelope(
+            goal=effective_goal,
+            plan=plan,
+            source="workbench_run_spec",
+        )
+        envelope_json = workflow_contracts.dump_normalized_intent_envelope(
+            workbench_envelope
+        ) or {}
+        run_metadata["goal_intent_profile"] = (
+            workflow_contracts.dump_goal_intent_profile(workbench_envelope.profile) or {}
+        )
+        run_metadata["normalized_intent_envelope"] = envelope_json
+        run_metadata["goal_intent_graph"] = workflow_contracts.dump_intent_graph(
+            workbench_envelope.graph
+        )
+        run_spec = run_spec.model_copy(update={"metadata": run_metadata})
+    serialized_run_spec = run_spec.model_dump(mode="json")
 
     metadata_overrides: dict[str, Any] = {
         **run_metadata,

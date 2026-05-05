@@ -374,7 +374,7 @@ def test_workbench_agent_run_with_definition_applies_defaults_and_stores_snapsho
         },
     )
 
-    assert launch_response.status_code == 200
+    assert launch_response.status_code == 200, launch_response.json()
     body = launch_response.json()
     run_id = body["run"]["id"]
     first_step = body["run_spec"]["steps"][0]
@@ -387,6 +387,7 @@ def test_workbench_agent_run_with_definition_applies_defaults_and_stores_snapsho
         "workspace_path": "workbench-agent",
         "constraints": "keep the change scoped\nrun focused tests",
         "max_steps": 5,
+        "prompt": "Implement the saved profile goal.",
     }
     assert body["run"]["metadata"]["agent_definition_id"] == agent_definition_id
     snapshot = body["run"]["metadata"]["agent_definition_snapshot"]
@@ -461,7 +462,7 @@ def test_workbench_agent_run_with_definition_version_uses_published_snapshot(
         },
     )
 
-    assert launch_response.status_code == 200
+    assert launch_response.status_code == 200, launch_response.json()
     body = launch_response.json()
     first_step = body["run_spec"]["steps"][0]
     assert body["run"]["title"] == "Published launch profile"
@@ -480,7 +481,35 @@ def test_workbench_agent_run_with_definition_version_uses_published_snapshot(
         "workspace_path": "published-launch-workspace",
         "constraints": "published launch constraint",
         "max_steps": 4,
+        "prompt": "Use published launch goal.",
     }
+
+
+def test_workbench_agent_run_hydrates_prompt_from_unsaved_codegen_goal(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main.capability_registry, "load_capability_registry", _agent_registry)
+
+    run_spec = _profile_agent_run_spec(extra_capability_id=None)
+    run_spec["steps"][0]["instruction"] = "Run the codegen agent."
+    run_spec["steps"][0]["input_bindings"] = {
+        "goal": "Verify unsaved agent launch.",
+        "workspace_path": "unsaved-agent-workspace",
+    }
+
+    launch_response = client.post(
+        "/workbench/agent-runs",
+        json={
+            "title": "Unsaved codegen agent launch",
+            "goal": "Verify unsaved agent launch.",
+            "context_json": {"workspace": "demo"},
+            "run_spec": run_spec,
+        },
+    )
+
+    assert launch_response.status_code == 200, launch_response.json()
+    first_step = launch_response.json()["run_spec"]["steps"][0]
+    assert first_step["input_bindings"]["prompt"] == "Verify unsaved agent launch."
 
 
 def test_workbench_agent_run_with_definition_version_rejects_mismatch(

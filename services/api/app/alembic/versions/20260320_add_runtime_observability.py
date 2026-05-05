@@ -1,6 +1,6 @@
 """add runtime observability tables
 
-Revision ID: 20260320_add_runtime_observability
+Revision ID: 20260320_runtime_obs
 Revises: 20260320_add_task_results
 Create Date: 2026-03-20
 """
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260320_add_runtime_observability"
+revision = "20260320_runtime_obs"
 down_revision = "20260320_add_task_results"
 branch_labels = None
 depends_on = None
